@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { deflateRawSync, deflateSync } from "node:zlib";
+import { deflateRawSync, deflateSync, inflateSync } from "node:zlib";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -23,6 +23,7 @@ try {
   testFilterAndParameterParsing();
   await testChainedFilters();
   await testFlate();
+  await testFlateEolRecovery();
   await testStreamingFlateChunks();
   await testLzw();
   await testAscii85();
@@ -135,6 +136,27 @@ async function testFlate() {
     hasPdfError("invalid-object", /empty/)
   );
 
+  // PDF 32000-1 7.3.8.1 puts an EOL marker after the stream data and excludes
+  // it from /Length. Producers that count it anyway leave a stray CR, LF, or
+  // CRLF after an otherwise complete zlib stream. The marker is not data, and
+  // the payload it follows decodes to exactly the same bytes.
+  for (const marker of [[0x0a], [0x0d], [0x0d, 0x0a]]) {
+    assert.deepEqual(
+      await decodeOne(concat(zlib, Uint8Array.from(marker)), "FlateDecode"),
+      decoded,
+      `zlib stream followed by a ${marker.length}-byte EOL marker`
+    );
+  }
+
+  // Only that marker is specified to sit there. Other trailing bytes, other
+  // whitespace, and more than one marker stay errors.
+  for (const junk of [[0x20], [0x09], [0x0a, 0x0a], [0x0a, 0x0d], [0x0d, 0x0a, 0x0a]]) {
+    await assert.rejects(
+      decodeOne(concat(zlib, Uint8Array.from(junk)), "FlateDecode"),
+      hasPdfError("invalid-object", /FlateDecode/),
+      `zlib stream followed by ${JSON.stringify(junk)}`
+    );
+  }
   // 0x7820 has a valid FCHECK and advertises FDICT. PDF Flate streams cannot
   // supply the external dictionary, so this is a deterministic typed failure.
   await assert.rejects(
@@ -147,6 +169,117 @@ async function testFlate() {
     }),
     hasPdfError("resource-limit", /configured byte limit/)
   );
+}
+
+async function testFlateEolRecovery() {
+  const decodeModes = [
+    (input, options) => decodePdfFilterChain(input, ["FlateDecode"], [null], options),
+    async (input, options) => {
+      const result = await collectFilterChunks(input, ["FlateDecode"], [null], { chunkSize: 4093, ...options });
+      assert.ok(result.chunks.every((chunk) => chunk.length > 0 && chunk.length <= 4093));
+      return result.bytes;
+    }
+  ];
+  // The low checksum byte is CR. A following LF is padding, but that CR is
+  // still part of the zlib stream: trying only a two-byte trim corrupts it.
+  const checksumCrPayload = Uint8Array.of(12);
+  const checksumCr = bytesOf(deflateSync(checksumCrPayload));
+  assert.equal(checksumCr.at(-1), 0x0d);
+  for (const decode of decodeModes) {
+    for (const marker of [[], [0x0a], [0x0d], [0x0d, 0x0a]]) {
+      assert.deepEqual(await decode(concat(checksumCr, Uint8Array.from(marker))), checksumCrPayload);
+    }
+    const damaged = checksumCr.slice();
+    damaged[damaged.length - 2] ^= 1;
+    for (const input of [
+      concat(damaged, Uint8Array.of(0x0a)),
+      concat(checksumCr.subarray(0, -2), Uint8Array.of(0x0d, 0x0a)),
+      ...[[0], [32], [9], [10, 10], [10, 13], [13, 13], [13, 10, 10], [13, 10, 13, 10]]
+        .map((junk) => concat(checksumCr, Uint8Array.from(junk)))
+    ]) {
+      await assert.rejects(decode(input), hasPdfError("invalid-object", /FlateDecode/));
+    }
+    assert.deepEqual(await decode(concat(bytesOf(deflateSync(Uint8Array.of())), Uint8Array.of(10))), Uint8Array.of());
+  }
+
+  const nativeDecompressionStream = globalThis.DecompressionStream;
+  try {
+    // Model Chromium's synchronous enqueue-then-error behavior. The actual
+    // TransformStream discards queued chunks after the pending read is filled.
+    // Also exercise a decoder that exposes no output until integrity succeeds.
+    for (const exposePrefix of [true, false]) {
+      globalThis.DecompressionStream = class {
+        constructor(format) {
+          assert.equal(format, "deflate");
+          const stream = new TransformStream({
+            transform(input, controller) {
+              const { buffer, engine } = inflateSync(input, { info: true });
+              const hasTrailingBytes = engine.bytesWritten < input.length;
+              if (exposePrefix || !hasTrailingBytes) {
+                // Different retry boundaries also exercise skipping a prefix
+                // that ends partway through a chunk, after multiple chunks.
+                const outputChunkSize = hasTrailingBytes ? 65536 : 32749;
+                for (let offset = 0; offset < buffer.length; offset += outputChunkSize) {
+                  controller.enqueue(bytesOf(buffer.subarray(offset, offset + outputChunkSize)));
+                }
+              }
+              if (hasTrailingBytes) throw new TypeError("Junk found after end of compressed data.");
+            }
+          });
+          this.readable = stream.readable;
+          this.writable = stream.writable;
+        }
+      };
+      for (const size of [65536, 65537, 200003]) {
+        const payload = Uint8Array.from({ length: size }, (_, index) => (index * 31 + (index >>> 7)) & 255);
+        for (const marker of [[10], [13], [13, 10]]) {
+          const encoded = concat(bytesOf(deflateSync(payload)), Uint8Array.from(marker));
+          for (const decode of decodeModes) {
+            assert.deepEqual(await decode(encoded), payload, "recovery must neither lose nor duplicate output");
+          }
+        }
+      }
+      const large = concat(bytesOf(deflateSync(new Uint8Array(200003))), Uint8Array.of(10));
+      for (const decode of decodeModes) {
+        await assert.rejects(decode(large, { limits: { maxDecodedStreamBytes: 100000 } }),
+          hasPdfError("resource-limit", /configured byte limit/));
+      }
+      const cancelled = new AbortController();
+      const iterator = decodePdfFilterChainChunks(large, ["FlateDecode"], [null], {
+        chunkSize: 4093, signal: cancelled.signal
+      })[Symbol.asyncIterator]();
+      let received = 0;
+      while (received <= 65536) received += (await iterator.next()).value.length;
+      cancelled.abort(new Error("cancel recovered output"));
+      await assert.rejects(iterator.next(), hasPdfError("aborted", /aborted/));
+      await iterator.return?.();
+    }
+    // Abort exactly when the retry starts, after the original error's abort
+    // check. It must escape as cancellation, not become a malformed PDF error.
+    for (const decode of decodeModes) {
+      const controller = new AbortController();
+      let attempts = 0;
+      globalThis.DecompressionStream = class extends nativeDecompressionStream {
+        constructor(format) {
+          super(format);
+          if (++attempts === 2) controller.abort(new Error("cancel EOL recovery"));
+        }
+      };
+      await assert.rejects(decode(concat(checksumCr, Uint8Array.of(13)), { signal: controller.signal }),
+        hasPdfError("aborted", /aborted/));
+    }
+  } finally {
+    globalThis.DecompressionStream = nativeDecompressionStream;
+  }
+
+  // Recovery belongs to original zlib input, never to the synthetic checksum
+  // used for validating the separate raw-DEFLATE compatibility path.
+  const raw = bytesOf(deflateRawSync(checksumCrPayload));
+  for (const decode of decodeModes) {
+    for (const marker of [[0], [10], [13], [13, 10]]) {
+      await assert.rejects(decode(concat(raw, Uint8Array.from(marker))), hasPdfError("invalid-object", /FlateDecode/));
+    }
+  }
 }
 
 async function testStreamingFlateChunks() {

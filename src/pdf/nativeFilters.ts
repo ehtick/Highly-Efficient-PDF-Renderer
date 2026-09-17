@@ -185,7 +185,7 @@ async function decodeFlate(
 ): Promise<Uint8Array> {
   const wrapper = classifyFlateWrapper(input);
   if (wrapper === "zlib") {
-    return (await inflateWithPlatformStream([input], "deflate", limit, signal, true)).bytes!;
+    return (await inflateWithPlatformStream([input], "deflate", limit, signal, true, true)).bytes!;
   }
   const decoded = (await inflateWithPlatformStream(
     [input],
@@ -227,7 +227,8 @@ async function* decodeFlateChunks(
     wrapper === "zlib" ? "deflate" : "deflate-raw",
     limit,
     signal,
-    inflateState
+    inflateState,
+    wrapper === "zlib"
   )) {
     if (checksum) updateAdler32(checksum, platformChunk, signal);
     for (let offset = 0; offset < platformChunk.length; offset += chunkSize) {
@@ -250,6 +251,34 @@ async function* decodeFlateChunks(
   if (validation.length !== inflateState.length) {
     throw new PdfError("invalid-object", "Raw FlateDecode validation length mismatch.");
   }
+}
+
+/**
+ * Find a strictly valid zlib stream with exactly one trailing EOL removed.
+ * Probe without retaining decoded chunks: some platforms discard queued output
+ * on error, so the initial attempt's delivered length cannot prove completeness.
+ */
+async function validateZlibWithoutEolMarker(
+  input: Uint8Array,
+  limit: number,
+  signal?: AbortSignal
+): Promise<{ readonly input: Uint8Array; readonly length: number } | null> {
+  const last = input[input.length - 1];
+  if (last !== 0x0a && last !== 0x0d) return null;
+  const maxTrim = last === 0x0a && input[input.length - 2] === 0x0d ? 2 : 1;
+  // Try LF alone before CRLF: the preceding CR can be a checksum byte.
+  for (let trim = 1; trim <= maxTrim; trim += 1) {
+    const candidate = input.subarray(0, input.length - trim);
+    try {
+      const decoded = await inflateWithPlatformStream([candidate], "deflate", limit, signal, false);
+      throwIfAborted(signal);
+      return { input: candidate, length: decoded.length };
+    } catch (cause) {
+      throwIfAborted(signal);
+      if (!(cause instanceof PdfError) || cause.code !== "invalid-object") throw cause;
+    }
+  }
+  return null;
 }
 
 function classifyFlateWrapper(input: Uint8Array): "zlib" | "raw" {
@@ -276,7 +305,8 @@ async function inflateWithPlatformStream(
   format: "deflate" | "deflate-raw",
   limit: number,
   signal: AbortSignal | undefined,
-  collect: boolean
+  collect: boolean,
+  recoverEolMarker = false
 ): Promise<{ readonly bytes?: Uint8Array; readonly length: number }> {
   const state: PlatformInflateState = { length: 0 };
   const writer = collect ? new BoundedByteWriter(limit) : null;
@@ -285,7 +315,8 @@ async function inflateWithPlatformStream(
     format,
     limit,
     signal,
-    state
+    state,
+    recoverEolMarker
   )) {
     writer?.append(chunk);
   }
@@ -303,7 +334,8 @@ async function* inflatePlatformChunks(
   format: "deflate" | "deflate-raw",
   limit: number,
   signal: AbortSignal | undefined,
-  state: PlatformInflateState
+  state: PlatformInflateState,
+  recoverEolMarker = false
 ): AsyncIterable<Uint8Array> {
   if (typeof DecompressionStream !== "function") {
     throw new PdfError("unsupported-filter", "FlateDecode requires DecompressionStream support.");
@@ -348,6 +380,37 @@ async function* inflatePlatformChunks(
     await reader.cancel().catch(() => undefined);
     if (cause instanceof PdfError) throw cause;
     if (signal?.aborted) throwIfAborted(signal);
+    // PDF 32000-1 7.3.8.1 excludes the following EOL from /Length, but some
+    // producers include it. Recover only original zlib input, never raw data
+    // or its synthetic validation checksum. Strict retries keep checksum,
+    // truncation, byte-limit and cancellation checks intact.
+    if (recoverEolMarker && format === "deflate" && inputs.length === 1) {
+      const recovered = await validateZlibWithoutEolMarker(inputs[0], limit, signal);
+      if (recovered && recovered.length >= state.length) {
+        if (recovered.length > state.length) {
+          // Replay only if the failed decoder withheld output. Skip the prefix
+          // already delivered, even if the retry uses different chunk sizes.
+          // Neither this replay nor the validation retains the full output.
+          let skip = state.length;
+          const replayState: PlatformInflateState = { length: 0 };
+          for await (const chunk of inflatePlatformChunks([recovered.input], format, limit, signal, replayState)) {
+            const offset = Math.min(skip, chunk.length);
+            skip -= offset;
+            if (offset < chunk.length) {
+              const remainder = chunk.subarray(offset);
+              state.length = checkedAdd(state.length, remainder.length, "FlateDecode output length");
+              yield remainder;
+            }
+          }
+          if (state.length !== recovered.length) {
+            throw new PdfError("invalid-object", "FlateDecode recovery length mismatch.");
+          }
+        }
+        throwIfAborted(signal);
+        completed = true;
+        return;
+      }
+    }
     throw new PdfError("invalid-object", "Malformed FlateDecode stream.", { cause });
   } finally {
     if (!completed) {

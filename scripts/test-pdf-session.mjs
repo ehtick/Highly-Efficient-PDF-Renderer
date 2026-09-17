@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { deflateSync } from "node:zlib";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -212,9 +213,45 @@ try {
   }), (error) => error?.code === "unsupported-content",
   "source cleanup must not mask the atomic page-compilation failure");
 
+  await testFlateEolStreams(openPdf, validateHeprPageData);
   console.log("PDF session and atomic parse tests passed.");
 } finally {
   hooks.deregister();
+}
+
+async function testFlateEolStreams(openPdf, validateHeprPageData) {
+  for (const [content, drawCount] of [
+    [Uint8Array.of(12), 0], // PDF whitespace whose zlib checksum ends in CR.
+    [new TextEncoder().encode(" ".repeat(70000) + "1 0 0 rg 1 2 3 4 re f\n"), 1]
+  ]) {
+    const compressed = deflateSync(content);
+    if (drawCount === 0) assert.equal(compressed.at(-1), 0x0d);
+    for (const marker of [[0x0a], [0x0d], [0x0d, 0x0a]]) {
+      // tinyPdfStream includes the extra EOL in /Length, reproducing the
+      // producer error rather than just feeding padded bytes to the filter.
+      const bytes = writeTinyPdf({ objects: [
+        { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+        { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+        { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>" },
+        { number: 4, body: tinyPdfStream("/Filter /FlateDecode", Buffer.concat([compressed, Buffer.from(marker)])) }
+      ] });
+      const session = await openPdf({ kind: "bytes", bytes });
+      try {
+        const page = await session.compilePage(0, { optimization: "none" });
+        validateHeprPageData(page);
+        const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+        assert.deepEqual(root.commands.map(({ source }) => source), Array(drawCount).fill("fill-paths"));
+        const scene = await session.compileVectorPage(0, { optimization: "none" });
+        assert.equal(scene.fillPathCount, drawCount);
+        if (drawCount > 0) {
+          assert.deepEqual([scene.fillPathMetaA[2], scene.fillPathMetaA[3], scene.fillPathMetaB[0], scene.fillPathMetaB[1]],
+            [1, 2, 4, 6], "the drawing after 64 KiB of decoded content must survive recovery");
+        }
+      } finally {
+        await session.close();
+      }
+    }
+  }
 }
 
 async function testDirectOperationLifecycle(openPdf, source, validateHeprPageData) {

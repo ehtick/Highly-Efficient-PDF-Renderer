@@ -426,6 +426,7 @@ export class NativePdfImageRegistry {
       terminalCodec,
       colorSpaceIndex,
       componentCount,
+      bitsPerComponent,
       this.colors,
       signal
     );
@@ -1904,13 +1905,18 @@ async function readImageDecode(
   codec: NativeImageCodec | null,
   colorSpaceIndex: number,
   componentCount: number,
+  bitsPerComponent: number,
   colors: NativePdfColorRegistry,
   signal?: AbortSignal
 ): Promise<number[]> {
+  // Indexed images default to raw palette indices, regardless of hival
+  // (PDF 1.6, table 4.40). The color-space range would rescale small palettes.
   const fallback = imageMask
     ? [0, 1]
     : colorSpaceIndex >= 0
-      ? [...colors.defaultDecode(colorSpaceIndex)]
+      ? colors.describe(colorSpaceIndex).kind === "Indexed"
+        ? [0, (2 ** bitsPerComponent) - 1]
+        : [...colors.defaultDecode(colorSpaceIndex)]
       : [];
   // Non-stencil JPEG 2000 images carry their decode mapping internally.
   if (codec === "jpeg2000" && !imageMask) return [];

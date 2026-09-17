@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { deflateSync } from "node:zlib";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
 const hooks = registerHooks({
@@ -184,6 +185,45 @@ const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture });
 
 try {
   const images = new NativePdfImageRegistry(document);
+
+  // MM16169_U-0028 uses five palette entries in an eight-bit image. Scaling
+  // samples to hival instead of preserving their indices made the tile black.
+  const palette = [[0, 0, 0], [128, 128, 128], [128, 130, 128], [192, 192, 192], [255, 255, 255]];
+  for (const [precision, highValue, bytes, indices, decode, mask] of [
+    [1, 1, [0x40], [0, 1]],
+    [2, 2, [0x1b], [0, 1, 2, 2]],
+    [4, 4, [0x01, 0x23, 0x4f], [0, 1, 2, 3, 4, 4]],
+    [8, 4, [0, 1, 2, 3, 4, 255], [0, 1, 2, 3, 4, 4]],
+    [16, 4, [0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 255, 255], [0, 1, 2, 3, 4, 4]],
+    [8, 4, [0, 64, 128, 191, 255], [4, 3, 2, 1, 0], [4, 0], [128, 128]],
+    [8, 0, [0, 1, 255], [0, 0, 0]]
+  ]) {
+    for (const compressed of [false, true]) {
+      const dictionary = new Map(Object.entries({
+        Type: name("XObject"), Subtype: name("Image"), Width: indices.length, Height: 1,
+        BitsPerComponent: precision,
+        ColorSpace: [name("Indexed"), name("DeviceRGB"), highValue, {
+          kind: "string", hex: true, bytes: Uint8Array.from(palette.slice(0, highValue + 1).flat())
+        }]
+      }));
+      if (compressed) dictionary.set("Filter", name("FlateDecode"));
+      if (decode) dictionary.set("Decode", decode);
+      if (mask) dictionary.set("Mask", mask);
+      const samples = Uint8Array.from(bytes);
+      const result = images.describe(await images.add({
+        kind: "stream", dictionary, bytes: compressed ? deflateSync(samples) : samples
+      }));
+      const actual = precision === 16
+        ? Array.from({ length: result.data.length / 2 }, (_, index) =>
+          new DataView(result.data.buffer, result.data.byteOffset, result.data.byteLength)
+            .getUint16(index * 2, false) / 257)
+        : [...result.data];
+      assert.deepEqual(actual, indices.flatMap((index, pixel) => [
+        ...palette[index], mask && bytes[pixel] === 128 ? 0 : 255
+      ]), `${precision}-bit Indexed pixels, hival=${highValue}, Decode=${decode}, Flate=${compressed}`);
+      assert.deepEqual(result.decode, decode ?? [0, (2 ** precision) - 1]);
+    }
+  }
 
   // Exercise the byte-image shortcut against the general color evaluator,
   // including every byte value, component order, Decode, and raw-sample masks.

@@ -1,4 +1,6 @@
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
+import { buildNativeVectorGradients } from "./nativeVectorGradients";
+import type { NativePdfShadingRegistry } from "./nativeShadings";
 import { buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
 import { appendVectorDrawRun, simplifyVectorDrawRuns } from "../vectorDrawOrder";
 import type {
@@ -14,6 +16,7 @@ import {
   DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
   DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
   DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT,
   DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
   DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
   DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED,
@@ -56,6 +59,7 @@ export interface BuildNativeVectorPageInput {
   readonly textCompilation: NativeTextCompilation;
   readonly fontResources: readonly NativeTextFontResource[];
   readonly imageRegistry: VectorSceneImageRegistry;
+  readonly shadingRegistry?: NativePdfShadingRegistry;
   readonly compositeRasterLayers?: readonly RasterLayer[];
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** Maximum distinct, nonempty glyph outlines derived for this page. */
@@ -153,6 +157,11 @@ export function buildNativeVectorPage(
   throwIfAborted(signal);
   validatePackedGeometry(compiled, pageInfo.sourcePageIndex);
   const sidecar = readVectorSceneData(compiled, pageInfo.sourcePageIndex);
+  const gradients = buildNativeVectorGradients(sidecar.shadingPaints ?? [], input.shadingRegistry, maxPaths, signal,
+    input.maxPathCoordinates);
+  if (gradients.gradientCount) input.onDiagnostic?.({ code: "gradient-color-approximation", severity: "warning",
+    pageIndex: pageInfo.sourcePageIndex,
+    message: "Vector shading color functions use a 1024-sample color table; their geometry remains resolution independent." });
   if (compiled.formPaints.length !== 0) {
     throw new PdfError(
       "unsupported-content",
@@ -208,6 +217,7 @@ export function buildNativeVectorPage(
   includePackedGeometryBounds(visualBounds, compiled);
   includeTextBounds(visualBounds, text);
   for (const layer of rasterLayers) includeTransformedUnitBounds(visualBounds, layer.matrix);
+  for (const paint of sidecar.shadingPaints ?? []) includeBounds(visualBounds, paint.clipBounds);
   if (visualBounds.empty) includeBounds(visualBounds, pageBounds);
 
   const firstRaster = rasterLayers[0];
@@ -217,9 +227,6 @@ export function buildNativeVectorPage(
     maxX: pageBounds.maxX,
     maxY: pageBounds.maxY
   };
-  // Worker responses transfer every scene-owned ArrayBuffer. Never reuse a
-  // module-global empty view: its buffer would stay detached after response 1.
-  const emptyFloats = new Float32Array(0);
   const scene: VectorScene = {
     pageCount: 1,
     pagesPerRow: 1,
@@ -238,29 +245,7 @@ export function buildNativeVectorPage(
     fillPathMetaC: compiled.fillPathMetaC,
     fillSegmentsA: compiled.fillSegmentsA,
     fillSegmentsB: compiled.fillSegmentsB,
-    gradientCount: 0,
-    gradientMetaA: emptyFloats,
-    gradientMetaB: emptyFloats,
-    gradientMetaC: emptyFloats,
-    gradientMetaD: emptyFloats,
-    gradientMetaE: emptyFloats,
-    gradientLut: new Uint8Array(0),
-    gradientFillPathCount: 0,
-    gradientFillSegmentCount: 0,
-    gradientFillPathMetaA: emptyFloats,
-    gradientFillPathMetaB: emptyFloats,
-    gradientFillPathMetaC: emptyFloats,
-    gradientFillPaintMeta: emptyFloats,
-    gradientFillSegmentsA: emptyFloats,
-    gradientFillSegmentsB: emptyFloats,
-    gradientStrokeRunCount: 0,
-    gradientStrokeSegmentCount: 0,
-    gradientStrokeRunMetaA: emptyFloats,
-    gradientStrokeRunMetaB: emptyFloats,
-    gradientStrokeEndpoints: emptyFloats,
-    gradientStrokePrimitiveMeta: emptyFloats,
-    gradientStrokePrimitiveBounds: emptyFloats,
-    gradientStrokeStyles: emptyFloats,
+    ...gradients,
     segmentCount: compiled.segmentCount,
     sourceSegmentCount: compiled.sourceSegmentCount,
     mergedSegmentCount: compiled.mergedSegmentCount,
@@ -330,6 +315,8 @@ export function buildNativeVectorPage(
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode);
+      } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
+        appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
           if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1);
@@ -428,12 +415,21 @@ function analyzeVectorSourceOrder(
 ): VectorSourceOrderAnalysis {
   let nextGlyphRun = 0;
   let nextImage = 0;
+  let nextShading = 0;
   let ordinaryBarrierSeen = false;
   let precedingVisibleText = false;
   let requiresLateImageProof = false;
   for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
     const kind = sidecar.sourceEvents[offset];
     const localIndex = sidecar.sourceEvents[offset + 1];
+    if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT && sidecar.pathPaintRanges) {
+      if (localIndex !== nextShading || localIndex >= (sidecar.shadingPaints?.length ?? 0)) {
+        throw invalid("Native VectorScene shading events are incomplete or out of order.", pageIndex,
+          "vector-source-event-shading");
+      }
+      nextShading++;
+      continue;
+    }
     if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
       if (localIndex !== nextGlyphRun || localIndex >= sidecar.glyphRunMeta.length / 3) {
         throw invalid("Native VectorScene glyph events are incomplete or out of order.", pageIndex,
@@ -488,7 +484,7 @@ function analyzeVectorSourceOrder(
       "legacy-vector-source-event-kind");
   }
   if (nextGlyphRun !== sidecar.glyphRunMeta.length / 3 ||
-      nextImage !== sidecar.imageIndices.length) {
+      nextImage !== sidecar.imageIndices.length || nextShading !== (sidecar.shadingPaints?.length ?? 0)) {
     throw invalid("Native VectorScene source events do not cover all paint resources.", pageIndex,
       "legacy-vector-source-event-coverage");
   }

@@ -5,6 +5,7 @@ import { loadNodeCanvas } from "./nodeCanvas";
 import {
   DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
   DENSE_PDF_VECTOR_SCENE_EVENT_STROKE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT,
   DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
   DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
   DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
@@ -126,6 +127,8 @@ import {
 import { NativePdfColorRegistry } from "./pdf/nativeColor";
 import { validateIccEngine, type NativeIccTransformResolver, type PdfIccOptions } from "./pdf/nativeIcc";
 import { NativePdfShadingRegistry } from "./pdf/nativeShadings";
+import { resolveNativeSolidPattern } from "./pdf/nativeSolidPatterns";
+import { supportedNativeVectorShadings } from "./pdf/nativeVectorGradients";
 import {
   NativePdfExtGStateRegistry,
   type NativePdfExtGStateDescription,
@@ -927,6 +930,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         textCompilation,
         fontResources: fontRegistry.resources,
         imageRegistry: imageResources.registry,
+        shadingRegistry: imageResources.shadings,
         maxPaths: options.limits?.maxPathsPerPage ??
           this.document.limits.maxPathsPerPage,
         maxPathCoordinates: options.limits?.maxPathCoordinatesPerPage ??
@@ -1243,6 +1247,9 @@ class NativePdfSession implements NativeVectorPdfSession {
       imageXObjects: imageResources.indexes,
       imageOptionalContent: imageResources.optionalContent,
       shadings: imageResources.shadingIndexes,
+      ...(output === "vector-scene" ? {
+        vectorShadings: supportedNativeVectorShadings(imageResources.shadings)
+      } : {}),
       patterns: imageResources.patternDefinitions,
       patternColorSpaces: imageResources.patternColorSpaces,
       formXObjects: pageForms,
@@ -2181,6 +2188,7 @@ async function flattenNativeVectorFormOccurrences(
   const imageClipBounds: number[] = [];
   const imagePaintOrders: number[] = [];
   const imageFlags: number[] = [];
+  const shadingPaints: NonNullable<DensePdfVectorSceneData["shadingPaints"]>[number][] = [];
   const activeDefinitions = new Set<number>();
   const maxCommands = options.limits?.maxCommandsPerPage ?? document.limits.maxCommandsPerPage;
   const maxPaths = options.limits?.maxPathsPerPage ?? document.limits.maxPathsPerPage;
@@ -2229,6 +2237,7 @@ async function flattenNativeVectorFormOccurrences(
     const seenGlyphRuns = new Uint8Array(sidecar.glyphRunMeta.length / 3);
     const seenImages = new Uint8Array(sidecar.imageIndices.length);
     const seenForms = new Uint8Array(occurrence.compiled.formPaints.length);
+    const seenShadings = new Uint8Array(sidecar.shadingPaints?.length ?? 0);
     let fillBase = 0;
     let strokeBase = 0;
     let ownerSawOrdinaryPaint = false;
@@ -2423,6 +2432,14 @@ async function flattenNativeVectorFormOccurrences(
           ownerRecordedGeometry = true;
           occurrenceHasPackedGeometry = true;
         }
+      } else if (ordered && kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
+        if (localIndex >= seenShadings.length || seenShadings[localIndex] !== 0) {
+          throw invalidVectorFormEvent(pageIndex, "shading", localIndex);
+        }
+        seenShadings[localIndex] = 1;
+        appendSourceEvent(kind, shadingPaints.length, vectorClip, blendMode);
+        const paint = sidecar.shadingPaints![localIndex];
+        shadingPaints.push({ ...paint, paintOrder: inheritedFormPaintOrder ?? paint.paintOrder });
       } else if (ordered && kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         appendSourceEvent(kind, localIndex);
       } else if (ordered && (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ||
@@ -2440,6 +2457,7 @@ async function flattenNativeVectorFormOccurrences(
     }
     if (seenGlyphRuns.some((value) => value === 0) ||
         seenImages.some((value) => value === 0) ||
+        seenShadings.some((value) => value === 0) ||
         seenForms.some((value) => value === 0)) {
       throw new PdfError("invalid-object", "A Form source-event tape is incomplete.", {
         pageIndex,
@@ -2480,7 +2498,8 @@ async function flattenNativeVectorFormOccurrences(
     imageTransforms: Float32Array.from(imageTransforms),
     imageClipBounds: Float32Array.from(imageClipBounds),
     imagePaintOrders: Uint32Array.from(imagePaintOrders),
-    imageFlags: Uint8Array.from(imageFlags)
+    imageFlags: Uint8Array.from(imageFlags),
+    ...(shadingPaints.length ? { shadingPaints: Object.freeze(shadingPaints) } : {})
   });
   return Object.freeze({
     compiled: mergeNativeVectorOccurrences(
@@ -6085,6 +6104,7 @@ async function loadPatternDefinitions(
       signal
     );
     const pattern = patterns.describe(patternIndex);
+    const solidColor = await resolveNativeSolidPattern(patterns, extGStates, patternIndex, signal);
     const extGState = pattern.patternType === 2 && pattern.extGState !== null
       ? denseExtGStateDefinition(
         `${resourceName}:ExtGState`,
@@ -6095,6 +6115,7 @@ async function loadPatternDefinitions(
       resourceName,
       patternIndex,
       kind: pattern.kind,
+      ...(solidColor ? { solidColor } : {}),
       hasExtGState: extGState !== undefined,
       ...(extGState ? { extGState } : {})
     }));

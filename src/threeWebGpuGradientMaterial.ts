@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
+import { registerThreeNodeClipPosition } from "./threeVectorClips";
 
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
@@ -462,6 +463,7 @@ export function createThreeWebGpuGradientFillMaterial(
     fillAAScreenPx: TSL.uniform(1),
     vectorOverride: TSL.uniform(options.vectorOverride)
   });
+  registerThreeNodeClipPosition(material, vertexValue.xy);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
@@ -503,6 +505,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride),
     ...createGradientNodes(options, gradientWidth)
   });
+  registerThreeNodeClipPosition(material, worldValue.xy);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,

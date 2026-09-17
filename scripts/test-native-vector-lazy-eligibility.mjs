@@ -139,13 +139,9 @@ async function assertShadingAfterTextKeepsTextVectors(openPdf) {
 }
 
 function assertGradientPixels(scene) {
-  assert.equal(scene.rasterLayers.length, 1, "the shading must produce one selective layer");
-  const layer = scene.rasterLayers[0];
-  const pixel = (fraction) => {
-    const offset = (Math.floor(layer.height / 2) * layer.width +
-      Math.floor(layer.width * fraction)) * 4;
-    return layer.data.subarray(offset, offset + 4);
-  };
+  assert.equal(scene.rasterLayers.length, 0, "the axial shading remains vector");
+  assert.equal(scene.gradientFillPathCount, 1);
+  const pixel = fraction => scene.gradientLut.subarray(Math.floor(1023 * fraction) * 4, Math.floor(1023 * fraction) * 4 + 4);
   const left = pixel(0.25);
   const right = pixel(0.75);
   assert.ok(left[3] >= 250 && right[3] >= 250, "gradient interior must remain opaque");

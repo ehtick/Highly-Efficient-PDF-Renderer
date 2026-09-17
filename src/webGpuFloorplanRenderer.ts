@@ -2109,10 +2109,10 @@ export class WebGpuFloorplanRenderer {
       bindGroupLayouts: [this.fillBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const gradientFillPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.gradientFillBindGroupLayout]
+      bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const gradientStrokePipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.gradientStrokeBindGroupLayout]
+      bindGroupLayouts: [this.gradientStrokeBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const textPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.textBindGroupLayout, this.vectorClipBindGroupLayout]
@@ -3839,6 +3839,7 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     pass.setPipeline(this.gradientFillPipeline);
+    this.bindVectorClip(pass);
     pass.setBindGroup(0, this.gradientFillBindGroup);
     pass.draw(4, 1, pathIndex * 4, 0);
   }
@@ -3853,6 +3854,7 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     pass.setPipeline(this.gradientStrokePipeline);
+    this.bindVectorClip(pass);
     pass.setBindGroup(0, this.gradientStrokeBindGroup);
     pass.draw(4, segmentCount, runIndex * 4, 0);
   }

@@ -1,4 +1,7 @@
+import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
+
 const GRADIENT_COMMON = `
+${VECTOR_CLIP_GLSL}
 uniform sampler2D uGradientMetaTexA;
 uniform sampler2D uGradientMetaTexB;
 uniform sampler2D uGradientMetaTexC;
@@ -304,7 +307,7 @@ void main() {
   float alpha = coverage * vAlpha * source.a * maskAlpha;
   if (alpha <= 0.001) discard;
   vec3 color = mix(source.rgb, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0));
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
 }
 `;
 
@@ -526,6 +529,6 @@ void main() {
   float alpha = coverage * vAlpha * source.a * maskAlpha;
   if (alpha <= 0.001) discard;
   vec3 color = mix(source.rgb, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0));
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
 }
 `;

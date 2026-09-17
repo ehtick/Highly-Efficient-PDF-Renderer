@@ -140,6 +140,8 @@ export interface DensePdfPatternDefinition {
   readonly resourceName: string;
   readonly patternIndex: number;
   readonly kind: "colored-tiling" | "uncolored-tiling" | "shading";
+  /** Proven opaque, uniform coverage of a gapless colored tiling cell. */
+  readonly solidColor?: readonly [number, number, number];
   /** PatternType 2 `/ExtGState`; merged at the exact source paint position. */
   readonly hasExtGState: boolean;
   readonly extGState?: Readonly<DensePdfExtGStateDefinition>;
@@ -288,6 +290,8 @@ export interface DensePdfContentCompileOptions {
   formXObjects?: ReadonlyMap<string, number>;
   /** Page-local HEPR gradient indexes keyed by `/Shading` resource name. */
   shadings?: ReadonlyMap<string, number>;
+  /** Gradients representable by the analytic, ordered VectorScene renderer. */
+  vectorShadings?: ReadonlySet<number>;
   /** Pre-resolved `/Pattern` and `[/Pattern base]` color spaces. */
   patternColorSpaces?: ReadonlyMap<string, Readonly<DensePdfPatternColorSpaceDefinition>>;
   /** Page-local HEPR pattern indexes keyed by `/Pattern` resource name. */
@@ -479,6 +483,12 @@ export const DENSE_PDF_VECTOR_SCENE_EVENT_FILL = 4;
 export const DENSE_PDF_VECTOR_SCENE_EVENT_STROKE = 5;
 /** A flattened root Form rendered as a bounded composite; index is its paint ordinal. */
 export const DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE = 6;
+export const DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT = 7;
+
+export interface DensePdfVectorShadingPaint extends DensePdfShadingPaint {
+  readonly alpha: number;
+  readonly paintOrder: number;
+}
 
 /** Stroke width/dashes live in graphics-state user space, independently of Tm/Tz. */
 export interface DensePdfVectorGlyphStroke {
@@ -498,6 +508,7 @@ export interface DensePdfVectorGlyphStroke {
  * @internal
  */
 export interface DensePdfVectorSceneData {
+  readonly shadingPaints?: readonly DensePdfVectorShadingPaint[];
   /** Optional first/count pairs addressed by FILL/STROKE source events. */
   readonly pathPaintRanges?: Uint32Array;
   readonly sourceClips?: readonly (DensePdfTextClip | null)[];
@@ -1297,6 +1308,7 @@ class DenseContentCompiler {
   readonly vectorSelectivePaintSourceSpans: number[] = [];
 
   readonly vectorSourceEvents: number[] = [];
+  readonly vectorShadingPaints: DensePdfVectorShadingPaint[] = [];
   readonly vectorSourceClipIndices: number[] = [];
   readonly vectorSourceBlendModes: number[] = [];
   readonly vectorFormClipIndices: number[] = [];
@@ -1686,6 +1698,7 @@ class DenseContentCompiler {
       fillSegmentsB,
       ...(this.policy.vectorScene === true ? {
         vectorSceneData: {
+          ...(this.vectorShadingPaints.length ? { shadingPaints: Object.freeze(this.vectorShadingPaints) } : {}),
           sourceEvents: Uint32Array.from(this.vectorSourceEvents),
           sourceBlendModes: Uint8Array.from(this.vectorSourceBlendModes),
           ...(this.policy.orderedPaint ? {
@@ -2274,8 +2287,17 @@ class DenseContentCompiler {
             );
           }
           this.referencedPatterns.add(resourceName);
-          if (stroke) this.state.strokePattern = definition;
-          else this.state.fillPattern = definition;
+          if (stroke) {
+            this.state.strokePattern = definition;
+            if (definition.solidColor) {
+              [this.state.strokeR, this.state.strokeG, this.state.strokeB] = definition.solidColor;
+            }
+          } else {
+            this.state.fillPattern = definition;
+            if (definition.solidColor) {
+              [this.state.fillR, this.state.fillG, this.state.fillB] = definition.solidColor;
+            }
+          }
           return;
         }
         const colorSpace = stroke ? this.state.strokeColorSpace : this.state.fillColorSpace;
@@ -2378,11 +2400,20 @@ class DenseContentCompiler {
           if (this.policy.vectorScene === true) {
             this.assertVectorSceneComposite("nonstroke", operator);
             const ordinal = this.nextVectorPaintOrdinal(operator);
-            this.vectorSelectivePaintSourceSpans.push(
-              this.operatorSourceOffset,
-              this.operatorSourceLength
-            );
-            this.recordVectorSelectivePaint(ordinal);
+            const [a, b, c, d] = this.state.matrix;
+            if (this.policy.orderedPaint && this.options.vectorShadings?.has(gradientIndex) &&
+                this.state.blendMode === "Normal" && Math.abs(a * d - b * c) > 1e-12) {
+              this.recordVectorSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT, this.vectorShadingPaints.length, operator);
+              this.vectorShadingPaints.push({ gradientIndex, transform: [...this.state.matrix],
+                clipBounds: { ...this.state.clipBounds }, alpha: this.state.fillAlpha, paintOrder: ordinal });
+              this.shadingBounds = combineBounds(this.shadingBounds, this.state.clipBounds);
+            } else {
+              this.vectorSelectivePaintSourceSpans.push(
+                this.operatorSourceOffset,
+                this.operatorSourceLength
+              );
+              this.recordVectorSelectivePaint(ordinal);
+            }
             this.vectorPathSpanStartFillCount = this.fillPathCount;
             this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
             this.vectorPathSpanStartOrdinal = ordinal + 1;
@@ -2913,8 +2944,10 @@ class DenseContentCompiler {
       }
     };
 
-    const fillUsesPattern = fillPaint && this.state.fillPatternColorSpace !== null;
-    const strokeUsesPattern = strokePaint && this.state.strokePatternColorSpace !== null;
+    const fillUsesPattern = fillPaint && this.state.fillPatternColorSpace !== null &&
+      !(this.policy.vectorScene && this.state.fillPattern?.solidColor);
+    const strokeUsesPattern = strokePaint && this.state.strokePatternColorSpace !== null &&
+      !(this.policy.vectorScene && this.state.strokePattern?.solidColor);
     const visiblePatternFill = fillPathVisible && fillUsesPattern &&
       this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON;
     const visiblePatternStroke = strokePathVisible && strokeUsesPattern &&
@@ -3271,6 +3304,9 @@ class DenseContentCompiler {
       definition.patternIndex > 0xffff_ffff ||
       (definition.kind !== "colored-tiling" &&
         definition.kind !== "uncolored-tiling" && definition.kind !== "shading") ||
+      (definition.solidColor !== undefined && (definition.kind !== "colored-tiling" ||
+        !Array.isArray(definition.solidColor) || definition.solidColor.length !== 3 ||
+        definition.solidColor.some(value => !Number.isFinite(value) || value < 0 || value > 1))) ||
       typeof definition.hasExtGState !== "boolean" ||
       definition.hasExtGState !== (definition.extGState !== undefined)
     ) {
@@ -3533,8 +3569,8 @@ class DenseContentCompiler {
     const strokes = renderingMode === 1 || renderingMode === 2 ||
       renderingMode === 5 || renderingMode === 6;
     const patternColorApproximation = Boolean(
-      (fills && this.state.fillPatternColorSpace) ||
-      (strokes && this.state.strokePatternColorSpace)
+      (fills && this.state.fillPatternColorSpace && !this.state.fillPattern?.solidColor) ||
+      (strokes && this.state.strokePatternColorSpace && !this.state.strokePattern?.solidColor)
     );
     const role = renderingMode === 1 || renderingMode === 5 ? "stroke" : "nonstroke";
     this.recordPaintTrace(
@@ -3603,7 +3639,8 @@ class DenseContentCompiler {
           "Tj"
         );
       }
-      if ((visibleFill && this.state.fillPatternColorSpace) || (visibleStroke && this.state.strokePatternColorSpace)) {
+      if ((visibleFill && this.state.fillPatternColorSpace && !this.state.fillPattern?.solidColor) ||
+          (visibleStroke && this.state.strokePatternColorSpace && !this.state.strokePattern?.solidColor)) {
         throw new DensePdfUnsupportedError(
           "VectorScene output cannot represent pattern-colored text.",
           "Tj"

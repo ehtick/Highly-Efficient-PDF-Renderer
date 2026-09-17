@@ -1,3 +1,5 @@
+import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+
 const CAMERA_STRUCT = /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
@@ -15,6 +17,8 @@ struct CameraUniforms {
 `;
 
 const GRADIENT_BINDINGS = /* wgsl */ `
+@group(1) @binding(0) var uVectorClipTex : texture_2d<f32>;
+@group(1) @binding(1) var<uniform> uVectorClip : vec4f;
 @group(0) @binding(GRADIENT_META_A_BINDING) var uGradientMetaA : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_B_BINDING) var uGradientMetaB : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_C_BINDING) var uGradientMetaC : texture_2d<f32>;
@@ -25,6 +29,7 @@ const GRADIENT_BINDINGS = /* wgsl */ `
 `;
 
 const GRADIENT_FUNCTIONS = /* wgsl */ `
+${VECTOR_CLIP_WGSL}
 fn gradientCoord(index : i32) -> vec2i {
   let dimensions = textureDimensions(uGradientMetaA);
   return vec2i(index % i32(dimensions.x), index / i32(dimensions.x));
@@ -302,7 +307,7 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
   let color = mix(source.rgb, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0));
+  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
 }
 `;
 
@@ -424,6 +429,6 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
   let color = mix(source.rgb, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0));
+  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
 }
 `;

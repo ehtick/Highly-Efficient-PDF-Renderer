@@ -3586,6 +3586,7 @@ export class WebGlFloorplanRenderer {
     const uniforms = this.gradientFillUniforms;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.gradientFillProgram);
+    this.bindVectorClip(this.gradientFillProgram);
     gl.bindVertexArray(this.gradientPaintVao);
 
     for (let index = 0; index < this.gradientFillTextures.length; index += 1) {
@@ -3640,6 +3641,7 @@ export class WebGlFloorplanRenderer {
     const uniforms = this.gradientStrokeUniforms;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.gradientStrokeProgram);
+    this.bindVectorClip(this.gradientStrokeProgram);
     gl.bindVertexArray(this.gradientPaintVao);
 
     for (let index = 0; index < this.gradientStrokeTextures.length; index += 1) {

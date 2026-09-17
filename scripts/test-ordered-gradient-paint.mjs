@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { registerHooks } from "node:module";
 
-import {
-  GRADIENT_FILL_WGSL,
-  GRADIENT_STROKE_WGSL
-} from "../src/nativeGradientWebGpuShaders.ts";
+const hooks = registerHooks({ resolve(specifier, context, next) {
+  if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
+    return next(`${specifier}.ts`, context);
+  }
+  return next(specifier, context);
+} });
+const { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } = await import("../src/nativeGradientWebGpuShaders.ts");
+hooks.deregister();
 import {
   buildOrderedGradientPaintCommands,
   orderedGradientPaintNeedsDirectRendering,

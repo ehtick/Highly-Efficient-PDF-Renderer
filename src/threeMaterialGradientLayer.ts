@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 
 import {
   CORE_FILL_FRAGMENT_SHADER_SOURCE,
@@ -78,6 +79,9 @@ const GRADIENT_LUT_WIDTH = 1024;
 
 export class ThreeMaterialGradientLayer {
   readonly group: THREE.Group;
+  private readonly vectorClipTexture: THREE.DataTexture | null;
+  private readonly fillClipIndices: number[];
+  private readonly strokeClipIndices: number[];
 
   private readonly entries: GradientLayerEntry[] = [];
   private readonly ownedTextures: THREE.DataTexture[] = [];
@@ -97,6 +101,14 @@ export class ThreeMaterialGradientLayer {
     this.colorCompositing = options.colorCompositing ?? "linear";
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(...options.vectorOverride);
+    this.vectorClipTexture = null;
+    this.fillClipIndices = Array(scene.gradientFillPathCount).fill(-1);
+    this.strokeClipIndices = Array(scene.gradientStrokeRunCount).fill(-1);
+    for (const run of scene.drawRuns ?? []) {
+      const indices = run.kind === "gradient-fill" ? this.fillClipIndices
+        : run.kind === "gradient-stroke" ? this.strokeClipIndices : undefined;
+      if (indices && run.clipIndex !== undefined) indices.fill(run.clipIndex, run.first, run.first + run.count);
+    }
 
     const source = scene as VectorScene & GradientVectorSceneContract;
     const gradientCount = normalizeCount(source.gradientCount);
@@ -107,6 +119,7 @@ export class ThreeMaterialGradientLayer {
       return;
     }
 
+    this.vectorClipTexture = this.own(createThreeVectorClipTexture(scene));
     const gradientTextures = this.createGradientTextures(source, gradientCount);
     const materialBackend = options.materialBackend ?? "webgl";
     this.createFillEntries(source, gradientTextures, materialBackend);
@@ -261,6 +274,7 @@ export class ThreeMaterialGradientLayer {
         );
       }
 
+      material = this.clipMaterial(material, this.fillClipIndices[pathIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
       const entry: GradientLayerEntry = {
@@ -346,6 +360,7 @@ export class ThreeMaterialGradientLayer {
         );
       }
 
+      material = this.clipMaterial(material, this.strokeClipIndices[runIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
       const entry: GradientLayerEntry = {
@@ -359,6 +374,13 @@ export class ThreeMaterialGradientLayer {
       this.entries.push(entry);
       this.group.add(mesh);
     }
+  }
+
+  private clipMaterial(material: THREE.Material, clipIndex: number): THREE.Material {
+    initializeThreeVectorClip(material, this.vectorClipTexture!);
+    const clipped = createThreeVectorClipMaterial(material, clipIndex);
+    if (clipped !== material) material.dispose();
+    return clipped;
   }
 
   private createWebGpuCommonOptions(

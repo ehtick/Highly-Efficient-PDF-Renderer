@@ -53,9 +53,6 @@ export function validateVectorDrawRuns(scene: VectorScene): void {
     if (run.blendMode && run.kind.startsWith("gradient-")) throw new Error("Gradient draw runs do not support Multiply blending.");
     if (run.clipIndex !== undefined && (!Number.isSafeInteger(run.clipIndex) || run.clipIndex < 0 ||
         run.clipIndex >= (scene.clipPaths?.length ?? 0))) throw new Error("Invalid draw-run clip reference.");
-    if (run.clipIndex !== undefined && run.kind.startsWith("gradient-")) {
-      throw new Error("Gradient draw runs do not support vector clip references.");
-    }
     const list = ranges.get(run.kind) ?? [];
     list.push(run);
     ranges.set(run.kind, list);

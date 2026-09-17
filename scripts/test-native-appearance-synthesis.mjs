@@ -459,6 +459,8 @@ async function testSquareAppearanceGeometryAndGuards() {
     // annotation placement must not stretch the inset path back to full size.
     ["/BS << /W 2 /S /D /D [2 1] >> /C [0] /IC [1 0 0] /RD [2 3 4 5]", /\[2 1\] 0 d\n3 6 32 10 re B/],
     ["/Border [0 0 2] /RD [0 0 0 0] /BE << >>", /1 1 38 18 re S/],
+    ["/Border [0 0 2] /BE << /S /C >>", /1 1 38 18 re S/],
+    ["/Border [0 0 2] /BE << /S /C /I 0 >>", /1 1 38 18 re S/],
     ["/Border [0 0 2] /RD 20 0 R /BE 22 0 R", /3 6 32 10 re S/],
     ["/BS << /S /U >>", /0 G\n1 w\n0\.5 0\.5 m 39\.5 0\.5 l S/],
     ["/BS << /W 2 /S /U >> /IC [1 0 0]", /1 1 38 18 re f\n1 1 m 39 1 l S/],
@@ -482,10 +484,12 @@ async function testSquareAppearanceGeometryAndGuards() {
     "/RD [21 0 20 0]",
     "/Border [0 0 2] /RD [19.5 0 19.5 0]",
     "/BE []",
-    "/BE << /S 1 >>"
+    "/BE << /S 1 >>",
+    "/BE << /S /C /I -1 >>",
+    "/BE << /S /C /I 2.1 >>",
+    "/BE << /S /C /I (bad) >>"
   ];
   const unsupportedCases = [
-    ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
     ["/BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"]
   ];
   const entries = [

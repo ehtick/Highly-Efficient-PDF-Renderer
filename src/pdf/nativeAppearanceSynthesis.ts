@@ -129,6 +129,7 @@ const EMPTY_FORM_RESOURCES: ReadonlyMap<string, number> = new Map();
 const DEFAULT_COLOR: AppearanceColor = Object.freeze({ components: Object.freeze([0]) });
 const TEXT_ENCODER = new TextEncoder();
 const KAPPA = 0.5522847498307936;
+const MAX_CLOUD_LOBES = 4096;
 
 /**
  * Deterministically synthesizes static default-view appearances for common
@@ -516,22 +517,7 @@ export class NativePdfAppearanceSynthesizer {
       });
     }
 
-    const rawEffect = await this.document.resolveValue(annotation.dictionary.get("BE"), signal);
-    if (rawEffect !== undefined && rawEffect !== null) {
-      if (!isPdfDictionary(rawEffect)) {
-        throw invalidBorder(annotation, "Square /BE is not a border effect dictionary.");
-      }
-      const effect = await this.document.resolveValue(rawEffect.get("S"), signal);
-      if (effect !== undefined && effect !== null && !isPdfName(effect)) {
-        throw invalidBorder(annotation, "Square /BE /S is not a name.");
-      }
-      if (effect && effect.value !== "S") {
-        throw synthesisError(annotation, `Square border effect /${effect.value} is unsupported.`, {
-          reason: "appearance-square-border-effect-unsupported",
-          borderEffect: effect.value
-        });
-      }
-    }
+    const cloudIntensity = await this.readSquareCloudIntensity(annotation, signal);
 
     // The border straddles the path, so the path is inset by half of it. A
     // transparent /C still reserves that width: the colour decides what is
@@ -548,7 +534,14 @@ export class NativePdfAppearanceSynthesizer {
     const rectanglePath =
       `${pdfNumber(rectangle[0] + inset)} ${pdfNumber(rectangle[1] + inset)} ${pdfNumber(width - border.width)} ` +
       `${pdfNumber(height - border.width)} re`;
-    if (strokeColor && border.style === "underline") {
+    if (cloudIntensity > 0) {
+      // /BE replaces the border shape; /BS still supplies its width and dash.
+      // Bevel joins prevent spikes at the inward-facing scallop junctions.
+      lines.push("2 j", cloudyRectanglePath(
+        rectangle, geometry.bbox, border.width, cloudIntensity,
+        this.document.limits.maxPathVerbsPerPage, annotation
+      ) + ` ${fillColor ? (strokeColor ? "B" : "f") : "S"}`);
+    } else if (strokeColor && border.style === "underline") {
       // Fill the interior separately so only the bottom edge is stroked.
       if (fillColor) lines.push(`${rectanglePath} f`);
       lines.push(
@@ -567,6 +560,33 @@ export class NativePdfAppearanceSynthesizer {
       "empty",
       optionalContentIndex
     );
+  }
+
+  private async readSquareCloudIntensity(
+    annotation: NativePdfAnnotationAppearance,
+    signal?: AbortSignal
+  ): Promise<number> {
+    const effect = await this.document.resolveValue(annotation.dictionary.get("BE"), signal);
+    if (effect === undefined || effect === null) return 0;
+    if (!isPdfDictionary(effect)) {
+      throw invalidBorder(annotation, "Square /BE is not a border effect dictionary.");
+    }
+    const style = await this.document.resolveValue(effect.get("S"), signal);
+    if (style !== undefined && style !== null && !isPdfName(style)) {
+      throw invalidBorder(annotation, "Square /BE /S is not a name.");
+    }
+    if (!style || style.value === "S") return 0;
+    if (style.value !== "C") {
+      throw synthesisError(annotation, `Square border effect /${style.value} is unsupported.`, {
+        reason: "appearance-square-border-effect-unsupported",
+        borderEffect: style.value
+      });
+    }
+    const intensity = await optionalFiniteNumber(this.document, effect, "I", 0, signal, "Square /BE");
+    if (intensity < 0 || intensity > 2) {
+      throw invalidBorder(annotation, "Square /BE /I must be from 0 through 2.");
+    }
+    return intensity;
   }
 
   private async readSquareRectangle(
@@ -2208,6 +2228,99 @@ function ellipsePath(cx: number, cy: number, rx: number, ry: number): string {
     `${pdfNumber(cx - rx)} ${pdfNumber(cy - oy)} ${pdfNumber(cx - ox)} ${pdfNumber(cy - ry)} ${pdfNumber(cx)} ${pdfNumber(cy - ry)} c`,
     `${pdfNumber(cx + ox)} ${pdfNumber(cy - ry)} ${pdfNumber(cx + rx)} ${pdfNumber(cy - oy)} ${pdfNumber(cx + rx)} ${pdfNumber(cy)} c h`
   ].join(" ");
+}
+
+/**
+ * A closed chain of overlapping circular lobes around a rectangle. ISO 32000-1
+ * Table 167 leaves the exact cloud shape unspecified. The nominal radius uses
+ * the Acrobat sizing documented by Apache PDFBox's CloudyBorder (4 * I + W / 2):
+ * https://github.com/apache/pdfbox/blob/trunk/pdfbox/src/main/java/org/apache/pdfbox/pdmodel/interactive/annotation/handlers/CloudyBorder.java
+ * The contour here is the outer circle-intersection boundary, without retraced
+ * curls, so a dash pattern can follow the entire outline continuously.
+ */
+function cloudyRectanglePath(
+  rectangle: NativePdfRectangle,
+  bounds: NativePdfRectangle,
+  borderWidth: number,
+  intensity: number,
+  maxPathVerbs: number,
+  annotation: NativePdfAnnotationAppearance
+): string {
+  const inset = borderWidth / 2;
+  const innerWidth = rectangle[2] - rectangle[0] - borderWidth;
+  const innerHeight = rectangle[3] - rectangle[1] - borderWidth;
+  const radius = Math.min(Math.max(0.5, 4 * intensity + inset), innerWidth / 4, innerHeight / 4);
+  if (radius <= 0) {
+    return `${pdfNumber(rectangle[0] + inset)} ${pdfNumber(rectangle[1] + inset)} ` +
+      `${pdfNumber(innerWidth)} ${pdfNumber(innerHeight)} re`;
+  }
+
+  // Keep the full annotation BBox for placement. Use /RD where it leaves room
+  // for the cloud, and reserve missing padding when /RD is absent or too small.
+  // Limiting the radius above keeps opposite edges apart even on tiny squares.
+  const left = Math.max(rectangle[0] + inset, bounds[0] + inset + radius);
+  const bottom = Math.max(rectangle[1] + inset, bounds[1] + inset + radius);
+  const right = Math.min(rectangle[2] - inset, bounds[2] - inset - radius);
+  const top = Math.min(rectangle[3] - inset, bounds[3] - inset - radius);
+  const spacing = radius * 1.6;
+  const horizontalCount = Math.max(1, Math.ceil((right - left) / spacing));
+  const verticalCount = Math.max(1, Math.ceil((top - bottom) / spacing));
+  const lobeCount = 2 * (horizontalCount + verticalCount);
+  const limitError = () => new PdfError("resource-limit", "A cloudy Square appearance exceeds its geometry limit.", {
+    pageIndex: annotation.pageIndex,
+    details: {
+      annotationIndex: annotation.annotationIndex,
+      feature: "appearance-synthesis",
+      reason: "appearance-cloud-geometry-limit",
+      lobeCount,
+      maxCloudLobes: MAX_CLOUD_LOBES,
+      maxPathVerbs
+    }
+  });
+  // Check before allocating or looping: a huge rectangle or near-zero radius
+  // must not turn a tiny annotation dictionary into unbounded generated content.
+  if (lobeCount > MAX_CLOUD_LOBES || lobeCount + 2 > maxPathVerbs) throw limitError();
+  const centers: Array<readonly [number, number]> = [];
+  for (let i = 0; i < horizontalCount; i++) centers.push([left + (right - left) * i / horizontalCount, bottom]);
+  for (let i = 0; i < verticalCount; i++) centers.push([right, bottom + (top - bottom) * i / verticalCount]);
+  for (let i = 0; i < horizontalCount; i++) centers.push([right - (right - left) * i / horizontalCount, top]);
+  for (let i = 0; i < verticalCount; i++) centers.push([left, top - (top - bottom) * i / verticalCount]);
+
+  const lines: string[] = [];
+  const quarterTurn = Math.PI / 2;
+  const fullTurn = Math.PI * 2;
+  // Intersect consecutive equal-radius circles on the outside of the CCW
+  // rectangle. At a corner the same construction produces a longer round arc.
+  for (let i = 0; i < centers.length; i++) {
+    const [x, y] = centers[i];
+    const [px, py] = centers[(i + centers.length - 1) % centers.length];
+    const [nx, ny] = centers[(i + 1) % centers.length];
+    const incoming = Math.acos(Math.min(1, Math.hypot(x - px, y - py) / (2 * radius)));
+    const outgoing = Math.acos(Math.min(1, Math.hypot(nx - x, ny - y) / (2 * radius)));
+    let angle = Math.atan2(y - py, x - px) - Math.PI + incoming;
+    angle = (angle % fullTurn + fullTurn) % fullTurn;
+    let end = Math.atan2(ny - y, nx - x) - outgoing;
+    end = (end % fullTurn + fullTurn) % fullTurn;
+    if (end <= angle) end += fullTurn;
+    if (i === 0) lines.push(`${pdfNumber(x + radius * Math.cos(angle))} ${pdfNumber(y + radius * Math.sin(angle))} m`);
+    while (end - angle > 1e-12) {
+      // Split at cardinal angles as well as limiting each arc to 90 degrees.
+      // This keeps the cubic control hull within the circle's bounding square.
+      const next = Math.min(end, (Math.floor(angle / quarterTurn + 1e-12) + 1) * quarterTurn);
+      const tangent = 4 / 3 * Math.tan((next - angle) / 4);
+      const cosA = Math.cos(angle), sinA = Math.sin(angle);
+      const cosB = Math.cos(next), sinB = Math.sin(next);
+      if (lines.length + 2 > maxPathVerbs) throw limitError();
+      lines.push(
+        `${pdfNumber(x + radius * (cosA - tangent * sinA))} ${pdfNumber(y + radius * (sinA + tangent * cosA))} ` +
+        `${pdfNumber(x + radius * (cosB + tangent * sinB))} ${pdfNumber(y + radius * (sinB - tangent * cosB))} ` +
+        `${pdfNumber(x + radius * cosB)} ${pdfNumber(y + radius * sinB)} c`
+      );
+      angle = next;
+    }
+  }
+  lines.push("h");
+  return lines.join("\n");
 }
 
 function roundedRectanglePath(

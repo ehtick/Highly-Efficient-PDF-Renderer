@@ -285,8 +285,8 @@ async function testSynthesizedSquares(openPdf, validateHeprPageData) {
   const bytes = squareSessionFixture([
     ...nonpainting,
     "<< /Subtype /Square /Rect [50 0 90 20] /Border [0 0 0] /IC [1 0 0] /RD [2 3 4 5] >>",
-    // Existing /AP takes precedence over otherwise unsupported synthesis settings.
-    "<< /Subtype /Square /Rect [100 0 140 20] /AP << /N 90 0 R >> /BS << /W 2 /S /U >> /BE << /S /C /I 2 >> >>"
+    // Existing /AP takes precedence even over malformed synthesis settings.
+    "<< /Subtype /Square /Rect [100 0 140 20] /AP << /N 90 0 R >> /BS << /W 2 /S /U >> /BE << /S /C /I 3 >> >>"
   ]);
   const session = await openPdf({ kind: "bytes", bytes });
   try {
@@ -326,8 +326,8 @@ async function testSynthesizedSquares(openPdf, validateHeprPageData) {
   }
 
   for (const [entries, reason] of [
-    ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
-    ["/BS << /W 2 /S /U >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"]
+    ["/BS << /W 2 /S /S >> /BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"],
+    ["/BS << /W 2 /S /U >> /BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"]
   ]) {
     const failingSession = await openPdf({
       kind: "bytes",

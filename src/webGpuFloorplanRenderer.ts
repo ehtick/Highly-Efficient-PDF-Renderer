@@ -1,6 +1,5 @@
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { RenderPerformanceProbe, renderProfilingEnabled } from "./renderPerformanceProbe";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 import { packVectorClips } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
@@ -1608,7 +1607,6 @@ export class WebGpuFloorplanRenderer {
 
   private vectorMinifyHeight = 0;
 
-  private readonly performanceProbe = new RenderPerformanceProbe("webgpu");
   private orderedRunCuller: VectorDrawRunCuller | null = null;
   private orderedCullingBounds: Bounds | null = null;
   private orderedRunsCulled = false;
@@ -2213,8 +2211,7 @@ export class WebGpuFloorplanRenderer {
       throw new Error("Failed to acquire a WebGPU adapter.");
     }
 
-    const profileTimestamps = renderProfilingEnabled() && adapter.features?.has("timestamp-query");
-    const device = await adapter.requestDevice(profileTimestamps ? { requiredFeatures: ["timestamp-query"] } : {});
+    const device = await adapter.requestDevice();
     let context: any = null;
     try {
       if (typeof device.addEventListener === "function") {
@@ -3196,7 +3193,6 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     this.isDisposed = true;
-    this.performanceProbe.dispose();
     this.orderedRunCuller = null;
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
@@ -3380,62 +3376,55 @@ export class WebGpuFloorplanRenderer {
   }
 
   private render(timestamp: number = performance.now()): void {
-    this.performanceProbe.begin(this.scene, { width: this.canvas.width, height: this.canvas.height, zoom: this.zoom,
-      layers: { stroke: this.strokeRenderingEnabled, fill: this.fillRenderingEnabled,
-        text: this.textRenderingEnabled, raster: this.rasterRenderingEnabled } });
-    try {
-      const isCameraAnimating = this.updateCameraWithDamping(timestamp);
-      this.updatePanReleaseVelocitySample(timestamp);
-      if (
-        !this.scene ||
-        (this.segmentCount === 0 &&
-          this.fillPathCount === 0 &&
-          this.textInstanceCount === 0 &&
-          (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
-          (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
-          this.rasterLayerResources.length === 0 &&
-          this.pageBackgroundResources.length === 0)
-      ) {
-        this.clearToScreen();
-        this.capturePresentedFrameState();
-        this.frameListener?.({
-          renderedSegments: 0,
-          totalSegments: 0,
-          usedCulling: false,
-          zoom: this.zoom
-        });
-        if (isCameraAnimating) {
-          this.requestFrame();
-        }
-        return;
-      }
-
-      if (!this.hasNativeRenderingEnabled()) {
-        this.capturePresentedFrameState();
-        this.frameListener?.({
-          renderedSegments: 0,
-          totalSegments: this.segmentCount,
-          usedCulling: false,
-          zoom: this.zoom
-        });
-        if (isCameraAnimating) {
-          this.requestFrame();
-        }
-        return;
-      }
-
-      if (this.shouldUsePanCache(isCameraAnimating)) {
-        this.renderWithPanCache();
-      } else {
-        this.renderDirectToScreen();
-      }
+    const isCameraAnimating = this.updateCameraWithDamping(timestamp);
+    this.updatePanReleaseVelocitySample(timestamp);
+    if (
+      !this.scene ||
+      (this.segmentCount === 0 &&
+        this.fillPathCount === 0 &&
+        this.textInstanceCount === 0 &&
+        (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
+        (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
+        this.rasterLayerResources.length === 0 &&
+        this.pageBackgroundResources.length === 0)
+    ) {
+      this.clearToScreen();
       this.capturePresentedFrameState();
-
+      this.frameListener?.({
+        renderedSegments: 0,
+        totalSegments: 0,
+        usedCulling: false,
+        zoom: this.zoom
+      });
       if (isCameraAnimating) {
         this.requestFrame();
       }
-    } finally {
-      this.performanceProbe.end({ orderedRunsCulled: this.orderedRunsCulled });
+      return;
+    }
+
+    if (!this.hasNativeRenderingEnabled()) {
+      this.capturePresentedFrameState();
+      this.frameListener?.({
+        renderedSegments: 0,
+        totalSegments: this.segmentCount,
+        usedCulling: false,
+        zoom: this.zoom
+      });
+      if (isCameraAnimating) {
+        this.requestFrame();
+      }
+      return;
+    }
+
+    if (this.shouldUsePanCache(isCameraAnimating)) {
+      this.renderWithPanCache();
+    } else {
+      this.renderDirectToScreen();
+    }
+    this.capturePresentedFrameState();
+
+    if (isCameraAnimating) {
+      this.requestFrame();
     }
   }
 
@@ -3551,7 +3540,6 @@ export class WebGpuFloorplanRenderer {
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
     const pass = encoder.beginRenderPass({
-      ...this.performanceProbe.gpuPass(this.gpuDevice),
       colorAttachments: [
         {
           view,
@@ -3566,7 +3554,6 @@ export class WebGpuFloorplanRenderer {
     this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
     pass.end();
-    this.performanceProbe.resolveGpu(encoder);
     this.gpuDevice.queue.submit([encoder.finish()]);
 
     this.frameListener?.({
@@ -3904,26 +3891,14 @@ export class WebGpuFloorplanRenderer {
     this.vectorClipIndex = -1;
     this.drawPageBackgroundContentIntoPass(pass);
     let strokes = 0;
-    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
-    let phaseStart = probe?.mark() ?? -1;
     const runs = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
-    probe?.phase("runCulling", phaseStart);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
     const plan = this.orderedBatches;
-    phaseStart = probe?.mark() ?? -1;
     const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
-    probe?.phase("batchPlan", phaseStart);
-    if (rebuilt) probe?.count("batchRebuilds");
-    phaseStart = probe?.mark() ?? -1;
     if (plan && rebuilt && plan.instanceCount > 0) {
-      probe?.count("instanceUploadBytes", plan.instanceCount * 8);
       this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
     }
-    probe?.phase("instanceUpload", phaseStart);
-    phaseStart = probe?.mark() ?? -1;
-    let submitted = 0;
     for (const run of plan?.batches ?? runs) {
-      if (probe?.skips(run.kind)) continue;
       this.vectorClipIndex = run.clipIndex ?? -1;
       const pipeline = run.kind === "fill" && this.fillRenderingEnabled ? this.fillPipeline
         : run.kind === "stroke" && this.strokeRenderingEnabled ? this.strokePipeline
@@ -3935,8 +3910,6 @@ export class WebGpuFloorplanRenderer {
         this.bindVectorClip(pass);
         pass.setBindGroup(0, bindGroup);
         pass.draw(4, run.count, 0, run.first);
-        submitted++;
-        probe?.draw(run.kind, run.count);
         if (run.kind === "stroke") strokes += run.count;
       } else {
         for (let index = run.first; index < run.first + run.count; index++) {
@@ -3947,24 +3920,16 @@ export class WebGpuFloorplanRenderer {
               this.bindVectorClip(pass);
               pass.setBindGroup(0, resource.bindGroup);
               pass.draw(4, 1, 0, 0);
-              submitted++;
-              probe?.draw(run.kind, 1);
             }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
-            submitted++;
-            probe?.draw(run.kind, 1);
             this.drawGradientFillIntoPass(pass, index);
           } else if (run.kind === "gradient-stroke" && this.strokeRenderingEnabled) {
-            submitted++;
-            probe?.draw(run.kind, 1);
             this.drawGradientStrokeIntoPass(pass, index);
           }
         }
       }
     }
     this.vectorClipIndex = -1;
-    probe?.phase("orderedSubmit", phaseStart);
-    this.performanceProbe?.orderedRuns(runs.length, submitted);
     return strokes;
   }
 
@@ -4434,14 +4399,11 @@ export class WebGpuFloorplanRenderer {
     const safeZoom = Math.max(zoomValue, 1e-6);
     this.vectorLodRuntime.setScreenSpaceTransform();
     this.vectorLodRuntime.updateForLocalUnitsPerPixel(1 / safeZoom);
-    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
-    const selectionStart = probe?.mark() ?? -1;
     const updated = this.vectorLodRuntime.update(
       { cameraCenterX: viewCenterX, cameraCenterY: viewCenterY, zoom: safeZoom },
       { width: Math.max(1, viewportWidthPx), height: Math.max(1, viewportHeightPx) },
       null
     );
-    probe?.phase("strokeLod", selectionStart);
     this.vectorLodStats = this.vectorLodRuntime.getStats();
     this.visibleSegmentCount = this.vectorLodStats.renderedSegments;
     this.usingAllSegments = false;

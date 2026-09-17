@@ -104,23 +104,8 @@ has a separate dependency installation for rendering comparisons. Run corpus
 benchmarks and baseline generation manually; the default tests do not establish
 full-corpus visual fidelity or browser performance.
 
-For temporary runtime diagnostics in the main viewer, add `heprProfile=1` to
-the URL query, reload, and reopen the PDF. While panning or zooming, the console
-prints `[HEPR profile scene]` once per scene and `[HEPR profile frame]` about
-every two seconds. Compare the whole-document overview, one page, and a small
-detail in both WebGL and WebGPU.
-
-The scene record contains counts only. Frame records include median/p95 CPU
-submission time, active frame intervals (idle gaps above 500 ms are excluded),
-visible source paint runs and actual batched draw requests. GPU timings are sampled asynchronously
-when supported: WebGL uses disjoint timer queries, while WebGPU measures the
-direct scene pass, including highlights. Cached/minified WebGPU passes are not
-timed. `gpuSamples: 0` or `gpuMs: null` means no GPU measurement is available;
-it does not mean zero GPU cost. No synchronous GPU waits are used.
-
-High CPU time points toward submission or driver overhead. High GPU time with
-low CPU time points toward shader/fragment work. Adjacent strokes, fills, or text
-share instanced draws even when their clip roots differ. Spatially independent
+Adjacent strokes, fills, or text share instanced draws even when their clip roots
+differ. Spatially independent
 pages also share draws: their paint streams are interleaved by type while keeping
 the order of overlapping paints. Actual content bounds determine those
 groups, including all stroke LOD levels, vector clips, and screen-space AA;
@@ -140,36 +125,4 @@ arbitrary local-to-clip projections keep their existing update path.
 Native WebGL/WebGPU ordered scenes use the existing soft 50,000-stroke LOD target;
 merging stays within each source paint, clip, and consecutive opaque color.
 Exact tile geometry returns when it fits the budget. The Draw counter reports
-selected strokes, while `orderedDrawRequests` reports submitted GPU draws.
-
-`cpuPhasesMs` separates stroke LOD selection, ordered-run culling, batch planning,
-instance-buffer uploads, and ordered draw submission. `other` contains the rest
-of the renderer frame, including the legacy draw paths and callbacks. Each phase
-reports median/p95 across all sampled frames; a cached or unexecuted phase counts
-as zero. These CPU phases do not measure GPU execution. WebGL GPU queries span
-the frame's GPU commands and may include gaps while the CPU feeds those commands;
-WebGPU timestamps span the direct render pass.
-
-`orderedDrawsByKind` reports the last frame's draws and instances separately for
-strokes, fills, text, images, and gradients. `workPerFrame` reports mean/max batch
-rebuilds, uploaded instance bytes, and WebGL texture bindings issued or avoided.
-This distinguishes a high primitive count from repeated CPU setup work. Texture
-binding counts cover the ordinary stroke/fill/text routines.
-
-For a temporary comparison in an ordered scene, capture 5–10 seconds of panning
-with everything visible, then enter `window.__HEPR_PROFILE_SKIP__ = "text"` in the
-console and pan again. This intentionally hides text during profiled frames;
-it leaves LOD and batch preparation intact, isolating text submission/rendering
-cost. Use `"fill"` for a second comparison if needed. Other accepted kinds are
-`"stroke"`, `"raster"`, `"gradient-fill"`, and `"gradient-stroke"`. Restore normal
-drawing with `delete window.__HEPR_PROFILE_SKIP__` and move the camera to redraw.
-The frame log labels the omitted kind in `skippedKinds`; `skipSupported` is false
-on legacy scenes. Changing the diagnostic mode starts a fresh timing window and
-discards pending GPU results from the previous mode. The switch has no effect
-when profiling is disabled. Only aggregated numbers are logged, never per draw.
-
-Disable logging immediately with `window.__HEPR_PROFILE__ = false`, or remove
-the query parameter and reload. Setting `window.__HEPR_PROFILE__ = true` enables
-CPU/WebGL diagnostics without reloading; WebGPU timestamp support must be
-requested at renderer creation, so use the URL option for that backend.
-Logs omit document names, text, geometry coordinates and image data.
+selected strokes.

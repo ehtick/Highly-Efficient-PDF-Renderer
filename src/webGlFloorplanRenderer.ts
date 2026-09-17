@@ -1,6 +1,5 @@
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { RenderPerformanceProbe } from "./renderPerformanceProbe";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 import { packVectorClips } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
@@ -1726,7 +1725,6 @@ export class WebGlFloorplanRenderer {
 
   private readonly uHighlightBorderColor: WebGLUniformLocation;
 
-  private readonly performanceProbe = new RenderPerformanceProbe("webgl");
   private orderedRunCuller: VectorDrawRunCuller | null = null;
   private orderedCullingBounds: Bounds | null = null;
   private orderedRunsCulled = false;
@@ -2837,7 +2835,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.isDisposed = true;
-    this.performanceProbe.dispose();
     this.orderedRunCuller = null;
 
     if (this.rafHandle !== 0) {
@@ -3031,58 +3028,51 @@ export class WebGlFloorplanRenderer {
   }
 
   private render(timestamp: number = performance.now()): void {
-    this.performanceProbe.begin(this.scene, { width: this.canvas.width, height: this.canvas.height, zoom: this.zoom,
-      layers: { stroke: this.strokeRenderingEnabled, fill: this.fillRenderingEnabled,
-        text: this.textRenderingEnabled, raster: this.rasterRenderingEnabled } }, this.gl);
-    try {
-      const isCameraAnimating = this.updateCameraWithDamping(timestamp);
-      this.updatePanReleaseVelocitySample(timestamp);
-      const gl = this.gl;
-      this.ensureRenderState();
+    const isCameraAnimating = this.updateCameraWithDamping(timestamp);
+    this.updatePanReleaseVelocitySample(timestamp);
+    const gl = this.gl;
+    this.ensureRenderState();
 
-      if (
-        !this.scene ||
-        (this.fillPathCount === 0 &&
-          this.segmentCount === 0 &&
-          this.textInstanceCount === 0 &&
-          (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
-          (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
-          this.rasterLayers.length === 0 &&
-          this.pageRects.length === 0)
-      ) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-        gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        this.capturePresentedFrameState();
-
-        this.frameListener?.({
-          renderedSegments: 0,
-          totalSegments: 0,
-          usedCulling: false,
-          zoom: this.zoom
-        });
-        if (isCameraAnimating) {
-          this.requestFrame();
-        }
-        return;
-      }
-
-      if (this.shouldUsePanCache(isCameraAnimating)) {
-        this.renderWithPanCache();
-      } else {
-        this.renderDirectToScreen();
-      }
-      // Drawn last with the live camera so highlights can never lag the scene,
-      // and never bake into the pan cache.
-      this.drawSearchHighlights(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    if (
+      !this.scene ||
+      (this.fillPathCount === 0 &&
+        this.segmentCount === 0 &&
+        this.textInstanceCount === 0 &&
+        (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
+        (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
+        this.rasterLayers.length === 0 &&
+        this.pageRects.length === 0)
+    ) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
       this.capturePresentedFrameState();
 
+      this.frameListener?.({
+        renderedSegments: 0,
+        totalSegments: 0,
+        usedCulling: false,
+        zoom: this.zoom
+      });
       if (isCameraAnimating) {
         this.requestFrame();
       }
-    } finally {
-      this.performanceProbe.end({ orderedRunsCulled: this.orderedRunsCulled });
+      return;
+    }
+
+    if (this.shouldUsePanCache(isCameraAnimating)) {
+      this.renderWithPanCache();
+    } else {
+      this.renderDirectToScreen();
+    }
+    // Drawn last with the live camera so highlights can never lag the scene,
+    // and never bake into the pan cache.
+    this.drawSearchHighlights(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    this.capturePresentedFrameState();
+
+    if (isCameraAnimating) {
+      this.requestFrame();
     }
   }
 
@@ -3923,14 +3913,12 @@ export class WebGlFloorplanRenderer {
   private bindOrderedTexture(unit: number, texture: WebGLTexture | null): void {
     if (this.vectorClipIndex === -2) {
       if (this.orderedTextureBindings[unit] === texture) {
-        this.performanceProbe?.count("textureBindSkips");
         return;
       }
       this.orderedTextureBindings[unit] = texture;
     }
     this.gl.activeTexture(this.gl.TEXTURE0 + unit);
     this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
-    this.performanceProbe?.count("textureBinds");
   }
 
   private prepareOrderedProgram(program: WebGLProgram): boolean {
@@ -3960,37 +3948,21 @@ export class WebGlFloorplanRenderer {
     this.vectorClipIndex = -1;
     if (this.rasterRenderingEnabled) this.drawPageBackgrounds(width, height, x, y, zoom);
     let strokes = 0;
-    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
-    let phaseStart = probe?.mark() ?? -1;
     const view = this.localToClipRenderingEnabled ? this.orderedCullingBounds : vectorViewBounds(width, height, x, y, zoom);
     const runs = this.orderedRunCuller?.select(view, 1 / Math.max(zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
-    probe?.phase("runCulling", phaseStart);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
     const plan = this.orderedBatches;
-    phaseStart = probe?.mark() ?? -1;
     const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6)) ?? false;
-    probe?.phase("batchPlan", phaseStart);
-    if (rebuilt) probe?.count("batchRebuilds");
-    phaseStart = probe?.mark() ?? -1;
     if (plan && rebuilt) {
-      probe?.count("instanceUploadBytes", plan.instanceCount * 8);
       this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.orderedInstanceBuffer);
       this.gl.bufferData(this.gl.ARRAY_BUFFER, plan.floatInstances.subarray(0, plan.instanceCount * 2), this.gl.DYNAMIC_DRAW);
     }
-    probe?.phase("instanceUpload", phaseStart);
-    phaseStart = probe?.mark() ?? -1;
-    let submitted = 0;
     for (const run of plan?.batches ?? runs) {
-      if (probe?.skips(run.kind)) continue;
       this.vectorClipIndex = run.clipIndex ?? -1;
       if (this.vectorClipIndex !== -2 && this.orderedTextureBindings) this.orderedTextureBindings.length = 0;
       if (run.kind === "fill" && this.fillRenderingEnabled) {
-        submitted++;
-        probe?.draw(run.kind, run.count);
         this.drawFilledPaths(width, height, x, y, zoom, run.first, run.count);
       } else if (run.kind === "stroke" && this.strokeRenderingEnabled) {
-        submitted++;
-        probe?.draw(run.kind, run.count);
         const level = plan ? this.vectorLodLevels[0] : undefined;
         if (level) {
           this.drawStrokeInstances(level, this.orderedInstanceBuffer!, run.count, width, height, x, y, zoom, run.first);
@@ -3999,30 +3971,20 @@ export class WebGlFloorplanRenderer {
           strokes += this.drawVisibleSegments(width, height, x, y, zoom, { start: run.first, count: run.count });
         }
       } else if (run.kind === "text" && this.textRenderingEnabled) {
-        submitted++;
-        probe?.draw(run.kind, run.count);
         this.drawTextInstances(width, height, x, y, zoom, undefined, { start: run.first, count: run.count });
       } else {
         for (let index = run.first; index < run.first + run.count; index++) {
           if (run.kind === "raster" && this.rasterRenderingEnabled) {
-            submitted++;
-            probe?.draw(run.kind, 1);
             this.drawRasterLayerAtIndex(index, width, height, x, y, zoom);
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
-            submitted++;
-            probe?.draw(run.kind, 1);
             this.drawGradientFillPath(index, width, height, x, y, zoom);
           } else if (run.kind === "gradient-stroke" && this.strokeRenderingEnabled) {
-            submitted++;
-            probe?.draw(run.kind, 1);
             this.drawGradientStrokeRun(index, width, height, x, y, zoom);
           }
         }
       }
     }
     this.vectorClipIndex = -1;
-    probe?.phase("orderedSubmit", phaseStart);
-    this.performanceProbe?.orderedRuns(runs.length, submitted);
     return strokes;
   }
 
@@ -4698,10 +4660,7 @@ export class WebGlFloorplanRenderer {
       this.vectorLodRuntime.updateForLocalUnitsPerPixel(localUnitsPerPixel);
     }
 
-    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
-    const selectionStart = probe?.mark() ?? -1;
     const updated = this.vectorLodRuntime.update(viewState, viewport, cullingBounds);
-    probe?.phase("strokeLod", selectionStart);
     this.vectorLodStats = this.vectorLodRuntime.getStats();
     this.visibleSegmentCount = this.vectorLodStats.renderedSegments;
     this.usingAllSegments = false;

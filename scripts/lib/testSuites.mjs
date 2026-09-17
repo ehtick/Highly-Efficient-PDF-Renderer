@@ -37,7 +37,7 @@ export const fastTests = [
   "scene-statistics",
   "vector-draw-order",
   "vector-clips",
-  "render-performance",
+  "vector-draw-run-culling",
   "vector-ordered-batches",
   "vector-page-batching",
   "text-parser-work",

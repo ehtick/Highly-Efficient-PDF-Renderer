@@ -1,3 +1,5 @@
+import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
 import {
@@ -47,6 +49,8 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialTextLayer {
+  private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly orderedRuns: ThreeVectorDrawRuns | null;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly textInstanceTextureA: THREE.DataTexture;
@@ -92,6 +96,7 @@ export class ThreeMaterialTextLayer {
   private renderedTextInstanceCount: number;
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
+    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const materialBackend = options.materialBackend ?? "webgl";
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
     const textGlyphCount = Math.max(0, scene.textGlyphCount | 0);
@@ -307,9 +312,11 @@ export class ThreeMaterialTextLayer {
     }
     configureStraightAlphaBlending(material);
 
+    initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex");
   }
 
   setVisible(visible: boolean): void {
@@ -378,6 +385,7 @@ export class ThreeMaterialTextLayer {
    * is copied here and never retained.
    */
   setSelectedTextInstanceIds(instanceIds: Uint32Array): boolean {
+    if (this.orderedRuns) return false;
     const count = instanceIds.length;
     if (count > this.textInstanceIds.length) {
       throw new RangeError(
@@ -443,7 +451,9 @@ export class ThreeMaterialTextLayer {
     if (this.usingExternalSelection) {
       return;
     }
+    this.orderedRuns?.beginUpdate();
     this.updateVisibleTextInstances(viewState, viewport, cullingBounds);
+    this.orderedRuns?.finishUpdate();
   }
 
   private updateVisibleTextInstances(
@@ -584,6 +594,8 @@ export class ThreeMaterialTextLayer {
   }
 
   dispose(): void {
+    this.orderedRuns?.dispose();
+    this.vectorClipTexture.dispose();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.textInstanceTextureA.dispose();

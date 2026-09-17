@@ -1,3 +1,4 @@
+import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
@@ -299,6 +300,8 @@ export function createThreeWebGpuStrokeMaterial(
     aaScreenPx: aaScreenPxUniform,
     vectorOverride: vectorOverrideUniform
   });
+
+  registerThreeNodeClipPosition(material, worldPackValue.xy);
 
   return {
     material,

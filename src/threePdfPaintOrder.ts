@@ -1,3 +1,4 @@
+import { vectorDrawRunRenderOrder } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -29,6 +30,18 @@ export function applyThreePdfOverlayPaintOrder(
   rasterGroup: THREE.Group,
   nativePaints: readonly ThreePdfOrderedPaintMesh[]
 ): void {
+  if (scene.drawRuns) {
+    const backgrounds = Math.max(1, Math.floor(scene.pageRects.length / 4));
+    scene.drawRuns.forEach((run, index) => {
+      for (let item = run.first; item < run.first + run.count; item++) {
+        const mesh = run.kind === "raster" ? rasterGroup.children[backgrounds + item]
+          : run.kind === "gradient-fill" ? nativePaints[item]?.mesh
+          : run.kind === "gradient-stroke" ? nativePaints[scene.gradientFillPathCount + item]?.mesh : null;
+        if (mesh) mesh.renderOrder = vectorDrawRunRenderOrder(index + (item - run.first) / run.count, scene.drawRuns!.length);
+      }
+    });
+    return;
+  }
   if (nativePaints.length === 0) {
     return;
   }

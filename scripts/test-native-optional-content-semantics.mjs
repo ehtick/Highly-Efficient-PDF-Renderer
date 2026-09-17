@@ -80,6 +80,30 @@ function pdfError(code, pattern) {
   };
 }
 
+await withRegistry(optionalContentPdf({
+  defaultConfiguration: "<< /BaseState /ON /OFF [12 0 R] >>",
+  pageProperties: ["/Off 12 0 R"]
+}), {}, async ({ document, registry, emitted }) => {
+  for (const resources of [undefined, new Map(), new Map([["Properties", new Map()]])]) {
+    const [property] = await registry.resolvePageProperties(resources, ["Gone"], undefined, ["Gone"]);
+    assert.equal(property.defaultVisible, true);
+    assert.equal(property.propertyList, null);
+    assert.equal(property.membershipIndex, null);
+    await registry.resolvePageProperties(resources, ["Gone"], undefined, ["Gone"]);
+  }
+  assert.equal(emitted.filter(d => d.code === "optional-content.unresolved-property").length, 3,
+    "missing resources, Properties and individual names are diagnosed once each");
+  const [missing, hidden] = await registry.resolvePageProperties(
+    document.getPage(0).resources, ["Gone", "Off"], undefined, ["Gone", "Off"]);
+  assert.equal(missing.defaultVisible, true);
+  assert.equal(hidden.defaultVisible, false, "valid hidden memberships still control visibility");
+  await assert.rejects(registry.resolvePageProperties(new Map([["Properties", 42]]),
+    ["Gone"], undefined, ["Gone"]), pdfError("invalid-object"),
+  "malformed membership resources still fail validation");
+  await assert.rejects(registry.resolvePageProperties(undefined, ["Gone"],
+    AbortSignal.abort(), ["Gone"]), error => error.name === "AbortError");
+});
+
 const primaryProperties = [
   "/G11 11 0 R",
   "/G12 12 0 R",

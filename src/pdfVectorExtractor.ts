@@ -1,3 +1,4 @@
+import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import {
   createLoadProgressReporter,
@@ -78,7 +79,26 @@ export interface SceneTextItem {
   pageIndex: number;
 }
 
+/** A vector clip is the intersection of this polygon and its parent. */
+export interface VectorClipPath {
+  parent: number;
+  fillRule: 0 | 1;
+  /** Directed [x0, y0, x1, y1] edges, including implicit subpath closures. */
+  edges: Float32Array;
+}
+
+/** Consecutive instances painted together, in PDF source order. */
+export interface VectorDrawRun {
+  clipIndex?: number;
+  kind: "fill" | "stroke" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
+  first: number;
+  count: number;
+}
+
 export interface VectorScene {
+  /** Absent on older scenes that use the fixed image/fill/stroke/text passes. */
+  drawRuns?: VectorDrawRun[];
+  clipPaths?: VectorClipPath[];
   pageCount: number;
   pagesPerRow: number;
   pageRects: Float32Array;
@@ -1198,6 +1218,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let combinedBounds: Bounds | null = null;
   let combinedPageBounds: Bounds | null = null;
 
+  const clipPaths: VectorClipPath[] = [];
+  const drawRuns: VectorDrawRun[] | undefined = pageScenes.some(scene => scene.drawRuns) ? [] : undefined;
   const rasterLayers: RasterLayer[] = [];
   const mergedTextIndexPages: PageTextIndex[] = [];
   const combinedTextContent: SceneTextItem[] = [];
@@ -1209,6 +1231,24 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
+    const clipBase = clipPaths.length;
+    for (const clip of scene.clipPaths ?? []) {
+      const edges = clip.edges.slice();
+      for (let i = 0; i < edges.length; i += 2) { edges[i] += tx; edges[i + 1] += ty; }
+      clipPaths.push({ parent: clip.parent < 0 ? -1 : clip.parent + clipBase, fillRule: clip.fillRule, edges });
+    }
+    if (drawRuns) {
+      validateVectorDrawRuns(scene);
+      const offsets: Record<VectorDrawRun["kind"], number> = {
+        fill: fillPathOffset, stroke: segmentOffset, text: textInstanceOffset,
+        raster: rasterLayers.length, "gradient-fill": gradientFillPathOffset,
+        "gradient-stroke": gradientStrokeRunOffset
+      };
+      for (const run of scene.drawRuns ?? defaultVectorDrawRuns({ ...scene, rasterLayers: listSceneRasterLayers(scene) })) {
+        appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count,
+          run.clipIndex === undefined ? undefined : run.clipIndex + clipBase);
+      }
+    }
 
     if (scene.textContent) {
       hasTextContent = true;
@@ -1482,6 +1522,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
   const composedScene: VectorScene = {
+    ...(clipPaths.length ? { clipPaths } : {}),
+    ...(drawRuns ? { drawRuns } : {}),
     pageCount: pageScenes.length,
     pagesPerRow,
     pageRects,

@@ -59,7 +59,13 @@ try {
 
   const rasterSession = await openPdf({ kind: "bytes", bytes: fixture(true) });
   try {
-    await assert.rejects(rasterSession.compileVectorPage(0),
+    const attempts = canvasAttempts;
+    const clipped = await rasterSession.compileVectorPage(0);
+    assert.equal(canvasAttempts, attempts, "clipped images no longer need a canvas backend");
+    assert.equal(clipped.clipPaths.length, 1);
+    assert.equal(clipped.rasterLayers[0].width, 2);
+    // Exercise the retained compatibility compositor explicitly.
+    await assert.rejects(rasterSession.compileVectorPage(0, { preserveDrawingOrder: false }),
       error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
   } finally {
     await rasterSession.close();
@@ -93,7 +99,7 @@ try {
 
   const installedSession = await openPdf({ kind: "bytes", bytes: fixture(true) });
   try {
-    const scene = await installedSession.compileVectorPage(0);
+    const scene = await installedSession.compileVectorPage(0, { preserveDrawingOrder: false });
     assert.equal(scene.rasterLayers.length, 1);
     assert.ok(scene.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value === 255));
   } finally {

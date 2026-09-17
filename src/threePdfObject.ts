@@ -1094,7 +1094,7 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.isDisposed) {
       return;
     }
-    const nextMode: TextLodMode = mode === "off" ? "off" : "auto";
+    const nextMode: TextLodMode = this.sceneData.drawRuns || mode === "off" ? "off" : "auto";
     this.rendererConfig.textLodMode = nextMode;
     this.renderer.setTextLodMode?.(nextMode);
     const replacementScene = this.textLodLayer?.setMode(nextMode, this.sceneData) ?? null;
@@ -1262,7 +1262,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private shouldUseThreeVectorLodLayer(mode: VectorLodMode): boolean {
-    return shouldUseVectorStrokeLod(mode, this.rendererType, this.sceneData.segmentCount);
+    return !this.sceneData.drawRuns && shouldUseVectorStrokeLod(mode, this.rendererType, this.sceneData.segmentCount);
   }
 
   private rebuildThreeStrokeLayer(useVectorLodLayer: boolean, useExactMaterialLayer: boolean): void {
@@ -1926,7 +1926,7 @@ export class HeprThreePdfObject extends THREE.Group {
     }
 
     // The invisible page rectangle is a cheap depth pre-pass for the PDF as a
-    // single scene object. PDF material layers draw after it in fixed order
+    // single scene object. PDF material layers draw after it in paint order
     // without depth testing, so coplanar page content cannot self-fight.
     this.pageMesh.frustumCulled = false;
     this.pageMesh.renderOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH;
@@ -2660,12 +2660,12 @@ export async function createThreePdfObject(
 
   const rendererConfig = normalizeRendererConfig(options);
   const initialFitPaddingPixels = DEFAULT_FIT_PADDING_PIXELS;
-  const useVectorLodStrokeLayer =
+  const useVectorLodStrokeLayer = !loadedScene.scene.drawRuns &&
     shouldUseVectorStrokeLod(
       rendererConfig.vectorLodMode,
       rendererType,
       loadedScene.scene.segmentCount
-  );
+    );
   const nativeRenderer = await waitForLoad(
     createNativeRenderer(rendererType, renderCanvas).then((renderer) => {
       if (signal?.aborted) {
@@ -2736,7 +2736,7 @@ export async function createThreePdfObject(
 
     const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
 
-    const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, rendererConfig.textLodMode);
+    const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, loadedScene.scene.drawRuns ? "off" : rendererConfig.textLodMode);
     let textMaterialLayer: ThreeMaterialTextLayer;
     try {
       textMaterialLayer = new ThreeMaterialTextLayer(textLodLayer.getRenderScene(), {

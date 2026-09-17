@@ -489,6 +489,8 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private readonly frames: GroupFrame[] = [];
   private readonly masks = new Map<number, CachedImage>();
   private readonly imageCache = new Map<string, Promise<CachedImage>>();
+  private readonly localImageSurfaces = new Map<string, CachedImage>();
+  private readonly diagnosedOverprintPaints = new Set<number>();
   private readonly timings: HeprCanvas2dTimings | undefined;
   private readonly sharedImages: HeprCanvas2dImageSurfaceCache | undefined;
   private readonly boundSoftMasks: boolean;
@@ -681,6 +683,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.frames.length = 0;
     this.masks.clear();
     this.imageCache.clear();
+    this.localImageSurfaces.clear();
     this.sharedImages?.endRender();
     if (this.ownsPatternRuntime) {
       this.patternRuntime.active.clear();
@@ -2567,12 +2570,15 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     const paints = this.page.stores.paints;
     const alpha = clamp01(paints.alphas[index]);
     const kind = paints.kinds[index];
-    if (alpha !== 0 && paints.overprint[index] !== 0) {
-      throw canvasError(
-        HEPR_CANVAS_2D_ERROR_CODES.UnsupportedPaint,
-        "Canvas2D cannot exactly represent visible PDF overprint.",
-        path
-      );
+    if (alpha !== 0 && paints.overprint[index] !== 0 && !this.diagnosedOverprintPaints.has(index)) {
+      this.diagnosedOverprintPaints.add(index);
+      this.options.onDiagnostic?.({
+        code: "overprint-approximation",
+        severity: "warning",
+        pageIndex: this.page.pageInfo.sourcePageIndex,
+        message: "PDF overprint uses ordinary screen-color compositing; overlapping ink colors may differ.",
+        details: { paintIndex: index, path }
+      });
     }
     if (kind === HEPR_PAINT_KIND.Gradient) {
       return {
@@ -2870,6 +2876,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         pending = Promise.resolve(shared);
       } else pending = this.createImageSurface(imageIndex, paint).then((image) => {
         if (this.sharedImages?.add(key, image)) this.releasePixels(image.accountedPixels);
+        else this.localImageSurfaces.set(key, image);
         return image;
       }).catch((error) => {
         this.imageCache.delete(key);
@@ -3155,6 +3162,25 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   ): CachedImage {
     const pixels = checkedPixels(width, height, label);
     this.sharedImages?.trimUnused(this.options.maxWorkingPixels - this.liveWorkingPixels - pixels);
+    // Images are consumed synchronously by drawImage before another surface
+    // allocation. Discard completed cached images before exhausting the budget;
+    // a later reuse can decode them again without changing the rendered pixels.
+    for (const [key, image] of this.localImageSurfaces) {
+      if (pixels <= this.options.maxWorkingPixels - this.liveWorkingPixels -
+          (this.sharedImages?.pixelCount ?? 0)) break;
+      try {
+        const canvas = image.surface.canvas as { width: number; height: number };
+        canvas.width = 1;
+        canvas.height = 1;
+      } catch {
+        // A host with immutable surface dimensions cannot release this cache
+        // entry eagerly; retain its accounting and enforce the same limit.
+        continue;
+      }
+      this.localImageSurfaces.delete(key);
+      this.imageCache.delete(key);
+      this.releasePixels(image.accountedPixels);
+    }
     if (pixels > this.options.maxWorkingPixels - this.liveWorkingPixels -
         (this.sharedImages?.pixelCount ?? 0)) {
       throw canvasError(

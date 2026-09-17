@@ -684,8 +684,11 @@ async function parseCompositeFont(
     parserLimits,
     signal
   );
+  const embeddedCff = await readEmbeddedCff(
+    descendant, descriptor, resolver, parserLimits, signal
+  );
   reportFontDiagnostics(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
-  const replacement = embeddedSfnt === null && descriptor.embeddedKind === null
+  const replacement = embeddedSfnt === null && embeddedCff === null && descriptor.embeddedKind === null
     ? await resolveMissingSfnt({
         baseFont,
         normalizedBaseFont: stripSubsetPrefix(baseFont),
@@ -721,7 +724,7 @@ async function parseCompositeFont(
     ? await readCidToGidMap(descendant.get("CIDToGIDMap"), resolver, signal)
     : null;
   const outlineReason = descendantSubtype === "CIDFontType0"
-    ? "CIDFontType0 CFF outlines require the native CFF kernel, which is not available."
+    ? "The CIDFontType0 font has no supported embedded CFF outline program."
     : descriptor.embeddedKind === "cff" || descriptor.embeddedKind === "cff2"
       ? "CFF/CFF2 outlines require the native CFF kernel, which is not available."
       : null;
@@ -732,9 +735,9 @@ async function parseCompositeFont(
     encoding.writingMode,
     descriptor,
     style,
-    sfnt?.unitsPerEm ?? 1000,
+    sfnt?.unitsPerEm ?? embeddedCff?.unitsPerEm ?? 1000,
     sfnt,
-    null,
+    embeddedCff,
     replacement?.substitution ?? null,
     Object.freeze([
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
@@ -751,7 +754,7 @@ async function parseCompositeFont(
       const key = cmapKey(entry.code, entry.byteLength);
       const cid = getCMapCid(encoding, key, entry.code, entry.byteLength) ??
         (encoding.identityBase ? entry.code : 0);
-      const rawGlyphId = cidToGid ? cidToGid(cid) : cid;
+      const rawGlyphId = embeddedCff ? embeddedCff.glyphIdForCid(cid) : cidToGid ? cidToGid(cid) : cid;
       const glyphId = sfnt && rawGlyphId >= sfnt.numGlyphs ? 0 : rawGlyphId;
       const unicode = toUnicode === null
         ? cidUnicode.shard?.unicodeForCid(cid) ?? null
@@ -2737,7 +2740,7 @@ async function readEmbeddedCff(
   const stream = await resolver.resolveValue(value, signal);
   if (!isPdfStream(stream)) throw unsupportedFont("An embedded CFF font file is not a stream.");
   const subtype = optionalName(await resolver.resolveValue(stream.dictionary.get("Subtype"), signal));
-  if (subtype !== "Type1C") {
+  if (subtype !== "Type1C" && subtype !== "CIDFontType0C") {
     throw unsupportedFont(`Embedded CFF stream subtype /${subtype ?? "(missing)"} is not supported.`);
   }
   const bytes = await resolver.decodeStream(stream, signal);

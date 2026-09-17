@@ -39,13 +39,15 @@ try {
       }
     });
     try {
-      const without = await session.compileVectorPageWithTimings(0, {}, { reusePageResources: false });
+      // Force the compatibility compositor: ordinary image clipping now needs no second pass.
+      const compile = (page, options = {}) => session.compileVectorPage(page, { ...options, preserveDrawingOrder: false });
+      const without = await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false }, { reusePageResources: false });
       const expectedHash = sceneFingerprint(without.scene);
       const oldCodecCount = counts.codecs.length;
       const oldFontCount = counts.fonts;
       counts.codecs.length = 0;
       counts.fonts = 0;
-      const reused = await session.compileVectorPageWithTimings(0);
+      const reused = await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false });
       assert.equal(sceneFingerprint(reused.scene), expectedHash, "reuse preserves every scene field and pixel");
       assert.equal(counts.fonts, 1);
       assert.equal(oldFontCount, counts.fonts * 2, "the second pass must not prepare the font again");
@@ -58,15 +60,15 @@ try {
       assert.equal(without.timings.selectiveCompilation.decodedImages, reused.timings.decodedImages);
 
       const perOperationCalls = counts.codecs.length;
-      await session.compileVectorPage(1);
+      await compile(1);
       assert.equal(counts.codecs.length, perOperationCalls * 2, "resources cannot leak across source pages");
       assert.equal(sceneFingerprint(reused.scene), expectedHash, "later operations cannot mutate returned scenes");
-      await assert.rejects(session.compileVectorPage(0, { limits: { maxDecodedStreamBytes: 8 } }),
+      await assert.rejects(compile(0, { limits: { maxDecodedStreamBytes: 8 } }),
         error => error?.code === "resource-limit");
 
       const aborted = new AbortController();
       let starts = 0;
-      await assert.rejects(session.compileVectorPage(0, {
+      await assert.rejects(compile(0, {
         signal: aborted.signal,
         onProgress(event) {
           if (event.stage === "content" && event.completed === 0 && ++starts === 2) aborted.abort();
@@ -74,7 +76,7 @@ try {
       }), error => error?.code === "aborted");
       assert.equal(starts, 2, "cancellation must occur after preparation, at the second pass");
       const beforeRetry = counts.codecs.length;
-      assert.equal(sceneFingerprint(await session.compileVectorPage(0)), expectedHash);
+      assert.equal(sceneFingerprint(await compile(0)), expectedHash);
       assert.equal(counts.codecs.length - beforeRetry, perOperationCalls,
         "a cancelled operation cannot retain a usable resource cache");
       const changingOptions = {
@@ -83,12 +85,12 @@ try {
           if (event.stage === "content") changingOptions.limits.maxDecodedStreamBytes = 8;
         }
       };
-      assert.equal(sceneFingerprint(await session.compileVectorPage(0, changingOptions)), expectedHash,
+      assert.equal(sceneFingerprint(await compile(0, changingOptions)), expectedHash,
         "the two passes use the same operation-owned limits snapshot");
-      await assert.rejects(session.compileVectorPage(0, changingOptions), error => error?.code === "resource-limit",
+      await assert.rejects(compile(0, changingOptions), error => error?.code === "resource-limit",
         "the next operation must honor the newly lowered limit");
       const beforeQueued = counts.codecs.length;
-      const queued = await Promise.all([session.compileVectorPage(0), session.compileVectorPage(0)]);
+      const queued = await Promise.all([compile(0), compile(0)]);
       for (const scene of queued) assert.equal(sceneFingerprint(scene), expectedHash);
       assert.equal(counts.codecs.length - beforeQueued, perOperationCalls * 2,
         "queued compilations own separate preparation caches");

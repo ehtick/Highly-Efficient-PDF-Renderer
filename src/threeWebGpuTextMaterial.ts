@@ -1,3 +1,4 @@
+import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
@@ -649,6 +650,8 @@ export function createThreeWebGpuTextMaterial(
     textCurveEnabled: curveUniform,
     vectorOverride: TSL.uniform(options.vectorOverride)
   });
+
+  registerThreeNodeClipPosition(material, (vertexPack as { xy: unknown }).xy);
 
   return {
     material,

@@ -1,3 +1,5 @@
+import { NativeVectorClipBuilder } from "./nativeVectorClips";
+import { appendVectorDrawRun, simplifyVectorDrawRuns } from "../vectorDrawOrder";
 import type {
   Bounds,
   PageTextIndex,
@@ -6,6 +8,9 @@ import type {
 } from "../pdfVectorExtractor";
 import { HEPR_IMAGE_FORMAT } from "../heprDocumentData";
 import {
+  DENSE_PDF_LEGACY_VECTOR_EVENT_FILL,
+  DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE,
+  DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE,
   DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
   DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
   DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
@@ -28,15 +33,15 @@ import type {
   NativeTextCompilation,
   NativeTextFontResource
 } from "./nativeText";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { NativeTextClipTester } from "./nativeTextClip";
 
 /**
  * Inputs for the bounded one-page native-parser to legacy-renderer boundary.
  *
  * `compiled` must have been produced with `legacyVectorOutput: true`. That
- * compiler mode proves that grouped legacy rendering preserves source paint
- * order and attaches the small `legacyVector` sidecar consumed here. Large
+ * compiler mode attaches the small `legacyVector` sidecar consumed here.
+ * Ordered sidecars retain draw ranges; older sidecars require grouped rendering. Large
  * packed fill and stroke buffers are retained by reference.
  */
 export interface BuildNativeVectorPageInput {
@@ -50,6 +55,8 @@ export interface BuildNativeVectorPageInput {
   readonly textCompilation: NativeTextCompilation;
   readonly fontResources: readonly NativeTextFontResource[];
   readonly imageRegistry: LegacyVectorImageRegistry;
+  readonly compositeRasterLayers?: readonly RasterLayer[];
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** Maximum distinct, nonempty glyph outlines derived for this page. */
   readonly maxPaths: number;
   readonly signal?: AbortSignal;
@@ -78,6 +85,7 @@ type NativeVectorGlyphPathCommand = NativeGlyphPathCommand | {
 };
 
 interface TextBuildResult {
+  readonly glyphToInstance: Int32Array;
   readonly sourceTextCount: number;
   readonly inPageCount: number;
   readonly outOfPageCount: number;
@@ -178,6 +186,8 @@ export function buildNativeVectorPage(
     pageInfo.sourcePageIndex,
     signal
   );
+  const imageLayerCount = rasterLayers.length;
+  rasterLayers.push(...(input.compositeRasterLayers ?? []));
   if (sourceOrder.requiresLateImageProof) {
     validateLateImageUnderlays(
       sidecar,
@@ -203,7 +213,7 @@ export function buildNativeVectorPage(
   // Worker responses transfer every scene-owned ArrayBuffer. Never reuse a
   // module-global empty view: its buffer would stay detached after response 1.
   const emptyFloats = new Float32Array(0);
-  return {
+  const scene: VectorScene = {
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([
@@ -283,6 +293,46 @@ export function buildNativeVectorPage(
     discardedDuplicateCount: compiled.discardedDuplicateCount,
     discardedContainedCount: compiled.discardedContainedCount
   };
+  if (sidecar.pathPaintRanges) {
+    const runs: NonNullable<VectorScene["drawRuns"]> = [];
+    const clipBuilder = new NativeVectorClipBuilder();
+    const imageOrder = Array.from(sidecar.imageIndices, (_, i) => i).sort((a, b) =>
+      sidecar.imagePaintOrders[a] - sidecar.imagePaintOrders[b] || a - b);
+    const imageLayers = new Uint32Array(imageOrder.length);
+    imageOrder.forEach((invocation, layer) => { imageLayers[invocation] = layer; });
+    for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
+      const kind = sidecar.sourceEvents[offset];
+      const index = sidecar.sourceEvents[offset + 1];
+      const clipIndex = kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT ||
+        kind === DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE ? undefined : clipBuilder.add(sidecar.sourceClips?.[offset / 2], signal);
+      if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FILL || kind === DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE) {
+        if (index * 2 + 1 >= sidecar.pathPaintRanges.length) {
+          throw invalid("Invalid ordered path range.", pageInfo.sourcePageIndex, "vector-draw-path-range");
+        }
+        appendVectorDrawRun(runs, kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FILL ? "fill" : "stroke",
+          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex);
+      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH) {
+        const first = sidecar.glyphRunMeta[index * 3];
+        const end = first + sidecar.glyphRunMeta[index * 3 + 1];
+        for (let glyph = first; glyph < end; glyph++) {
+          const instance = text.glyphToInstance[glyph];
+          if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex);
+        }
+      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE) {
+        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex);
+      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE) {
+        for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
+          if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1);
+        }
+      }
+    }
+    scene.drawRuns = runs;
+    if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
+    if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",
+      pageIndex: pageInfo.sourcePageIndex, message: "Curved clip boundaries use vector edges with a 0.0001-point subdivision tolerance." });
+    simplifyVectorDrawRuns(scene);
+  }
+  return scene;
 }
 
 function readLegacyVectorSidecar(
@@ -385,11 +435,11 @@ function analyzeLegacySourceOrder(
       }
       const markedLate = (sidecar.imageFlags[localIndex] &
         DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT) !== 0;
-      if (markedLate !== precedingVisibleText) {
+      if (!sidecar.pathPaintRanges && markedLate !== precedingVisibleText) {
         throw invalid("Native VectorScene late-image ordering metadata is inconsistent.", pageIndex,
           "legacy-vector-image-order-metadata");
       }
-      requiresLateImageProof ||= markedLate;
+      requiresLateImageProof ||= markedLate && !sidecar.pathPaintRanges;
       const markedAfterPath = (sidecar.imageFlags[localIndex] &
         DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH) !== 0;
       if (markedAfterPath && !ordinaryBarrierSeen) {
@@ -407,6 +457,8 @@ function analyzeLegacySourceOrder(
       ordinaryBarrierSeen = true;
       continue;
     }
+    if (sidecar.pathPaintRanges && (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FILL ||
+        kind === DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE || kind === DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE)) continue;
     if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FORM) {
       // buildNativeVectorPage rejects unflattened Forms before this analysis;
       // a flattened sidecar must not retain any Form events.
@@ -709,7 +761,7 @@ function buildLegacyText(
   // spatial eligibility separate so only the first two remain searchable.
   const glyphIndexable = new Uint8Array(glyphCount);
   const clipTester = new NativeTextClipTester();
-  const compositedInkBounds = new Map<string, readonly number[] | null>();
+  const glyphInkBounds = new Map<string, readonly number[] | null>();
   const indexQuads = new Map<number, readonly number[]>();
   const geometryByKey = new Map<string, number>();
   const geometries: GlyphGeometry[] = [];
@@ -836,13 +888,13 @@ function buildLegacyText(
         if (visuallyPainted && geometryIndex >= 0) outOfPageCount += 1;
         continue;
       }
-      if (composited && exactClip) {
+      if (exactClip && (visuallyPainted || composited)) {
         const key = `${fontIndex}:${glyphId}`;
-        let ink = compositedInkBounds.get(key);
+        let ink = glyphInkBounds.get(key);
         if (ink === undefined) {
           const outline = fonts[fontIndex].getGlyphOutline(glyphId);
           ink = outline.commands.length === 0 ? null : outline.bounds;
-          compositedInkBounds.set(key, ink);
+          glyphInkBounds.set(key, ink);
         }
         if (ink) {
           const inkBounds = transformedBounds(boundsFromQuad(ink), glyphTransform);
@@ -932,6 +984,7 @@ function buildLegacyText(
     instanceB,
     instanceC,
     sourceGlyphPaintBounds,
+    glyphToInstance,
     clipRects: Float32Array.from(clipRects),
     glyphMetaA,
     glyphMetaB,
@@ -1556,6 +1609,12 @@ function buildRasterLayers(
   order.sort((left, right) =>
     sidecar.imagePaintOrders[left] - sidecar.imagePaintOrders[right] || left - right
   );
+  const vectorClipped = new Uint8Array(sidecar.imageIndices.length);
+  for (let event = 0; event < sidecar.sourceEvents.length; event += 2) {
+    if (sidecar.sourceEvents[event] === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE && sidecar.sourceClips?.[event / 2]) {
+      vectorClipped[sidecar.sourceEvents[event + 1]] = 1;
+    }
+  }
   const layers: RasterLayer[] = [];
   let compositedImages: Map<number, Uint8Array> | null = null;
   for (const invocation of order) {
@@ -1612,7 +1671,7 @@ function buildRasterLayers(
     let layerHeight = image.height;
     let layerData = imageData;
     let layerMatrix = flipImageMatrix(transform);
-    if ((sidecar.imageFlags[invocation] & DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED) !== 0 &&
+    if (!vectorClipped[invocation] && (sidecar.imageFlags[invocation] & DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED) !== 0 &&
         !boundsContainBoundsExactly(
           clipBounds,
           transformedBounds({ minX: 0, minY: 0, maxX: 1, maxY: 1 }, transform)

@@ -38,11 +38,11 @@ try {
   await assertIdenticalFormOccurrenceCache(openPdf);
   await assertSelectiveTransparencyComposite(openPdf);
   await assertBackdropMultiplyCorrection(openPdf);
-  await assertTypedFormFailure(openPdf, clippedCallerFixture(), "vector-form-caller-clip");
-  await assertTypedFormFailure(openPdf, interleavedPaintFixture(), "vector-form-interleaved-paint");
+  await assertClippedFormVectors(openPdf);
+  await assertOrderedInterleavedPaint(openPdf);
   await assertSafeDisjointInterleavedPaint(openPdf);
   await assertSafeDisjointInterleavedText(openPdf);
-  await assertUnsafeOverlappingInterleavedText(openPdf);
+  await assertOrderedOverlappingInterleavedText(openPdf);
   await assertExactRectangleFillClip(openPdf, false);
   await assertExactRectangleFillClip(openPdf, true);
   await assertExactRectangleStrokeClip(openPdf, "4 w 2 0 m 8 0 l S", {
@@ -69,7 +69,7 @@ try {
   });
   await assertExactRectangleTextClip(openPdf);
   await assertOutsideFormTextIsCulled(openPdf);
-  await assertArbitraryTextClipFailure(openPdf);
+  await assertArbitraryTextClipVectors(openPdf);
   console.log("native direct VectorScene Form flattening passed");
 } finally {
   hooks.deregister();
@@ -112,19 +112,16 @@ async function assertIdenticalFormOccurrenceCache(openPdf) {
   );
 }
 
-async function assertTypedFormFailure(openPdf, bytes, reason) {
-  const session = await openPdf({ kind: "bytes", bytes });
+async function assertClippedFormVectors(openPdf) {
+  const session = await openPdf({ kind: "bytes", bytes: clippedCallerFixture() });
   try {
-    await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
-      (error) => error?.code === "unsupported-content" && error?.details?.reason === reason
-    );
-    const scene = await session.compileVectorPage(0, { optimization: "none" });
-    assert.equal(scene.rasterLayers.length, 1);
-    assert.ok(session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
-  } finally {
-    await session.close();
-  }
+    const scene = await session.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" });
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.equal(scene.fillPathCount, 1);
+    assert.equal(scene.clipPaths.length, 2, "caller path intersects the Form BBox");
+    assert.equal(scene.drawRuns[0].clipIndex, 1);
+    assert(!session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
+  } finally { await session.close(); }
 }
 
 async function assertSelectiveTransparencyComposite(openPdf) {
@@ -243,7 +240,7 @@ async function assertSafeDisjointInterleavedText(openPdf) {
   }
 }
 
-async function assertUnsafeOverlappingInterleavedText(openPdf) {
+async function assertOrderedOverlappingInterleavedText(openPdf) {
   const session = await openPdf(
     { kind: "bytes", bytes: interleavedTextFixture(2, 2) },
     {
@@ -253,12 +250,11 @@ async function assertUnsafeOverlappingInterleavedText(openPdf) {
     }
   );
   try {
-    await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
-      (error) => error?.code === "unsupported-content" &&
-        error?.details?.reason === "vector-form-interleaved-paint"
-    );
-    assert.equal((await session.compileVectorPage(0)).rasterLayers.length, 1);
+    const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.deepEqual(scene.drawRuns, [
+      { kind: "text", first: 0, count: 1 }, { kind: "fill", first: 0, count: 1, clipIndex: 0 }
+    ]);
   } finally {
     await session.close();
   }
@@ -372,7 +368,7 @@ async function assertOutsideFormTextIsCulled(openPdf) {
   }
 }
 
-async function assertArbitraryTextClipFailure(openPdf) {
+async function assertArbitraryTextClipVectors(openPdf) {
   const session = await openPdf(
     { kind: "bytes", bytes: arbitraryTextClipFixture() },
     {
@@ -382,13 +378,13 @@ async function assertArbitraryTextClipFailure(openPdf) {
     }
   );
   try {
-    await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
-      (error) => error?.code === "unsupported-content" &&
-        error?.details?.operator === "Tj" &&
-        /arbitrary clipped visible text run/.test(error.message)
-    );
-    assert.equal((await session.compileVectorPage(0)).rasterLayers.length, 1);
+    const scene = await session.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" });
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.equal(scene.textInstanceCount, 1, "clipped text retains its original glyph outlines");
+    assert.equal(scene.drawRuns[0].clipIndex, 1);
+    assert.equal(scene.textIndex.pages[0].text, "A", "clipped Form text remains searchable");
+    assert([...scene.textIndex.pages[0].charInstance].every(index => index >= 0));
+    assert(!session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
   } finally {
     await session.close();
   }
@@ -606,4 +602,21 @@ function oneFormFixture(extraDictionary, formContent, pageContent = "/Fm Do") {
       }
     ]
   });
+}
+
+async function assertOrderedInterleavedPaint(openPdf) {
+  const session = await openPdf({ kind: "bytes", bytes: oneFormFixture("", "0 0 10 10 re f",
+    "0 0 m 8 8 l S /Fm Do 1 1 2 2 re f 1 1 m 8 1 l S") });
+  try {
+    const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.equal(scene.fillPathCount, 2);
+    assert.equal(scene.segmentCount, 2);
+    assert.deepEqual(scene.drawRuns, [
+      { kind: "stroke", first: 0, count: 1 },
+      { kind: "fill", first: 1, count: 1, clipIndex: 0 },
+      { kind: "fill", first: 0, count: 1 },
+      { kind: "stroke", first: 1, count: 1 }
+    ]);
+  } finally { await session.close(); }
 }

@@ -1,3 +1,4 @@
+import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
 
 import {
@@ -43,6 +44,8 @@ interface RasterLayerSource {
 }
 
 export class ThreeMaterialRasterLayer {
+  private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly vectorClipIndices: number[];
   readonly group: THREE.Group;
 
   private readonly geometry: THREE.BufferGeometry;
@@ -63,6 +66,11 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.vectorClipTexture = createThreeVectorClipTexture(scene);
+    this.vectorClipIndices = Array(scene.rasterLayers.length).fill(-1);
+    for (const run of scene.drawRuns ?? []) {
+      if (run.kind === "raster" && run.clipIndex !== undefined) this.vectorClipIndices.fill(run.clipIndex, run.first, run.first + run.count);
+    }
     this.materialBackend = options.materialBackend ?? "webgl";
     this.colorCompositing = options.colorCompositing ?? "linear";
     this.group = new THREE.Group();
@@ -105,7 +113,9 @@ export class ThreeMaterialRasterLayer {
       const entry = this.createEntry(
         texture,
         source.matrix,
-        HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset
+        HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
+        this.geometry,
+        this.vectorClipIndices[this.rasterEntries.length] ?? -1
       );
       entry.mesh.visible = false;
       this.entries.push(entry);
@@ -197,6 +207,7 @@ export class ThreeMaterialRasterLayer {
   }
 
   dispose(): void {
+    this.vectorClipTexture.dispose();
     for (const entry of this.entries) {
       this.group.remove(entry.mesh);
       entry.material.dispose();
@@ -226,7 +237,8 @@ export class ThreeMaterialRasterLayer {
     texture: THREE.Texture,
     matrixSource: Float32Array,
     renderOrder: number,
-    geometry: THREE.BufferGeometry = this.geometry
+    geometry: THREE.BufferGeometry = this.geometry,
+    clipIndex = -1
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
 
@@ -243,6 +255,10 @@ export class ThreeMaterialRasterLayer {
       state.zoomUniform.value = this.zoomUniform.value;
       state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
 
+      initializeThreeVectorClip(state.material, this.vectorClipTexture);
+      const sourceMaterial = state.material;
+      state.material = createThreeVectorClipMaterial(sourceMaterial, clipIndex);
+      if (state.material !== sourceMaterial) sourceMaterial.dispose();
       const mesh = new THREE.Mesh(geometry, state.material);
       mesh.frustumCulled = false;
       mesh.renderOrder = renderOrder;
@@ -275,11 +291,14 @@ export class ThreeMaterialRasterLayer {
       }
     });
 
-    const mesh = new THREE.Mesh(geometry, material);
+    initializeThreeVectorClip(material, this.vectorClipTexture);
+    const clippedMaterial = createThreeVectorClipMaterial(material, clipIndex);
+    if (clippedMaterial !== material) material.dispose();
+    const mesh = new THREE.Mesh(geometry, clippedMaterial);
     mesh.frustumCulled = false;
     mesh.renderOrder = renderOrder;
 
-    return { mesh, material };
+    return { mesh, material: clippedMaterial };
   }
 }
 

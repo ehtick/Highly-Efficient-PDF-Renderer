@@ -1,3 +1,5 @@
+import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -31,6 +33,8 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialFillLayer {
+  private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly orderedRuns: ThreeVectorDrawRuns | null;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly fillPathMetaTextureA: THREE.DataTexture;
@@ -62,6 +66,7 @@ export class ThreeMaterialFillLayer {
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
+    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
@@ -183,9 +188,11 @@ export class ThreeMaterialFillLayer {
     }
     configureStraightAlphaBlending(material);
 
+    initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex");
   }
 
   setVisible(visible: boolean): void {
@@ -220,10 +227,14 @@ export class ThreeMaterialFillLayer {
     if (this.webGpuState) {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
     }
+    this.orderedRuns?.beginUpdate();
     this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
+    this.orderedRuns?.finishUpdate();
   }
 
   dispose(): void {
+    this.orderedRuns?.dispose();
+    this.vectorClipTexture.dispose();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.fillPathMetaTextureA.dispose();

@@ -68,10 +68,12 @@ try {
     const searcher = createSceneTextSearcher(scene);
     assert.equal(searcher.search("A").length, 2, "hidden A is gone; inside-clip and Q-restored A survive");
     assert.equal(searcher.search("B").length, 3, "partially clipped B, mode-3 OCR and zero-alpha OCR all survive");
-    assert.equal(scene.textInstanceCount, 1, "only Q-restored A is a vector instance");
+    assert.equal(scene.textInstanceCount, 3, "inside, partially clipped and Q-restored glyphs remain vector instances");
     const page = scene.textIndex.pages[0];
-    assert(searcher.search("B").every(match => page.charInstance[match.startChar] <= -2));
-    assert(scene.rasterLayers.length > 0, "visible clipped glyphs still paint in image layers");
+    const references = searcher.search("B").map(match => page.charInstance[match.startChar]);
+    assert.equal(references.filter(ref => ref >= 0).length, 1, "partial B retains its vector instance");
+    assert.equal(references.filter(ref => ref <= -2).length, 2, "invisible OCR retains fallback highlights");
+    assert.equal(scene.rasterLayers.length, 0);
   }
 } finally {
   hooks.deregister();

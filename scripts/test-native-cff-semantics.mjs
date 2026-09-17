@@ -416,11 +416,169 @@ function expectPdf(callback, code, message) {
   });
 }
 
+function buildCidCffFixture({
+  fdSelect = Uint8Array.of(0, 0, 0, 1, 0, 1),
+  charset = Uint8Array.of(0, 0, 42, 0, 43, 3, 132, 3, 133),
+  topMatrix = null,
+  fdMatrix = null
+} = {}) {
+  const header = Uint8Array.of(1, 0, 4, 4);
+  const names = cffIndex([ascii("SyntheticCID")]);
+  const strings = cffIndex([ascii("Adobe"), ascii("Identity")]);
+  // A global subroutine calls the selected Font DICT's local subroutine.
+  const globalSubrs = cffIndex([type2([-107, "callsubr", "return"])]);
+  const charStrings = cffIndex([
+    type2(["endchar"]),
+    type2([10, 20, "rmoveto", -107, "callgsubr", "endchar"]),
+    type2([10, 20, "rmoveto", -107, "callgsubr", "endchar"]),
+    type2([25, 10, 20, "rmoveto", -107, "callgsubr", "endchar"]),
+    type2([25, 10, 20, "rmoveto", -107, "callgsubr", "endchar"])
+  ]);
+  const privateDict = index => concat(
+    dictInteger(500 + 100 * index), Uint8Array.of(20),
+    dictInteger(100 + 100 * index), Uint8Array.of(21),
+    dictInteger(18), Uint8Array.of(19)
+  );
+  const privateParts = [0, 1].map(index => concat(privateDict(index),
+    cffIndex([type2([100 + 100 * index, 0, 0, 50, -100 - 100 * index, 0, "rlineto", "return"])])));
+  const matrixBytes = matrix => matrix === null ? new Uint8Array()
+    : concat(...matrix.map(dictReal), Uint8Array.of(12, 7));
+  const fd = offset => concat(matrixBytes(fdMatrix),
+    dictInteger(18), dictInteger(offset), Uint8Array.of(18));
+  const top = (charsetOffset, stringsOffset, arrayOffset, selectOffset) => concat(
+    dictInteger(391), dictInteger(392), dictInteger(0), Uint8Array.of(12, 30),
+    matrixBytes(topMatrix),
+    dictInteger(charsetOffset), Uint8Array.of(15),
+    dictInteger(stringsOffset), Uint8Array.of(17),
+    dictInteger(arrayOffset), Uint8Array.of(12, 36),
+    dictInteger(selectOffset), Uint8Array.of(12, 37)
+  );
+  const charsetOffset = header.length + names.length + cffIndex([top(0, 0, 0, 0)]).length +
+    strings.length + globalSubrs.length;
+  const selectOffset = charsetOffset + charset.length;
+  const stringsOffset = selectOffset + fdSelect.length;
+  const arrayOffset = stringsOffset + charStrings.length;
+  const privateOffset = arrayOffset + cffIndex([fd(0), fd(0)]).length;
+  return concat(header, names, cffIndex([top(charsetOffset, stringsOffset, arrayOffset, selectOffset)]),
+    strings, globalSubrs, charset, fdSelect, charStrings,
+    cffIndex([fd(privateOffset), fd(privateOffset + privateParts[0].length)]), ...privateParts);
+}
+
+async function testCidCffOutlinesAndPdfSelection() {
+  const rangeSelect = Uint8Array.of(3, 0, 4, 0, 0, 0, 0, 2, 1, 0, 3, 0, 0, 4, 1, 0, 5);
+  for (const fdSelect of [undefined, rangeSelect]) {
+    for (const charset of [undefined, Uint8Array.of(1, 0, 42, 1, 3, 132, 1),
+      Uint8Array.of(2, 0, 42, 0, 1, 3, 132, 0, 1)]) {
+      const font = NativeCffFont.parse(buildCidCffFixture({ fdSelect, charset }));
+      assert.equal(font.glyphIdForCid(42), 1, "subset CIDs are not GIDs");
+      assert.equal(font.glyphIdForCid(901), 4);
+      assert.equal(font.glyphIdForCid(7), 0, "unmapped CIDs select .notdef");
+      assert.equal(font.glyphIdForName("A"), 0);
+      assert(font.builtInGlyphNames.every(name => name === null), "CID CFF has no simple encoding");
+      assert.deepEqual(font.getGlyphOutline(1).bounds, [10, 20, 110, 70]);
+      assert.deepEqual(font.getGlyphOutline(2).bounds, [10, 20, 210, 70]);
+      assert.equal(font.getGlyphOutline(1).advanceWidth, 500);
+      assert.equal(font.getGlyphOutline(2).advanceWidth, 600);
+      assert.equal(font.getGlyphOutline(3).advanceWidth, 125);
+      assert.equal(font.getGlyphOutline(4).advanceWidth, 225);
+      assert.strictEqual(font.getGlyphOutline(2), font.getGlyphOutline(2));
+    }
+  }
+  const childMatrix = [0.002, 0, 0, 0.003, 0.01, -0.02];
+  assert.deepEqual(NativeCffFont.parse(buildCidCffFixture({ fdMatrix: childMatrix }))
+    .getGlyphOutline(1).bounds, [30, 40, 230, 190]);
+  const matrixFont = NativeCffFont.parse(buildCidCffFixture({
+    topMatrix: [0.001, 0, 0, 0.001, 0, 0], fdMatrix: [2, 0, 0, 3, 10, -20]
+  }));
+  assert.deepEqual(matrixFont.getGlyphOutline(1).bounds, [30, 40, 230, 190]);
+
+  for (const fdSelect of [Uint8Array.of(0, 0, 0, 2, 0, 1),
+    Uint8Array.of(3, 0, 1, 0, 1, 0, 0, 5),
+    Uint8Array.of(3, 0, 1, 0, 0, 0, 0, 4),
+    Uint8Array.of(3, 0, 2, 0, 0, 0, 0, 0, 1, 0, 5)]) {
+    expectPdf(() => NativeCffFont.parse(buildCidCffFixture({ fdSelect })), "unsupported-font", /FDSelect/);
+  }
+  expectPdf(() => NativeCffFont.parse(buildCidCffFixture({
+    charset: Uint8Array.of(0, 0, 42, 0, 42, 3, 132, 3, 133)
+  })), "unsupported-font", /duplicate CIDs/);
+  expectPdf(() => NativeCffFont.parse(buildCidCffFixture(), { maxCffIndexEntries: 5 }),
+    "resource-limit", /INDEX/);
+  const limited = NativeCffFont.parse(buildCidCffFixture(), { maxType2SubrCalls: 1 });
+  expectPdf(() => limited.getGlyphOutline(1), "resource-limit", /subroutine/);
+
+  const name = value => ({ kind: "name", value });
+  const stream = (bytes, dictionary = new Map()) => ({ kind: "stream", bytes, dictionary });
+  const resolver = { async resolveValue(value) { return value; }, async decodeStream(value) { return value.bytes; } };
+  const dictionary = new Map([
+    ["Subtype", name("Type0")], ["BaseFont", name("SyntheticCID")], ["Encoding", name("Identity-H")],
+    ["ToUnicode", stream(ascii("1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <002a> <03a9> endbfchar"))],
+    ["DescendantFonts", [new Map([
+      ["Subtype", name("CIDFontType0")], ["W", [42, [700]]],
+      ["CIDSystemInfo", new Map([
+        ["Registry", { kind: "string", bytes: ascii("Adobe"), hex: false }],
+        ["Ordering", { kind: "string", bytes: ascii("Identity"), hex: false }],
+        ["Supplement", 0]
+      ])],
+      ["FontDescriptor", new Map([["FontFile3", stream(buildCidCffFixture(), new Map([["Subtype", name("CIDFontType0C")]]))]])]
+    ])]]
+  ]);
+  const parsed = await parseNativePdfFont(dictionary, resolver);
+  const glyph = parsed.decode(Uint8Array.of(0, 42));
+  assert.equal(glyph.cid, 42);
+  assert.equal(glyph.glyphId, 1);
+  assert.equal(glyph.unicode, "Ω", "ToUnicode changes extraction, never the selected outline");
+  assert.equal(glyph.width, 700, "PDF widths take precedence over the CFF width");
+  assert.deepEqual(parsed.getGlyphOutline(glyph.glyphId).bounds, [10, 20, 110, 70]);
+  const { tinyPdfStream, writeTinyPdf } = await import("./lib/tinyPdfWriter.mjs");
+  const { openPdf } = await import("../src/pdfSession.ts");
+  const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
+  const { createCanvas } = await import("@napi-rs/canvas");
+  for (const patterned of [false, true]) {
+    const bytes = writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 30 20] /Resources << /Font << /F 5 0 R >> /Pattern << /P 9 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", `${patterned ? "/Pattern cs /P scn" : "0 g"} BT /F 100 Tf 1 0 0 1 2 2 Tm <002a> Tj ET`) },
+      { number: 5, body: "<< /Type /Font /Subtype /Type0 /BaseFont /SyntheticCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>" },
+      { number: 6, body: "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /SyntheticCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /W [42 [700]] >>" },
+      { number: 7, body: "<< /Type /FontDescriptor /FontName /SyntheticCID /Flags 4 /FontBBox [0 0 300 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile3 8 0 R >>" },
+      { number: 8, body: tinyPdfStream("/Subtype /CIDFontType0C", buildCidCffFixture()) },
+      { number: 9, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 2 2] /XStep 2 /YStep 2 /Resources << >>", "1 0 0 rg 0 0 2 2 re f") },
+      { number: 10, body: tinyPdfStream("", "1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <002a> <0041> endbfchar") }
+    ] });
+    const session = await openPdf({ kind: "bytes", bytes });
+    try {
+      const page = await session.compilePage(0);
+      assert.equal(page.textIndex.text, "A");
+      const rendered = await renderHeprPageToCanvas2d(page, {
+        surfaceFactory(width, height) {
+          const canvas = createCanvas(width, height);
+          return { canvas, context: canvas.getContext("2d") };
+        }
+      });
+      assert.deepEqual([...rendered.surface.context.getImageData(5, 14, 1, 1).data], [0, 0, 0, 255],
+        "embedded CID outline paints at the correct position, including pattern-color fallback");
+      const scene = await session.compileVectorPage(0);
+      assert.equal(scene.textIndex.pages[0].text, "A");
+      if (patterned) {
+        assert.ok(scene.rasterLayers.length > 0);
+        assert.equal(session.getDiagnostics().filter(d => d.code === "text-pattern-approximation").length, 1);
+      } else {
+        assert.equal(scene.textInstanceCount, 1, "ordinary CID CFF text retains vector geometry");
+        assert.equal(scene.rasterLayers.length, 0);
+      }
+    } finally {
+      await session.close();
+    }
+  }
+}
+
 testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
 testBaseFontBlendIsNotMultipleMaster();
 testSyntheticBaseRemainsUnsupported();
 await testPdfFontSelectionIsSeparateFromToUnicode();
+await testCidCffOutlinesAndPdfSelection();
 testMalformedProgramsAndLimits();
 testDeprecatedPdfDotsectionCompatibility();
 

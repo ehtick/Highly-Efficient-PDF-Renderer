@@ -55,7 +55,10 @@ try {
     { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8", Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0)) }
   ] }) });
 
-  const scene = await session.compileVectorPage(0);
+  // This fixture used to rasterize because of its clip. Exercise that retained
+  // compatibility path so these tests still verify compositor resource cleanup.
+  const compile = (options = {}) => session.compileVectorPage(0, { ...options, preserveDrawingOrder: false });
+  const scene = await compile();
   assert.equal(scene.rasterLayers.length, 1);
   assert(canvases.length >= 2, "fixture must create both output and intermediate image surfaces");
   const pixels = scene.rasterLayers[0].data;
@@ -69,7 +72,7 @@ try {
   for (const mode of ["readback", "context"]) {
     canvases.length = 0;
     failure = mode;
-    await assert.rejects(session.compileVectorPage(0), mode === "readback"
+    await assert.rejects(compile(), mode === "readback"
       ? /fixture pixel readback failed/
       : error => error?.code === "canvas2d.invalid-surface" &&
         error.cause?.message === "OffscreenCanvas 2D is unavailable.");
@@ -79,12 +82,12 @@ try {
   canvases.length = 0;
   failure = "abort";
   cancelReadback = new AbortController();
-  await assert.rejects(session.compileVectorPage(0, { signal: cancelReadback.signal }),
+  await assert.rejects(compile({ signal: cancelReadback.signal }),
     error => error?.code === "aborted");
   assertReleased();
   failure = null;
   canvases.length = 0;
-  const retried = await session.compileVectorPage(0);
+  const retried = await compile();
   assertReleased();
   assert.deepEqual(retried.rasterLayers[0].data, snapshot, "the session remains reusable after failed rendering");
   assert.deepEqual(pixels, snapshot, "released canvases must not own returned scene pixels");

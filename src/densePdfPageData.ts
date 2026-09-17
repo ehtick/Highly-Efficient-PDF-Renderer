@@ -920,6 +920,7 @@ export function createHeprPageDataFromDense(
     hairline: state.lineWidth === 0,
     strokeAdjust: state.strokeAdjustment ?? false
   });
+  const approximationDiagnostics: PdfDiagnostic[] = [];
   const glyphPaintResources = (
     paint: DensePdfFormProgramData["compiled"]["glyphPaints"][number],
     renderingMode: number,
@@ -929,6 +930,15 @@ export function createHeprPageDataFromDense(
       throw new DensePdfUnsupportedError(
         `PDF text rendering mode ${renderingMode} is not representable without glyph clipping.`
       );
+    }
+    if (paint.patternColorApproximation &&
+        !approximationDiagnostics.some(diagnostic => diagnostic.code === "text-pattern-approximation")) {
+      approximationDiagnostics.push({
+        code: "text-pattern-approximation",
+        severity: "warning",
+        pageIndex: pageInfo.sourcePageIndex,
+        message: "Pattern-colored text uses its solid fallback color; glyph shapes and positions are preserved."
+      });
     }
     const state = paint.initialGraphicsState;
     const fillComposite: DensePdfCompositeState = Object.freeze({
@@ -1181,9 +1191,14 @@ export function createHeprPageDataFromDense(
     overprintRepresented: boolean
   ): void => {
     if (composite.overprint && !overprintRepresented) {
-      throw new DensePdfUnsupportedError(
-        "Overprint for this PDF paint source is not represented by the page ABI."
-      );
+      if (!approximationDiagnostics.some(diagnostic => diagnostic.code === "overprint-approximation")) {
+        approximationDiagnostics.push({
+          code: "overprint-approximation",
+          severity: "warning",
+          pageIndex: pageInfo.sourcePageIndex,
+          message: "PDF overprint on images or shading uses ordinary screen-color compositing; overlapping ink colors may differ."
+        });
+      }
     }
     const softMaskGroupIndex = composite.softMaskIndex < 0
       ? -1
@@ -2415,7 +2430,8 @@ export function createHeprPageDataFromDense(
     textIndex,
     diagnostics: [
       ...(options.diagnostics ?? []),
-      ...(options.text?.diagnostics ?? [])
+      ...(options.text?.diagnostics ?? []),
+      ...approximationDiagnostics
     ]
   };
 }

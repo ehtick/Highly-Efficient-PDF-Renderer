@@ -1,3 +1,4 @@
+import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { HepArchive, type HepArchiveEntry } from "./hepContainer";
 import { waitForLoad } from "./loadCancellation";
 
@@ -135,6 +136,8 @@ interface ParsedDataRasterLayerEntry {
 }
 
 interface ParsedDataSceneEntry {
+  drawRuns?: unknown;
+  clipPaths?: unknown;
   bounds?: unknown;
   pageBounds?: unknown;
   pageRects?: unknown;
@@ -222,6 +225,7 @@ export async function buildHepBlobForLayout(
   sceneRasterLayers: RasterLayer[],
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
+  validateVectorDrawRuns(scene);
   throwIfBuildAborted(options.signal);
   const encodeRasterImages = options.encodeRasterImages ?? true;
   const compression = options.compression ?? "DEFLATE";
@@ -413,6 +417,8 @@ export async function buildHepBlobForLayout(
       maxHalfWidth: scene.maxHalfWidth,
       operatorCount: scene.operatorCount,
       operatorCountKind: scene.operatorCountKind,
+      drawRuns: scene.drawRuns,
+      clipPaths: scene.clipPaths?.map(clip => ({ ...clip, edges: Array.from(clip.edges) })),
       imageLayerSegmentCount: scene.imageLayerSegmentCount,
       discardedTransparentCount: scene.discardedTransparentCount,
       discardedDegenerateCount: scene.discardedDegenerateCount,
@@ -1124,6 +1130,7 @@ const preparedHepScenes = new WeakSet<VectorScene>();
  * preparation. Cached parser pages remain untouched. No archive is generated.
  */
 export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
+  validateVectorDrawRuns(scene);
   if (preparedHepScenes.has(scene)) {
     return scene;
   }
@@ -1897,6 +1904,20 @@ async function loadSceneFromHepInternal(
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   });
+  if (sceneMeta.clipPaths !== undefined) {
+    if (!Array.isArray(sceneMeta.clipPaths)) throw new Error("Invalid scene clip paths.");
+    scene.clipPaths = sceneMeta.clipPaths.map(clip => {
+      if (!clip || !Array.isArray(clip.edges) ||
+          !clip.edges.every((value: unknown) => typeof value === "number" && Number.isFinite(value))) {
+        throw new Error("Invalid scene clip edges.");
+      }
+      return { parent: clip.parent, fillRule: clip.fillRule, edges: Float32Array.from(clip.edges) };
+    });
+  }
+  if (sceneMeta.drawRuns !== undefined) {
+    scene.drawRuns = sceneMeta.drawRuns as VectorScene["drawRuns"];
+  }
+  validateVectorDrawRuns(scene);
   if (strokeGeometry) {
     preparedStrokeGeometry.set(scene, strokeGeometry.encoded);
   }

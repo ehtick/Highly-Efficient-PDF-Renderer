@@ -1,3 +1,5 @@
+import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -36,6 +38,8 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialStrokeLayer {
+  private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly orderedRuns: ThreeVectorDrawRuns | null;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly segmentTextureA: THREE.DataTexture;
@@ -68,6 +72,7 @@ export class ThreeMaterialStrokeLayer {
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
+    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const segmentCount = Math.max(0, scene.segmentCount | 0);
     this.segmentCount = segmentCount;
     const segmentTextureSize = chooseSegmentTextureSize(segmentCount);
@@ -182,9 +187,11 @@ export class ThreeMaterialStrokeLayer {
     }
     configureStraightAlphaBlending(material);
 
+    initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "stroke", this.mesh, "aSegmentIndex");
   }
 
   setVisible(visible: boolean): void {
@@ -192,6 +199,7 @@ export class ThreeMaterialStrokeLayer {
   }
 
   setDrawEnabled(enabled: boolean): void {
+    if (this.orderedRuns) { this.orderedRuns.setEnabled(enabled); return; }
     this.mesh.geometry.instanceCount = enabled ? this.drawInstanceCount : 0;
   }
 
@@ -199,7 +207,7 @@ export class ThreeMaterialStrokeLayer {
     if (!this.mesh.visible) {
       return 0;
     }
-    return Math.max(0, this.mesh.geometry.instanceCount ?? 0);
+    return this.orderedRuns?.getRenderedCount() ?? Math.max(0, this.mesh.geometry.instanceCount ?? 0);
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -227,7 +235,9 @@ export class ThreeMaterialStrokeLayer {
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
     this.updateFrameUniforms(viewState, viewport);
+    this.orderedRuns?.beginUpdate();
     this.updateVisibleSegments(viewState, viewport, cullingBounds);
+    this.orderedRuns?.finishUpdate();
   }
 
   updateFrameWithVisibleSegmentIds(
@@ -256,6 +266,8 @@ export class ThreeMaterialStrokeLayer {
   }
 
   dispose(): void {
+    this.orderedRuns?.dispose();
+    this.vectorClipTexture.dispose();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.segmentTextureA.dispose();

@@ -14,6 +14,7 @@ import {
 
 export const NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES = Object.freeze({
   HiddenDefault: "optional-content.hidden",
+  UnresolvedOptionalProperty: "optional-content.unresolved-property",
   UnresolvedMetadataProperty: "marked-content.unresolved-property"
 } as const);
 
@@ -391,6 +392,7 @@ export class NativeOptionalContentRegistry {
     /**
      * Exact names used by an /OC-tagged BDC or DP operator. When omitted, the
      * historical strict classifier behavior is retained for direct callers.
+     * When supplied, missing references retain visible paint with a diagnostic.
      */
     optionalContentPropertyNames?: Iterable<string>
   ): Promise<readonly NativeOptionalContentPageProperty[]> {
@@ -449,18 +451,18 @@ export class NativeOptionalContentRegistry {
     }
     const hasStrictProperty = classifyEveryProperty || optionalNames.size > 0;
     if (resourcesValue === undefined || resourcesValue === null) {
-      if (hasStrictProperty) {
+      if (classifyEveryProperty) {
         throw invalidOptionalContent("A content operator uses /Properties but the page has no resources.");
       }
-      return this.unresolvedMetadataProperties(names, "resources-missing");
+      return this.unresolvedMetadataProperties(names, "resources-missing", optionalNames);
     }
     const resources = await this.resolveDictionary(resourcesValue, signal, "The page /Resources entry");
     const propertiesValue = resources.get("Properties");
     if (propertiesValue === undefined || propertiesValue === null) {
-      if (hasStrictProperty) {
+      if (classifyEveryProperty) {
         throw invalidOptionalContent("A content operator uses /Properties but the resource dictionary has none.");
       }
-      return this.unresolvedMetadataProperties(names, "properties-missing");
+      return this.unresolvedMetadataProperties(names, "properties-missing", optionalNames);
     }
     let properties: PdfDictionary;
     try {
@@ -479,10 +481,12 @@ export class NativeOptionalContentRegistry {
       const optionalPaint = optionalNames.has(name);
       const strict = classifyEveryProperty || optionalPaint;
       if (!properties.has(name)) {
-        if (strict) {
+        if (classifyEveryProperty) {
           throw invalidOptionalContent(`The used page property /${name} is missing from /Resources /Properties.`);
         }
-        output.push(this.unresolvedMetadataProperty(name, "property-missing"));
+        // Broken layer references occur in otherwise usable Form XObjects.
+        // Keep their paint visible; never borrow membership from another scope.
+        output.push(this.unresolvedMetadataProperty(name, "property-missing", optionalPaint));
         continue;
       }
       const value = properties.get(name);
@@ -527,22 +531,29 @@ export class NativeOptionalContentRegistry {
 
   private unresolvedMetadataProperties(
     names: readonly string[],
-    reason: string
+    reason: string,
+    optionalNames: ReadonlySet<string> = new Set()
   ): readonly NativeOptionalContentPageProperty[] {
-    return Object.freeze(names.map((name) => this.unresolvedMetadataProperty(name, reason)));
+    return Object.freeze(names.map((name) =>
+      this.unresolvedMetadataProperty(name, reason, optionalNames.has(name))));
   }
 
   private unresolvedMetadataProperty(
     name: string,
-    reason: string
+    reason: string,
+    optionalPaint = false
   ): NativeOptionalContentPageProperty {
-    const identity = `${name}:${reason}`;
+    const identity = `${optionalPaint}:${name}:${reason}`;
     if (!this.diagnosedUnresolvedMetadataProperties.has(identity)) {
       this.diagnosedUnresolvedMetadataProperties.add(identity);
       const diagnostic: PdfDiagnostic = {
-        code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.UnresolvedMetadataProperty,
+        code: optionalPaint
+          ? NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.UnresolvedOptionalProperty
+          : NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.UnresolvedMetadataProperty,
         severity: "warning",
-        message: `Non-optional marked-content property /${name} could not be resolved; its content remains visible.`,
+        message: optionalPaint
+          ? `Optional-content property /${name} is missing; its content remains visible and layer visibility may differ.`
+          : `Non-optional marked-content property /${name} could not be resolved; its content remains visible.`,
         details: { propertyName: name, reason, defaultVisible: true }
       };
       this.diagnostics.push(diagnostic);

@@ -83,6 +83,35 @@ per-entry `STORE` overrides are grouped separately from compressed entries.
 CRC32 is the IEEE reflected polynomial `0xedb88320`, initialized and finalized
 with XOR `0xffffffff` (the same convention as ZIP and zlib).
 
+## Scene draw order
+
+The optional `manifest.scene.drawRuns` array records PDF paint order across
+vector and image stores. Each entry is `{ "kind": "fill", "first": 0, "count": 1 }`.
+Kinds are `fill`, `stroke`, `text`, `raster`, `gradient-fill`, and `gradient-stroke`;
+indices address the corresponding path, segment, glyph-instance, image-layer,
+or gradient-paint store. Counts are positive. Ranges must cover each store exactly
+once, without overlap. Page backgrounds precede these runs and interaction
+highlights follow them.
+
+When this field is absent, readers use the established image/gradient prefix,
+then fills, strokes, and text. A scene containing draw runs requires a reader
+that honors them; treating it as separate fixed passes can change overlaps.
+The ordered scenes retain vector geometry; bounded raster layers are used for
+content that requires unsupported compositing or paint features.
+
+An optional `clipIndex` on a fill, stroke, text or raster run references
+`manifest.scene.clipPaths`. Each clip is `{ "parent": -1, "fillRule": 0,
+"edges": [x0, y0, x1, y1, ...] }`. Coordinates describe directed polygon edges in
+page space. A parent index references an earlier clip to intersect with; `-1`
+means no parent. Fill rule `0` is nonzero winding, `1` is even-odd. Empty paths
+clip everything. Clip paths require ordered draw runs and a reader that applies
+their references. They do not modify the image pixels or painted vector geometry.
+Limits are 8,192 edges per path, 64 intersected clips and 4,194,304 total nodes
+plus edges (64 MiB of packed coordinate data). Curved clip boundaries
+are subdivided into vector edges at a 0.0001-point tolerance before Float32
+storage, with a diagnostic; glyph outlines and painted curves are unaffected.
+Renderers evaluate clipping at the current zoom without a raster mask.
+
 ## Limits and integrity
 
 Readers reject unknown versions, codecs, nonzero reserved fields, malformed names,

@@ -1,6 +1,6 @@
 import { createEmptyVectorScene } from "../emptyVectorScene";
 import type { HeprPageData } from "../heprDocumentData";
-import type { VectorScene } from "../pdfVectorExtractor";
+import type { SceneTextIndex, VectorScene } from "../pdfVectorExtractor";
 
 /** Keep a page's appearance and searchable text in the existing scene/HEP ABI. */
 export function buildNativeRasterPage(
@@ -25,6 +25,13 @@ export function buildNativeRasterPage(
     rasterLayers: [layer], rasterLayerWidth: layer.width, rasterLayerHeight: layer.height,
     rasterLayerData: layer.data, rasterLayerMatrix: layer.matrix, imagePaintOpCount: 1
   });
+  scene.textIndex = buildNativeFallbackTextIndex(page, signal);
+  scene.sourceTextCount = page.stores.glyphs.glyphIds.length;
+  return scene;
+}
+
+/** Search quads for text whose paint lives partly or wholly in raster composites. */
+export function buildNativeFallbackTextIndex(page: HeprPageData, signal: AbortSignal): SceneTextIndex {
   const index = page.textIndex;
   const references = new Int32Array(index.charGlyphIndices.length);
   const { fonts, glyphs, transforms, paths } = page.stores;
@@ -80,9 +87,7 @@ export function buildNativeRasterPage(
     converted[glyph] = reference;
     references[i] = reference;
   }
-  scene.textIndex = { version: 2, pages: [{
+  return { version: 2, pages: [{
     text: index.text, charInstance: references, fallbackQuads: quads
   }] };
-  scene.sourceTextCount = glyphs.glyphIds.length;
-  return scene;
 }

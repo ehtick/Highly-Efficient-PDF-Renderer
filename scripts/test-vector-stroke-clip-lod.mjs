@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 
-import { buildVectorStrokeLodScenes } from "../src/vectorStrokeLodCore.ts";
+import { registerHooks } from "node:module";
+const hooks = registerHooks({ resolve(s, c, n) {
+  return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
+} });
+const { buildVectorStrokeLodScenes } = await import("../src/vectorStrokeLodCore.ts");
+hooks.deregister();
 
 const segmentsPerClip = 20;
 const segmentCount = segmentsPerClip * 2;

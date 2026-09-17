@@ -34,7 +34,7 @@ try {
   const session = await openPdf({ kind: "bytes", bytes: strokeFixture() });
   try {
     for (const optimization of ["default", "none"]) {
-      const scene = await session.compileVectorPage(0, optimization === "none" ? { optimization } : {});
+      const scene = await session.compileVectorPage(0, { optimization, preserveDrawingOrder: false });
       const counts = getSceneSegmentAccounting(scene);
       assert(counts.culled !== null, "native counts must reconcile");
       assert(counts.imageLayers > 0, "fixture transfers strokes into a late-image span");

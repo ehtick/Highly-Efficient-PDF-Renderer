@@ -211,11 +211,19 @@ EMC
     label: "unresolved-oc-form-property.pdf"
   });
   try {
-    await assert.rejects(
-      unresolvedOcSession.compilePage(0),
-      (error) => error?.code === "invalid-object" && /resource dictionary has none/.test(error.message),
-      "an unresolved optional-content membership must fail instead of painting"
-    );
+    const page = await unresolvedOcSession.compilePage(0);
+    validateHeprPageData(page);
+    const markedIndex = page.stores.markedContent.propertyNames.indexOf("R62");
+    assert.notEqual(markedIndex, -1);
+    assert.equal(page.stores.markedContent.tags[markedIndex], "OC");
+    assert.ok(page.displayProgram.programs.some(program => program.commands.some(command =>
+      command.markedContentIndex === markedIndex && command.optionalContentIndex === -1)),
+    "missing layer metadata must preserve visible Form paint");
+    const scene = await unresolvedOcSession.compileVectorPage(0);
+    assert.equal(scene.fillPathCount, 1, "the viewer retains the Form rectangle");
+    const warnings = unresolvedOcSession.getDiagnostics().filter(d => d.code === "optional-content.unresolved-property");
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].details.defaultVisible, true);
   } finally {
     await unresolvedOcSession.close();
   }
@@ -242,7 +250,7 @@ function unresolvedFormPropertyFixture(tag) {
         number: 5,
         body: tinyPdfStream(
           "/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /ExtGState << /R9 6 0 R >> >>",
-          `/${tag} /R62 BDC /R9 gs 0 0 10 10 re f EMC`
+          `/${tag} /R62 DP /${tag} /R62 BDC /R9 gs 0 0 10 10 re f EMC`
         )
       },
       { number: 6, body: "<< /Type /ExtGState /CA 1 /ca 1 >>" }

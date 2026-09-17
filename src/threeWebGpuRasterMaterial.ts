@@ -1,3 +1,4 @@
+import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
@@ -123,6 +124,8 @@ export function createThreeWebGpuRasterMaterial(
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
     color: TSL.texture(options.texture, rasterPackValue.zw as never)
   });
+
+  registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy);
 
   return {
     material,

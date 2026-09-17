@@ -252,6 +252,51 @@ try {
   assert.equal(decoderCalls, 1, "an encoded resource is decoded once and cached");
   assertPixelNear(pagePixel(decodedResult, 10, 3), [0, 255, 0, 255], 2, "decoded image");
 
+  const compatibilityBytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 16 4] /Resources << /XObject << /A 5 0 R /B 6 0 R /C 7 0 R >> /ExtGState << /OP 8 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", "/OP gs q 4 0 0 4 0 0 cm /A Do Q q 4 0 0 4 4 0 cm /B Do Q q 4 0 0 4 8 0 cm /C Do Q q 4 0 0 4 12 0 cm /A Do Q") },
+    ...[[255, 0, 0], [0, 255, 0], [0, 0, 255]].map((color, index) => ({
+      number: 5 + index,
+      body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        Uint8Array.from({ length: 8 * 8 * 3 }, (_, index) => color[index % 3]))
+    })),
+    { number: 8, body: "<< /Type /ExtGState /op true /OPM 1 >>" }
+  ] });
+  const compatibilityDiagnostics = [];
+  const compatibilitySession = await openPdf({ kind: "bytes", bytes: compatibilityBytes }, {
+    onDiagnostic: diagnostic => compatibilityDiagnostics.push(diagnostic)
+  });
+  try {
+    const imagePage = await compatibilitySession.compilePage(0);
+    assert.equal(imagePage.diagnostics.filter(d => d.code === "overprint-approximation").length, 1);
+    assert.equal(compatibilityDiagnostics.filter(d => d.code === "overprint-approximation").length, 1);
+    const normal = await renderHeprPageToCanvas2d(imagePage, { surfaceFactory });
+    const allocated = [];
+    const bounded = await renderHeprPageToCanvas2d(imagePage, {
+      maxWorkingPixels: 64,
+      surfaceFactory(width, height) {
+        const surface = surfaceFactory(width, height);
+        allocated.push(surface);
+        return surface;
+      }
+    });
+    assert.deepEqual(bounded.surface.context.getImageData(0, 0, 16, 4).data,
+      normal.surface.context.getImageData(0, 0, 16, 4).data,
+      "eviction and re-decoding preserve image pixels and ordering");
+    assert.equal(allocated.filter(surface => surface.canvas.width === 1).length, 3,
+      "completed image buffers are actually released");
+    assertPixelNear(pagePixel(bounded, 1, 2), [255, 0, 0, 255], 0, "first image");
+    assertPixelNear(pagePixel(bounded, 13, 2), [255, 0, 0, 255], 0, "reused evicted image");
+    await assert.rejects(renderHeprPageToCanvas2d(imagePage, { surfaceFactory, maxWorkingPixels: 63 }),
+      isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit), "a single oversized image still fails");
+    const scene = await compatibilitySession.compileVectorPage(0);
+    assert.ok(scene.rasterLayers.length > 0, "the viewer's fallback renders overprinting images");
+  } finally {
+    await compatibilitySession.close();
+  }
+
   const knockoutPage = structuredClone(page);
   const invoked = knockoutPage.displayProgram.groups.find((group, index) =>
     index !== knockoutPage.displayProgram.rootGroupIndex && group.alpha < 1
@@ -266,10 +311,22 @@ try {
   const overprintPage = structuredClone(page);
   const firstPaint = firstSolidPaint(overprintPage);
   overprintPage.stores.paints.overprint[firstPaint] = 1;
-  await assert.rejects(
-    renderHeprPageToCanvas2d(overprintPage, { surfaceFactory }),
-    isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedPaint)
-  );
+  const overprintDiagnostics = [];
+  const approximated = await renderHeprPageToCanvas2d(overprintPage, {
+    surfaceFactory, scale: 2, background: [1, 1, 1, 1],
+    onDiagnostic: diagnostic => overprintDiagnostics.push(diagnostic)
+  });
+  assert.deepEqual(approximated.surface.context.getImageData(0, 0, 24, 20).data,
+    result.surface.context.getImageData(0, 0, 24, 20).data,
+    "overprint retains all visible paint using ordinary compositing");
+  assert.equal(overprintDiagnostics.length, 1, "report a reused overprint paint once");
+  assert.equal(overprintDiagnostics[0].code, "overprint-approximation");
+  overprintPage.stores.paints.alphas[firstPaint] = 0;
+  const transparentDiagnostics = [];
+  await renderHeprPageToCanvas2d(overprintPage, {
+    surfaceFactory, onDiagnostic: diagnostic => transparentDiagnostics.push(diagnostic)
+  });
+  assert.equal(transparentDiagnostics.length, 0, "invisible overprint needs no approximation warning");
 
   await assert.rejects(
     renderHeprPageToCanvas2d(page, { surfaceFactory, maxCanvasPixels: 10 }),

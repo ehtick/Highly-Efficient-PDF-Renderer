@@ -1,3 +1,4 @@
+import { strokePaintGroups, strokePaintOrigins, setStrokePaintOrigins } from "./vectorStrokePaintOrder";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
 import type {ViewState} from "./webGlFloorplanRenderer";
 
@@ -169,6 +170,8 @@ export interface RuntimeVectorStrokeLodLevel extends RuntimeStrokeTileBuckets {
 }
 
 interface StrokePrimitive {
+  paintOrder?: number;
+  paintGroup?: number;
   x0: number;
   y0: number;
   cx: number;
@@ -187,6 +190,8 @@ interface StrokePrimitive {
 }
 
 interface IntervalGroup {
+  paintOrder?: number;
+  paintGroup?: number;
   tileIndex: number;
   axisX: number;
   axisY: number;
@@ -329,6 +334,8 @@ export class VectorStrokeLodRuntime {
   private readonly localToClip = new Float64Array(16);
   private localUnitsPerPixel = 1;
   private lastVisibleSegmentCount = 0;
+  private readonly allLevelBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  private fullViewBaselineLevelIndex = -1;
   private stats: VectorStrokeLodStats;
 
   constructor(scene: VectorScene, buildData?: VectorStrokeLodRuntimeBuildData) {
@@ -347,6 +354,14 @@ export class VectorStrokeLodRuntime {
         ...tileData
       };
     });
+    for (const level of this.levels) {
+      for (let index = 0; index < level.segmentCount; index++) {
+        this.allLevelBounds.minX = Math.min(this.allLevelBounds.minX, level.segmentMinX[index]);
+        this.allLevelBounds.minY = Math.min(this.allLevelBounds.minY, level.segmentMinY[index]);
+        this.allLevelBounds.maxX = Math.max(this.allLevelBounds.maxX, level.segmentMaxX[index]);
+        this.allLevelBounds.maxY = Math.max(this.allLevelBounds.maxY, level.segmentMaxY[index]);
+      }
+    }
     if (this.levels.length > 0) {
       this.activeLevelIndex = 0;
     }
@@ -374,13 +389,14 @@ export class VectorStrokeLodRuntime {
     return this.activeLevelIndex > 0;
   }
 
-  update(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
+  /** False means the previous visible IDs and statistics remain valid. */
+  update(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): boolean {
     if (this.levels.length <= 0) {
       this.lastVisibleSegmentCount = 0;
       this.stats = this.createEmptyStats();
-      return;
+      return true;
     }
-    this.updateTiledVisibleSegments(viewState, viewport, cullingBounds);
+    return this.updateTiledVisibleSegments(viewState, viewport, cullingBounds);
   }
 
   getStats(): VectorStrokeLodStats {
@@ -391,6 +407,7 @@ export class VectorStrokeLodRuntime {
   }
 
   resetVisible(): void {
+    this.fullViewBaselineLevelIndex = -1;
     this.lastVisibleSegmentCount = 0;
     for (const level of this.levels) {
       level.visibleSegmentCount = 0;
@@ -423,16 +440,24 @@ export class VectorStrokeLodRuntime {
     viewState: ViewState,
     viewport: ViewportPixels,
     cullingBounds?: CullingBounds | null
-  ): void {
-    this.resetLevelDrawLists();
-
+  ): boolean {
     const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
     const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     const tileRange = tileRangeForBounds(viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY, this.tileGrid);
+    // A static planar overview keeps the same tile budget and geometry while
+    // every LOD's bounds remain visible. Panning needs no new selection scan.
+    const fullyVisible = !this.useLocalToClip && tileRange !== null &&
+      tileRange.c0 === 0 && tileRange.r0 === 0 &&
+      tileRange.c1 === this.tileGrid.columns - 1 && tileRange.r1 === this.tileGrid.rows - 1 &&
+      viewBounds.minX <= this.allLevelBounds.minX && viewBounds.minY <= this.allLevelBounds.minY &&
+      viewBounds.maxX >= this.allLevelBounds.maxX && viewBounds.maxY >= this.allLevelBounds.maxY;
+    if (fullyVisible && this.fullViewBaselineLevelIndex === screenErrorLevelIndex) return false;
+    this.fullViewBaselineLevelIndex = -1;
+    this.resetLevelDrawLists();
     if (!tileRange) {
       this.lastVisibleSegmentCount = 0;
       this.updateLevelStats(0, 0, 0, 0, screenErrorLevelIndex, 0, screenErrorLevelIndex, screenErrorLevelIndex);
-      return;
+      return true;
     }
 
     this.activeLevelIndex = screenErrorLevelIndex;
@@ -480,6 +505,8 @@ export class VectorStrokeLodRuntime {
       maxSelectedTileLevelIndex,
       screenErrorLevelIndex
     );
+    if (fullyVisible) this.fullViewBaselineLevelIndex = screenErrorLevelIndex;
+    return true;
   }
 
   private resetLevelDrawLists(): void {
@@ -494,6 +521,12 @@ export class VectorStrokeLodRuntime {
   }
 
   private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    // Restore exact geometry as soon as it fits. At close zoom the larger
+    // per-tile budget must not keep a coarse level alive through hysteresis.
+    if (this.levels[0].tileCounts[tileIndex] <= targetSegmentsPerTile) {
+      this.tileSelectedLevelIndices[tileIndex] = 0;
+      return 0;
+    }
     const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile);
     const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
 
@@ -761,6 +794,7 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
         maxHalfWidth: simplified.maxHalfWidth
       }
     });
+    setStrokePaintOrigins(levels[levels.length - 1].scene, simplified.paintOrigins);
     previousCount = simplified.segmentCount;
   }
 
@@ -872,6 +906,7 @@ async function buildVectorStrokeLodScenesAsync(
         maxHalfWidth: simplified.maxHalfWidth
       }
     });
+    setStrokePaintOrigins(levels[levels.length - 1].scene, simplified.paintOrigins);
     previousCount = simplified.segmentCount;
   }
 
@@ -885,6 +920,7 @@ async function buildSimplifiedStrokeSceneAsync(
   startValue: number,
   endValue: number
 ): Promise<{
+  paintOrigins?: Uint32Array;
   segmentCount: number;
   endpoints: Float32Array;
   primitiveMeta: Float32Array;
@@ -905,6 +941,7 @@ async function buildSimplifiedStrokeSceneAsync(
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
   const styles = new Float4Builder(Math.min(segmentCount, 65_536));
   const outBounds = createEmptyBounds();
+  const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
 
   for (let index = 0; index < segmentCount; index += 1) {
@@ -917,7 +954,7 @@ async function buildSimplifiedStrokeSceneAsync(
     }
 
     if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
-      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
@@ -926,7 +963,7 @@ async function buildSimplifiedStrokeSceneAsync(
     const dy = primitive.y1 - primitive.y0;
     if (dx * dx + dy * dy <= 1e-10) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
-        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       }
       continue;
@@ -951,7 +988,7 @@ async function buildSimplifiedStrokeSceneAsync(
   let groupIndex = 0;
   const groupCount = Math.max(1, groups.size);
   for (const group of groups.values()) {
-    emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance);
+    emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
     groupIndex += 1;
     if ((groupIndex & 1023) === 0) {
       const value = startValue + (endValue - startValue) * (0.72 + 0.28 * groupIndex / groupCount);
@@ -964,6 +1001,7 @@ async function buildSimplifiedStrokeSceneAsync(
   }
 
   return {
+    paintOrigins: paintOrigins ? Uint32Array.from(paintOrigins) : undefined,
     segmentCount: endpoints.quadCount,
     endpoints: endpoints.toTypedArray(),
     primitiveMeta: primitiveMeta.toTypedArray(),
@@ -1506,6 +1544,7 @@ function tileLevelTargetScore(tileSegments: number, targetSegmentsPerTile: numbe
 }
 
 function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
+  paintOrigins?: Uint32Array;
   segmentCount: number;
   endpoints: Float32Array;
   primitiveMeta: Float32Array;
@@ -1526,6 +1565,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
   const styles = new Float4Builder(Math.min(segmentCount, 65_536));
   const outBounds = createEmptyBounds();
+  const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
 
   for (let index = 0; index < segmentCount; index += 1) {
@@ -1538,7 +1578,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
     }
 
     if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
-      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
@@ -1547,7 +1587,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
     const dy = primitive.y1 - primitive.y0;
     if (dx * dx + dy * dy <= 1e-10) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
-        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       }
       continue;
@@ -1565,7 +1605,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
   }
 
   for (const group of groups.values()) {
-    emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance);
+    emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
   }
 
   if (endpoints.quadCount === 0) {
@@ -1573,6 +1613,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
   }
 
   return {
+    paintOrigins: paintOrigins ? Uint32Array.from(paintOrigins) : undefined,
     segmentCount: endpoints.quadCount,
     endpoints: endpoints.toTypedArray(),
     primitiveMeta: primitiveMeta.toTypedArray(),
@@ -1616,6 +1657,8 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
   }
 
   return {
+    paintOrder: strokePaintOrigins(scene)?.[index],
+    paintGroup: strokePaintGroups(scene)?.[index],
     x0,
     y0,
     cx,
@@ -1685,7 +1728,7 @@ function resolveIntervalGroup(
   // culling bounds. Keep distinct rectangles in distinct merge groups so an
   // approximate LOD level cannot replace their intersection with a union.
   const clip = primitive.visibleBounds;
-  const baseKey = `${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
+  const baseKey = `${primitive.paintGroup ?? ""}|${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
   const key = clip
     ? `${baseKey}|clip:${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}`
     : baseKey;
@@ -1693,6 +1736,8 @@ function resolveIntervalGroup(
   let group = groups.get(key);
   if (!group) {
     group = {
+      paintOrder: primitive.paintOrder,
+      paintGroup: primitive.paintGroup,
       tileIndex,
       axisX,
       axisY,
@@ -1743,7 +1788,8 @@ function emitMergedIntervals(
   primitiveBounds: Float4Builder,
   styles: Float4Builder,
   bounds: Bounds,
-  tolerance: number
+  tolerance: number,
+  paintOrigins?: number[]
 ): void {
   const pairCount = group.intervals.length >> 1;
   if (pairCount <= 0) {
@@ -1773,11 +1819,11 @@ function emitMergedIntervals(
       currentEnd = Math.max(currentEnd, interval.end);
       continue;
     }
-    emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd);
+    emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd, paintOrigins);
     currentStart = interval.start;
     currentEnd = interval.end;
   }
-  emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd);
+  emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd, paintOrigins);
 }
 
 function emitInterval(
@@ -1788,7 +1834,8 @@ function emitInterval(
   styles: Float4Builder,
   bounds: Bounds,
   start: number,
-  end: number
+  end: number,
+  paintOrigins?: number[]
 ): void {
   if (end - start <= 1e-6) {
     return;
@@ -1798,6 +1845,8 @@ function emitInterval(
     group.clipMinX <= group.clipMaxX &&
     group.clipMinY <= group.clipMaxY;
   emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, {
+    paintOrder: group.paintOrder,
+    paintGroup: group.paintGroup,
     x0: group.axisX * start + group.normalX * group.offset,
     y0: group.axisY * start + group.normalY * group.offset,
     cx: group.axisX * end + group.normalX * group.offset,
@@ -1814,7 +1863,7 @@ function emitInterval(
     visibleBounds: hasClip
       ? {minX: group.clipMinX, minY: group.clipMinY, maxX: group.clipMaxX, maxY: group.clipMaxY}
       : undefined
-  });
+  }, paintOrigins);
 }
 
 function emitPrimitive(
@@ -1823,8 +1872,10 @@ function emitPrimitive(
   primitiveBounds: Float4Builder,
   styles: Float4Builder,
   bounds: Bounds,
-  primitive: StrokePrimitive
+  primitive: StrokePrimitive,
+  paintOrigins?: number[]
 ): void {
+  paintOrigins?.push(primitive.paintOrder ?? 0);
   endpoints.push(primitive.x0, primitive.y0, primitive.cx, primitive.cy);
   primitiveMeta.push(
     primitive.x1,

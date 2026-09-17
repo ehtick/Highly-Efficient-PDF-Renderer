@@ -1,3 +1,9 @@
+import { VectorOrderedBatches } from "./vectorOrderedBatches";
+import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
+import { RenderPerformanceProbe, renderProfilingEnabled } from "./renderPerformanceProbe";
+import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { packVectorClips } from "./vectorClips";
+import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
   buildOrderedGradientPaintCommands,
@@ -163,6 +169,7 @@ struct SegmentIdBuffer {
 @group(0) @binding(5) var<storage, read> uSegmentIds : SegmentIdBuffer;
 
 struct VsOut {
+  @location(11) @interpolate(flat) vectorClipIndex: f32,
   @builtin(position) position : vec4f,
   @location(0) local : vec2f,
   @location(1) @interpolate(flat) p0 : vec2f,
@@ -205,7 +212,9 @@ ${CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE}
 ${CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE}
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
-  let segmentIndex = uSegmentIds.values[instanceIndex];
+  var segmentIndex: u32;
+  if (uVectorClip.x < -1.5) { segmentIndex = uOrderedInstances[instanceIndex].x; }
+  else { segmentIndex = uSegmentIds.values[instanceIndex]; }
   let dims = textureDimensions(uSegmentTexA);
   let coord = coordFromIndex(segmentIndex, dims.x);
 
@@ -232,6 +241,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), isQuadratic);
 
   var out : VsOut;
+  out.vectorClipIndex = uVectorClip.x;
+  if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
@@ -279,6 +290,11 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   return out;
 }
 
+@group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> uVectorClip: vec4f;
+@group(1) @binding(2) var<storage, read> uOrderedInstances: array<vec2u>;
+${VECTOR_CLIP_WGSL}
+
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
   if (inData.alpha <= 0.001) {
@@ -308,7 +324,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return heprEncodeOutputColor(vec4f(color, alpha));
+  return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.local, inData.vectorClipIndex, uVectorClipTex);
 }
 `;
 
@@ -335,6 +351,7 @@ struct CameraUniforms {
 @group(0) @binding(5) var uFillSegmentTexB : texture_2d<f32>;
 
 struct VsOut {
+  @location(11) @interpolate(flat) vectorClipIndex: f32,
   @builtin(position) position : vec4f,
   @location(0) local : vec2f,
   @location(1) @interpolate(flat) segmentStart : i32,
@@ -468,7 +485,8 @@ fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, windi
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
   let metaDims = textureDimensions(uFillPathMetaTexA);
-  let pathIndex = i32(instanceIndex);
+  var pathIndex = i32(instanceIndex);
+  if (uVectorClip.x < -1.5) { pathIndex = i32(uOrderedInstances[instanceIndex].x); }
   let coord = coordFromIndex(pathIndex, i32(metaDims.x));
 
   let metaA = textureLoad(uFillPathMetaTexA, coord, 0);
@@ -479,6 +497,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let alpha = metaC.w;
 
   var out : VsOut;
+  out.vectorClipIndex = uVectorClip.x;
+  if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0 || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
@@ -509,6 +529,11 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.fillHasCompanionStroke = metaC.y;
   return out;
 }
+
+@group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> uVectorClip: vec4f;
+@group(1) @binding(2) var<storage, read> uOrderedInstances: array<vec2u>;
+${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
@@ -560,7 +585,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     if (alpha <= 0.001) {
       discard;
     }
-    return heprEncodeOutputColor(vec4f(color, alpha));
+    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.local, inData.vectorClipIndex, uVectorClipTex);
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
@@ -571,7 +596,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return heprEncodeOutputColor(vec4f(color, alpha));
+  return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.local, inData.vectorClipIndex, uVectorClipTex);
 }
 `;
 
@@ -609,6 +634,7 @@ struct TextInstanceIdBuffer {
 @group(0) @binding(11) var<storage, read> uTextInstanceIds : TextInstanceIdBuffer;
 
 struct VsOut {
+  @location(11) @interpolate(flat) vectorClipIndex: f32,
   @builtin(position) position : vec4f,
   @location(0) local : vec2f,
   @location(1) @interpolate(flat) segmentStart : i32,
@@ -820,7 +846,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   // pad0 is an indirection flag for the LOD pipeline. Ordinary scenes retain
   // the original direct instance-index path and do not read the ID buffer.
   var selectedInstanceIndex = instanceIndex;
-  if (uCamera.pad0 >= 0.5) {
+  if (uVectorClip.x < -1.5) {
+    selectedInstanceIndex = uOrderedInstances[instanceIndex].x;
+  } else if (uCamera.pad0 >= 0.5) {
     selectedInstanceIndex = uTextInstanceIds.values[instanceIndex];
   }
   let instanceIndexI = i32(selectedInstanceIndex);
@@ -839,6 +867,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let segmentCount = i32(glyphMetaA.y + 0.5);
 
   var out : VsOut;
+  out.vectorClipIndex = uVectorClip.x;
+  if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
@@ -886,6 +916,11 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.world = world;
   return out;
 }
+
+@group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> uVectorClip: vec4f;
+@group(1) @binding(2) var<storage, read> uOrderedInstances: array<vec2u>;
+${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
@@ -974,7 +1009,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
       discard;
     }
     let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-    return heprEncodeOutputColor(vec4f(color, alpha));
+    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.world, inData.vectorClipIndex, uVectorClipTex);
   }
 
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
@@ -1099,7 +1134,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return heprEncodeOutputColor(vec4f(color, alpha));
+  return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.world, inData.vectorClipIndex, uVectorClipTex);
 }
 `;
 
@@ -1131,6 +1166,7 @@ struct RasterUniforms {
 struct VsOut {
   @builtin(position) position : vec4f,
   @location(0) uv : vec2f,
+  @location(1) world : vec2f,
 };
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -1173,8 +1209,13 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
   var out : VsOut;
   out.position = vec4f(clip, 0.0, 1.0);
   out.uv = localTopDown;
+  out.world = world;
   return out;
 }
+
+@group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> uVectorClip: vec4f;
+${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
@@ -1182,7 +1223,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   if (color.a <= 0.001) {
     discard;
   }
-  return color;
+  return color * heprVectorClip(inData.world, uVectorClip.x, uVectorClipTex);
 }
 `;
 
@@ -1567,6 +1608,17 @@ export class WebGpuFloorplanRenderer {
 
   private vectorMinifyHeight = 0;
 
+  private readonly performanceProbe = new RenderPerformanceProbe("webgpu");
+  private orderedRunCuller: VectorDrawRunCuller | null = null;
+  private orderedCullingBounds: Bounds | null = null;
+  private orderedRunsCulled = false;
+  private vectorClipTexture: any = null;
+  private readonly vectorClipBindGroupLayout: any;
+  private vectorClipBuffers: any[] = [];
+  private vectorClipBindGroups: any[] = [];
+  private vectorClipIndex = -1;
+  private orderedBatches: VectorOrderedBatches | null = null;
+  private orderedInstanceBuffer: any = null;
   private scene: VectorScene | null = null;
 
   private sceneStats: SceneStats | null = null;
@@ -1764,6 +1816,11 @@ export class WebGpuFloorplanRenderer {
       return buffer;
     });
 
+    this.vectorClipBindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: gpuShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
+      { binding: 1, visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } },
+      { binding: 2, visibility: gpuShaderStage.VERTEX, buffer: { type: "read-only-storage", minBindingSize: 8 } }
+    ] });
     this.strokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -2045,10 +2102,10 @@ export class WebGpuFloorplanRenderer {
     });
 
     const strokePipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.strokeBindGroupLayout]
+      bindGroupLayouts: [this.strokeBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const fillPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.fillBindGroupLayout]
+      bindGroupLayouts: [this.fillBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const gradientFillPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.gradientFillBindGroupLayout]
@@ -2057,10 +2114,10 @@ export class WebGpuFloorplanRenderer {
       bindGroupLayouts: [this.gradientStrokeBindGroupLayout]
     });
     const textPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.textBindGroupLayout]
+      bindGroupLayouts: [this.textBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const rasterPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.rasterBindGroupLayout]
+      bindGroupLayouts: [this.rasterBindGroupLayout, this.vectorClipBindGroupLayout]
     });
     const blitPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.blitBindGroupLayout]
@@ -2156,7 +2213,8 @@ export class WebGpuFloorplanRenderer {
       throw new Error("Failed to acquire a WebGPU adapter.");
     }
 
-    const device = await adapter.requestDevice();
+    const profileTimestamps = renderProfilingEnabled() && adapter.features?.has("timestamp-query");
+    const device = await adapter.requestDevice(profileTimestamps ? { requiredFeatures: ["timestamp-query"] } : {});
     let context: any = null;
     try {
       if (typeof device.addEventListener === "function") {
@@ -2472,6 +2530,8 @@ export class WebGpuFloorplanRenderer {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
     }
+    validateVectorDrawRuns(scene);
+    this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
@@ -2491,7 +2551,7 @@ export class WebGpuFloorplanRenderer {
 
     const maxTextureSize = this.maxTextureSize();
 
-    const textLodBuildResult = this.textLodMode === "auto"
+    const textLodBuildResult = scene.drawRuns ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.textLodRuntime = textLodBuildResult
@@ -3125,10 +3185,19 @@ export class WebGpuFloorplanRenderer {
   }
 
   dispose(): void {
+    this.orderedInstanceBuffer?.destroy();
+    this.orderedInstanceBuffer = null;
+    this.orderedBatches = null;
+    this.vectorClipTexture?.destroy();
+    for (const buffer of this.vectorClipBuffers) buffer.destroy();
+    this.vectorClipBuffers = [];
+    this.vectorClipBindGroups = [];
     if (this.isDisposed) {
       return;
     }
     this.isDisposed = true;
+    this.performanceProbe.dispose();
+    this.orderedRunCuller = null;
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
@@ -3311,55 +3380,62 @@ export class WebGpuFloorplanRenderer {
   }
 
   private render(timestamp: number = performance.now()): void {
-    const isCameraAnimating = this.updateCameraWithDamping(timestamp);
-    this.updatePanReleaseVelocitySample(timestamp);
-    if (
-      !this.scene ||
-      (this.segmentCount === 0 &&
-        this.fillPathCount === 0 &&
-        this.textInstanceCount === 0 &&
-        (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
-        (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
-        this.rasterLayerResources.length === 0 &&
-        this.pageBackgroundResources.length === 0)
-    ) {
-      this.clearToScreen();
+    this.performanceProbe.begin(this.scene, { width: this.canvas.width, height: this.canvas.height, zoom: this.zoom,
+      layers: { stroke: this.strokeRenderingEnabled, fill: this.fillRenderingEnabled,
+        text: this.textRenderingEnabled, raster: this.rasterRenderingEnabled } });
+    try {
+      const isCameraAnimating = this.updateCameraWithDamping(timestamp);
+      this.updatePanReleaseVelocitySample(timestamp);
+      if (
+        !this.scene ||
+        (this.segmentCount === 0 &&
+          this.fillPathCount === 0 &&
+          this.textInstanceCount === 0 &&
+          (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
+          (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
+          this.rasterLayerResources.length === 0 &&
+          this.pageBackgroundResources.length === 0)
+      ) {
+        this.clearToScreen();
+        this.capturePresentedFrameState();
+        this.frameListener?.({
+          renderedSegments: 0,
+          totalSegments: 0,
+          usedCulling: false,
+          zoom: this.zoom
+        });
+        if (isCameraAnimating) {
+          this.requestFrame();
+        }
+        return;
+      }
+
+      if (!this.hasNativeRenderingEnabled()) {
+        this.capturePresentedFrameState();
+        this.frameListener?.({
+          renderedSegments: 0,
+          totalSegments: this.segmentCount,
+          usedCulling: false,
+          zoom: this.zoom
+        });
+        if (isCameraAnimating) {
+          this.requestFrame();
+        }
+        return;
+      }
+
+      if (this.shouldUsePanCache(isCameraAnimating)) {
+        this.renderWithPanCache();
+      } else {
+        this.renderDirectToScreen();
+      }
       this.capturePresentedFrameState();
-      this.frameListener?.({
-        renderedSegments: 0,
-        totalSegments: 0,
-        usedCulling: false,
-        zoom: this.zoom
-      });
+
       if (isCameraAnimating) {
         this.requestFrame();
       }
-      return;
-    }
-
-    if (!this.hasNativeRenderingEnabled()) {
-      this.capturePresentedFrameState();
-      this.frameListener?.({
-        renderedSegments: 0,
-        totalSegments: this.segmentCount,
-        usedCulling: false,
-        zoom: this.zoom
-      });
-      if (isCameraAnimating) {
-        this.requestFrame();
-      }
-      return;
-    }
-
-    if (this.shouldUsePanCache(isCameraAnimating)) {
-      this.renderWithPanCache();
-    } else {
-      this.renderDirectToScreen();
-    }
-    this.capturePresentedFrameState();
-
-    if (isCameraAnimating) {
-      this.requestFrame();
+    } finally {
+      this.performanceProbe.end({ orderedRunsCulled: this.orderedRunsCulled });
     }
   }
 
@@ -3466,7 +3542,7 @@ export class WebGpuFloorplanRenderer {
       this.frameListener?.({
         renderedSegments,
         totalSegments: this.segmentCount,
-        usedCulling: !this.usingAllSegments,
+        usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
         zoom: this.zoom
       });
       return;
@@ -3475,6 +3551,7 @@ export class WebGpuFloorplanRenderer {
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
     const pass = encoder.beginRenderPass({
+      ...this.performanceProbe.gpuPass(this.gpuDevice),
       colorAttachments: [
         {
           view,
@@ -3489,12 +3566,13 @@ export class WebGpuFloorplanRenderer {
     this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
     pass.end();
+    this.performanceProbe.resolveGpu(encoder);
     this.gpuDevice.queue.submit([encoder.finish()]);
 
     this.frameListener?.({
       renderedSegments,
       totalSegments: this.segmentCount,
-      usedCulling: !this.usingAllSegments,
+      usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     });
   }
@@ -3516,6 +3594,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private shouldUseVectorMinifyPath(): boolean {
+    if (this.scene?.drawRuns) return false;
     if (!NATIVE_VECTOR_MINIFY_ENABLED) {
       return false;
     }
@@ -3694,6 +3773,10 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
+    if (this.scene?.drawRuns) {
+      this.orderedCullingBounds = vectorViewBounds(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, this.zoom);
+      return this.drawSourceOrderedContentIntoPass(pass);
+    }
     this.drawOrderedGradientPaintIntoPass(pass);
     return this.drawVectorContentIntoPass(pass);
   }
@@ -3703,6 +3786,7 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     pass.setPipeline(this.rasterPipeline);
+    this.bindVectorClip(pass);
     for (const layer of this.pageBackgroundResources) {
       pass.setBindGroup(0, layer.bindGroup);
       pass.draw(4, 1, 0, 0);
@@ -3719,6 +3803,7 @@ export class WebGpuFloorplanRenderer {
         const resource = this.rasterLayerResources[command.index];
         if (resource) {
           pass.setPipeline(this.rasterPipeline);
+          this.bindVectorClip(pass);
           pass.setBindGroup(0, resource.bindGroup);
           pass.draw(4, 1, 0, 0);
         }
@@ -3775,6 +3860,7 @@ export class WebGpuFloorplanRenderer {
 
     if (this.rasterLayerResources.length > 0) {
       pass.setPipeline(this.rasterPipeline);
+      this.bindVectorClip(pass);
       for (const command of this.orderedGradientPaintCommands) {
         if (command.kind !== "raster") {
           continue;
@@ -3788,9 +3874,104 @@ export class WebGpuFloorplanRenderer {
     }
   }
 
+  private uploadVectorClips(scene: VectorScene): void {
+    this.vectorClipTexture?.destroy();
+    for (const buffer of this.vectorClipBuffers) buffer.destroy();
+    this.vectorClipBuffers = [];
+    this.vectorClipBindGroups = [];
+    const data = packVectorClips(scene.clipPaths);
+    const dims = chooseTextureDimensions(data.length / 4, this.maxTextureSize());
+    this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
+    const usage = (globalThis as any).GPUBufferUsage;
+    for (let index = -2; index < (scene.clipPaths?.length ?? 0); index++) {
+      const buffer = this.gpuDevice.createBuffer({ size: 16, usage: usage.UNIFORM | usage.COPY_DST });
+      this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0]));
+      this.vectorClipBuffers.push(buffer);
+      this.vectorClipBindGroups.push(this.gpuDevice.createBindGroup({ layout: this.vectorClipBindGroupLayout, entries: [
+        { binding: 0, resource: this.vectorClipTexture.createView() },
+        { binding: 1, resource: { buffer } },
+        { binding: 2, resource: { buffer: this.orderedInstanceBuffer } }
+      ] }));
+    }
+    this.vectorClipIndex = -1;
+  }
+
+  private bindVectorClip(pass: any): void {
+    pass.setBindGroup(1, this.vectorClipBindGroups[this.vectorClipIndex + 2]);
+  }
+
+  private drawSourceOrderedContentIntoPass(pass: any): number {
+    this.vectorClipIndex = -1;
+    this.drawPageBackgroundContentIntoPass(pass);
+    let strokes = 0;
+    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
+    let phaseStart = probe?.mark() ?? -1;
+    const runs = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    probe?.phase("runCulling", phaseStart);
+    this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
+    const plan = this.orderedBatches;
+    phaseStart = probe?.mark() ?? -1;
+    const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
+    probe?.phase("batchPlan", phaseStart);
+    if (rebuilt) probe?.count("batchRebuilds");
+    phaseStart = probe?.mark() ?? -1;
+    if (plan && rebuilt && plan.instanceCount > 0) {
+      probe?.count("instanceUploadBytes", plan.instanceCount * 8);
+      this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
+    }
+    probe?.phase("instanceUpload", phaseStart);
+    phaseStart = probe?.mark() ?? -1;
+    let submitted = 0;
+    for (const run of plan?.batches ?? runs) {
+      if (probe?.skips(run.kind)) continue;
+      this.vectorClipIndex = run.clipIndex ?? -1;
+      const pipeline = run.kind === "fill" && this.fillRenderingEnabled ? this.fillPipeline
+        : run.kind === "stroke" && this.strokeRenderingEnabled ? this.strokePipeline
+        : run.kind === "text" && this.textRenderingEnabled ? this.textPipeline : null;
+      const bindGroup = run.kind === "fill" ? this.fillBindGroup
+        : run.kind === "stroke" ? (plan ? this.vectorLodLevelResources[0]?.bindGroup : null) ?? this.strokeBindGroupAll : this.textBindGroup;
+      if (pipeline && bindGroup) {
+        pass.setPipeline(pipeline);
+        this.bindVectorClip(pass);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(4, run.count, 0, run.first);
+        submitted++;
+        probe?.draw(run.kind, run.count);
+        if (run.kind === "stroke") strokes += run.count;
+      } else {
+        for (let index = run.first; index < run.first + run.count; index++) {
+          if (run.kind === "raster" && this.rasterRenderingEnabled) {
+            const resource = this.rasterLayerResources[index];
+            if (resource) {
+              pass.setPipeline(this.rasterPipeline);
+              this.bindVectorClip(pass);
+              pass.setBindGroup(0, resource.bindGroup);
+              pass.draw(4, 1, 0, 0);
+              submitted++;
+              probe?.draw(run.kind, 1);
+            }
+          } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
+            submitted++;
+            probe?.draw(run.kind, 1);
+            this.drawGradientFillIntoPass(pass, index);
+          } else if (run.kind === "gradient-stroke" && this.strokeRenderingEnabled) {
+            submitted++;
+            probe?.draw(run.kind, 1);
+            this.drawGradientStrokeIntoPass(pass, index);
+          }
+        }
+      }
+    }
+    this.vectorClipIndex = -1;
+    probe?.phase("orderedSubmit", phaseStart);
+    this.performanceProbe?.orderedRuns(runs.length, submitted);
+    return strokes;
+  }
+
   private drawVectorContentIntoPass(pass: any): number {
     if (this.fillRenderingEnabled && this.fillPathCount > 0 && this.fillBindGroup) {
       pass.setPipeline(this.fillPipeline);
+      this.bindVectorClip(pass);
       pass.setBindGroup(0, this.fillBindGroup);
       pass.draw(4, this.fillPathCount, 0, 0);
     }
@@ -3805,6 +3986,7 @@ export class WebGpuFloorplanRenderer {
           continue;
         }
         pass.setPipeline(this.strokePipeline);
+        this.bindVectorClip(pass);
         pass.setBindGroup(0, resource.bindGroup);
         pass.draw(4, instanceCount, 0, 0);
         strokeInstanceCount += instanceCount;
@@ -3817,6 +3999,7 @@ export class WebGpuFloorplanRenderer {
         const strokeBindGroup = this.usingAllSegments ? this.strokeBindGroupAll : this.strokeBindGroupVisible;
         if (strokeBindGroup) {
           pass.setPipeline(this.strokePipeline);
+          this.bindVectorClip(pass);
           pass.setBindGroup(0, strokeBindGroup);
           pass.draw(4, strokeInstanceCount, 0, 0);
         }
@@ -3831,6 +4014,7 @@ export class WebGpuFloorplanRenderer {
         return strokeInstanceCount;
       }
       pass.setPipeline(this.textPipeline);
+      this.bindVectorClip(pass);
       pass.setBindGroup(0, this.textBindGroup);
       pass.draw(4, textDrawCount, 0, 0);
     }
@@ -3853,6 +4037,10 @@ export class WebGpuFloorplanRenderer {
       zoom: number;
     }
   ): void {
+    if (this.scene?.drawRuns) {
+      prepareTextLodSelection = false;
+      this.useTextInstanceIndirection = false;
+    }
     if (prepareTextLodSelection) {
       this.useTextInstanceIndirection = this.updateTextLodSelection(
         textLodProjection?.viewportWidth ?? viewportWidth,
@@ -4246,14 +4434,19 @@ export class WebGpuFloorplanRenderer {
     const safeZoom = Math.max(zoomValue, 1e-6);
     this.vectorLodRuntime.setScreenSpaceTransform();
     this.vectorLodRuntime.updateForLocalUnitsPerPixel(1 / safeZoom);
-    this.vectorLodRuntime.update(
+    const probe = this.performanceProbe?.active ? this.performanceProbe : undefined;
+    const selectionStart = probe?.mark() ?? -1;
+    const updated = this.vectorLodRuntime.update(
       { cameraCenterX: viewCenterX, cameraCenterY: viewCenterY, zoom: safeZoom },
       { width: Math.max(1, viewportWidthPx), height: Math.max(1, viewportHeightPx) },
       null
     );
+    probe?.phase("strokeLod", selectionStart);
     this.vectorLodStats = this.vectorLodRuntime.getStats();
     this.visibleSegmentCount = this.vectorLodStats.renderedSegments;
     this.usingAllSegments = false;
+    if (!updated) return;
+    if (this.orderedBatches) { this.orderedBatches.invalidate(); return; }
 
     for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
       const runtimeLevel = this.vectorLodRuntime.levels[levelIndex];
@@ -4279,6 +4472,14 @@ export class WebGpuFloorplanRenderer {
       this.vectorLodRuntime = null;
     }
     this.vectorLodStats = null;
+    this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
+      this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+    this.orderedInstanceBuffer?.destroy();
+    const usage = (globalThis as any).GPUBufferUsage;
+    this.orderedInstanceBuffer = this.gpuDevice.createBuffer({
+      size: Math.max(8, this.orderedBatches?.uintInstances.byteLength ?? 0), usage: usage.STORAGE | usage.COPY_DST
+    });
+    this.uploadVectorClips(scene);
 
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
       this.destroyVectorLodResources();
@@ -4287,7 +4488,7 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.uploadVectorLodLevels();
-    return this.vectorLodLevelResources.length > 1;
+    return this.vectorLodRuntime.levels.length > 1;
   }
 
   private uploadVectorLodLevels(): void {
@@ -4297,6 +4498,22 @@ export class WebGpuFloorplanRenderer {
     }
 
     const maxTextureSize = this.maxTextureSize();
+    if (this.orderedBatches) {
+      const scene = this.orderedBatches.strokeScene;
+      const dims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
+      const textureA = this.createFloatTexture(dims.width, dims.height, scene.endpoints);
+      const textureB = this.createFloatTexture(dims.width, dims.height, scene.primitiveMeta);
+      const textureC = this.createFloatTexture(dims.width, dims.height, scene.styles);
+      const textureD = this.createFloatTexture(dims.width, dims.height, scene.primitiveBounds);
+      // Ordered shaders obtain IDs from group 1; group 0 retains a valid dummy
+      // binding for the legacy stroke shader branch.
+      const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(1, false);
+      this.vectorLodLevelResources.push({ textureA, textureB, textureC, textureD,
+        textureWidth: dims.width, textureHeight: dims.height, ownsTextures: true, visibleSegmentIdBuffer,
+        bindGroup: this.createStrokeBindGroup(textureA, textureB, textureC, textureD, visibleSegmentIdBuffer) });
+      return;
+    }
+
     for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
       const level = this.vectorLodRuntime.levels[levelIndex];
       const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(Math.max(1, level.segmentCount), false);

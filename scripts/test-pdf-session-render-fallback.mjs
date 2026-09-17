@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, Path2D } from "@napi-rs/canvas";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 import { buildTinySfnt } from "./lib/tinySfnt.mjs";
 
@@ -48,8 +48,15 @@ try {
       const scene = await session.compileVectorPage(0, { optimization: "none" });
       assert.equal(scene.rasterLayers.length, 1, name);
       assert.equal(scene.fillPathCount, 0, name);
-      assert.equal(warnings.filter(d => d.code === "page-raster-fallback").length, 1, name);
-      assert.equal(warnings.find(d => d.code === "page-raster-fallback").pageIndex, 0);
+      if (name === "arbitrary image clip") {
+        assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
+        assert.equal(scene.clipPaths.length, 1);
+        assert.equal(scene.rasterLayers[0].width, 1, "the original image is retained without resampling");
+        assert.equal(scene.rasterLayers[0].height, 1);
+      } else {
+        assert.equal(warnings.filter(d => d.code === "page-raster-fallback").length, 1, name);
+        assert.equal(warnings.find(d => d.code === "page-raster-fallback").pageIndex, 0);
+      }
       check(scene);
       const second = await session.compileVectorPage(0, { optimization: "none" });
       assert.deepEqual(second.rasterLayerData, scene.rasterLayerData, "repeat operations own usable resources");
@@ -144,6 +151,20 @@ function surfaceFactory(width, height) {
 }
 function assertPixel(scene, x, y, expected) {
   const layer = scene.rasterLayers[0];
+  let clipIndex = scene.drawRuns?.find(run => run.kind === "raster" && run.first === 0)?.clipIndex ?? -1;
+  while (clipIndex >= 0) {
+    const clip = scene.clipPaths[clipIndex];
+    const path = new Path2D();
+    for (let i = 0; i < clip.edges.length; i += 4) {
+      if (i === 0 || clip.edges[i] !== clip.edges[i - 2] || clip.edges[i + 1] !== clip.edges[i - 1]) path.moveTo(clip.edges[i], clip.edges[i + 1]);
+      path.lineTo(clip.edges[i + 2], clip.edges[i + 3]);
+    }
+    // Independent Canvas winding oracle; the raster's alpha remains unchanged.
+    if (!createCanvas(1, 1).getContext("2d").isPointInPath(path, x, y, clip.fillRule ? "evenodd" : "nonzero")) {
+      assert.deepEqual([0, 0, 0, 0], expected); return;
+    }
+    clipIndex = clip.parent;
+  }
   const width = scene.pageBounds.maxX, height = scene.pageBounds.maxY;
   const offset = (Math.floor((height - y) / height * layer.height) * layer.width + Math.floor(x / width * layer.width)) * 4;
   assert.deepEqual([...layer.data.subarray(offset, offset + 4)], expected);

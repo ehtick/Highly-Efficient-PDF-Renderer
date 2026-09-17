@@ -32,6 +32,15 @@ interface CffIndex {
   readonly end: number;
 }
 
+type CffMatrix = readonly [number, number, number, number, number, number];
+
+interface CffFontDictionary {
+  readonly localSubrs: readonly Uint8Array[];
+  readonly defaultWidthX: number;
+  readonly nominalWidthX: number;
+  readonly fontMatrix: CffMatrix;
+}
+
 interface RawGlyphOutline {
   readonly commands: readonly NativeGlyphPathCommand[];
   readonly advanceWidth: number;
@@ -51,9 +60,9 @@ interface Type2Seac {
 }
 
 /**
- * Bounds-checked CFF v1, name-keyed Type 2 outline provider.
+ * Bounds-checked CFF v1, name-keyed and CID-keyed Type 2 outline provider.
  *
- * CID-keyed CFF, CFF2, Multiple Master blend programs, and deterministicly
+ * CFF2, Multiple Master blend programs, and deterministically
  * unsafe Type 2 operations fail with typed errors instead of being omitted.
  */
 export class NativeCffFont {
@@ -63,11 +72,10 @@ export class NativeCffFont {
   readonly builtInGlyphNames: readonly (string | null)[];
 
   private readonly charStrings: readonly Uint8Array[];
-  private readonly localSubrs: readonly Uint8Array[];
   private readonly globalSubrs: readonly Uint8Array[];
-  private readonly defaultWidthX: number;
-  private readonly nominalWidthX: number;
-  private readonly fontMatrix: readonly [number, number, number, number, number, number];
+  private readonly fontDictionaries: readonly CffFontDictionary[];
+  private readonly fdSelect: Uint8Array;
+  private readonly glyphIdsByCid: ReadonlyMap<number, number> | null;
   private readonly limits: Readonly<NativeCffParserLimits>;
   private readonly glyphIdsByName: ReadonlyMap<string, number>;
   private readonly rawOutlineCache = new Map<number, RawGlyphOutline>();
@@ -75,23 +83,21 @@ export class NativeCffFont {
 
   private constructor(options: {
     readonly charStrings: readonly Uint8Array[];
-    readonly localSubrs: readonly Uint8Array[];
     readonly globalSubrs: readonly Uint8Array[];
     readonly glyphNames: readonly string[];
     readonly builtInGlyphNames: readonly (string | null)[];
-    readonly defaultWidthX: number;
-    readonly nominalWidthX: number;
-    readonly fontMatrix: readonly [number, number, number, number, number, number];
+    readonly fontDictionaries: readonly CffFontDictionary[];
+    readonly fdSelect: Uint8Array;
+    readonly glyphIdsByCid: ReadonlyMap<number, number> | null;
     readonly limits: Readonly<NativeCffParserLimits>;
   }) {
     this.charStrings = options.charStrings;
-    this.localSubrs = options.localSubrs;
     this.globalSubrs = options.globalSubrs;
     this.glyphNames = options.glyphNames;
     this.builtInGlyphNames = options.builtInGlyphNames;
-    this.defaultWidthX = options.defaultWidthX;
-    this.nominalWidthX = options.nominalWidthX;
-    this.fontMatrix = options.fontMatrix;
+    this.fontDictionaries = options.fontDictionaries;
+    this.fdSelect = options.fdSelect;
+    this.glyphIdsByCid = options.glyphIdsByCid;
     this.limits = options.limits;
     this.numGlyphs = options.charStrings.length;
     const glyphIds = new Map<string, number>();
@@ -139,7 +145,7 @@ export class NativeCffFont {
     const names = reader.readIndex(headerSize, "Name INDEX");
     if (names.objects.length !== 1) {
       throw cffUnsupported(
-        "A PDF Type1C font must contain exactly one name-keyed CFF font.",
+        "An embedded CFF program must contain exactly one font.",
         "cff-font-count"
       );
     }
@@ -147,7 +153,7 @@ export class NativeCffFont {
     const topIndexes = reader.readIndex(names.end, "Top DICT INDEX");
     if (topIndexes.objects.length !== 1) {
       throw cffUnsupported(
-        "A PDF Type1C font must contain exactly one Top DICT.",
+        "An embedded CFF program must contain exactly one Top DICT.",
         "cff-top-dict-count"
       );
     }
@@ -164,11 +170,13 @@ export class NativeCffFont {
     const globalSubrsIndex = reader.readIndex(stringsIndex.end, "Global Subrs INDEX");
     const top = parseCffDict(topIndexes.objects[0], "Top DICT", TOP_DICT_OPERATORS);
 
-    if (top.has(dictOperator(12, 30)) || top.has(dictOperator(12, 36)) || top.has(dictOperator(12, 37))) {
-      throw cffUnsupported(
-        "CID-keyed CFF outlines require the native CID CFF engine, which is not available.",
-        "cff-cid-not-supported"
-      );
+    const ros = top.get(dictOperator(12, 30));
+    const cidKeyed = ros !== undefined;
+    if (ros && (ros.length !== 3 || ros.some(value => !Number.isSafeInteger(value) || value < 0))) {
+      throw cffUnsupported("The CFF ROS entry is invalid.", "cff-cid-ros");
+    }
+    if (!cidKeyed && (top.has(dictOperator(12, 36)) || top.has(dictOperator(12, 37)))) {
+      throw cffUnsupported("A CFF Font DICT array requires ROS.", "cff-cid-ros");
     }
     // 12 20 is SyntheticBase: those glyphs are defined against another font and
     // cannot be read from this CharStrings INDEX alone. 12 23 is BaseFontBlend,
@@ -193,76 +201,76 @@ export class NativeCffFont {
       throw cffUnsupported("The CFF CharStrings INDEX is empty.", "cff-charstrings-empty");
     }
 
-    const privateOperands = top.get(dictOperator(18));
-    if (!privateOperands || privateOperands.length !== 2) {
-      throw cffUnsupported("The CFF Top DICT has no valid Private DICT range.",
-        "cff-private-range");
-    }
-    const privateSize = requireNonnegativeInteger(privateOperands[0], "CFF Private DICT size");
-    const privateOffset = requireNonnegativeInteger(privateOperands[1], "CFF Private DICT offset");
-    const privateBytes = reader.slice(privateOffset, privateSize, "Private DICT");
-    const privateDictionary = parseCffDict(privateBytes, "Private DICT", PRIVATE_DICT_OPERATORS);
-    const defaultWidthX = readOptionalSingleton(
-      privateDictionary, dictOperator(20), 0, "defaultWidthX"
-    );
-    const nominalWidthX = readOptionalSingleton(
-      privateDictionary, dictOperator(21), 0, "nominalWidthX"
-    );
-    const localSubrOperands = privateDictionary.get(dictOperator(19));
-    let localSubrs: readonly Uint8Array[] = Object.freeze([]);
-    if (localSubrOperands) {
-      if (localSubrOperands.length !== 1) {
-        throw cffUnsupported("The CFF Private DICT /Subrs offset is invalid.",
-          "cff-local-subrs-offset");
-      }
-      const relativeOffset = requireNonnegativeInteger(
-        localSubrOperands[0], "CFF local Subrs offset"
+    const glyphCount = charStringsIndex.objects.length;
+    const topMatrix = readCffFontMatrix(top);
+    let fontDictionaries: readonly CffFontDictionary[];
+    let fdSelect: Uint8Array;
+    let glyphIdsByCid: ReadonlyMap<number, number> | null = null;
+    let glyphNames: readonly string[];
+    let builtInGlyphNames: readonly (string | null)[];
+    if (cidKeyed) {
+      const dictionaries = reader.readIndex(
+        readRequiredOffset(top, dictOperator(12, 36), "FDArray"), "Font DICT INDEX"
       );
-      const absoluteOffset = checkedAdd(privateOffset, relativeOffset, "CFF local Subrs offset");
-      localSubrs = reader.readIndex(absoluteOffset, "Local Subrs INDEX").objects;
-    }
-
-    const glyphNames = readCffCharset(
-      reader,
-      readOptionalOffset(top, dictOperator(15), 0, "charset"),
-      charStringsIndex.objects.length,
-      customStrings
-    );
-    const glyphIds = new Map(glyphNames.map((name, glyphId) => [name, glyphId] as const));
-    const builtInGlyphNames = readCffEncoding(
-      reader,
-      readOptionalOffset(top, dictOperator(16), 0, "Encoding"),
-      glyphNames,
-      glyphIds,
-      customStrings
-    );
-    const fontMatrixValues = top.get(dictOperator(12, 7)) ?? [0.001, 0, 0, 0.001, 0, 0];
-    if (fontMatrixValues.length !== 6 || fontMatrixValues.some((value) => !Number.isFinite(value))) {
-      throw cffUnsupported("The CFF FontMatrix is invalid.", "cff-font-matrix");
-    }
-    const determinant = fontMatrixValues[0] * fontMatrixValues[3] -
-      fontMatrixValues[1] * fontMatrixValues[2];
-    if (!Number.isFinite(determinant) || determinant === 0) {
-      throw cffUnsupported("The CFF FontMatrix is singular.", "cff-font-matrix");
+      if (dictionaries.objects.length === 0 || dictionaries.objects.length > 256) {
+        throw cffUnsupported("The CFF Font DICT count is invalid.", "cff-fd-count");
+      }
+      fontDictionaries = Object.freeze(dictionaries.objects.map(bytes => {
+        const dictionary = parseCffDict(bytes, "Font DICT", TOP_DICT_OPERATORS);
+        const matrix = dictionary.has(dictOperator(12, 7))
+          ? top.has(dictOperator(12, 7))
+            ? multiplyCffMatrices(topMatrix, readCffFontMatrix(dictionary))
+            : readCffFontMatrix(dictionary)
+          : topMatrix;
+        return readCffPrivateDictionary(reader, dictionary, matrix);
+      }));
+      fdSelect = readCffFdSelect(reader,
+        readRequiredOffset(top, dictOperator(12, 37), "FDSelect"), glyphCount, fontDictionaries.length);
+      const charsetOffset = readRequiredOffset(top, dictOperator(15), "CID charset");
+      if (charsetOffset <= 2) {
+        throw cffUnsupported("CID CFF fonts cannot use predefined charsets.", "cff-cid-charset");
+      }
+      const cids = readCffCharsetValues(reader, charsetOffset, glyphCount);
+      const mapping = new Map<number, number>();
+      for (let glyphId = 0; glyphId < cids.length; glyphId += 1) {
+        if (mapping.has(cids[glyphId])) {
+          throw cffUnsupported("The CFF charset contains duplicate CIDs.", "cff-cid-duplicate");
+        }
+        mapping.set(cids[glyphId], glyphId);
+      }
+      glyphIdsByCid = mapping;
+      glyphNames = Object.freeze([]);
+      builtInGlyphNames = Object.freeze(Array<string | null>(256).fill(null));
+    } else {
+      fontDictionaries = Object.freeze([readCffPrivateDictionary(reader, top, topMatrix)]);
+      fdSelect = new Uint8Array(glyphCount);
+      glyphNames = readCffCharset(reader,
+        readOptionalOffset(top, dictOperator(15), 0, "charset"), glyphCount, customStrings);
+      const glyphIds = new Map(glyphNames.map((name, glyphId) => [name, glyphId] as const));
+      builtInGlyphNames = readCffEncoding(reader,
+        readOptionalOffset(top, dictOperator(16), 0, "Encoding"), glyphNames, glyphIds, customStrings);
     }
 
     return new NativeCffFont({
       charStrings: charStringsIndex.objects,
-      localSubrs,
       globalSubrs: globalSubrsIndex.objects,
       glyphNames,
       builtInGlyphNames,
-      defaultWidthX,
-      nominalWidthX,
-      fontMatrix: Object.freeze(fontMatrixValues.slice()) as unknown as readonly [
-        number, number, number, number, number, number
-      ],
+      fontDictionaries,
+      fdSelect,
+      glyphIdsByCid,
       limits
     });
   }
 
   glyphIdForName(name: string | null): number {
     return name === null ? 0 : this.glyphIdsByName.get(name) ?? 0;
+  }
+
+  glyphIdForCid(cid: number): number {
+    return this.glyphIdsByCid === null
+      ? Number.isSafeInteger(cid) && cid >= 0 && cid < this.numGlyphs ? cid : 0
+      : this.glyphIdsByCid.get(cid) ?? 0;
   }
 
   getGlyphOutline(glyphId: number): NativeGlyphOutline {
@@ -274,11 +282,12 @@ export class NativeCffFont {
     if (cached) return cached;
     const budget: Type2Budget = { executedBytes: 0, operators: 0, subrCalls: 0 };
     const raw = this.evaluateRawGlyph(glyphId, new Set(), 0, budget);
+    const fontMatrix = this.fontDictionaries[this.fdSelect[glyphId]].fontMatrix;
     const commands = Object.freeze(raw.commands.map((command) =>
-      Object.freeze(transformCommand(command, this.fontMatrix))
+      Object.freeze(transformCommand(command, fontMatrix))
     ));
     const bounds = measureCommands(commands);
-    const advanceWidth = transformWidth(raw.advanceWidth, this.fontMatrix);
+    const advanceWidth = transformWidth(raw.advanceWidth, fontMatrix);
     const outline: NativeGlyphOutline = Object.freeze({
       glyphId,
       commands,
@@ -308,19 +317,23 @@ export class NativeCffFont {
     }
     glyphAncestry.add(glyphId);
     try {
+      const dictionary = this.fontDictionaries[this.fdSelect[glyphId]];
       const interpreter = new Type2Interpreter({
         glyphId,
         charString: this.charStrings[glyphId],
-        localSubrs: this.localSubrs,
+        localSubrs: dictionary.localSubrs,
         globalSubrs: this.globalSubrs,
-        defaultWidthX: this.defaultWidthX,
-        nominalWidthX: this.nominalWidthX,
+        defaultWidthX: dictionary.defaultWidthX,
+        nominalWidthX: dictionary.nominalWidthX,
         limits: this.limits,
         budget
       });
       const interpreted = interpreter.run();
       let commands = [...interpreted.commands];
       if (interpreted.seac) {
+        if (this.glyphIdsByCid !== null) {
+          throw cffUnsupported("CID CFF glyphs cannot use endchar composites.", "type2-cid-seac");
+        }
         const baseName = standardEncodingGlyphName(interpreted.seac.baseCode);
         const accentName = standardEncodingGlyphName(interpreted.seac.accentCode);
         const baseGlyphId = baseName === null ? undefined : this.glyphIdsByName.get(baseName);
@@ -1197,6 +1210,111 @@ function parseCffDict(
   return dictionary;
 }
 
+function readCffPrivateDictionary(
+  reader: CffReader,
+  dictionary: CffDictionary,
+  fontMatrix: CffMatrix
+): CffFontDictionary {
+  const operands = dictionary.get(dictOperator(18));
+  if (!operands || operands.length !== 2) {
+    throw cffUnsupported("The CFF font has no valid Private DICT range.", "cff-private-range");
+  }
+  const size = requireNonnegativeInteger(operands[0], "CFF Private DICT size");
+  const offset = requireNonnegativeInteger(operands[1], "CFF Private DICT offset");
+  const privateDictionary = parseCffDict(
+    reader.slice(offset, size, "Private DICT"), "Private DICT", PRIVATE_DICT_OPERATORS
+  );
+  const subrs = privateDictionary.get(dictOperator(19));
+  let localSubrs: readonly Uint8Array[] = Object.freeze([]);
+  if (subrs) {
+    if (subrs.length !== 1) {
+      throw cffUnsupported("The CFF Private DICT /Subrs offset is invalid.", "cff-local-subrs-offset");
+    }
+    const relativeOffset = requireNonnegativeInteger(subrs[0], "CFF local Subrs offset");
+    const absoluteOffset = checkedAdd(offset, relativeOffset, "CFF local Subrs offset");
+    localSubrs = reader.readIndex(absoluteOffset, "Local Subrs INDEX").objects;
+  }
+  return Object.freeze({
+    localSubrs,
+    defaultWidthX: readOptionalSingleton(privateDictionary, dictOperator(20), 0, "defaultWidthX"),
+    nominalWidthX: readOptionalSingleton(privateDictionary, dictOperator(21), 0, "nominalWidthX"),
+    fontMatrix
+  });
+}
+
+function readCffFontMatrix(dictionary: CffDictionary): CffMatrix {
+  return validateCffFontMatrix(dictionary.get(dictOperator(12, 7)) ?? [0.001, 0, 0, 0.001, 0, 0]);
+}
+
+function validateCffFontMatrix(values: readonly number[]): CffMatrix {
+  if (values.length !== 6 || values.some(value => !Number.isFinite(value))) {
+    throw cffUnsupported("The CFF FontMatrix is invalid.", "cff-font-matrix");
+  }
+  const determinant = values[0] * values[3] - values[1] * values[2];
+  if (!Number.isFinite(determinant) || determinant === 0) {
+    throw cffUnsupported("The CFF FontMatrix is singular.", "cff-font-matrix");
+  }
+  return Object.freeze(values.slice()) as unknown as CffMatrix;
+}
+
+function multiplyCffMatrices(parent: CffMatrix, child: CffMatrix): CffMatrix {
+  return validateCffFontMatrix([
+    parent[0] * child[0] + parent[2] * child[1],
+    parent[1] * child[0] + parent[3] * child[1],
+    parent[0] * child[2] + parent[2] * child[3],
+    parent[1] * child[2] + parent[3] * child[3],
+    parent[0] * child[4] + parent[2] * child[5] + parent[4],
+    parent[1] * child[4] + parent[3] * child[5] + parent[5]
+  ]);
+}
+
+// Adobe Technical Note #5176, sections 18–19. Select the Private DICT by
+// GID, independently of the charset's CID mapping and the PDF's text CMap.
+function readCffFdSelect(
+  reader: CffReader,
+  offset: number,
+  glyphCount: number,
+  dictionaryCount: number
+): Uint8Array {
+  const format = reader.u8(offset++, "FDSelect format");
+  const selected = new Uint8Array(glyphCount);
+  const validateIndex = (index: number): number => {
+    if (index >= dictionaryCount) {
+      throw cffUnsupported("CFF FDSelect references a missing Font DICT.", "cff-fd-index");
+    }
+    return index;
+  };
+  if (format === 0) {
+    for (let glyph = 0; glyph < glyphCount; glyph += 1) {
+      selected[glyph] = validateIndex(reader.u8(offset++, "FDSelect entry"));
+    }
+  } else if (format === 3) {
+    const count = reader.u16(offset, "FDSelect range count");
+    offset += 2;
+    if (count === 0 || count > glyphCount) {
+      throw cffUnsupported("CFF FDSelect has an invalid range count.", "cff-fd-ranges");
+    }
+    let first = reader.u16(offset, "FDSelect first glyph");
+    offset += 2;
+    if (first !== 0) {
+      throw cffUnsupported("CFF FDSelect must start at glyph zero.", "cff-fd-ranges");
+    }
+    for (let range = 0; range < count; range += 1) {
+      const index = validateIndex(reader.u8(offset++, "FDSelect Font DICT"));
+      const next = reader.u16(offset, "FDSelect next glyph or sentinel");
+      offset += 2;
+      if (next <= first || next > glyphCount || (range === count - 1 && next !== glyphCount)) {
+        throw cffUnsupported("CFF FDSelect ranges or sentinel are invalid.", "cff-fd-ranges");
+      }
+      selected.fill(index, first, next);
+      first = next;
+    }
+  } else {
+    throw cffUnsupported(`CFF FDSelect format ${format} is not supported.`, "cff-fd-format");
+  }
+  return selected;
+}
+
 function readCffCharset(
   reader: CffReader,
   charsetOffset: number,
@@ -1217,36 +1335,41 @@ function readCffCharset(
       "cff-expert-charset-not-supported"
     );
   }
+  return Object.freeze(readCffCharsetValues(reader, charsetOffset, glyphCount)
+    .map(sid => resolveCffSid(sid, customStrings)));
+}
+
+function readCffCharsetValues(
+  reader: CffReader,
+  charsetOffset: number,
+  glyphCount: number
+): readonly number[] {
   const format = reader.u8(charsetOffset, "CFF charset");
   let offset = charsetOffset + 1;
-  const names = [".notdef"];
+  const values = [0];
   if (format === 0) {
-    while (names.length < glyphCount) {
-      const sid = reader.u16(offset, "CFF format 0 charset");
+    while (values.length < glyphCount) {
+      values.push(reader.u16(offset, "CFF format 0 charset"));
       offset += 2;
-      names.push(resolveCffSid(sid, customStrings));
     }
   } else if (format === 1 || format === 2) {
-    while (names.length < glyphCount) {
-      const firstSid = reader.u16(offset, `CFF format ${format} charset`);
+    while (values.length < glyphCount) {
+      const first = reader.u16(offset, `CFF format ${format} charset`);
       offset += 2;
       const left = format === 1
         ? reader.u8(offset++, "CFF format 1 charset")
         : reader.u16(offset, "CFF format 2 charset");
       if (format === 2) offset += 2;
-      if (left + 1 > glyphCount - names.length) {
-        throw cffUnsupported("A CFF charset range exceeds the CharStrings INDEX.",
+      if (left + 1 > glyphCount - values.length || first + left > 65535) {
+        throw cffUnsupported("A CFF charset range exceeds its glyph or character bounds.",
           "cff-charset-length");
       }
-      for (let delta = 0; delta <= left; delta += 1) {
-        names.push(resolveCffSid(firstSid + delta, customStrings));
-      }
+      for (let delta = 0; delta <= left; delta += 1) values.push(first + delta);
     }
   } else {
-    throw cffUnsupported(`CFF charset format ${format} is not supported.`,
-      "cff-charset-format");
+    throw cffUnsupported(`CFF charset format ${format} is not supported.`, "cff-charset-format");
   }
-  return Object.freeze(names);
+  return Object.freeze(values);
 }
 
 function readCffEncoding(

@@ -122,6 +122,7 @@ try {
 
   await testSynthesizedCheckbox(openPdf, validateHeprPageData);
   await testSynthesizedLinks(openPdf, validateHeprPageData);
+  await testSynthesizedSquares(openPdf, validateHeprPageData);
   await testFailClosed(openPdf);
   console.log("PDF session Form/annotation display-program tests passed");
 } finally {
@@ -273,6 +274,93 @@ async function testSynthesizedLinks(openPdf, validateHeprPageData) {
   } finally {
     await session.close();
   }
+}
+
+async function testSynthesizedSquares(openPdf, validateHeprPageData) {
+  const nonpainting = [
+    "<< /Subtype /Square /Rect [938 2102 925 2158] /Border [0 0 0] /F 64 >>",
+    "<< /Subtype /Square /Rect [0 0 40 20] /BS << /W 2 /S /U >> /CA 0 /BE << /S /C /I 2 >> >>"
+  ];
+  const bytes = squareSessionFixture([
+    ...nonpainting,
+    "<< /Subtype /Square /Rect [50 0 90 20] /Border [0 0 0] /IC [1 0 0] /RD [2 3 4 5] >>",
+    // Existing /AP takes precedence over otherwise unsupported synthesis settings.
+    "<< /Subtype /Square /Rect [100 0 140 20] /AP << /N 90 0 R >> /BS << /W 2 /S /U >> /BE << /S /C /I 2 >> >>"
+  ]);
+  const session = await openPdf({ kind: "bytes", bytes });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+    assert.deepEqual(root.commands.map(({ kind }) => kind), ["invoke-program", "invoke-program"]);
+    const insetProgram = page.displayProgram.programs[root.commands[0].programIndex];
+    assert.equal(insetProgram.resourceName, "Square#2");
+    assert.deepEqual(insetProgram.bounds, [0, 0, 40, 20]);
+    assert.deepEqual(readTransform(page, root.commands[0].transformIndex), [1, 0, 0, 1, 50, 0]);
+    const fill = insetProgram.commands.find((command) => command.kind === "draw" && command.source === "fill-paths");
+    assert.ok(fill);
+    const offset = fill.first * 4;
+    assert.deepEqual([
+      page.stores.paths.fillPathMetaA[offset + 2],
+      page.stores.paths.fillPathMetaA[offset + 3],
+      page.stores.paths.fillPathMetaB[offset],
+      page.stores.paths.fillPathMetaB[offset + 1]
+    ], [2, 5, 36, 17], "/RD changes the painted path without changing the appearance placement scale");
+    assert.equal(page.displayProgram.programs[root.commands[1].programIndex].resourceName, "Square#3");
+    assert.equal(session.getDiagnostics().filter(({ code }) => code === "annotation.appearance-synthesized").length, 1);
+  } finally {
+    await session.close();
+  }
+
+  const emptySession = await openPdf({ kind: "bytes", bytes: squareSessionFixture(nonpainting) });
+  try {
+    const page = await emptySession.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    assert.equal(page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length, 0);
+    const scene = await emptySession.compileVectorPage(0, { optimization: "none" });
+    assert.equal(scene.fillPathCount, 0);
+    assert.equal(scene.segmentCount, 0);
+  } finally {
+    await emptySession.close();
+  }
+
+  for (const [entries, reason] of [
+    ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
+    ["/BS << /W 2 /S /U >>", "appearance-border-style-unsupported"]
+  ]) {
+    const failingSession = await openPdf({
+      kind: "bytes",
+      bytes: squareSessionFixture([`<< /Subtype /Square /Rect [0 0 40 20] ${entries} >>`])
+    });
+    try {
+      for (const method of ["compilePage", "compileVectorPage"]) {
+        await assert.rejects(
+          failingSession[method](0, { optimization: "none" }),
+          (error) => error?.code === "unsupported-content" && error?.details?.reason === reason,
+          `${method} must reject unsupported Square border semantics`
+        );
+      }
+    } finally {
+      await failingSession.close();
+    }
+  }
+}
+
+function squareSessionFixture(annotations) {
+  return writeTinyPdf({
+    objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      {
+        number: 3,
+        body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2400 2400] /Resources << >> /Contents 4 0 R " +
+          `/Annots [${annotations.map((_, index) => `${5 + index} 0 R`).join(" ")}] >>`
+      },
+      { number: 4, body: tinyPdfStream("", "") },
+      ...annotations.map((body, index) => ({ number: 5 + index, body })),
+      { number: 90, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 40 20] /Resources << >>", "0 0 40 20 re f") }
+    ]
+  });
 }
 
 async function testSynthesizedCheckbox(openPdf, validateHeprPageData) {

@@ -161,6 +161,8 @@ try {
     diagnostic.code === "annotation.appearance-synthesized"
   ));
   await testLinkAppearanceSynthesis();
+  await testSquareAppearanceSynthesis();
+  await testSquareAppearanceGeometryAndGuards();
 } finally {
   await document.close();
   hooks.deregister();
@@ -386,6 +388,169 @@ function fixture() {
       { number: 65, body: "<< /FT /Ch /T (List) /Ff 2097152 /Opt [(One) (Two) (Three) (Four)] /V [(Two) (Four)] /I [1 3] /TI 1 /DA (/Helv 9 Tf 0 g) /Kids [24 0 R] >>" },
       { number: 66, body: "<< /FT /Tx /T (Comb) /Ff 16777216 /MaxLen 4 /V (123) /Q 2 /Kids [25 0 R] >>" },
       { number: 99, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 1 1]", "") }
+    ]
+  });
+}
+
+async function testSquareAppearanceSynthesis() {
+  const squareDocument = await openNativePdfDocument({
+    kind: "bytes",
+    bytes: squareFixture()
+  });
+  try {
+    const registry = new NativePdfFormAppearanceRegistry(squareDocument);
+    const synthesizer = new NativePdfAppearanceSynthesizer(squareDocument);
+    const annotations = await registry.listPageAnnotations(0);
+    assert.equal(annotations.length, 6);
+    const resolve = (annotation) =>
+      resolveNativePdfAnnotationAppearanceWithSynthesis(registry, synthesizer, annotation);
+
+    // A zero-width border with no interior colour paints nothing at all. Such
+    // an annotation must not fail the page: real drawings carry these as pure
+    // metadata markers.
+    assert.equal(await resolve(annotations[0]), null);
+
+    // /C is absent, so the border takes the interoperable black default, and
+    // the stroked rectangle is inset by half the border width.
+    const defaulted = await resolve(annotations[1]);
+    assert(defaulted?.synthesized);
+    const defaultedContent = decoder.decode(defaulted.decodedContent);
+    assert.match(defaultedContent, /0 G/);
+    assert.match(defaultedContent, /2 w/);
+    assert.match(defaultedContent, /1 1 38 18 re S/);
+
+    // An interior colour paints even when the border width is zero.
+    const filledOnly = await resolve(annotations[2]);
+    assert(filledOnly?.synthesized);
+    const filledOnlyContent = decoder.decode(filledOnly.decodedContent);
+    assert.match(filledOnlyContent, /1 0 0 rg/);
+    assert.match(filledOnlyContent, /0 0 40 20 re f/);
+    assert.doesNotMatch(filledOnlyContent, / S/);
+
+    // Border and interior together fill and stroke the same inset rectangle.
+    const both = await resolve(annotations[3]);
+    assert(both?.synthesized);
+    const bothContent = decoder.decode(both.decodedContent);
+    assert.match(bothContent, /1 1 0 rg/);
+    assert.match(bothContent, /0 0 1 RG/);
+    assert.match(bothContent, /1 1 38 18 re B/);
+
+    // An empty /C is transparent, so the interior is painted on its own. The
+    // declared border width still positions the path: colour decides what is
+    // painted, width decides where the path runs, so the fill stays inset.
+    const transparentBorder = await resolve(annotations[4]);
+    assert(transparentBorder?.synthesized);
+    const transparentContent = decoder.decode(transparentBorder.decodedContent);
+    assert.match(transparentContent, /0 1 0 rg/);
+    assert.match(transparentContent, /1 1 38 18 re f/);
+    assert.doesNotMatch(transparentContent, / re B/);
+
+    // A fully transparent annotation contributes no display command.
+    assert.equal(await resolve(annotations[5]), null);
+  } finally {
+    await squareDocument.close();
+  }
+}
+
+async function testSquareAppearanceGeometryAndGuards() {
+  const paintingCases = [
+    ["/Border [0 0 0] /IC [1 0 0] /RD [5 5 5 5]", /5 5 30 10 re f/],
+    // /RD is left, top, right, bottom. The form still covers all of /Rect so
+    // annotation placement must not stretch the inset path back to full size.
+    ["/BS << /W 2 /S /D /D [2 1] >> /C [0] /IC [1 0 0] /RD [2 3 4 5]", /\[2 1\] 0 d\n3 6 32 10 re B/],
+    ["/Border [0 0 2] /RD [0 0 0 0] /BE << >>", /1 1 38 18 re S/],
+    ["/Border [0 0 2] /RD 20 0 R /BE 22 0 R", /3 6 32 10 re S/],
+    ["/BS << /W 0 /S /U >> /IC [1 0 0]", /0 0 40 20 re f/],
+    ["/BS << /W 2 /S /U >> /C [] /IC [0 1 0]", /1 1 38 18 re f/]
+  ];
+  const nonpaintingCases = [
+    "/Border [0 0 0] /BE << /S /C /I 2 >>",
+    "/BS << /W 2 /S /U >> /C [] /BE << /S /C /I 2 >>",
+    "/BS << /W 2 /S /U >> /C [0] /IC [1 0 0] /CA 0 /BE << /S /C /I 2 >>"
+  ];
+  const invalidCases = [
+    "/RD (bad)",
+    "/RD [1 2 3]",
+    "/RD [-1 0 0 0]",
+    "/RD [0 /Bad 0 0]",
+    "/RD [20 0 20 0]",
+    "/RD [0 10 0 10]",
+    "/RD [21 0 20 0]",
+    "/Border [0 0 2] /RD [19.5 0 19.5 0]",
+    "/BE []",
+    "/BE << /S 1 >>"
+  ];
+  const unsupportedCases = [
+    ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
+    ["/BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"],
+    ["/BS << /W 2 /S /U >> /IC [1 0 0]", "appearance-border-style-unsupported"]
+  ];
+  const entries = [
+    ...paintingCases.map(([entry]) => entry),
+    ...nonpaintingCases,
+    ...invalidCases,
+    ...unsupportedCases.map(([entry]) => entry)
+  ];
+  const squareDocument = await openNativePdfDocument({
+    kind: "bytes",
+    bytes: squareFixture(
+      entries.map((entry) => `<< /Type /Annot /Subtype /Square /Rect [0 0 40 20] ${entry} >>`),
+      [
+        { number: 20, body: "[21 0 R 3 4 5]" },
+        { number: 21, body: "2" },
+        { number: 22, body: "<< /S 23 0 R >>" },
+        { number: 23, body: "/S" }
+      ]
+    )
+  });
+  try {
+    const registry = new NativePdfFormAppearanceRegistry(squareDocument);
+    const synthesizer = new NativePdfAppearanceSynthesizer(squareDocument);
+    const annotations = await registry.listPageAnnotations(0);
+    let index = 0;
+    const resolveNext = () => resolveNativePdfAnnotationAppearanceWithSynthesis(
+      registry, synthesizer, annotations[index++]
+    );
+    for (const [entry, content] of paintingCases) {
+      const appearance = await resolveNext();
+      assert(appearance?.synthesized, entry);
+      assert.deepEqual(appearance.normalAppearance.form.bbox, [0, 0, 40, 20]);
+      assert.match(decoder.decode(appearance.decodedContent), content, entry);
+    }
+    for (const entry of nonpaintingCases) assert.equal(await resolveNext(), null, entry);
+    for (const entry of invalidCases) {
+      await assert.rejects(resolveNext(), hasPdfError("invalid-object"), entry);
+    }
+    for (const [entry, reason] of unsupportedCases) {
+      await assert.rejects(resolveNext(), hasPdfError("unsupported-content", reason), entry);
+    }
+    assert.equal(index, annotations.length);
+  } finally {
+    await squareDocument.close();
+  }
+}
+
+function squareFixture(annotations = [
+  "<< /Type /Annot /Subtype /Square /Rect [0 0 40 20] /Border [0 0 0] >>",
+  "<< /Type /Annot /Subtype /Square /Rect [45 0 85 20] /Border [0 0 2] >>",
+  "<< /Type /Annot /Subtype /Square /Rect [90 0 130 20] /Border [0 0 0] /IC [1 0 0] >>",
+  "<< /Type /Annot /Subtype /Square /Rect [135 0 175 20] /Border [0 0 2] /C [0 0 1] /IC [1 1 0] >>",
+  "<< /Type /Annot /Subtype /Square /Rect [180 0 220 20] /Border [0 0 2] /C [] /IC [0 1 0] >>",
+  "<< /Type /Annot /Subtype /Square /Rect [0 30 40 50] /Border [0 0 2] /C [0 0 1] /CA 0 >>"
+], extraObjects = []) {
+  return writeTinyPdf({
+    objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      {
+        number: 3,
+        body: [
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Resources << >>",
+          `/Annots [${annotations.map((_, index) => `${100 + index} 0 R`).join(" ")}] >>`
+        ].join(" ")
+      },
+      ...annotations.map((body, index) => ({ number: 100 + index, body })),
+      ...extraObjects
     ]
   });
 }

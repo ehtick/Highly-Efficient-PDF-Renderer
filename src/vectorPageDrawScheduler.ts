@@ -3,6 +3,8 @@ import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 const kinds = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
 const PAINT_LOOKAHEAD = 32;
+// Large visibility changes should regroup draws instead of retaining a sparse schedule.
+const MIN_CACHED_PAINT_FRACTION = 0.875;
 
 /** Interleave independent paint streams; overlapping streams retain source order. */
 export class VectorPageDrawScheduler {
@@ -19,6 +21,11 @@ export class VectorPageDrawScheduler {
   private readonly ordered: number[] = [];
   private readonly compacted: number[] = [];
   private readonly skipped = new Int32Array(PAINT_LOOKAHEAD);
+  private readonly previousPaints: Uint32Array;
+  private readonly selectedPaints: Uint8Array;
+  private readonly filtered: number[] = [];
+  private previousPaintCount = -1;
+  private scheduleDirty = true;
   private padding = NaN;
   private enabled = false;
 
@@ -42,6 +49,8 @@ export class VectorPageDrawScheduler {
     this.heads = new Int32Array(pages);
     this.tails = new Int32Array(pages);
     this.next = new Int32Array(runs.length);
+    this.previousPaints = new Uint32Array(runs.length);
+    this.selectedPaints = new Uint8Array(runs.length);
     const box = [0, 0, 0, 0];
     runs.forEach((run, index) => {
       this.kindForRun[index] = kinds.indexOf(run.kind);
@@ -74,6 +83,7 @@ export class VectorPageDrawScheduler {
     if (this.enabled && padding === this.padding) return false;
     this.enabled = true;
     this.padding = padding;
+    this.scheduleDirty = true;
     const pages = this.components.length;
     for (let page = 0; page < pages; page++) this.pageBounds.set([Infinity, Infinity, -Infinity, -Infinity], page * 4);
     const box = [0, 0, 0, 0];
@@ -119,6 +129,29 @@ export class VectorPageDrawScheduler {
 
   schedule(runs: readonly number[]): readonly number[] {
     if (!this.enabled) return runs;
+    // Dependency bounds include every LOD level, so changing primitive IDs
+    // within the same paints does not invalidate this order.
+    if (!this.scheduleDirty && runs.length <= this.previousPaintCount &&
+        runs.length >= this.previousPaintCount * MIN_CACHED_PAINT_FRACTION) {
+      let cursor = 0;
+      for (let index = 0; index < this.previousPaintCount && cursor < runs.length; index++) {
+        if (runs[cursor] === this.previousPaints[index]) cursor++;
+      }
+      // Removing paints from a valid schedule preserves every overlap dependency
+      // and cannot increase its draw count. Keep the original template so paints
+      // that reenter the view can reuse it too; new paints still require scheduling.
+      if (cursor === runs.length) {
+        if (runs.length === this.previousPaintCount) return this.compacted;
+        this.selectedPaints.fill(0);
+        for (const run of runs) this.selectedPaints[run] = 1;
+        this.filtered.length = 0;
+        for (const run of this.compacted) if (this.selectedPaints[run]) this.filtered.push(run);
+        return this.filtered;
+      }
+    }
+    this.previousPaints.set(runs);
+    this.previousPaintCount = runs.length;
+    this.scheduleDirty = false;
     if (this.independentGroups <= 1) return this.compact(runs);
     this.heads.fill(-1); this.tails.fill(-1); this.ordered.length = 0;
     for (const run of runs) {

@@ -105,6 +105,8 @@ try {
   boundaryPlan.invalidate();
   boundaryPlan.update(boundaryScene.drawRuns);
   assert.equal(boundaryPlan.instanceCount, 0, "empty selection leaves no stale rank bits");
+  boundaryPlan.invalidate();
+  assert.equal(boundaryPlan.update(boundaryScene.drawRuns), false, "selection caches compare active length, not buffer capacity");
 
   // A red/blue/red stroke run cannot merge its two red paints through blue.
   const colors = makeScene(60);

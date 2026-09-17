@@ -132,6 +132,92 @@ try {
   const strokeIds = paints(boundedLodPlan).filter(p => p.startsWith("stroke:")).map(p => Number(p.split(":")[1]));
   assert.deepEqual(strokeIds.slice().sort((a, b) => a - b), [4, 5, 6, 7]);
 
+  // Camera transitions can change LOD IDs while keeping the same paints.
+  // Cached scheduling must still use fresh instances, and notice changes to
+  // the contents of the culler's reused array or to screen-space coverage.
+  const transitionScene = makePages([0, 100, 200]);
+  const transitionRuntime = { levels: [0, 1].map(index => ({ scene: transitionScene, tolerance: index,
+    segmentCount: 6, visibleSegmentIds: Uint32Array.from([0, 1, 2, 3, 4, 5]), visibleSegmentCount: index ? 0 : 6 })) };
+  const transition = new VectorOrderedBatches(transitionScene, transitionRuntime);
+  let schedules = 0;
+  const compact = transition.scheduler.compact.bind(transition.scheduler);
+  transition.scheduler.compact = runs => { schedules++; return compact(runs); };
+  const compareFresh = (runs, scale) => {
+    const fresh = new VectorOrderedBatches(transitionScene, transitionRuntime);
+    fresh.update(runs, scale);
+    assert.deepEqual(transition.batches, fresh.batches);
+    assert.equal(transition.instanceCount, fresh.instanceCount);
+    assert.deepEqual(transition.uintInstances.slice(0, transition.instanceCount * 2),
+      fresh.uintInstances.slice(0, fresh.instanceCount * 2), "cached scheduling keeps the current primitive IDs and clips");
+    assert.deepEqual([...transition.floatInstances.slice(0, transition.instanceCount * 2)],
+      [...transition.uintInstances.slice(0, transition.instanceCount * 2)], "both native backends receive the same instances");
+  };
+  transition.update(transitionScene.drawRuns, 0.1);
+  assert.equal(schedules, 1);
+  const [fine, coarseLevel] = transitionRuntime.levels;
+  fine.visibleSegmentCount = 0; coarseLevel.visibleSegmentCount = 6;
+  transition.invalidate();
+  assert(transition.update(transitionScene.drawRuns, 0.1));
+  assert.equal(schedules, 1, "a different LOD reuses the paint schedule");
+  compareFresh(transitionScene.drawRuns, 0.1);
+  fine.visibleSegmentIds.set([0, 2, 4]); coarseLevel.visibleSegmentIds.set([1, 3, 5]);
+  fine.visibleSegmentCount = coarseLevel.visibleSegmentCount = 3;
+  transition.invalidate();
+  assert(transition.update(transitionScene.drawRuns, 0.1));
+  assert.equal(schedules, 1, "mixed tile LODs can share the same schedule");
+  compareFresh(transitionScene.drawRuns, 0.1);
+  const movingRuns = transitionScene.drawRuns.slice(0, 5);
+  transition.update(movingRuns, 0.1);
+  assert.equal(schedules, 2);
+  compareFresh(movingRuns, 0.1);
+  movingRuns.splice(0, 5, ...transitionScene.drawRuns.slice(5, 10));
+  assert(transition.update(movingRuns, 0.1));
+  assert.equal(schedules, 3, "same-length visibility changes refresh the schedule");
+  compareFresh(movingRuns, 0.1);
+  transition.update(movingRuns, 20);
+  assert.equal(schedules, 4, "AA bucket changes refresh dependencies for the same paints");
+  compareFresh(movingRuns, 20);
+  for (const scale of [null, 0.1]) {
+    transition.update(movingRuns, scale);
+    compareFresh(movingRuns, scale);
+  }
+  assert.equal(schedules, 5, "restoring a planar projection refreshes scheduling");
+
+  // Small visibility changes filter a previously valid schedule. The template
+  // must survive removals so reentering paints regain their original position.
+  const nearbyScene = makePages([0, 5, 100, 200]);
+  const nearby = new VectorOrderedBatches(nearbyScene, null);
+  let nearbySchedules = 0;
+  const compactNearby = nearby.scheduler.compact.bind(nearby.scheduler);
+  nearby.scheduler.compact = runs => { nearbySchedules++; return compactNearby(runs); };
+  nearby.update(nearbyScene.drawRuns, 0.1);
+  const template = paints(nearby), templateDraws = nearby.batches.length;
+  const movingPaints = [];
+  for (const hidden of [[3], [1, 7], [], [4], []]) {
+    movingPaints.length = 0;
+    const visibleKeys = new Set();
+    nearbyScene.drawRuns.forEach((run, index) => {
+      if (hidden.includes(index)) return;
+      movingPaints.push(run); visibleKeys.add(`${run.kind}:${run.first}:0`);
+    });
+    nearby.update(movingPaints, 0.1);
+    assert.equal(nearbySchedules, 1, "nearby visibility changes reuse scheduling, including reentry");
+    assert.deepEqual(paints(nearby), template.filter(paint => visibleKeys.has(paint)), "only the current visible paints are emitted");
+    assert(nearby.batches.length <= templateDraws, "filtering never adds draws to the cached schedule");
+  }
+  nearby.update(nearbyScene.drawRuns.slice(0, 10), 0.1);
+  assert.equal(nearbySchedules, 2, "large removals regroup draws for the smaller view");
+  nearby.update(nearbyScene.drawRuns.slice(1, 11), 0.1);
+  assert.equal(nearbySchedules, 3, "paints outside the template require a new schedule");
+  nearby.update(nearbyScene.drawRuns.slice(1, 11), 20);
+  assert.equal(nearbySchedules, 4, "larger antialiasing bounds invalidate the subset cache");
+  for (const scale of [null, 0.1]) {
+    nearby.update(nearbyScene.drawRuns, scale);
+    const fresh = new VectorOrderedBatches(nearbyScene, null);
+    fresh.update(nearbyScene.drawRuns, scale);
+    assert.deepEqual(paints(nearby), paints(fresh), "projection changes restore the correct paint order");
+  }
+
   // Exercise both production dispatchers, including disabling scheduling for
   // GL's arbitrary local-to-clip projection. These checks need no GPU/server.
   for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
@@ -217,6 +303,11 @@ try {
     const original = paints(plan);
     plan.update(scene.drawRuns, 0.1);
     assertOverlapOrder(plan, original, scene);
+    // Also exhaustively validate overlap dependencies after a cached removal.
+    const hidden = Math.floor(scene.drawRuns.length / 2);
+    const selected = scene.drawRuns.filter((_, index) => index !== hidden);
+    plan.update(selected, 0.1);
+    assertOverlapOrder(plan, original.filter((_, index) => index !== hidden), { ...scene, drawRuns: selected });
   }
   function assertOverlapOrder(plan, original, scene, culler = new VectorDrawRunCuller(scene)) {
     const actual = paints(plan);

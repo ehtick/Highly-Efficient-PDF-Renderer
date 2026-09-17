@@ -24,11 +24,11 @@ export class VectorOrderedBatches {
   private readonly previousSelectedIds: Uint32Array;
   private previousSelectedCount = 0;
   private readonly sourceRuns: readonly VectorDrawRun[];
-  private readonly sourceInstances: Uint32Array;
   private readonly runRanges: Uint32Array;
   private readonly visiblePaints: number[] = [];
   private readonly scheduler: VectorPageDrawScheduler | null;
   private previousSelectedRanks = new Uint32Array(0);
+  private previousRankCount = 0;
   private previousRuns: VectorDrawRun[] = [];
   private previousRunsAreSource = false;
   private initialized = false;
@@ -80,7 +80,6 @@ export class VectorOrderedBatches {
     const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
     this.floatInstances = new Float32Array(capacity);
     this.uintInstances = new Uint32Array(capacity);
-    this.sourceInstances = this.scheduler ? new Uint32Array(capacity) : this.uintInstances;
   }
 
   invalidate(): void { this.dirty = true; }
@@ -141,7 +140,7 @@ export class VectorOrderedBatches {
       this.orderedSelectedCount = count;
     }
     selectedCount = this.orderedSelectedCount;
-    let sameSelection = sameRuns && selectedCount === this.previousSelectedRanks.length;
+    let sameSelection = sameRuns && selectedCount === this.previousRankCount;
     if (sameSelection) {
       for (let index = 0; index < selectedCount; index++) {
         if (this.previousSelectedRanks[index] !== this.selectedRanks[index]) { sameSelection = false; break; }
@@ -149,35 +148,37 @@ export class VectorOrderedBatches {
     }
     if (sameSelection && !orderChanged) return false;
     this.initialized = true;
-    this.previousRuns = runs.slice();
+    if (!sameRuns) {
+      this.previousRuns.length = runs.length;
+      for (let index = 0; index < runs.length; index++) this.previousRuns[index] = runs[index];
+    }
     this.previousRunsAreSource = runs === this.sourceRuns;
-    this.previousSelectedRanks = this.selectedRanks.slice(0, selectedCount);
+    if (this.previousSelectedRanks.length < selectedCount) {
+      this.previousSelectedRanks = new Uint32Array(Math.min(this.selectedRanks.length,
+        Math.max(selectedCount, this.previousSelectedRanks.length * 2)));
+    }
+    this.previousSelectedRanks.set(this.selectedRanks.subarray(0, selectedCount));
+    this.previousRankCount = selectedCount;
     this.batches.length = 0;
     this.instanceCount = 0;
     this.visiblePaints.length = 0;
     let cursor = 0;
     for (const run of runs) {
       const runIndex = this.runIndices.get(run)!;
-      const first = this.instanceCount;
+      let first = run.first, count = run.count;
       if (run.kind === "stroke" && this.runtime) {
         while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] < runIndex) cursor++;
-        while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] === runIndex) {
-          const id = this.rankToId[this.selectedRanks[cursor++]];
-          this.appendInstance(run, id);
-        }
-      } else if (run.kind === "stroke" || run.kind === "fill" || run.kind === "text") {
-        for (let id = run.first; id < run.first + run.count; id++) this.appendInstance(run, id);
+        first = cursor;
+        while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] === runIndex) cursor++;
+        count = cursor - first;
       }
-      const instanced = run.kind === "stroke" || run.kind === "fill" || run.kind === "text";
-      const count = instanced ? this.instanceCount - first : run.count;
       if (count === 0) continue;
-      this.runRanges[runIndex * 2] = instanced ? first : run.first;
+      this.runRanges[runIndex * 2] = first;
       this.runRanges[runIndex * 2 + 1] = count;
       this.visiblePaints.push(runIndex);
     }
-    // First collect selected LOD geometry in source order, then interleave
-    // independent page streams and concatenate compatible instance spans.
-    let first = 0;
+    // Schedule paint ranges first, then write selected instances directly in
+    // final order. No intermediate instance copy or per-run array views.
     for (const runIndex of this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints) {
       const run = this.sourceRuns[runIndex];
       const start = this.runRanges[runIndex * 2], count = this.runRanges[runIndex * 2 + 1];
@@ -185,13 +186,17 @@ export class VectorOrderedBatches {
         this.batches.push({ ...run });
         continue;
       }
-      if (this.sourceInstances !== this.uintInstances) {
-        this.uintInstances.set(this.sourceInstances.subarray(start * 2, (start + count) * 2), first * 2);
+      const first = this.instanceCount;
+      if (run.kind === "stroke" && this.runtime) {
+        for (let index = start; index < start + count; index++) {
+          this.appendInstance(run, this.rankToId[this.selectedRanks[index]]);
+        }
+      } else {
+        for (let id = start; id < start + count; id++) this.appendInstance(run, id);
       }
       const previous = this.batches[this.batches.length - 1];
       if (previous?.kind === run.kind && previous.clipIndex === -2) previous.count += count;
       else this.batches.push({ kind: run.kind, first, count, clipIndex: -2 });
-      first += count;
     }
     this.floatInstances.set(this.uintInstances.subarray(0, this.instanceCount * 2));
     return true;
@@ -199,8 +204,8 @@ export class VectorOrderedBatches {
 
   private appendInstance(run: VectorDrawRun, id: number): void {
     const offset = this.instanceCount * 2;
-    this.sourceInstances[offset] = id;
-    this.sourceInstances[offset + 1] = (run.clipIndex ?? -1) + 1;
+    this.uintInstances[offset] = id;
+    this.uintInstances[offset + 1] = (run.clipIndex ?? -1) + 1;
     this.instanceCount++;
   }
 }

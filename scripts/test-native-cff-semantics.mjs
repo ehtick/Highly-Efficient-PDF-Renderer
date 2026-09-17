@@ -75,10 +75,27 @@ function testBaseFontBlendIsNotMultipleMaster() {
   }));
   assert.equal(blended.numGlyphs, baseline.numGlyphs);
   assert.deepEqual(blended.glyphNames, baseline.glyphNames);
-  assert.deepEqual(
-    blended.getGlyphOutline(1).commands,
-    baseline.getGlyphOutline(1).commands
-  );
+  assert.deepEqual(blended.builtInGlyphNames, baseline.builtInGlyphNames);
+  for (let glyphId = 0; glyphId < baseline.numGlyphs; glyphId += 1) {
+    assert.deepEqual(
+      blended.getGlyphOutline(glyphId),
+      baseline.getGlyphOutline(glyphId),
+      `BaseFontBlend must preserve glyph ${glyphId}'s commands, bounds, width, and side bearing`
+    );
+  }
+}
+
+function testSyntheticBaseRemainsUnsupported() {
+  const syntheticBase = concat(dictInteger(0), Uint8Array.of(12, 20));
+  const baseFontBlend = concat(dictInteger(408), dictInteger(-397), Uint8Array.of(12, 23));
+  for (const topDictExtra of [syntheticBase, concat(syntheticBase, baseFontBlend)]) {
+    assert.throws(() => NativeCffFont.parse(buildCffFixture({ topDictExtra })), (error) => {
+      assert(error instanceof PdfError);
+      assert.equal(error.code, "unsupported-font");
+      assert.equal(error.details?.reason, "cff-synthetic-not-supported");
+      return true;
+    });
+  }
 }
 
 function testFontMatrixNormalization() {
@@ -402,6 +419,7 @@ function expectPdf(callback, code, message) {
 testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
 testBaseFontBlendIsNotMultipleMaster();
+testSyntheticBaseRemainsUnsupported();
 await testPdfFontSelectionIsSeparateFromToUnicode();
 testMalformedProgramsAndLimits();
 testDeprecatedPdfDotsectionCompatibility();

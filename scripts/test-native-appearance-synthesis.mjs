@@ -97,7 +97,7 @@ try {
     await compileDensePdfContent(appearance.decodedContent, {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX: left, minY: bottom, maxX: right, maxY: top },
-      preservePaintOrder: true,
+      output: "display-program",
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       textOperatorSink: NOOP_TEXT_SINK
@@ -241,7 +241,7 @@ async function testLinkAppearanceSynthesis() {
       await compileDensePdfContent(appearance.decodedContent, {
         pageMatrix: [1, 0, 0, 1, 0, 0],
         pageBounds: { minX: left, minY: bottom, maxX: right, maxY: top },
-        preservePaintOrder: true,
+        output: "display-program",
         enableSegmentMerge: false,
         enableInvisibleCull: false,
         textOperatorSink: NOOP_TEXT_SINK

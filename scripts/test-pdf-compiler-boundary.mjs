@@ -102,7 +102,7 @@ async function assertCompilerRuntimeBoundary() {
 
   const nativeResult = await nativeCompiler.compileDensePdfContent(content, {
     ...options,
-    preservePaintOrder: true
+    output: "display-program"
   });
   assert.ok(nativeResult.paintRuns instanceof Uint32Array);
   assert.ok(Array.isArray(nativeResult.paintRunCompositeStates));
@@ -117,8 +117,8 @@ async function assertDirectVectorBoundary() {
   const body = readMethodBody(sessionSource, "compileVectorPageUnlocked");
   assert.match(
     body,
-    /preparePageCompilation\([\s\S]*?\btrue\b[\s\S]*?\)/,
-    "the native VectorScene path must request the legacy-renderer compiler sidecar"
+    /preparePageCompilation\([\s\S]*?"vector-scene"[\s\S]*?\)/,
+    "the native VectorScene path must request VectorScene compiler data"
   );
   assert.match(
     body,

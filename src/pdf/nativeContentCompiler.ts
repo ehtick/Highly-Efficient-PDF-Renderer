@@ -4,7 +4,7 @@
  * The caller is responsible for resolving and decoding page content streams.
  * The compiler grows by resource-aware handlers while retaining this streaming,
  * allocation-conscious core. Unsupported visible content throws a typed error;
- * callers must not omit it or replace the page with a parser-generated raster.
+ * callers can then apply bounded fallback without silently omitting content.
  */
 
 export type DensePdfMatrix = [number, number, number, number, number, number];
@@ -242,6 +242,12 @@ export interface DensePdfMarkedContentNode {
 }
 
 export interface DensePdfContentCompileOptions {
+  /**
+   * Geometry stores alone, a source-ordered HEPR display program, or data for
+   * the VectorScene adapter. VectorScene pages preserve drawing order and
+   * retain unsupported paint for the session's selective raster fallback.
+   */
+  output: "geometry" | "display-program" | "vector-scene";
   /** Maximum retained generic paths in this compilation. */
   maxPathResources?: number;
   /** Maximum source path verbs retained across generic paths and clips. */
@@ -290,43 +296,8 @@ export interface DensePdfContentCompileOptions {
   colorSpaceResolver?: DensePdfColorSpaceResolver;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
-  /**
-   * Retain source paint ordering as compact `[kind, start, count]` runs.
-   *
-   * When enabled, the final containment compaction pass is skipped because it
-   * changes primitive indexes after commands have been recorded. Streaming
-   * transparent/degenerate/duplicate rejection remains available and is
-   * reflected in each recorded range.
-   */
-  preservePaintOrder?: boolean;
-  /**
-   * Retain the text/image side data needed to adapt packed stores to VectorScene.
-   * `legacyOrderedPaint` also retains path ranges in source order.
-   *
-   * This is an internal migration bridge. It is mutually exclusive with
-   * `preservePaintOrder`; unsupported source-order or compositing semantics
-   * fail instead of being omitted from the bridge output.
-   * @internal
-   */
-  legacyVectorOutput?: boolean;
-  /** Retain packed path ranges alongside text, images and Forms in source order. */
-  legacyOrderedPaint?: boolean;
   /** Exact inherited page-space clip for vector Form specialization. */
   initialVectorClip?: DensePdfTextClip | null;
-  /** Retain composite root Form events for the selective-raster migration bridge. @internal */
-  legacyAllowCompositeForms?: boolean;
-  /** Retain aggregate checkpoints for path-only spans overlapped by a late image. @internal */
-  legacySelectiveImageSpans?: boolean;
-  /** Capture clipped root images requiring a resample or arbitrary clip. @internal */
-  legacySelectiveClippedImages?: boolean;
-  /** Capture root shadings through the ordered raster migration bridge. @internal */
-  legacySelectiveShadings?: boolean;
-  /** Capture root path paints that the packed legacy ABI cannot represent exactly. @internal */
-  legacySelectivePaths?: boolean;
-  /** Capture visible text under an arbitrary clip while retaining its text index. @internal */
-  legacySelectiveTextClips?: boolean;
-  /** Match the PDF.js oracle, which ignores OP/op/OPM in static rendering. @internal */
-  legacyIgnoreOverprint?: boolean;
   /** Retain transient root paint identities for an internal selective-render retry. @internal */
   capturePaintSourceIdentities?: boolean;
   /** Resource-aware text interpreter sharing this compiler's token stream. */
@@ -345,6 +316,43 @@ export interface DensePdfContentCompileOptions {
   signal?: AbortSignal;
   yieldIntervalMs?: number;
   onProgress?: (progress: DensePdfCompileProgress) => void;
+}
+
+/** Shared inputs for compilation contexts whose output is fixed. @internal */
+export type DensePdfContentInputOptions = Omit<DensePdfContentCompileOptions, "output">;
+
+/** Policies belong to the output adapter, never to individual callers. */
+interface ContentOutputPolicy {
+  /** Display commands use their own paint/state stores instead of VectorScene metadata. */
+  readonly displayProgram: boolean;
+  readonly vectorScene: boolean;
+  /** Preserve VectorScene draw ranges; grouped output is only for compatibility or retained text. */
+  readonly orderedPaint: boolean;
+  /** Only the page adapter can consume selective paint and composite Form captures. */
+  readonly selectiveRaster: boolean;
+  /** Vector pages/Forms match the static renderer's treatment of OP/op/OPM. */
+  readonly ignoreOverprint: boolean;
+}
+
+const GEOMETRY_OUTPUT_POLICY: ContentOutputPolicy = Object.freeze({
+  displayProgram: false,
+  vectorScene: false,
+  orderedPaint: false,
+  selectiveRaster: false,
+  ignoreOverprint: false
+});
+
+function vectorSceneOutputPolicy(
+  scope: "page" | "form" | "retained-text",
+  orderedPaint: boolean
+): ContentOutputPolicy {
+  return {
+    displayProgram: false,
+    vectorScene: true,
+    orderedPaint,
+    selectiveRaster: scope === "page",
+    ignoreOverprint: scope !== "retained-text"
+  };
 }
 
 export interface DensePdfCompiledPage {
@@ -366,8 +374,8 @@ export interface DensePdfCompiledPage {
   fillPathMetaC: Float32Array;
   fillSegmentsA: Float32Array;
   fillSegmentsB: Float32Array;
-  /** Compact side data for the internal grouped-VectorScene bridge. @internal */
-  legacyVector?: DensePdfLegacyVectorOutput;
+  /** Compact paint metadata consumed by the VectorScene adapter. @internal */
+  vectorSceneData?: DensePdfVectorSceneData;
   /** Source-ordered triples of kind, store start, and store count. */
   paintRuns: Uint32Array;
   /** One optional-content membership index per paint-run triple, or -1. */
@@ -435,49 +443,49 @@ export function getDensePdfPaintSourceIdentity(
   return [identities.offsets[paintRunIndex], identities.lengths[paintRunIndex]];
 }
 
-/** A legacy-vector image invocation used a non-default PDF clip. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED = 1 << 0;
+/** A VectorScene image invocation used a non-default PDF clip. @internal */
+export const DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED = 1 << 0;
 
 /**
  * An image followed visible text in source order, but no visible path paint.
- * The legacy adapter must prove that every preceding glyph is spatially
+ * The grouped adapter must prove that every preceding glyph is spatially
  * disjoint before it may move this image into the raster-underlay pass.
  * @internal
  */
-export const DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT = 1 << 1;
+export const DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT = 1 << 1;
 
 /** Preceding visible paths were conservatively proven disjoint at compile time. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH = 1 << 2;
+export const DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_PATH = 1 << 2;
 /** A preceding contiguous path-only span must be captured with this image. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN = 1 << 3;
+export const DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN = 1 << 3;
 
 /** A glyph run was emitted under a non-default clip. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED = 1 << 0;
+export const DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED = 1 << 0;
 /** Painted text routed to an image layer, not invisible/OCR text. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_COMPOSITED = 1 << 1;
+export const DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED = 1 << 1;
 
-/** Source-event kind used by `DensePdfLegacyVectorOutput.sourceEvents`. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH = 0;
+/** Source-event kind used by `DensePdfVectorSceneData.sourceEvents`. @internal */
+export const DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH = 0;
 
-/** Source-event kind used by `DensePdfLegacyVectorOutput.sourceEvents`. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE = 1;
+/** Source-event kind used by `DensePdfVectorSceneData.sourceEvents`. @internal */
+export const DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE = 1;
 
-/** Source-event kind used by `DensePdfLegacyVectorOutput.sourceEvents`. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_FORM = 2;
+/** Source-event kind used by `DensePdfVectorSceneData.sourceEvents`. @internal */
+export const DENSE_PDF_VECTOR_SCENE_EVENT_FORM = 2;
 
-/** Source-event kind used by `DensePdfLegacyVectorOutput.sourceEvents`. @internal */
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT = 3;
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_FILL = 4;
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE = 5;
+/** Source-event kind used by `DensePdfVectorSceneData.sourceEvents`. @internal */
+export const DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT = 3;
+export const DENSE_PDF_VECTOR_SCENE_EVENT_FILL = 4;
+export const DENSE_PDF_VECTOR_SCENE_EVENT_STROKE = 5;
 /** A flattened root Form rendered as a bounded composite; index is its paint ordinal. */
-export const DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE = 6;
+export const DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE = 6;
 
 /**
- * Compact text/image sidecar for the internal grouped-VectorScene bridge.
+ * Compact paint metadata for the VectorScene adapter, including ordered draw ranges.
  * Packed fill and stroke geometry remains in `DensePdfCompiledPage` itself.
  * @internal
  */
-export interface DensePdfLegacyVectorOutput {
+export interface DensePdfVectorSceneData {
   /** Optional first/count pairs addressed by FILL/STROKE source events. */
   readonly pathPaintRanges?: Uint32Array;
   readonly sourceClips?: readonly (DensePdfTextClip | null)[];
@@ -495,7 +503,7 @@ export interface DensePdfLegacyVectorOutput {
   readonly glyphFillColors: Float32Array;
   /** Four exact page-space clip bounds per glyph run. */
   readonly glyphClipBounds?: Float32Array;
-  /** Per-run DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_* bits. */
+  /** Per-run DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_* bits. */
   readonly glyphRunFlags?: Uint8Array;
   /** Exact, shared clipping chains for search-only visibility proofs. */
   readonly glyphRunClips?: readonly (DensePdfTextClip | null)[];
@@ -509,7 +517,7 @@ export interface DensePdfLegacyVectorOutput {
   readonly imagePaintOrders: Uint32Array;
   /** One source paint ordinal per Form invocation. */
   readonly formPaintOrders?: Uint32Array;
-  /** Bit field per image invocation; see DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_*. */
+  /** Bit field per image invocation; see DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_*. */
   readonly imageFlags: Uint8Array;
   /** Six values per image: fill start/end, stroke start/end, span/image paint ordinals. */
   readonly imagePathSpanCheckpoints?: Uint32Array;
@@ -848,16 +856,62 @@ interface StrokeFinalizeResult {
   discardedContainedCount: number;
 }
 
-/** Compile already-decoded page content into native HEPR stores and source-ordered commands. */
+/** Compile already-decoded content for the requested output adapter. */
 export async function compileDensePdfContent(
   source: DensePdfContentSource | DensePdfPreparedContentSource,
   options: DensePdfContentCompileOptions
+): Promise<DensePdfCompiledPage> {
+  switch (options.output) {
+    case "geometry":
+      return compileContent(source, options, GEOMETRY_OUTPUT_POLICY);
+    case "display-program":
+      return compileContent(source, options, { ...GEOMETRY_OUTPUT_POLICY, displayProgram: true });
+    case "vector-scene":
+      return compileContent(source, options, vectorSceneOutputPolicy("page", true));
+    default:
+      throw new TypeError("Unknown PDF compiler output. Expected geometry, display-program, or vector-scene.");
+  }
+}
+
+/** Compatibility retry used internally after ordered page adaptation fails. @internal */
+export function compileGroupedVectorPageContent(
+  source: DensePdfContentSource | DensePdfPreparedContentSource,
+  options: DensePdfContentInputOptions
+): Promise<DensePdfCompiledPage> {
+  return compileContent(source, options, vectorSceneOutputPolicy("page", false));
+}
+
+/**
+ * Compile a Form for vector flattening. Unsupported paint is handled by the
+ * enclosing page, which can capture the whole Form with its compositing state.
+ * @internal
+ */
+export function compileVectorFormContent(
+  source: DensePdfContentSource | DensePdfPreparedContentSource,
+  options: DensePdfContentInputOptions,
+  drawingOrder: "source" | "grouped" = "source"
+): Promise<DensePdfCompiledPage> {
+  return compileContent(source, options, vectorSceneOutputPolicy("form", drawingOrder === "source"));
+}
+
+/** Compile prevalidated text retained by the dense geometry path. @internal */
+export function compileRetainedTextContent(
+  source: DensePdfContentSource | DensePdfPreparedContentSource,
+  options: DensePdfContentInputOptions
+): Promise<DensePdfCompiledPage> {
+  return compileContent(source, options, vectorSceneOutputPolicy("retained-text", false));
+}
+
+async function compileContent(
+  source: DensePdfContentSource | DensePdfPreparedContentSource,
+  options: DensePdfContentInputOptions,
+  policy: ContentOutputPolicy
 ): Promise<DensePdfCompiledPage> {
   assertFiniteMatrix(options.pageMatrix);
   assertValidBounds(options.pageBounds, "pageBounds");
   options.signal?.throwIfAborted();
 
-  const compiler = new DenseContentCompiler(options);
+  const compiler = new DenseContentCompiler(options, policy);
   const lexer = new IncrementalPdfLexer((token) => compiler.consumeToken(token));
   const yieldIntervalMs = Math.max(4, options.yieldIntervalMs ?? DEFAULT_YIELD_INTERVAL_MS);
   let processedBytes = 0;
@@ -1015,7 +1069,7 @@ export function scanDensePdfMarkedContentPropertyReferences(
 }
 
 function normalizeExtGStateDefinitions(
-  options: DensePdfContentCompileOptions
+  options: DensePdfContentInputOptions
 ): ReadonlyMap<string, DensePdfExtGStateDefinition> {
   const definitions = new Map<string, DensePdfExtGStateDefinition>();
   for (const resourceName of options.availableExtGStates ?? []) {
@@ -1110,7 +1164,9 @@ function isDensePdfBlendMode(value: string): value is DensePdfBlendMode {
 }
 
 class DenseContentCompiler {
-  readonly options: DensePdfContentCompileOptions;
+  readonly options: DensePdfContentInputOptions;
+
+  private readonly policy: ContentOutputPolicy;
 
   readonly path = new ReusablePathBuilder();
 
@@ -1194,51 +1250,51 @@ class DenseContentCompiler {
 
   readonly patternPaints: DensePdfPatternPaint[] = [];
 
-  readonly legacyGlyphRunMeta: number[] = [];
+  readonly vectorGlyphRunMeta: number[] = [];
 
-  readonly legacyGlyphFillColors: number[] = [];
+  readonly vectorGlyphFillColors: number[] = [];
 
-  readonly legacyGlyphClipBounds: number[] = [];
+  readonly vectorGlyphClipBounds: number[] = [];
 
-  readonly legacyGlyphRunFlags: number[] = [];
-  readonly legacyGlyphClipIndices: number[] = [];
+  readonly vectorGlyphRunFlags: number[] = [];
+  readonly vectorGlyphClipIndices: number[] = [];
 
-  readonly legacyImageIndices: number[] = [];
+  readonly vectorImageIndices: number[] = [];
 
-  readonly legacyImageTransforms: number[] = [];
+  readonly vectorImageTransforms: number[] = [];
 
-  readonly legacyImageClipBounds: number[] = [];
+  readonly vectorImageClipBounds: number[] = [];
 
-  readonly legacyImagePaintOrders: number[] = [];
+  readonly vectorImagePaintOrders: number[] = [];
 
-  readonly legacyFormPaintOrders: number[] = [];
+  readonly vectorFormPaintOrders: number[] = [];
 
-  readonly legacyImageFlags: number[] = [];
+  readonly vectorImageFlags: number[] = [];
 
-  readonly legacyImagePathSpanCheckpoints: number[] = [];
+  readonly vectorImagePathSpanCheckpoints: number[] = [];
 
-  readonly legacyImagePathSourceSpans: number[] = [];
+  readonly vectorImagePathSourceSpans: number[] = [];
 
-  readonly legacySelectivePaintOrdinalSpans: number[] = [];
+  readonly vectorSelectivePaintOrdinalSpans: number[] = [];
 
-  readonly legacySelectivePaintSourceSpans: number[] = [];
+  readonly vectorSelectivePaintSourceSpans: number[] = [];
 
-  readonly legacySourceEvents: number[] = [];
-  readonly legacySourceClipIndices: number[] = [];
-  readonly legacyFormClipIndices: number[] = [];
-  readonly legacyPathPaintRanges: number[] = [];
+  readonly vectorSourceEvents: number[] = [];
+  readonly vectorSourceClipIndices: number[] = [];
+  readonly vectorFormClipIndices: number[] = [];
+  readonly vectorPathPaintRanges: number[] = [];
 
-  private legacyPathSpanStartFillCount = 0;
+  private vectorPathSpanStartFillCount = 0;
 
-  private legacyPathSpanStartStrokeCount = 0;
+  private vectorPathSpanStartStrokeCount = 0;
 
-  private legacyPathSpanStartOrdinal = 0;
+  private vectorPathSpanStartOrdinal = 0;
 
-  private legacyPathSpanHasPaint = false;
+  private vectorPathSpanHasPaint = false;
 
-  private legacyPathSpanSourceOffset = -1;
+  private vectorPathSpanSourceOffset = -1;
 
-  private legacyPathSpanSourceLength = -1;
+  private vectorPathSpanSourceLength = -1;
 
   private state: GraphicsState;
 
@@ -1287,14 +1343,14 @@ class DenseContentCompiler {
 
   private retainedDashValues = 0;
 
-  private legacyPaintOrdinal = 0;
+  private vectorPaintOrdinal = 0;
 
-  private legacySawVisibleText = false;
+  private vectorSawVisibleText = false;
 
   /** Visible path paint cannot be reordered behind a later image by the grouped ABI. */
-  private legacySawPathPaint = false;
+  private vectorSawPathPaint = false;
 
-  private legacyRecordedOrdinaryPaintBarrier = false;
+  private vectorRecordedOrdinaryPaintBarrier = false;
 
   private finished = false;
 
@@ -1306,13 +1362,9 @@ class DenseContentCompiler {
 
   operatorCount = 0;
 
-  constructor(options: DensePdfContentCompileOptions) {
+  constructor(options: DensePdfContentInputOptions, policy: ContentOutputPolicy) {
     this.options = options;
-    if (options.legacyVectorOutput === true && options.preservePaintOrder === true) {
-      throw new TypeError(
-        "legacyVectorOutput and preservePaintOrder are mutually exclusive compiler modes."
-      );
-    }
+    this.policy = policy;
     this.extGStates = normalizeExtGStateDefinitions(options);
     this.alwaysVisibleOptionalContentProperties = new Set(
       options.alwaysVisibleOptionalContentProperties ?? []
@@ -1422,7 +1474,7 @@ class DenseContentCompiler {
     };
     this.strokes = new DenseStrokeBuilder(
       options.enableInvisibleCull !== false,
-      options.preservePaintOrder === true || options.legacyOrderedPaint === true
+      policy.displayProgram === true || policy.orderedPaint === true
     );
     this.fillPathMetaA = new Float4Builder(2_048);
     this.fillPathMetaB = new Float4Builder(2_048);
@@ -1551,23 +1603,23 @@ class DenseContentCompiler {
 
     // Uniform opaque, stroke-only pages can retain the established containment
     // optimization. Mixed paints keep every source range stable.
-    const compactOrderedStrokes = this.options.legacyOrderedPaint === true &&
-      this.legacySourceEvents.every((value, i) => i % 2 !== 0 ||
-        value === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT || value === DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE) &&
-      this.legacySourceClipIndices.every(index => index === this.legacySourceClipIndices[0]) &&
+    const compactOrderedStrokes = this.policy.orderedPaint === true &&
+      this.vectorSourceEvents.every((value, i) => i % 2 !== 0 ||
+        value === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT || value === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) &&
+      this.vectorSourceClipIndices.every(index => index === this.vectorSourceClipIndices[0]) &&
       this.strokes.hasUniformOpaqueColor();
     const strokeResult = await this.strokes.finalize(checkpoint, compactOrderedStrokes);
     if (compactOrderedStrokes) {
-      const clipIndex = this.legacySourceClipIndices[0] ?? -1;
-      this.legacySourceClipIndices.length = 0;
-      this.legacySourceEvents.length = 0;
-      this.legacyPathPaintRanges.length = 0;
+      const clipIndex = this.vectorSourceClipIndices[0] ?? -1;
+      this.vectorSourceClipIndices.length = 0;
+      this.vectorSourceEvents.length = 0;
+      this.vectorPathPaintRanges.length = 0;
       const count = strokeResult.endpoints.length / 4;
       if (count > 0) {
-        this.legacySourceEvents.push(DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-          DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE, 0);
-        this.legacyPathPaintRanges.push(0, count);
-        this.legacySourceClipIndices.push(clipIndex, clipIndex);
+        this.vectorSourceEvents.push(DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+          DENSE_PDF_VECTOR_SCENE_EVENT_STROKE, 0);
+        this.vectorPathPaintRanges.push(0, count);
+        this.vectorSourceClipIndices.push(clipIndex, clipIndex);
       }
     }
     const fillPathMetaA = this.fillPathMetaA.toTypedArray();
@@ -1585,7 +1637,7 @@ class DenseContentCompiler {
       ...this.options.pageBounds
     };
     const textClips: DensePdfTextClip[] = [];
-    if (this.options.legacyVectorOutput && (this.options.legacySelectiveTextClips || this.options.legacyOrderedPaint)) {
+    if (this.policy.vectorScene && (this.policy.selectiveRaster || this.policy.orderedPaint)) {
       for (const clip of this.clipPaths) {
         textClips.push(Object.freeze({
           parent: textClips[clip.parentIndex] ?? this.options.initialVectorClip ?? null,
@@ -1611,30 +1663,30 @@ class DenseContentCompiler {
       fillPathMetaC,
       fillSegmentsA,
       fillSegmentsB,
-      ...(this.options.legacyVectorOutput === true ? {
-        legacyVector: {
-          sourceEvents: Uint32Array.from(this.legacySourceEvents),
-          ...(this.options.legacyOrderedPaint ? {
-            pathPaintRanges: Uint32Array.from(this.legacyPathPaintRanges),
-            sourceClips: this.legacySourceClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null)
+      ...(this.policy.vectorScene === true ? {
+        vectorSceneData: {
+          sourceEvents: Uint32Array.from(this.vectorSourceEvents),
+          ...(this.policy.orderedPaint ? {
+            pathPaintRanges: Uint32Array.from(this.vectorPathPaintRanges),
+            sourceClips: this.vectorSourceClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null)
           } : {}),
-          glyphRunMeta: Uint32Array.from(this.legacyGlyphRunMeta),
-          glyphFillColors: Float32Array.from(this.legacyGlyphFillColors),
-          glyphClipBounds: Float32Array.from(this.legacyGlyphClipBounds),
-          glyphRunFlags: Uint8Array.from(this.legacyGlyphRunFlags),
+          glyphRunMeta: Uint32Array.from(this.vectorGlyphRunMeta),
+          glyphFillColors: Float32Array.from(this.vectorGlyphFillColors),
+          glyphClipBounds: Float32Array.from(this.vectorGlyphClipBounds),
+          glyphRunFlags: Uint8Array.from(this.vectorGlyphRunFlags),
           ...(textClips.length === 0 && !this.options.initialVectorClip ? {} : {
-            glyphRunClips: Object.freeze(this.legacyGlyphClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null))
+            glyphRunClips: Object.freeze(this.vectorGlyphClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null))
           }),
-          imageIndices: Uint32Array.from(this.legacyImageIndices),
-          imageTransforms: Float32Array.from(this.legacyImageTransforms),
-          imageClipBounds: Float32Array.from(this.legacyImageClipBounds),
-          imagePaintOrders: Uint32Array.from(this.legacyImagePaintOrders),
-          formPaintOrders: Uint32Array.from(this.legacyFormPaintOrders),
-          imageFlags: Uint8Array.from(this.legacyImageFlags),
-          imagePathSpanCheckpoints: Uint32Array.from(this.legacyImagePathSpanCheckpoints),
-          imagePathSourceSpans: Float64Array.from(this.legacyImagePathSourceSpans),
-          selectivePaintOrdinalSpans: Uint32Array.from(this.legacySelectivePaintOrdinalSpans),
-          selectivePaintSourceSpans: Float64Array.from(this.legacySelectivePaintSourceSpans)
+          imageIndices: Uint32Array.from(this.vectorImageIndices),
+          imageTransforms: Float32Array.from(this.vectorImageTransforms),
+          imageClipBounds: Float32Array.from(this.vectorImageClipBounds),
+          imagePaintOrders: Uint32Array.from(this.vectorImagePaintOrders),
+          formPaintOrders: Uint32Array.from(this.vectorFormPaintOrders),
+          imageFlags: Uint8Array.from(this.vectorImageFlags),
+          imagePathSpanCheckpoints: Uint32Array.from(this.vectorImagePathSpanCheckpoints),
+          imagePathSourceSpans: Float64Array.from(this.vectorImagePathSourceSpans),
+          selectivePaintOrdinalSpans: Uint32Array.from(this.vectorSelectivePaintOrdinalSpans),
+          selectivePaintSourceSpans: Float64Array.from(this.vectorSelectivePaintSourceSpans)
         }
       } : {}),
       paintRuns: Uint32Array.from(this.paintRuns),
@@ -1702,7 +1754,7 @@ class DenseContentCompiler {
       ),
       formPaints: Object.freeze(
         this.formPaints.map((paint, index) => Object.freeze({
-          ...(this.options.legacyOrderedPaint ? { vectorClip: textClips[this.legacyFormClipIndices[index]] ?? this.options.initialVectorClip ?? null } : {}),
+          ...(this.policy.orderedPaint ? { vectorClip: textClips[this.vectorFormClipIndices[index]] ?? this.options.initialVectorClip ?? null } : {}),
           definitionIndex: paint.definitionIndex,
           transform: Object.freeze([...paint.transform]) as DensePdfMatrix,
           clipBounds: Object.freeze({ ...paint.clipBounds }),
@@ -1884,7 +1936,7 @@ class DenseContentCompiler {
         return;
       case "h":
         this.requireArgs(operator, args, 0);
-        this.path.closePath(this.options.preservePaintOrder === true);
+        this.path.closePath(this.policy.displayProgram === true);
         this.assertCurrentPathLimits(operator);
         return;
       case "W":
@@ -1933,7 +1985,7 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 1);
         {
           const lineWidth = numberArg(args, 0);
-          if (this.options.preservePaintOrder && lineWidth < 0) {
+          if (this.policy.displayProgram && lineWidth < 0) {
             throw new DensePdfSyntaxError("w requires a non-negative line width.");
           }
           this.state.lineWidth = Math.abs(lineWidth);
@@ -1985,7 +2037,7 @@ class DenseContentCompiler {
           throw new DensePdfSyntaxError("Negative dash-array entry in PDF content.");
         }
         if (
-          this.options.preservePaintOrder && dash.length > 0 &&
+          this.policy.displayProgram && dash.length > 0 &&
           dash.every((value) => value === 0)
         ) {
           throw new DensePdfSyntaxError("A PDF dash array cannot contain only zero lengths.");
@@ -2289,9 +2341,9 @@ class DenseContentCompiler {
             operator
           );
         }
-        if (this.options.preservePaintOrder !== true &&
-            !(this.options.legacyVectorOutput === true &&
-              this.options.legacySelectiveShadings === true)) {
+        if (this.policy.displayProgram !== true &&
+            !(this.policy.vectorScene === true &&
+              this.policy.selectiveRaster === true)) {
           throw new DensePdfUnsupportedError(
             "The sh operator requires source-ordered display-program compilation.",
             operator
@@ -2299,17 +2351,17 @@ class DenseContentCompiler {
         }
         this.referencedShadings.add(resourceName);
         if (this.contentVisible && this.state.clipBounds) {
-          if (this.options.legacyVectorOutput === true) {
-            this.assertLegacyVectorComposite("nonstroke", operator);
-            const ordinal = this.nextLegacyPaintOrdinal(operator);
-            this.legacySelectivePaintSourceSpans.push(
+          if (this.policy.vectorScene === true) {
+            this.assertVectorSceneComposite("nonstroke", operator);
+            const ordinal = this.nextVectorPaintOrdinal(operator);
+            this.vectorSelectivePaintSourceSpans.push(
               this.operatorSourceOffset,
               this.operatorSourceLength
             );
-            this.recordLegacySelectivePaint(ordinal);
-            this.legacyPathSpanStartFillCount = this.fillPathCount;
-            this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
-            this.legacyPathSpanStartOrdinal = ordinal + 1;
+            this.recordVectorSelectivePaint(ordinal);
+            this.vectorPathSpanStartFillCount = this.fillPathCount;
+            this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
+            this.vectorPathSpanStartOrdinal = ordinal + 1;
           } else {
             this.recordShadingPaint(gradientIndex);
           }
@@ -2744,7 +2796,7 @@ class DenseContentCompiler {
   private paintPath(operator: string): void {
     const closesPath = operator === "s" || operator === "b" || operator === "b*";
     if (closesPath) {
-      this.path.closePath(this.options.preservePaintOrder === true);
+      this.path.closePath(this.policy.displayProgram === true);
       this.assertCurrentPathLimits(operator);
     }
 
@@ -2771,7 +2823,7 @@ class DenseContentCompiler {
     }
 
     const pathData = this.path.view();
-    if (!this.options.preservePaintOrder && pathData.length > MAX_PAINT_PATH_FLOATS) {
+    if (!this.policy.displayProgram && pathData.length > MAX_PAINT_PATH_FLOATS) {
       throw new DensePdfUnsupportedError(
         "A single PDF path is too large for cooperative dense-vector compilation.",
         operator
@@ -2802,12 +2854,12 @@ class DenseContentCompiler {
       ? operator.includes("*") ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO
       : null;
     const largeDisconnectedFill =
-      !this.options.preservePaintOrder && pathVisible &&
+      !this.policy.displayProgram && pathVisible &&
       fillRule === FILL_RULE_NONZERO &&
       countPathMoveOps(pathData) >= 100;
     if (largeDisconnectedFill && !(
-      this.options.legacyVectorOutput === true &&
-      this.options.legacySelectivePaths === true
+      this.policy.vectorScene === true &&
+      this.policy.selectiveRaster === true
     )) {
       throw new DensePdfUnsupportedError(
         "Large disconnected nonzero fills require source-ordered exact path compilation.",
@@ -2818,7 +2870,7 @@ class DenseContentCompiler {
     let exactPathIndex = -1;
     const finishClip = (): void => {
       if (this.pendingClipRule === null) return;
-      if (this.options.preservePaintOrder || this.options.legacySelectiveTextClips || this.options.legacyOrderedPaint) {
+      if (this.policy.displayProgram || this.policy.selectiveRaster || this.policy.orderedPaint) {
         if (exactPathIndex < 0) {
           exactPathIndex = this.retainExactPath(pathData, pathBounds, false, operator);
         }
@@ -2860,33 +2912,33 @@ class DenseContentCompiler {
       this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON;
     const visibleStroke = strokePathVisible && strokePaint && !strokeUsesPattern &&
       this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON;
-    const selectivelyCapturedPath = this.options.legacyVectorOutput === true &&
-      this.options.legacySelectivePaths === true &&
+    const selectivelyCapturedPath = this.policy.vectorScene === true &&
+      this.policy.selectiveRaster === true &&
       (largeDisconnectedFill || visiblePatternFill || visiblePatternStroke ||
-        ((!this.options.legacyOrderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) &&
+        ((!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) &&
           (visibleFill || visibleStroke)));
     if (selectivelyCapturedPath) {
-      if (visibleFill || visiblePatternFill) this.assertLegacyVectorComposite("nonstroke", operator);
-      if (visibleStroke || visiblePatternStroke) this.assertLegacyVectorComposite("stroke", operator);
-      const ordinal = this.nextLegacyPaintOrdinal(operator);
-      this.legacySelectivePaintSourceSpans.push(
+      if (visibleFill || visiblePatternFill) this.assertVectorSceneComposite("nonstroke", operator);
+      if (visibleStroke || visiblePatternStroke) this.assertVectorSceneComposite("stroke", operator);
+      const ordinal = this.nextVectorPaintOrdinal(operator);
+      this.vectorSelectivePaintSourceSpans.push(
         this.operatorSourceOffset,
         this.operatorSourceLength
       );
-      this.recordLegacySelectivePaint(ordinal);
+      this.recordVectorSelectivePaint(ordinal);
       finishClip();
       this.clearPaintPathState();
       return;
     }
-    if (this.options.legacyVectorOutput === true) {
+    if (this.policy.vectorScene === true) {
       // Validate before emitting into the optimizing stores: a duplicate or
       // contained primitive may otherwise be removed before its unsupported
       // blend/mask semantics are observed.
-      if (visibleFill) this.noteLegacyOrdinaryPaint("nonstroke", operator);
-      if (visibleStroke) this.noteLegacyOrdinaryPaint("stroke", operator);
+      if (visibleFill) this.noteVectorOrdinaryPaint("nonstroke", operator);
+      if (visibleStroke) this.noteVectorOrdinaryPaint("stroke", operator);
     }
     if (visiblePatternFill || visiblePatternStroke) {
-      if (!this.options.preservePaintOrder) {
+      if (!this.policy.displayProgram) {
         throw new DensePdfUnsupportedError(
           "Pattern path painting requires source-ordered display-program compilation.",
           operator
@@ -2940,7 +2992,7 @@ class DenseContentCompiler {
         this.state.lineWidth,
         this.state.lineDash.length > 0
       );
-    const genericPaint = this.options.preservePaintOrder === true &&
+    const genericPaint = this.policy.displayProgram === true &&
       (visibleFill || visibleStroke) && !simpleDenseFill && !simpleDenseStroke;
 
     if (genericPaint) {
@@ -2986,7 +3038,7 @@ class DenseContentCompiler {
         this.state.strokeR,
         this.state.strokeG,
         this.state.strokeB,
-        this.options.preservePaintOrder ? 1 : this.state.strokeAlpha,
+        this.policy.displayProgram ? 1 : this.state.strokeAlpha,
         flags,
         this.state.lineDash,
         this.state.dashPhase,
@@ -3013,7 +3065,7 @@ class DenseContentCompiler {
             this.state.fillR,
             this.state.fillG,
             this.state.fillB,
-            this.options.preservePaintOrder ? 1 : this.state.fillAlpha,
+            this.policy.displayProgram ? 1 : this.state.fillAlpha,
             fillPathMetaA,
             fillPathMetaB,
             fillPathMetaC,
@@ -3080,8 +3132,8 @@ class DenseContentCompiler {
       return;
     }
     if (this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON) {
-      if (this.options.legacyVectorOutput === true) {
-        this.noteLegacyOrdinaryPaint("stroke", "S");
+      if (this.policy.vectorScene === true) {
+        this.noteVectorOrdinaryPaint("stroke", "S");
       }
       this.assertSupportedStrokeState("S");
     }
@@ -3106,7 +3158,7 @@ class DenseContentCompiler {
         x0, y0, x1, y1, x1, y1, STROKE_PRIMITIVE_LINE,
         halfWidth,
         this.state.strokeR, this.state.strokeG, this.state.strokeB,
-        this.options.preservePaintOrder ? 1 : this.state.strokeAlpha, flags,
+        this.policy.displayProgram ? 1 : this.state.strokeAlpha, flags,
         clipped ? clip.minX : geometryMinX,
         clipped ? clip.minY : geometryMinY,
         clipped ? clip.maxX : geometryMaxX,
@@ -3124,7 +3176,7 @@ class DenseContentCompiler {
     // The compact unordered representation retains its established
     // approximation behavior. Source-ordered compilation must fail instead
     // of discarding visible stroke semantics.
-    if (!this.options.preservePaintOrder) return;
+    if (!this.policy.displayProgram) return;
     if (this.state.lineCap === 2) {
       throw new DensePdfUnsupportedError(
         "Projecting-square line caps require the native stroke-style expansion.",
@@ -3228,7 +3280,7 @@ class DenseContentCompiler {
     return [clamp01(converted[0]), clamp01(converted[1]), clamp01(converted[2])];
   }
 
-  private assertLegacyVectorComposite(
+  private assertVectorSceneComposite(
     role: "stroke" | "nonstroke",
     operator: string,
     requireOpaque = false,
@@ -3238,36 +3290,36 @@ class DenseContentCompiler {
     const alpha = stroke ? this.state.strokeAlpha : this.state.fillAlpha;
     // `/AIS` only changes compositing when an alpha source can reduce the
     // source contribution. With unit constant alpha and no soft mask, shape
-    // and opacity are identically 1, so the legacy result is exact. Keep the
+    // and opacity are identically 1, so the VectorScene result is exact. Keep the
     // rejection for every active-alpha case below.
     if (this.state.alphaIsShape && (alpha !== 1 || this.state.softMaskIndex >= 0)) {
       throw new DensePdfUnsupportedError(
-        "Legacy vector output cannot represent alpha-as-shape compositing.",
+        "VectorScene output cannot represent alpha-as-shape compositing.",
         operator
       );
     }
     if (this.state.blendMode !== "Normal") {
       throw new DensePdfUnsupportedError(
-        `Legacy vector output cannot represent /${this.state.blendMode} blending.`,
+        `VectorScene output cannot represent /${this.state.blendMode} blending.`,
         operator
       );
     }
     if (this.state.softMaskIndex >= 0) {
       throw new DensePdfUnsupportedError(
-        "Legacy vector output cannot represent a soft mask.",
+        "VectorScene output cannot represent a soft mask.",
         operator
       );
     }
     if ((stroke ? this.state.strokeOverprint : this.state.fillOverprint) &&
-        this.options.legacyIgnoreOverprint !== true) {
+        this.policy.ignoreOverprint !== true) {
       throw new DensePdfUnsupportedError(
-        "Legacy vector output cannot represent active overprint.",
+        "VectorScene output cannot represent active overprint.",
         operator
       );
     }
     if (requireOpaque && alpha !== 1) {
       throw new DensePdfUnsupportedError(
-        "Legacy vector image output requires opaque constant alpha.",
+        "VectorScene image output requires opaque constant alpha.",
         operator
       );
     }
@@ -3276,83 +3328,83 @@ class DenseContentCompiler {
       (stroke ? this.state.strokePaintInherited : this.state.fillPaintInherited)
     ) {
       throw new DensePdfUnsupportedError(
-        "Legacy vector output cannot represent inherited caller paint.",
+        "VectorScene output cannot represent inherited caller paint.",
         operator
       );
     }
   }
 
-  private nextLegacyPaintOrdinal(operator: string): number {
-    if (this.legacyPaintOrdinal > 0xffff_ffff) {
+  private nextVectorPaintOrdinal(operator: string): number {
+    if (this.vectorPaintOrdinal > 0xffff_ffff) {
       throw new DensePdfResourceLimitError(
-        "Legacy vector output exceeds the 32-bit source paint-order range.",
+        "VectorScene output exceeds the 32-bit source paint-order range.",
         operator
       );
     }
-    return this.legacyPaintOrdinal++;
+    return this.vectorPaintOrdinal++;
   }
 
-  private recordLegacySelectivePaint(ordinal: number): void {
-    this.legacySelectivePaintOrdinalSpans.push(ordinal, ordinal);
-    if (this.options.legacyOrderedPaint) {
-      this.recordLegacySourceEvent(DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE, ordinal, "paint");
+  private recordVectorSelectivePaint(ordinal: number): void {
+    this.vectorSelectivePaintOrdinalSpans.push(ordinal, ordinal);
+    if (this.policy.orderedPaint) {
+      this.recordVectorSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, ordinal, "paint");
     }
   }
 
-  private recordLegacySourceEvent(kind: number, index: number, operator: string): void {
+  private recordVectorSourceEvent(kind: number, index: number, operator: string): void {
     if (
       !Number.isSafeInteger(kind) || kind < 0 || kind > 0xffff_ffff ||
       !Number.isSafeInteger(index) || index < 0 || index > 0xffff_ffff ||
-      this.legacySourceEvents.length > 0xffff_ffff - 2
+      this.vectorSourceEvents.length > 0xffff_ffff - 2
     ) {
       throw new DensePdfResourceLimitError(
-        "Legacy vector source events exceed the 32-bit event-tape range.",
+        "VectorScene source events exceed the 32-bit event-tape range.",
         operator
       );
     }
-    this.legacySourceEvents.push(kind, index);
-    this.legacySourceClipIndices.push(this.state.clipIndex);
+    this.vectorSourceEvents.push(kind, index);
+    this.vectorSourceClipIndices.push(this.state.clipIndex);
   }
 
-  private recordLegacyOrdinaryPaintBarrier(operator: string): void {
-    if (this.legacyRecordedOrdinaryPaintBarrier) return;
-    this.recordLegacySourceEvent(
-      DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT,
+  private recordVectorOrdinaryPaintBarrier(operator: string): void {
+    if (this.vectorRecordedOrdinaryPaintBarrier) return;
+    this.recordVectorSourceEvent(
+      DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
       0,
       operator
     );
-    this.legacyRecordedOrdinaryPaintBarrier = true;
+    this.vectorRecordedOrdinaryPaintBarrier = true;
   }
 
-  private recordLegacyOrdinaryPaint(
+  private recordVectorOrdinaryPaint(
     role: "stroke" | "nonstroke",
     operator: string
   ): void {
-    this.assertLegacyVectorComposite(role, operator);
-    this.nextLegacyPaintOrdinal(operator);
-    this.recordLegacyOrdinaryPaintBarrier(operator);
+    this.assertVectorSceneComposite(role, operator);
+    this.nextVectorPaintOrdinal(operator);
+    this.recordVectorOrdinaryPaintBarrier(operator);
   }
 
-  private recordLegacyPathPaint(
+  private recordVectorPathPaint(
     role: "stroke" | "nonstroke",
     operator: string
   ): void {
-    if (!this.legacyPathSpanHasPaint) {
-      this.legacyPathSpanSourceOffset = this.operatorSourceOffset;
-      this.legacyPathSpanSourceLength = this.operatorSourceLength;
-      this.legacyPathSpanHasPaint = true;
+    if (!this.vectorPathSpanHasPaint) {
+      this.vectorPathSpanSourceOffset = this.operatorSourceOffset;
+      this.vectorPathSpanSourceLength = this.operatorSourceLength;
+      this.vectorPathSpanHasPaint = true;
     }
-    this.recordLegacyOrdinaryPaint(role, operator);
-    this.legacySawPathPaint = true;
+    this.recordVectorOrdinaryPaint(role, operator);
+    this.vectorSawPathPaint = true;
   }
 
-  private noteLegacyOrdinaryPaint(
+  private noteVectorOrdinaryPaint(
     role: "stroke" | "nonstroke",
     operator: string
   ): void {
-    this.assertLegacyVectorComposite(role, operator);
-    this.recordLegacyOrdinaryPaintBarrier(operator);
-    this.legacySawPathPaint = true;
+    this.assertVectorSceneComposite(role, operator);
+    this.recordVectorOrdinaryPaintBarrier(operator);
+    this.vectorSawPathPaint = true;
   }
 
   private recordPaintRun(kind: number, start: number, count: number): void {
@@ -3365,28 +3417,28 @@ class DenseContentCompiler {
     if (role === null) {
       throw new DensePdfSyntaxError("A non-path paint run reached the path paint recorder.");
     }
-    if (this.options.legacyVectorOutput === true) {
-      if (!this.options.legacyOrderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
+    if (this.policy.vectorScene === true) {
+      if (!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
         throw new DensePdfUnsupportedError(
-          "Legacy vector output cannot represent an arbitrary clipped visible path.",
+          "VectorScene output cannot represent an arbitrary clipped visible path.",
           kind === DENSE_PDF_PAINT_RUN_STROKE ? "S" : "f"
         );
       }
-      this.recordLegacyPathPaint(
+      this.recordVectorPathPaint(
         role,
         kind === DENSE_PDF_PAINT_RUN_STROKE ? "S" : "f"
       );
-      if (this.options.legacyOrderedPaint) {
-        this.recordLegacySourceEvent(
+      if (this.policy.orderedPaint) {
+        this.recordVectorSourceEvent(
           kind === DENSE_PDF_PAINT_RUN_STROKE
-            ? DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE : DENSE_PDF_LEGACY_VECTOR_EVENT_FILL,
-          this.legacyPathPaintRanges.length / 2,
+            ? DENSE_PDF_VECTOR_SCENE_EVENT_STROKE : DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
+          this.vectorPathPaintRanges.length / 2,
           role === "stroke" ? "S" : "f"
         );
-        this.legacyPathPaintRanges.push(start, count);
+        this.vectorPathPaintRanges.push(start, count);
       }
     }
-    if (!this.options.preservePaintOrder) return;
+    if (!this.policy.displayProgram) return;
     // A run is scoped to exactly one source painting operator. Even adjacent
     // compatible stores may be separated by a clip, group, marked-content, or
     // backdrop-sensitive state transition that has no geometry of its own.
@@ -3414,12 +3466,12 @@ class DenseContentCompiler {
 
   private recordGlyphPaintRun(start: number, count: number, renderingMode: number): void {
     if (count <= 0) return;
-    if (this.options.legacyVectorOutput === true) {
-      this.recordLegacyGlyphPaintRun(start, count, renderingMode);
+    if (this.policy.vectorScene === true) {
+      this.recordVectorGlyphPaintRun(start, count, renderingMode);
       return;
     }
     if (renderingMode >= 4) {
-      if (!this.options.preservePaintOrder) {
+      if (!this.policy.displayProgram) {
         throw new DensePdfUnsupportedError(
           "Text clipping modes require source-ordered display-program compilation.",
           "Tr"
@@ -3443,7 +3495,7 @@ class DenseContentCompiler {
       }
       pending.count += count;
     }
-    if (!this.options.preservePaintOrder) return;
+    if (!this.policy.displayProgram) return;
     if (!this.state.textKnockout) {
       throw new DensePdfUnsupportedError(
         "Text knockout disabled requires a text-object transparency group.",
@@ -3487,7 +3539,7 @@ class DenseContentCompiler {
     });
   }
 
-  private recordLegacyGlyphPaintRun(
+  private recordVectorGlyphPaintRun(
     start: number,
     count: number,
     renderingMode: number
@@ -3497,79 +3549,79 @@ class DenseContentCompiler {
       start > 0xffff_ffff - count
     ) {
       throw new DensePdfResourceLimitError(
-        "A legacy-vector glyph range exceeds the 32-bit glyph-index range.",
+        "A VectorScene glyph range exceeds the 32-bit glyph-index range.",
         "Tj"
       );
     }
     if (renderingMode !== 0 && renderingMode !== 3) {
       throw new DensePdfUnsupportedError(
-        `Legacy vector output supports only fill and invisible text, not rendering mode ${renderingMode}.`,
+        `VectorScene output supports only fill and invisible text, not rendering mode ${renderingMode}.`,
         "Tr"
       );
     }
     if (renderingMode === 0 && this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON) {
       if (!this.state.textKnockout) {
         throw new DensePdfUnsupportedError(
-          "Legacy vector output cannot represent text knockout disabled.",
+          "VectorScene output cannot represent text knockout disabled.",
           "Tj"
         );
       }
       if (this.state.fillPatternColorSpace) {
         throw new DensePdfUnsupportedError(
-          "Legacy vector output cannot represent pattern-colored text.",
+          "VectorScene output cannot represent pattern-colored text.",
           "Tj"
         );
       }
-      if (!this.options.legacyOrderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
-        if (this.options.legacySelectiveTextClips === true) {
-          this.assertLegacyVectorComposite("nonstroke", "Tj");
-          const ordinal = this.nextLegacyPaintOrdinal("Tj");
-          this.legacySelectivePaintSourceSpans.push(
+      if (!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
+        if (this.policy.selectiveRaster === true) {
+          this.assertVectorSceneComposite("nonstroke", "Tj");
+          const ordinal = this.nextVectorPaintOrdinal("Tj");
+          this.vectorSelectivePaintSourceSpans.push(
             this.operatorSourceOffset,
             this.operatorSourceLength
           );
-          this.recordLegacySelectivePaint(ordinal);
-          const glyphRunIndex = this.legacyGlyphRunMeta.length / 3;
-          this.legacyGlyphRunMeta.push(start, count, renderingMode);
-          this.legacyGlyphFillColors.push(0, 0, 0, 0);
+          this.recordVectorSelectivePaint(ordinal);
+          const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
+          this.vectorGlyphRunMeta.push(start, count, renderingMode);
+          this.vectorGlyphFillColors.push(0, 0, 0, 0);
           const clip = this.state.clipBounds ?? this.options.pageBounds;
-          this.legacyGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
-          this.legacyGlyphRunFlags.push(DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED |
-            DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_COMPOSITED);
-          this.legacyGlyphClipIndices.push(this.state.clipIndex);
-          this.recordLegacySourceEvent(
-            DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
+          this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
+          this.vectorGlyphRunFlags.push(DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED |
+            DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED);
+          this.vectorGlyphClipIndices.push(this.state.clipIndex);
+          this.recordVectorSourceEvent(
+            DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
             glyphRunIndex,
             "Tj"
           );
           return;
         }
         throw new DensePdfUnsupportedError(
-          "Legacy vector output cannot prove an arbitrary clipped visible text run.",
+          "VectorScene output cannot prove an arbitrary clipped visible text run.",
           "Tj"
         );
       }
-      this.recordLegacyOrdinaryPaint("nonstroke", "Tj");
+      this.recordVectorOrdinaryPaint("nonstroke", "Tj");
     }
-    const glyphRunIndex = this.legacyGlyphRunMeta.length / 3;
-    this.legacyGlyphRunMeta.push(start, count, renderingMode);
-    this.legacyGlyphClipIndices.push(this.state.clipIndex);
-    this.legacyGlyphFillColors.push(
+    const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
+    this.vectorGlyphRunMeta.push(start, count, renderingMode);
+    this.vectorGlyphClipIndices.push(this.state.clipIndex);
+    this.vectorGlyphFillColors.push(
       this.state.fillR,
       this.state.fillG,
       this.state.fillB,
       this.state.fillAlpha
     );
     const clip = this.state.clipBounds ?? this.options.pageBounds;
-    this.legacyGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
-    this.legacyGlyphRunFlags.push(
-      this.state.clipIsDefault ? 0 : DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED
+    this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
+    this.vectorGlyphRunFlags.push(
+      this.state.clipIsDefault ? 0 : DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED
     );
     if (renderingMode === 0 && this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON) {
-      this.legacySawVisibleText = true;
+      this.vectorSawVisibleText = true;
     }
-    this.recordLegacySourceEvent(
-      DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
+    this.recordVectorSourceEvent(
+      DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
       glyphRunIndex,
       "Tj"
     );
@@ -3611,7 +3663,7 @@ class DenseContentCompiler {
     operator: "Do" | "BI" = "Do"
   ): void {
     if (!this.state.clipBounds) return;
-    if (!this.options.preservePaintOrder && this.options.legacyVectorOutput !== true) return;
+    if (!this.policy.displayProgram && this.policy.vectorScene !== true) return;
     if (
       !Number.isSafeInteger(imageIndex) || imageIndex < 0 || imageIndex > 0xffff_ffff ||
       !Number.isSafeInteger(sourceOffset) || sourceOffset < -1 ||
@@ -3620,94 +3672,94 @@ class DenseContentCompiler {
     ) {
       throw new DensePdfSyntaxError("Image paint source metadata is invalid.");
     }
-    if (this.options.legacyVectorOutput === true) {
-      if (!this.options.legacyOrderedPaint && this.options.legacySelectiveClippedImages === true &&
+    if (this.policy.vectorScene === true) {
+      if (!this.policy.orderedPaint && this.policy.selectiveRaster === true &&
           !this.state.clipIsDefault && (!this.state.clipIsExactRectangle ||
           this.state.matrix[1] !== 0 || this.state.matrix[2] !== 0)) {
-        this.assertLegacyVectorComposite("nonstroke", operator, true, false);
-        const ordinal = this.nextLegacyPaintOrdinal(operator);
-        this.legacySelectivePaintSourceSpans.push(sourceOffset, sourceLength);
-        this.recordLegacySelectivePaint(ordinal);
+        this.assertVectorSceneComposite("nonstroke", operator, true, false);
+        const ordinal = this.nextVectorPaintOrdinal(operator);
+        this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
+        this.recordVectorSelectivePaint(ordinal);
         return;
       }
       let overlappingPathSpan = false;
-      if (this.legacySawPathPaint && !this.options.legacyOrderedPaint) {
-        overlappingPathSpan = this.legacyPrecedingPathsOverlapImage(operator);
+      if (this.vectorSawPathPaint && !this.policy.orderedPaint) {
+        overlappingPathSpan = this.vectorPrecedingPathsOverlapImage(operator);
         if (overlappingPathSpan && (
-          this.options.legacySelectiveImageSpans !== true ||
+          !this.policy.selectiveRaster ||
           this.genericPathPaints.length !== 0
         )) {
           throw new DensePdfUnsupportedError(
-            "Legacy vector output cannot move an image behind overlapping preceding visible path paint.",
+            "VectorScene output cannot move an image behind overlapping preceding visible path paint.",
             operator
           );
         }
       }
-      if (this.options.legacySelectiveImageSpans === true &&
-          this.legacySawVisibleText && !overlappingPathSpan) {
-        this.assertLegacyVectorComposite("nonstroke", operator, true, false);
-        const ordinal = this.nextLegacyPaintOrdinal(operator);
-        this.legacySelectivePaintSourceSpans.push(sourceOffset, sourceLength);
-        this.recordLegacySelectivePaint(ordinal);
-        this.legacyPathSpanStartFillCount = this.fillPathCount;
-        this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
+      if (this.policy.selectiveRaster && !this.policy.orderedPaint &&
+          this.vectorSawVisibleText && !overlappingPathSpan) {
+        this.assertVectorSceneComposite("nonstroke", operator, true, false);
+        const ordinal = this.nextVectorPaintOrdinal(operator);
+        this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
+        this.recordVectorSelectivePaint(ordinal);
+        this.vectorPathSpanStartFillCount = this.fillPathCount;
+        this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
         return;
       }
-      if (!this.options.legacyOrderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
+      if (!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
         throw new DensePdfUnsupportedError(
-          "Legacy vector output cannot prove an arbitrarily clipped image underlay.",
+          "VectorScene output cannot prove an arbitrarily clipped image underlay.",
           operator
         );
       }
-      this.assertLegacyVectorComposite("nonstroke", operator, true, false);
-      const ordinal = this.nextLegacyPaintOrdinal(operator);
-      const imageInvocationIndex = this.legacyImageIndices.length;
-      this.legacyImageIndices.push(imageIndex);
-      this.legacyImageTransforms.push(...this.state.matrix);
-      this.legacyImageClipBounds.push(
+      this.assertVectorSceneComposite("nonstroke", operator, true, false);
+      const ordinal = this.nextVectorPaintOrdinal(operator);
+      const imageInvocationIndex = this.vectorImageIndices.length;
+      this.vectorImageIndices.push(imageIndex);
+      this.vectorImageTransforms.push(...this.state.matrix);
+      this.vectorImageClipBounds.push(
         this.state.clipBounds.minX,
         this.state.clipBounds.minY,
         this.state.clipBounds.maxX,
         this.state.clipBounds.maxY
       );
-      this.legacyImagePaintOrders.push(ordinal);
-      this.legacyImageFlags.push(
-        (this.state.clipIsDefault ? 0 : DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED) |
-        (this.legacySawVisibleText
-          ? DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT
+      this.vectorImagePaintOrders.push(ordinal);
+      this.vectorImageFlags.push(
+        (this.state.clipIsDefault ? 0 : DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED) |
+        (this.vectorSawVisibleText
+          ? DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT
           : 0) |
-        (this.legacySawPathPaint
-          ? DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH
+        (this.vectorSawPathPaint
+          ? DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_PATH
           : 0) |
         (overlappingPathSpan
-          ? DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN
+          ? DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN
           : 0)
       );
-      this.legacyImagePathSpanCheckpoints.push(
-        overlappingPathSpan ? this.legacyPathSpanStartFillCount : this.fillPathCount,
+      this.vectorImagePathSpanCheckpoints.push(
+        overlappingPathSpan ? this.vectorPathSpanStartFillCount : this.fillPathCount,
         this.fillPathCount,
-        overlappingPathSpan ? this.legacyPathSpanStartStrokeCount : this.strokes.primitiveCount,
+        overlappingPathSpan ? this.vectorPathSpanStartStrokeCount : this.strokes.primitiveCount,
         this.strokes.primitiveCount,
-        overlappingPathSpan ? this.legacyPathSpanStartOrdinal : ordinal,
+        overlappingPathSpan ? this.vectorPathSpanStartOrdinal : ordinal,
         ordinal
       );
-      this.legacyImagePathSourceSpans.push(
-        overlappingPathSpan ? this.legacyPathSpanSourceOffset : sourceOffset,
-        overlappingPathSpan ? this.legacyPathSpanSourceLength : sourceLength,
+      this.vectorImagePathSourceSpans.push(
+        overlappingPathSpan ? this.vectorPathSpanSourceOffset : sourceOffset,
+        overlappingPathSpan ? this.vectorPathSpanSourceLength : sourceLength,
         sourceOffset,
         sourceLength
       );
-      this.recordLegacySourceEvent(
-        DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
+      this.recordVectorSourceEvent(
+        DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
         imageInvocationIndex,
         operator
       );
-      this.legacyPathSpanStartFillCount = this.fillPathCount;
-      this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
-      this.legacyPathSpanStartOrdinal = ordinal + 1;
-      this.legacyPathSpanHasPaint = false;
-      this.legacyPathSpanSourceOffset = -1;
-      this.legacyPathSpanSourceLength = -1;
+      this.vectorPathSpanStartFillCount = this.fillPathCount;
+      this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
+      this.vectorPathSpanStartOrdinal = ordinal + 1;
+      this.vectorPathSpanHasPaint = false;
+      this.vectorPathSpanSourceOffset = -1;
+      this.vectorPathSpanSourceLength = -1;
       return;
     }
     this.recordPaintTrace(
@@ -3738,7 +3790,7 @@ class DenseContentCompiler {
    * At the first late image all retained path stores contain preceding paints
    * only, so scan those existing bounds without keeping a source-order journal.
    */
-  private legacyPrecedingPathsOverlapImage(operator: string): boolean {
+  private vectorPrecedingPathsOverlapImage(operator: string): boolean {
     let imageBounds: DensePdfBounds | null = transformRectangleBounds(
       { minX: 0, minY: 0, maxX: 1, maxY: 1 },
       this.state.matrix
@@ -3766,12 +3818,12 @@ class DenseContentCompiler {
     };
     const fillA = this.fillPathMetaA.usedView();
     const fillB = this.fillPathMetaB.usedView();
-    for (let offset = this.legacyPathSpanStartFillCount * 4; offset < fillA.length; offset += 4) {
+    for (let offset = this.vectorPathSpanStartFillCount * 4; offset < fillA.length; offset += 4) {
       check({ minX: fillA[offset + 2], minY: fillA[offset + 3],
         maxX: fillB[offset], maxY: fillB[offset + 1] });
     }
     const strokeBounds = this.strokes.primitiveBounds.usedView();
-    for (let offset = this.legacyPathSpanStartStrokeCount * 4; offset < strokeBounds.length; offset += 4) {
+    for (let offset = this.vectorPathSpanStartStrokeCount * 4; offset < strokeBounds.length; offset += 4) {
       check({ minX: strokeBounds[offset], minY: strokeBounds[offset + 1],
         maxX: strokeBounds[offset + 2], maxY: strokeBounds[offset + 3] });
     }
@@ -3793,7 +3845,7 @@ class DenseContentCompiler {
 
   private recordFormPaint(definitionIndex: number, optionalContentIndex: number): void {
     if (!this.state.clipBounds) return;
-    if (this.options.legacyVectorOutput === true) {
+    if (this.policy.vectorScene === true) {
       if (this.state.strokePatternColorSpace || this.state.fillPatternColorSpace) {
         throw new DensePdfUnsupportedError(
           "A Form invoked with inherited pattern color state cannot be specialized exactly.",
@@ -3803,12 +3855,12 @@ class DenseContentCompiler {
       // A Form can inherit either paint role. Validate both now so the event
       // tape never advertises an occurrence whose caller state the grouped
       // bridge cannot represent conservatively.
-      if (this.options.legacyAllowCompositeForms !== true) {
-        this.assertLegacyVectorComposite("nonstroke", "Do");
-        this.assertLegacyVectorComposite("stroke", "Do");
+      if (this.policy.selectiveRaster !== true) {
+        this.assertVectorSceneComposite("nonstroke", "Do");
+        this.assertVectorSceneComposite("stroke", "Do");
       }
       const paintIndex = this.formPaints.length;
-      const paintOrder = this.nextLegacyPaintOrdinal("Do");
+      const paintOrder = this.nextVectorPaintOrdinal("Do");
       this.formPaints.push({
         definitionIndex,
         transform: [...this.state.matrix],
@@ -3817,16 +3869,16 @@ class DenseContentCompiler {
         clipIsExactRectangle: this.state.clipIsExactRectangle,
         initialGraphicsState: snapshotInitialGraphicsState(this.state)
       });
-      this.legacyFormPaintOrders.push(paintOrder);
-      this.legacyFormClipIndices.push(this.state.clipIndex);
-      this.recordLegacySourceEvent(
-        DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
+      this.vectorFormPaintOrders.push(paintOrder);
+      this.vectorFormClipIndices.push(this.state.clipIndex);
+      this.recordVectorSourceEvent(
+        DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
         paintIndex,
         "Do"
       );
       return;
     }
-    if (!this.options.preservePaintOrder) return;
+    if (!this.policy.displayProgram) return;
     if (this.state.strokePatternColorSpace || this.state.fillPatternColorSpace) {
       throw new DensePdfUnsupportedError(
         "A Form invoked with inherited pattern color state cannot be specialized exactly.",
@@ -3852,7 +3904,7 @@ class DenseContentCompiler {
   }
 
   private recordShadingPaint(gradientIndex: number): void {
-    if (!this.options.preservePaintOrder || !this.state.clipBounds) return;
+    if (!this.policy.displayProgram || !this.state.clipBounds) return;
     this.recordPaintTrace(
       DENSE_PDF_PAINT_RUN_GRADIENT,
       gradientIndex,
@@ -3876,7 +3928,7 @@ class DenseContentCompiler {
     role: "fill" | "stroke",
     operator: string
   ): void {
-    if (!this.options.preservePaintOrder) {
+    if (!this.policy.displayProgram) {
       throw new DensePdfUnsupportedError(
         "Pattern painting requires source-ordered display-program compilation."
       );

@@ -3,15 +3,15 @@ import { buildNativeRasterPage, buildNativeFallbackTextIndex } from "./pdf/nativ
 import { findRgbaAlphaBounds } from "./rgbaBounds";
 import { loadNodeCanvas } from "./nodeCanvas";
 import {
-  DENSE_PDF_LEGACY_VECTOR_EVENT_FILL,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT,
-  DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED,
-  DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN,
+  DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
+  DENSE_PDF_VECTOR_SCENE_EVENT_STROKE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+  DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
+  DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED,
+  DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN,
   DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED,
   DENSE_PDF_PAINT_RUN_FILL,
   DENSE_PDF_PAINT_RUN_FORM,
@@ -23,14 +23,17 @@ import {
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
   compileDensePdfContent,
+  compileGroupedVectorPageContent,
+  compileVectorFormContent,
   type DensePdfBounds,
   type DensePdfColorSpaceDefinition,
   type DensePdfColorSpaceResolver,
   type DensePdfCompiledPage,
   type DensePdfContentSegment,
+  type DensePdfContentInputOptions,
   type DensePdfExtGStateDefinition,
   type DensePdfInitialGraphicsState,
-  type DensePdfLegacyVectorOutput,
+  type DensePdfVectorSceneData,
   type DensePdfMarkedContentPropertyDefinition,
   type DensePdfMatrix,
   type DensePdfPatternColorSpaceDefinition,
@@ -626,7 +629,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         sourcePageIndex,
         options,
         signal,
-        false,
+        "display-program",
         timings,
         capturePaintSourceIdentities,
         reuse
@@ -843,7 +846,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         sourcePageIndex,
         options,
         signal,
-        true,
+        "vector-scene",
         timings,
         false,
         reuse
@@ -884,7 +887,7 @@ class NativePdfSession implements NativeVectorPdfSession {
           timings.compileScanMs += nativeVectorTimingNow() - formCompileStartedAt;
         }
       } else {
-        const selective = suppressLegacySelectiveImageSpans(compiled, sourcePageIndex);
+        const selective = suppressVectorSelectiveImageSpans(compiled, sourcePageIndex);
         vectorCompiled = selective.compiled;
         selectiveImagePaintOrdinalSpans = selective.paintOrdinalSpans;
         selectivePaintSourceSpans = selective.paintSourceSpans;
@@ -1039,7 +1042,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: PdfCompileOptions,
     signal: AbortSignal,
-    legacyVectorOutput: boolean,
+    output: "display-program" | "vector-scene",
     timings?: NativeVectorCompileTimings
   ): Promise<PreparedNativePageResources> {
     const page = this.document.getPage(sourcePageIndex);
@@ -1097,7 +1100,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       page,
       signal
     );
-    if (legacyVectorOutput) {
+    if (output === "vector-scene") {
       await assertNoNativeVectorAnnotationAppearances(
         this.formRegistry,
         this.appearanceSynthesizer,
@@ -1148,7 +1151,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       signal
     );
     const hasReferencedForms = xObjectReferences.some(({ kind }) => kind === "Form");
-    const formGraph = legacyVectorOutput && !hasReferencedForms
+    const formGraph = output === "vector-scene" && !hasReferencedForms
       ? EMPTY_NATIVE_FORM_DEFINITION_GRAPH
       : await buildNativePdfFormDefinitionGraph(
           this.document,
@@ -1188,14 +1191,14 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: PdfCompileOptions,
     signal: AbortSignal,
-    legacyVectorOutput: boolean,
+    output: "display-program" | "vector-scene",
     timings?: NativeVectorCompileTimings,
     capturePaintSourceIdentities = false,
     reuse?: NativePagePreparationReuse
   ) {
     signal.throwIfAborted();
     const prepared = reuse?.prepared ?? await this.preparePageResources(
-      sourcePageIndex, options, signal, legacyVectorOutput, timings
+      sourcePageIndex, options, signal, output, timings
     );
     if (reuse) reuse.prepared = prepared;
     const {
@@ -1232,26 +1235,14 @@ class NativePdfSession implements NativeVectorPdfSession {
     ));
     const compileStartedAt = timings ? nativeVectorTimingNow() : 0;
     let finalizeStartedAt: number | null = null;
-    const compiled = await compileDensePdfContent(pageContentSegments, {
+    const compileOptions: DensePdfContentInputOptions = {
       pageMatrix,
       pageBounds,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      preservePaintOrder: !legacyVectorOutput,
-      ...(!legacyVectorOutput && capturePaintSourceIdentities
+      ...(output === "display-program" && capturePaintSourceIdentities
         ? { capturePaintSourceIdentities: true }
         : {}),
-      ...(legacyVectorOutput ? { legacyVectorOutput: true,
-        legacyOrderedPaint: nativeVectorOrderedPaintEnabled(options) } : {}),
-      ...(legacyVectorOutput ? { legacyAllowCompositeForms: true } : {}),
-      ...(legacyVectorOutput && !nativeVectorOrderedPaintEnabled(options) ? { legacySelectiveImageSpans: true } : {}),
-      ...(legacyVectorOutput ? { legacySelectiveClippedImages: true } : {}),
-      ...(legacyVectorOutput ? {
-        legacySelectiveShadings: true,
-        legacySelectivePaths: true,
-        legacySelectiveTextClips: true,
-        legacyIgnoreOverprint: true
-      } : {}),
       textOperatorSink,
       extGStates,
       imageXObjects: imageResources.indexes,
@@ -1282,7 +1273,10 @@ class NativePdfSession implements NativeVectorPdfSession {
           this.info.byteLength
         ));
       }
-    });
+    };
+    const compiled = output === "vector-scene" && !nativeVectorOrderedPaintEnabled(options)
+      ? await compileGroupedVectorPageContent(pageContentSegments, compileOptions)
+      : await compileDensePdfContent(pageContentSegments, { ...compileOptions, output });
     if (timings) {
       const compileFinishedAt = nativeVectorTimingNow();
       const finalizeSplitAt = finalizeStartedAt ?? compileFinishedAt;
@@ -1838,7 +1832,7 @@ async function flattenNativeVectorFormOccurrences(
   signal.throwIfAborted();
   if (graph.annotationPlacements.length !== 0) {
     throw vectorFormUnsupported(
-      "Annotation appearances cannot be flattened into the legacy VectorScene.",
+      "Annotation appearances cannot be flattened into the VectorScene.",
       pageIndex,
       "vector-form-annotation"
     );
@@ -2046,19 +2040,16 @@ async function flattenNativeVectorFormOccurrences(
         return emittedTextRuns;
       }
     };
-    const compiled = await compileDensePdfContent(await scopedContent(definition), {
+    const compiled = await compileVectorFormContent(await scopedContent(definition), {
       pageMatrix: transform,
       pageBounds: clipBounds,
       initialGraphicsState: paint.initialGraphicsState,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      legacyVectorOutput: true,
-      legacyOrderedPaint: nativeVectorOrderedPaintEnabled(options),
       ...(nativeVectorOrderedPaintEnabled(options) ? { initialVectorClip: rectangleVectorClip({
         minX: definition.form.bbox[0], minY: definition.form.bbox[1],
         maxX: definition.form.bbox[2], maxY: definition.form.bbox[3]
       }, transform, paint.vectorClip ?? null) } : {}),
-      legacyIgnoreOverprint: true,
       textOperatorSink,
       extGStates,
       imageXObjects: images.indexes,
@@ -2077,7 +2068,7 @@ async function flattenNativeVectorFormOccurrences(
       patternColorSpaces: colors.patternColorSpaces,
       totalBytes: definition.content.length,
       signal
-    });
+    }, nativeVectorOrderedPaintEnabled(options) ? "source" : "grouped");
     imageResources.assertReferencedCodecsAvailable(compiled.referencedXObjects, images.indexes);
     const text = textCompiler.build();
     if (!nativeVectorOrderedPaintEnabled(options)) assertVectorFormPathsWithinClip(
@@ -2088,7 +2079,7 @@ async function flattenNativeVectorFormOccurrences(
     );
     if (!nativeVectorOrderedPaintEnabled(options)) assertVectorFormTextWithinClip(
       text,
-      compiled.legacyVector,
+      compiled.vectorSceneData,
       fontRegistry.resources,
       clipBounds,
       pageIndex,
@@ -2124,7 +2115,7 @@ async function flattenNativeVectorFormOccurrences(
     }
     const resolved: (NativeVectorCompiledOccurrence | null)[] = [];
     children.set(owner, resolved);
-    const sidecar = owner.compiled.legacyVector!;
+    const sidecar = owner.compiled.vectorSceneData!;
     if (!ordered && owner.formDefinitionIndex >= 0) {
       for (let i = 0; i < sidecar.imageIndices.length; i++) {
         if (!unitSquareInsideBounds(sidecar.imageTransforms.subarray(i * 6, i * 6 + 6), owner.clipBounds)) {
@@ -2167,7 +2158,7 @@ async function flattenNativeVectorFormOccurrences(
   const glyphFillColors: number[] = [];
   const glyphClipBounds: number[] = [];
   const glyphRunFlags: number[] = [];
-  const glyphRunClips: NonNullable<DensePdfLegacyVectorOutput["glyphRunClips"]>[number][] = [];
+  const glyphRunClips: NonNullable<DensePdfVectorSceneData["glyphRunClips"]>[number][] = [];
   const imageIndices: number[] = [];
   const imageTransforms: number[] = [];
   const imageClipBounds: number[] = [];
@@ -2210,7 +2201,7 @@ async function flattenNativeVectorFormOccurrences(
     signal.throwIfAborted();
     registerOccurrence(occurrence);
     textAccumulator.appendDiagnosticsFrom(occurrence.text);
-    const sidecar = occurrence.compiled.legacyVector;
+    const sidecar = occurrence.compiled.vectorSceneData;
     if (!sidecar || !(sidecar.sourceEvents instanceof Uint32Array) ||
         sidecar.sourceEvents.length % 2 !== 0) {
       throw new PdfError("invalid-object", "A Form occurrence has no valid source-event tape.", {
@@ -2231,7 +2222,7 @@ async function flattenNativeVectorFormOccurrences(
       const kind = sidecar.sourceEvents[offset];
       const localIndex = sidecar.sourceEvents[offset + 1];
       const vectorClip = sidecar.sourceClips?.[offset / 2] ?? null;
-      if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH) {
+      if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
         }
@@ -2263,15 +2254,15 @@ async function flattenNativeVectorFormOccurrences(
         glyphRunFlags.push(
           (sidecar.glyphRunFlags?.[localIndex] ?? 0) |
           (occurrence.formDefinitionIndex >= 0
-            ? DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED
+            ? DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED
             : 0)
         );
         glyphRunClips.push(sidecar.glyphRunClips?.[localIndex] ?? null);
         appendSourceEvent(
-          DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
+          DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
           glyphRunMeta.length / 3 - 1, vectorClip
         );
-      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE) {
+      } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         if (localIndex >= seenImages.length || seenImages[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "image", localIndex);
         }
@@ -2313,9 +2304,9 @@ async function flattenNativeVectorFormOccurrences(
             : inheritedFormPaintOrder ?? globalIndex
         );
         imageFlags.push(sidecar.imageFlags[localIndex]);
-        appendSourceEvent(DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, globalIndex, vectorClip);
+        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip);
         if (occurrence.formDefinitionIndex === -1) rootPackedFormSinceImage = false;
-      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FORM) {
+      } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM) {
         if (localIndex >= seenForms.length || seenForms[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "Form", localIndex);
         }
@@ -2353,7 +2344,7 @@ async function flattenNativeVectorFormOccurrences(
             if (ordered && occurrence.formDefinitionIndex === -1 && rejectedRootForms.has(localIndex)) {
               selectiveCompositeFormPaintIndices.push(localIndex);
               selectiveCompositeFormPaintOrders.push(formPaintOrder);
-              appendSourceEvent(DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE, formPaintOrder);
+              appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder);
             }
             const child = ordered ? children.get(occurrence)![localIndex]
               : await compileOccurrence(paint.definitionIndex, paint);
@@ -2368,7 +2359,7 @@ async function flattenNativeVectorFormOccurrences(
             }
             // Suppress only the outermost invocation. Its complete reusable
             // display-program subtree is captured later as one ordered layer,
-            // so no nested paint can leak into the packed legacy stores.
+            // so no nested paint can leak into the packed VectorScene stores.
             selectiveCompositeFormPaintIndices.push(localIndex);
             selectiveCompositeFormPaintOrders.push(formPaintOrder);
           }
@@ -2394,14 +2385,14 @@ async function flattenNativeVectorFormOccurrences(
         if (occurrence.formDefinitionIndex === -1 && childHasPackedGeometry) {
           rootPackedFormSinceImage = true;
         }
-      } else if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT) {
+      } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) {
         if (localIndex !== 0 || ownerSawOrdinaryPaint) {
           throw invalidVectorFormEvent(pageIndex, "ordinary-paint", localIndex);
         }
         ownerSawOrdinaryPaint = true;
         globalSawOrdinaryPaint = true;
         if (!recordedGlobalOrdinaryBarrier) {
-          appendSourceEvent(DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0);
+          appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0);
           recordedGlobalOrdinaryBarrier = true;
         }
         if (occurrence.compiled.fillPathCount !== 0 || occurrence.compiled.segmentCount !== 0) {
@@ -2413,17 +2404,17 @@ async function flattenNativeVectorFormOccurrences(
           ownerRecordedGeometry = true;
           occurrenceHasPackedGeometry = true;
         }
-      } else if (ordered && kind === DENSE_PDF_LEGACY_VECTOR_EVENT_COMPOSITE) {
+      } else if (ordered && kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         appendSourceEvent(kind, localIndex);
-      } else if (ordered && (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FILL ||
-          kind === DENSE_PDF_LEGACY_VECTOR_EVENT_STROKE)) {
+      } else if (ordered && (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ||
+          kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE)) {
         const ranges = sidecar.pathPaintRanges;
         if (!ranges || localIndex * 2 + 1 >= ranges.length || !ownerRecordedGeometry) {
           throw invalidVectorFormEvent(pageIndex, "path", localIndex);
         }
         appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip);
         pathPaintRanges.push(ranges[localIndex * 2] +
-          (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FILL ? fillBase : strokeBase), ranges[localIndex * 2 + 1]);
+          (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? fillBase : strokeBase), ranges[localIndex * 2 + 1]);
       } else {
         throw invalidVectorFormEvent(pageIndex, "unknown", localIndex);
       }
@@ -2446,7 +2437,7 @@ async function flattenNativeVectorFormOccurrences(
     return occurrenceHasPackedGeometry;
   };
 
-  const selectiveImageSpans = suppressLegacySelectiveImageSpans(rootCompiled, pageIndex);
+  const selectiveImageSpans = suppressVectorSelectiveImageSpans(rootCompiled, pageIndex);
   const rootOccurrence = Object.freeze({
     compiled: selectiveImageSpans.compiled,
     text: rootText,
@@ -2456,7 +2447,7 @@ async function flattenNativeVectorFormOccurrences(
   if (ordered) await preflight(rootOccurrence);
   await walkOccurrence(rootOccurrence);
   const accumulatedText = textAccumulator.build().compilation;
-  const legacyVector: DensePdfLegacyVectorOutput = Object.freeze({
+  const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
     ...(ordered ? { pathPaintRanges: Uint32Array.from(pathPaintRanges), sourceClips } : {}),
     glyphRunMeta: Uint32Array.from(glyphRunMeta),
@@ -2475,7 +2466,7 @@ async function flattenNativeVectorFormOccurrences(
       rootCompiled,
       geometryOccurrences,
       allOccurrences,
-      legacyVector
+      vectorSceneData
     ),
     textCompilation: accumulatedText,
     selectiveCompositeFormPaintIndices: Object.freeze(selectiveCompositeFormPaintIndices),
@@ -2486,7 +2477,7 @@ async function flattenNativeVectorFormOccurrences(
   });
 }
 
-function suppressLegacySelectiveImageSpans(
+function suppressVectorSelectiveImageSpans(
   compiled: DensePdfCompiledPage,
   pageIndex: number
 ): {
@@ -2495,7 +2486,7 @@ function suppressLegacySelectiveImageSpans(
   paintSourceSpans: readonly (readonly [number, number])[];
   paintSourceIntervals: readonly (readonly [number, number, number, number])[];
 } {
-  const sidecar = compiled.legacyVector;
+  const sidecar = compiled.vectorSceneData;
   const checkpoints = sidecar?.imagePathSpanCheckpoints;
   const imageSourceSpans = sidecar?.imagePathSourceSpans;
   const standalone = sidecar?.selectivePaintOrdinalSpans;
@@ -2551,7 +2542,7 @@ function suppressLegacySelectiveImageSpans(
   const imageSuppressed = new Uint8Array(sidecar.imageIndices.length);
   const spans: Array<readonly [number, number]> = [...standaloneSpans];
   for (let image = 0; image < sidecar.imageIndices.length; image += 1) {
-    if ((sidecar.imageFlags[image] & DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN) === 0) continue;
+    if ((sidecar.imageFlags[image] & DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN) === 0) continue;
     const offset = image * 6;
     const fillStart = checkpoints[offset];
     const fillEnd = checkpoints[offset + 1];
@@ -2634,8 +2625,8 @@ function suppressLegacySelectiveImageSpans(
   for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
     const kind = sidecar.sourceEvents[offset];
     const index = sidecar.sourceEvents[offset + 1];
-    if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE && imageSuppressed[index]) continue;
-    sourceEvents.push(kind, kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE ? imageMap[index] : index);
+    if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE && imageSuppressed[index]) continue;
+    sourceEvents.push(kind, kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE ? imageMap[index] : index);
   }
   const reducedFillBounds = aggregateFloat4Bounds(fillMetaA, fillMetaB, 2, 3, 0, 1);
   const reducedStrokeBounds = aggregateFloat4Bounds(
@@ -2666,7 +2657,7 @@ function suppressLegacySelectiveImageSpans(
       fillBounds: reducedFillBounds,
       strokeBounds: reducedStrokeBounds,
       bounds: unionDenseBounds(reducedFillBounds, reducedStrokeBounds) ?? compiled.bounds,
-      legacyVector: {
+      vectorSceneData: {
         ...sidecar,
         sourceEvents: Uint32Array.from(sourceEvents),
         imageIndices: Uint32Array.from(imageIndices),
@@ -2721,7 +2712,7 @@ function unionDenseBounds(
 
 function isOrderedFormClipFailure(error: unknown): boolean {
   if (error instanceof DensePdfUnsupportedError) {
-    return /^(Legacy vector output cannot (?:represent|prove) an? arbitrary|Legacy vector output cannot prove an arbitrarily)/.test(error.message);
+    return /^(VectorScene output cannot (?:represent|prove) an? arbitrary|VectorScene output cannot prove an arbitrarily)/.test(error.message);
   }
   return error instanceof PdfError && error.code === "unsupported-content" &&
     ["vector-form-caller-clip", "vector-form-path-bbox", "vector-form-image-bbox",
@@ -2730,9 +2721,9 @@ function isOrderedFormClipFailure(error: unknown): boolean {
 
 function isSelectiveCompositeCandidateError(error: unknown): boolean {
   if (error instanceof DensePdfUnsupportedError) {
-    return error.message === "Legacy vector output cannot represent alpha-as-shape compositing." ||
-      error.message === "Legacy vector output cannot represent a soft mask." ||
-      /^Legacy vector output cannot represent \/.+ blending\.$/.test(error.message);
+    return error.message === "VectorScene output cannot represent alpha-as-shape compositing." ||
+      error.message === "VectorScene output cannot represent a soft mask." ||
+      /^VectorScene output cannot represent \/.+ blending\.$/.test(error.message);
   }
   if (!(error instanceof PdfError) || error.code !== "unsupported-content") return false;
   const reason = error.details?.reason;
@@ -2907,7 +2898,7 @@ async function renderNativeSelectiveCompositeLayers(
       if (unselectedGlyphOffset >= 0 && !onCompositeText) {
         throw new PdfError(
           "unsupported-content",
-          "A selective composite contains text and cannot preserve legacy search semantics.",
+          "A selective composite contains text and cannot preserve VectorScene search semantics.",
           {
             details: {
               reason: "selective-composite-nonvector-resource",
@@ -2988,7 +2979,7 @@ function createSelectiveCompositePage(
     backdropPaintIndex: -1,
     ...(!preserveBackdropGroups?.has(index) ? {
       // A standalone layer has no parent backdrop. Keep every nested scope
-      // independent so the resulting RGBA can be moved through the legacy
+      // independent so the resulting RGBA can be moved through the VectorScene
       // raster-underlay ABI without sampling unrelated page pixels.
       isolated: true,
       alphaIsShape: false,
@@ -3427,7 +3418,7 @@ function mergeNativeVectorOccurrences(
   root: DensePdfCompiledPage,
   geometry: readonly NativeVectorCompiledOccurrence[],
   all: readonly NativeVectorCompiledOccurrence[],
-  legacyVector: DensePdfLegacyVectorOutput
+  vectorSceneData: DensePdfVectorSceneData
 ): DensePdfCompiledPage {
   const fillPathCount = sumOccurrenceField(geometry, "fillPathCount");
   const fillSegmentCount = sumOccurrenceField(geometry, "fillSegmentCount");
@@ -3485,7 +3476,7 @@ function mergeNativeVectorOccurrences(
     fillPathMetaC,
     fillSegmentsA,
     fillSegmentsB,
-    legacyVector,
+    vectorSceneData,
     paintRuns: new Uint32Array(0),
     paintRunOptionalContentIndices: new Int32Array(0),
     paintRunMarkedContentIndices: new Int32Array(0),
@@ -3634,15 +3625,15 @@ function unitSquareInsideBounds(
 
 function assertVectorFormTextWithinClip(
   text: NativeTextCompilation,
-  legacy: DensePdfLegacyVectorOutput | undefined,
+  vectorData: DensePdfVectorSceneData | undefined,
   fonts: readonly NativeTextFontResource[],
   clipBounds: Readonly<DensePdfBounds>,
   pageIndex: number,
   resourceName: string,
   signal: AbortSignal
 ): void {
-  if (!legacy) {
-    throw new PdfError("invalid-object", "A compiled Form has no legacy-vector sidecar.", {
+  if (!vectorData) {
+    throw new PdfError("invalid-object", "A compiled Form has no VectorScene sidecar.", {
       pageIndex,
       details: { reason: "vector-form-sidecar", resourceName }
     });
@@ -3650,21 +3641,21 @@ function assertVectorFormTextWithinClip(
   for (let runIndex = 0; runIndex < text.runs.length; runIndex += 1) {
     signal.throwIfAborted();
     const run = text.runs[runIndex];
-    if (run.renderingMode !== 0 || legacy.glyphFillColors[runIndex * 4 + 3] <= 1e-5) continue;
+    if (run.renderingMode !== 0 || vectorData.glyphFillColors[runIndex * 4 + 3] <= 1e-5) continue;
     let activeClip = clipBounds;
-    if ((legacy.glyphRunFlags?.[runIndex] ?? 0) !== 0) {
+    if ((vectorData.glyphRunFlags?.[runIndex] ?? 0) !== 0) {
       const offset = runIndex * 4;
-      if (!legacy.glyphClipBounds || offset + 4 > legacy.glyphClipBounds.length) {
+      if (!vectorData.glyphClipBounds || offset + 4 > vectorData.glyphClipBounds.length) {
         throw new PdfError("invalid-object", "A clipped Form text run has no clip bounds.", {
           pageIndex,
           details: { reason: "vector-form-text-clip", resourceName }
         });
       }
       activeClip = {
-        minX: legacy.glyphClipBounds[offset],
-        minY: legacy.glyphClipBounds[offset + 1],
-        maxX: legacy.glyphClipBounds[offset + 2],
-        maxY: legacy.glyphClipBounds[offset + 3]
+        minX: vectorData.glyphClipBounds[offset],
+        minY: vectorData.glyphClipBounds[offset + 1],
+        maxX: vectorData.glyphClipBounds[offset + 2],
+        maxY: vectorData.glyphClipBounds[offset + 3]
       };
     }
     for (let glyph = run.first; glyph < run.first + run.count; glyph += 1) {
@@ -4089,7 +4080,7 @@ async function compileNativeFormPrograms(
       extGStates,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      preservePaintOrder: true,
+      output: "display-program",
       totalBytes: definition.content.length,
       signal
     });
@@ -4510,7 +4501,7 @@ async function compileNativeType3Programs(
       colorSpaceResolver: colorScope.resolver,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      preservePaintOrder: true,
+      output: "display-program",
       type3PaintMode: glyph.charProc.metrics.colored ? "colored" : "uncolored",
       totalBytes: content.length,
       signal
@@ -4918,7 +4909,7 @@ async function compileNativeSoftMaskProgram(
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       formXObjects: graph.pageForms,
-      preservePaintOrder: true,
+      output: "display-program",
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       colorSpaceResolver: resources.colorSpaceResolver,
@@ -5622,7 +5613,7 @@ async function compileNativePatternPrograms(
       colorSpaceResolver: colorScope.resolver,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      preservePaintOrder: true,
+      output: "display-program",
       uncoloredPatternPaint: pattern.kind === "uncolored-tiling",
       totalBytes: content.length,
       signal
@@ -6640,7 +6631,7 @@ function isNativeVectorRepresentationFailure(error: unknown): error is PdfError 
       (error.code !== "unsupported-content" && error.code !== "unsupported-image")) return false;
   const reason = String(error.details?.reason ?? "");
   return /^(legacy-vector-|vector-|selective-)/.test(reason) ||
-    /^(Legacy vector|The legacy VectorScene)/i.test(error.message);
+    /^(VectorScene|The VectorScene)/i.test(error.message);
 }
 
 function normalizeCompileError(error: unknown, sourcePageIndex: number): unknown {

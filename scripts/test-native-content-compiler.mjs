@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 
 import {
-  DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT,
-  DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT,
-  DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH,
-  DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN,
+  DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
+  DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+  DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
+  DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT,
+  DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_PATH,
+  DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN,
   DENSE_PDF_PAINT_RUN_IMAGE,
   compileDensePdfContent,
+  compileGroupedVectorPageContent,
+  compileVectorFormContent,
+  compileRetainedTextContent,
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
   getDensePdfPaintSourceIdentity,
@@ -19,6 +24,7 @@ import {
 const encoder = new TextEncoder();
 const NOOP_TEXT_SINK = Object.freeze({ applyOperator() {} });
 const DEFAULT_OPTIONS = Object.freeze({
+  output: "geometry",
   pageMatrix: [1, 0, 0, 1, 0, 0],
   pageBounds: { minX: -1_000, minY: -1_000, maxX: 1_000, maxY: 1_000 },
   enableSegmentMerge: true,
@@ -29,7 +35,8 @@ const DEFAULT_OPTIONS = Object.freeze({
 await testChunkBoundaryLexer();
 await testPreparedInlineImageSegments();
 await testPrivatePaintSourceIdentityRange();
-await testLegacyVectorOutput();
+await testCompilationContexts();
+await testVectorSceneOutput();
 await testPathsTransformsAndCurves();
 await testClippingAndDashes();
 await testDeviceColorsAndMetadataCounts();
@@ -44,14 +51,30 @@ await testCooperativeEligibilityLimits();
 
 console.log("Dense PDF content compiler tests passed.");
 
-async function compile(content, options = {}) {
+async function compile(content, options = {}, compiler = compileDensePdfContent) {
   const source = typeof content === "string" ? encoder.encode(content) : content;
-  return compileDensePdfContent(source, {
+  return compiler(source, {
     ...DEFAULT_OPTIONS,
     ...options,
     pageMatrix: options.pageMatrix ?? [...DEFAULT_OPTIONS.pageMatrix],
     pageBounds: options.pageBounds ?? { ...DEFAULT_OPTIONS.pageBounds }
   });
+}
+
+function groupedFormCompiler(source, options) {
+  return compileVectorFormContent(source, options, "grouped");
+}
+
+function compileGroupedForm(content, options = {}) {
+  return compile(content, options, groupedFormCompiler);
+}
+
+function compileGroupedPage(content, options = {}) {
+  return compile(content, options, compileGroupedVectorPageContent);
+}
+
+function expectUnsupportedGroupedForm(content, operator, options = {}) {
+  return expectUnsupported(content, operator, options, groupedFormCompiler);
 }
 
 async function testChunkBoundaryLexer() {
@@ -104,7 +127,7 @@ async function testPreparedInlineImageSegments() {
 
   const scene = await compileDensePdfContent(segments, {
     ...DEFAULT_OPTIONS,
-    preservePaintOrder: true,
+    output: "display-program",
     enableInvisibleCull: false,
     markedContentProperties: new Map([["Layer", {
       resourceName: "Layer",
@@ -130,7 +153,7 @@ async function testPrivatePaintSourceIdentityRange() {
     { kind: "content", bytes, sourceOffset, sourceLength: bytes.length }
   ], {
     ...DEFAULT_OPTIONS,
-    preservePaintOrder: true,
+    output: "display-program",
     capturePaintSourceIdentities: true
   });
   assert.deepEqual(
@@ -138,12 +161,84 @@ async function testPrivatePaintSourceIdentityRange() {
     [sourceOffset + bytes.lastIndexOf(0x66), 1],
     "private source identities retain offsets above the signed 32-bit range"
   );
-  const ordinary = await compile("0 0 1 1 re f", { preservePaintOrder: true });
+  const ordinary = await compile("0 0 1 1 re f", { output: "display-program" });
   assert.equal(getDensePdfPaintSourceIdentity(ordinary, 0), null,
     "ordinary dense compilation does not allocate a paint-identity trace");
 }
 
-async function testLegacyVectorOutput() {
+async function testCompilationContexts() {
+  const textOperatorSink = {
+    applyOperator(operator) {
+      return operator === "Tj" ? [{ first: 0, count: 1, renderingMode: 0 }] : undefined;
+    }
+  };
+  const content = "BT (covered) Tj ET 0 0 10 10 re f /Im0 Do";
+  const options = { textOperatorSink, imageXObjects: new Map([["Im0", 0]]) };
+  const geometry = await compile(content, options);
+  assert.equal(geometry.vectorSceneData, undefined);
+  assert.equal(geometry.paintRuns.length, 0);
+
+  const display = await compile(content, { ...options, output: "display-program" });
+  assert.equal(display.vectorSceneData, undefined);
+  assert.equal(display.paintRuns.length, 9, "all three paints have display commands");
+
+  const page = await compile(content, { ...options, output: "vector-scene" });
+  const form = await compile(content, options, compileVectorFormContent);
+  for (const compiled of [page, form]) {
+    assert.equal(compiled.paintRuns.length, 0);
+    assert.deepEqual([...compiled.vectorSceneData.pathPaintRanges], [0, 1]);
+    const kinds = [...compiled.vectorSceneData.sourceEvents].filter((_, i) => i % 2 === 0);
+    assert.deepEqual(kinds.filter(kind => kind !== DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT), [
+      DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+      DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
+      DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE
+    ], "normal page and Form output preserve text/fill/image overlap order");
+  }
+
+  const clip = "0 0 m 10 0 l 5 10 l h W n 0 0 10 10 re f";
+  for (const compiler of [compileDensePdfContent, compileVectorFormContent]) {
+    const clipped = await compile(clip, { output: "vector-scene" }, compiler);
+    assert.ok(clipped.vectorSceneData.sourceClips.some(Boolean), "ordered output keeps exact clips");
+    assert.equal(clipped.vectorSceneData.selectivePaintSourceSpans.length, 0);
+  }
+  const groupedClip = await compileGroupedPage(clip);
+  assert.equal(groupedClip.fillPathCount, 0);
+  assert.equal(groupedClip.vectorSceneData.pathPaintRanges, undefined);
+  assert.equal(groupedClip.vectorSceneData.selectivePaintSourceSpans.length, 2,
+    "the grouped page retry captures clipped paint automatically");
+  await expectUnsupportedGroupedForm(clip, "f");
+
+  const shadingOptions = { output: "vector-scene", shadings: new Map([["Sh0", 0]]) };
+  const shading = await compile("/Sh0 sh", shadingOptions);
+  assert.deepEqual([...shading.vectorSceneData.sourceEvents], [DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, 0]);
+  assert.equal(shading.vectorSceneData.selectivePaintSourceSpans.length, 2);
+  await expectUnsupported("/Sh0 sh", "sh", shadingOptions, compileVectorFormContent);
+
+  const compositeOptions = {
+    output: "vector-scene",
+    formXObjects: new Map([["Fm0", 0]]),
+    extGStates: [{ resourceName: "Multiply", blendMode: "Multiply" }]
+  };
+  const composite = await compile("/Multiply gs /Fm0 Do", compositeOptions);
+  assert.equal(composite.formPaints.length, 1, "the page delegates composite Forms to its adapter");
+  await expectUnsupported("/Multiply gs /Fm0 Do", "Do", compositeOptions, compileVectorFormContent);
+
+  const textOptions = { textOperatorSink, extGStates: [{ resourceName: "OP", fillOverprint: true }] };
+  const retained = await compile("BT (label) Tj ET", textOptions, compileRetainedTextContent);
+  assert.deepEqual([...retained.vectorSceneData.glyphRunMeta], [0, 1, 0]);
+  assert.equal(retained.vectorSceneData.pathPaintRanges, undefined);
+  await expectUnsupported("/OP gs BT (label) Tj ET", "Tj", textOptions, compileRetainedTextContent);
+  for (const compiler of [compileDensePdfContent, compileVectorFormContent]) {
+    const staticText = await compile("/OP gs BT (label) Tj ET", { ...textOptions, output: "vector-scene" }, compiler);
+    assert.equal(staticText.vectorSceneData.glyphRunMeta.length, 3,
+      "page and Form output retain the static renderer's overprint approximation");
+  }
+
+  await assert.rejects(compile("", { output: undefined }), TypeError);
+  await assert.rejects(compile("", { output: "unknown" }), TypeError);
+}
+
+async function testVectorSceneOutput() {
   const textSink = (renderingMode, first = 5, count = 2) => ({
     applyOperator(operator) {
       return operator === "Tj" ? [{ first, count, renderingMode }] : undefined;
@@ -162,90 +257,86 @@ async function testLegacyVectorOutput() {
     extGStates: [{ resourceName: "Half", fillAlpha: 0.5 }]
   };
   const baseline = await compile(content, options);
-  const scene = await compile(content, { ...options, legacyVectorOutput: true });
+  const scene = await compileGroupedForm(content, options);
 
   assertSceneGeometryEqual(scene, baseline);
   assert.equal(scene.paintRuns.length, 0, "the grouped bridge does not retain vector paint runs");
   assert.equal(scene.glyphPaints.length, 0, "the ordered glyph ABI remains unused");
   assert.equal(scene.imageTransforms.length, 0, "the ordered image ABI remains unused");
   assert.equal("displayProgram" in scene, false, "direct compilation does not construct HEP data");
-  assert.equal(baseline.legacyVector, undefined);
+  assert.equal(baseline.vectorSceneData, undefined);
 
-  const legacy = scene.legacyVector;
-  assert.ok(legacy);
-  assert.ok(legacy.sourceEvents instanceof Uint32Array);
-  assert.ok(legacy.glyphRunMeta instanceof Uint32Array);
-  assert.ok(legacy.glyphFillColors instanceof Float32Array);
-  assert.ok(legacy.imageIndices instanceof Uint32Array);
-  assert.ok(legacy.imageTransforms instanceof Float32Array);
-  assert.ok(legacy.imageClipBounds instanceof Float32Array);
-  assert.ok(legacy.imagePaintOrders instanceof Uint32Array);
-  assert.ok(legacy.imageFlags instanceof Uint8Array);
-  assert.deepEqual([...legacy.glyphRunMeta], [5, 2, 0]);
+  const vectorData = scene.vectorSceneData;
+  assert.ok(vectorData);
+  assert.ok(vectorData.sourceEvents instanceof Uint32Array);
+  assert.ok(vectorData.glyphRunMeta instanceof Uint32Array);
+  assert.ok(vectorData.glyphFillColors instanceof Float32Array);
+  assert.ok(vectorData.imageIndices instanceof Uint32Array);
+  assert.ok(vectorData.imageTransforms instanceof Float32Array);
+  assert.ok(vectorData.imageClipBounds instanceof Float32Array);
+  assert.ok(vectorData.imagePaintOrders instanceof Uint32Array);
+  assert.ok(vectorData.imageFlags instanceof Uint8Array);
+  assert.deepEqual([...vectorData.glyphRunMeta], [5, 2, 0]);
   assert.deepEqual(
-    [...legacy.glyphFillColors],
+    [...vectorData.glyphFillColors],
     [Math.fround(0.2), Math.fround(0.4), Math.fround(0.6), 0.5]
   );
-  assert.deepEqual([...legacy.imageIndices], [4]);
-  assert.deepEqual([...legacy.imageTransforms], [2, 0, 0, 3, 5, 7]);
-  assert.deepEqual([...legacy.imageClipBounds], [-1_000, -1_000, 1_000, 1_000]);
-  assert.deepEqual([...legacy.imagePaintOrders], [0]);
-  assert.deepEqual([...legacy.imageFlags], [0]);
-  assert.deepEqual([...legacy.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0
+  assert.deepEqual([...vectorData.imageIndices], [4]);
+  assert.deepEqual([...vectorData.imageTransforms], [2, 0, 0, 3, 5, 7]);
+  assert.deepEqual([...vectorData.imageClipBounds], [-1_000, -1_000, 1_000, 1_000]);
+  assert.deepEqual([...vectorData.imagePaintOrders], [0]);
+  assert.deepEqual([...vectorData.imageFlags], [0]);
+  assert.deepEqual([...vectorData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0
   ]);
 
-  const invisibleThenImage = await compile("BT (ocr) Tj ET /Im0 Do", {
-    legacyVectorOutput: true,
+  const invisibleThenImage = await compileGroupedForm("BT (ocr) Tj ET /Im0 Do", {
     imageXObjects: new Map([["Im0", 9]]),
     textOperatorSink: textSink(3, 11, 1)
   });
-  assert.deepEqual([...invisibleThenImage.legacyVector.glyphRunMeta], [11, 1, 3]);
-  assert.deepEqual([...invisibleThenImage.legacyVector.imageIndices], [9]);
-  assert.deepEqual([...invisibleThenImage.legacyVector.imagePaintOrders], [0]);
-  assert.deepEqual([...invisibleThenImage.legacyVector.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0
+  assert.deepEqual([...invisibleThenImage.vectorSceneData.glyphRunMeta], [11, 1, 3]);
+  assert.deepEqual([...invisibleThenImage.vectorSceneData.imageIndices], [9]);
+  assert.deepEqual([...invisibleThenImage.vectorSceneData.imagePaintOrders], [0]);
+  assert.deepEqual([...invisibleThenImage.vectorSceneData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0
   ]);
 
-  const selectivelyClippedText = await compile(
+  const selectivelyClippedText = await compileGroupedPage(
     "0 0 m 10 0 l 5 10 l h W n BT (label) Tj ET",
     {
-      legacyVectorOutput: true,
-      legacySelectiveTextClips: true,
       textOperatorSink: textSink(0, 0, 1)
     }
   );
-  assert.deepEqual([...selectivelyClippedText.legacyVector.glyphRunMeta], [0, 1, 0]);
-  assert.equal(selectivelyClippedText.legacyVector.glyphFillColors[3], 0,
-    "selectively rasterized text remains indexed but is transparent in the legacy glyph layer");
-  assert.equal(selectivelyClippedText.legacyVector.selectivePaintSourceSpans.length, 2);
+  assert.deepEqual([...selectivelyClippedText.vectorSceneData.glyphRunMeta], [0, 1, 0]);
+  assert.equal(selectivelyClippedText.vectorSceneData.glyphFillColors[3], 0,
+    "selectively rasterized text remains indexed but is transparent in the VectorScene glyph layer");
+  assert.equal(selectivelyClippedText.vectorSceneData.selectivePaintSourceSpans.length, 2);
   assert.deepEqual(
-    [...selectivelyClippedText.legacyVector.selectivePaintOrdinalSpans],
+    [...selectivelyClippedText.vectorSceneData.selectivePaintOrdinalSpans],
     [0, 0],
-    "a selectively captured operator retains its legacy raster ordering slot"
+    "a selectively captured operator retains its VectorScene raster ordering slot"
   );
 
-  const visibleThenImage = await compile("BT (label) Tj ET /Im0 Do", {
-    legacyVectorOutput: true,
+  const visibleThenImage = await compileGroupedForm("BT (label) Tj ET /Im0 Do", {
     imageXObjects: new Map([["Im0", 10]]),
     textOperatorSink: textSink(0, 0, 1)
   });
-  assert.deepEqual([...visibleThenImage.legacyVector.imagePaintOrders], [1]);
+  assert.deepEqual([...visibleThenImage.vectorSceneData.imagePaintOrders], [1]);
   assert.deepEqual(
-    [...visibleThenImage.legacyVector.imageFlags],
-    [DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT]
+    [...visibleThenImage.vectorSceneData.imageFlags],
+    [DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT]
   );
-  assert.deepEqual([...visibleThenImage.legacyVector.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0
+  assert.deepEqual([...visibleThenImage.vectorSceneData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0
   ]);
 
   let orderedTextShow = 0;
-  const formOrdering = await compile([
+  const formOrdering = await compileGroupedForm([
     "BT (ocr) Tj ET",
     "/Im0 Do",
     "/Hidden Do",
@@ -253,7 +344,6 @@ async function testLegacyVectorOutput() {
     "0 0 1 1 re f",
     "BT (visible) Tj ET"
   ].join("\n"), {
-    legacyVectorOutput: true,
     imageXObjects: new Map([["Im0", 3]]),
     formXObjects: new Map([["Visible", 7], ["Hidden", 8]]),
     formOptionalContent: new Map([
@@ -273,136 +363,122 @@ async function testLegacyVectorOutput() {
     [7],
     "a default-hidden Form does not create a paint occurrence"
   );
-  assert.deepEqual([...formOrdering.legacyVector.formPaintOrders], [1]);
-  assert.deepEqual([...formOrdering.legacyVector.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_FORM, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 1
+  assert.deepEqual([...formOrdering.vectorSceneData.formPaintOrders], [1]);
+  assert.deepEqual([...formOrdering.vectorSceneData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_FORM, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 1
   ]);
 
-  const formThenImage = await compile("/Fm0 Do /Im0 Do", {
-    legacyVectorOutput: true,
+  const formThenImage = await compileGroupedForm("/Fm0 Do /Im0 Do", {
     formXObjects: new Map([["Fm0", 6]]),
     imageXObjects: new Map([["Im0", 2]])
   });
-  assert.deepEqual([...formThenImage.legacyVector.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_FORM, 0,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0
+  assert.deepEqual([...formThenImage.vectorSceneData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_FORM, 0,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0
   ], "a Form event is not itself an ordinary-paint barrier");
-  assert.deepEqual([...formThenImage.legacyVector.formPaintOrders], [0]);
+  assert.deepEqual([...formThenImage.vectorSceneData.formPaintOrders], [0]);
   assert.deepEqual(
-    [...formThenImage.legacyVector.imagePaintOrders],
+    [...formThenImage.vectorSceneData.imagePaintOrders],
     [1],
     "a Form and a following image must share one monotonically ordered raster timeline"
   );
 
-  const clippedImage = await compile("0 0 10 10 re W n /Im0 Do", {
-    legacyVectorOutput: true,
+  const clippedImage = await compileGroupedForm("0 0 10 10 re W n /Im0 Do", {
     imageXObjects: new Map([["Im0", 1]])
   });
-  assert.deepEqual([...clippedImage.legacyVector.imageClipBounds], [0, 0, 10, 10]);
-  assert.deepEqual([...clippedImage.legacyVector.imageFlags], [1]);
-  await expectUnsupported(
+  assert.deepEqual([...clippedImage.vectorSceneData.imageClipBounds], [0, 0, 10, 10]);
+  assert.deepEqual([...clippedImage.vectorSceneData.imageFlags], [1]);
+  await expectUnsupportedGroupedForm(
     "0 0 m 10 0 l 5 10 l h W n /Im0 Do",
     "Do",
     {
-      legacyVectorOutput: true,
       imageXObjects: new Map([["Im0", 1]])
     }
   );
 
-  const rectangularClip = await compile(
+  const rectangularClip = await compileGroupedForm(
     "0 0 10 10 re W n -5 -5 20 20 re f 1 1 m 9 9 l S",
-    { legacyVectorOutput: true }
+    {}
   );
   assert.equal(rectangularClip.fillPathCount, 1);
   assert.equal(rectangularClip.segmentCount, 1);
-  await expectUnsupported(
+  await expectUnsupportedGroupedForm(
     "0 0 m 10 0 l 5 10 l h W n 0 0 10 10 re f",
     "f",
-    { legacyVectorOutput: true }
+    {}
   );
-  await expectUnsupported(
+  await expectUnsupportedGroupedForm(
     "0 0 m 10 0 l 5 10 l h W n 1 1 m 9 9 l S",
     "S",
-    { legacyVectorOutput: true }
+    {}
   );
 
-  const disjointPathThenImage = await compile("0 20 10 10 re f /Im0 Do", {
-    legacyVectorOutput: true,
+  const disjointPathThenImage = await compileGroupedForm("0 20 10 10 re f /Im0 Do", {
     imageXObjects: new Map([["Im0", 1]])
   });
-  assert.deepEqual([...disjointPathThenImage.legacyVector.imageFlags], [
-    DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH
+  assert.deepEqual([...disjointPathThenImage.vectorSceneData.imageFlags], [
+    DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_PATH
   ], "a conservatively disjoint preceding path may remain above the image underlay");
-  await expectUnsupported("0 0 10 10 re f /Im0 Do", "Do", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("0 0 10 10 re f /Im0 Do", "Do", {
     imageXObjects: new Map([["Im0", 1]])
   });
-  const selectiveLateImage = await compile(
+  const selectiveLateImage = await compileGroupedPage(
     "/Im0 Do 0 0 10 10 re f /Im1 Do",
     {
-      legacyVectorOutput: true,
-      legacySelectiveImageSpans: true,
       imageXObjects: new Map([["Im0", 0], ["Im1", 1]])
     }
   );
-  assert.equal(selectiveLateImage.legacyVector.imageFlags[1],
-    DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_PATH |
-    DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_SELECTIVE_PATH_SPAN);
-  assert.deepEqual([...selectiveLateImage.legacyVector.imagePathSpanCheckpoints], [
+  assert.equal(selectiveLateImage.vectorSceneData.imageFlags[1],
+    DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_PATH |
+    DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_SELECTIVE_PATH_SPAN);
+  assert.deepEqual([...selectiveLateImage.vectorSceneData.imagePathSpanCheckpoints], [
     0, 0, 0, 0, 0, 0,
     0, 1, 0, 0, 1, 2
   ]);
-  const densePathOnly = await compile(
+  const densePathOnly = await compileGroupedPage(
     Array.from({ length: 1_000 }, (_, index) => `${index} 20 1 1 re f`).join("\n"),
-    { legacyVectorOutput: true, legacySelectiveImageSpans: true }
+    {}
   );
-  assert.equal(densePathOnly.legacyVector.imagePathSpanCheckpoints.length, 0,
+  assert.equal(densePathOnly.vectorSceneData.imagePathSpanCheckpoints.length, 0,
     "path-dense pages allocate no per-path selective-image tape");
-  const selectiveDisconnectedFill = await compile(
+  const selectiveDisconnectedFill = await compileGroupedPage(
     Array.from({ length: 100 }, (_, index) => `${index * 2} 0 m ${index * 2 + 1} 0 l ${index * 2 + 1} 1 l h`).join("\n") + "\nf",
-    { legacyVectorOutput: true, legacySelectivePaths: true }
+    {}
   );
   assert.equal(selectiveDisconnectedFill.fillPathCount, 0,
-    "a selectively captured exact path is omitted from the packed legacy store");
-  assert.equal(selectiveDisconnectedFill.legacyVector.selectivePaintSourceSpans.length, 2,
+    "a selectively captured exact path is omitted from the packed VectorScene store");
+  assert.equal(selectiveDisconnectedFill.vectorSceneData.selectivePaintSourceSpans.length, 2,
     "a selectively captured exact path retains one transient source identity");
-  assert.deepEqual([...selectiveDisconnectedFill.legacyVector.selectivePaintOrdinalSpans], [0, 0]);
-  const formBarrierSpan = await compile(
+  assert.deepEqual([...selectiveDisconnectedFill.vectorSceneData.selectivePaintOrdinalSpans], [0, 0]);
+  const formBarrierSpan = await compileGroupedPage(
     "/Im0 Do 0 0 10 10 re f /Fm0 Do /Im1 Do",
     {
-      legacyVectorOutput: true,
-      legacyAllowCompositeForms: true,
-      legacySelectiveImageSpans: true,
       imageXObjects: new Map([["Im0", 0], ["Im1", 1]]),
       formXObjects: new Map([["Fm0", 0]])
     }
   );
-  assert.equal(formBarrierSpan.legacyVector.imagePathSourceSpans.length, 8,
+  assert.equal(formBarrierSpan.vectorSceneData.imagePathSourceSpans.length, 8,
     "the compiler defers Form-barrier safety to resource-aware flattening");
-  await expectUnsupported(
+  await expectUnsupportedGroupedForm(
     "0 0 m 10 0 l S 10 0 m 0 0 l S /Im0 Do",
     "Do",
     {
-      legacyVectorOutput: true,
       imageXObjects: new Map([["Im0", 1]])
     }
   );
-  await expectUnsupported("BT (stroke) Tj ET", "Tr", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("BT (stroke) Tj ET", "Tr", {
     textOperatorSink: textSink(1)
   });
-  await expectUnsupported("/Multiply gs 0 0 10 10 re f", "f", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("/Multiply gs 0 0 10 10 re f", "f", {
     extGStates: [{ resourceName: "Multiply", blendMode: "Multiply" }]
   });
-  const inertAlphaAsShape = await compile(
+  const inertAlphaAsShape = await compileGroupedForm(
     "/Shape gs 0 0 10 10 re f 0 20 m 10 20 l S",
     {
-      legacyVectorOutput: true,
       extGStates: [{
         resourceName: "Shape",
         strokeAlpha: 1,
@@ -415,24 +491,21 @@ async function testLegacyVectorOutput() {
   );
   assert.equal(inertAlphaAsShape.fillPathCount, 1);
   assert.equal(inertAlphaAsShape.segmentCount, 1);
-  const ignoredStrokeAdjustment = await compile(
+  const ignoredStrokeAdjustment = await compileGroupedForm(
     "/Adjusted gs 0 0 m 10 0 l S",
     {
-      legacyVectorOutput: true,
       extGStates: [{ resourceName: "Adjusted", strokeAdjustment: true }]
     }
   );
   assert.equal(ignoredStrokeAdjustment.segmentCount, 1);
-  const clearedSoftMask = await compile(
+  const clearedSoftMask = await compileGroupedForm(
     "/NoMask gs 0 0 10 10 re f",
     {
-      legacyVectorOutput: true,
       extGStates: [{ resourceName: "NoMask", softMaskIndex: null }]
     }
   );
   assert.equal(clearedSoftMask.fillPathCount, 1);
-  await expectUnsupported("/Shape gs 0 0 10 10 re f", "f", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("/Shape gs 0 0 10 10 re f", "f", {
     extGStates: [{
       resourceName: "Shape",
       fillAlpha: 0.5,
@@ -441,8 +514,7 @@ async function testLegacyVectorOutput() {
       alphaIsShape: true
     }]
   });
-  await expectUnsupported("/ShapeMask gs 0 0 10 10 re f", "f", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("/ShapeMask gs 0 0 10 10 re f", "f", {
     extGStates: [{
       resourceName: "ShapeMask",
       fillAlpha: 1,
@@ -451,32 +523,27 @@ async function testLegacyVectorOutput() {
       alphaIsShape: true
     }]
   });
-  await expectUnsupported("/Half gs /Im0 Do", "Do", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("/Half gs /Im0 Do", "Do", {
     imageXObjects: new Map([["Im0", 1]]),
     extGStates: [{ resourceName: "Half", fillAlpha: 0.5 }]
   });
-  await expectUnsupported("/Multiply gs /Fm0 Do", "Do", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("/Multiply gs /Fm0 Do", "Do", {
     formXObjects: new Map([["Fm0", 0]]),
     extGStates: [{ resourceName: "Multiply", blendMode: "Multiply" }]
   });
-  const deferredCompositeForm = await compile("/Multiply gs /Fm0 Do", {
-    legacyVectorOutput: true,
-    legacyAllowCompositeForms: true,
+  const deferredCompositeForm = await compileGroupedPage("/Multiply gs /Fm0 Do", {
     formXObjects: new Map([["Fm0", 0]]),
     extGStates: [{ resourceName: "Multiply", blendMode: "Multiply" }]
   });
-  assert.deepEqual([...deferredCompositeForm.legacyVector.sourceEvents], [
-    DENSE_PDF_LEGACY_VECTOR_EVENT_FORM, 0
+  assert.deepEqual([...deferredCompositeForm.vectorSceneData.sourceEvents], [
+    DENSE_PDF_VECTOR_SCENE_EVENT_FORM, 0
   ], "the selective-composite bridge retains the exact root Form event");
-  await expectUnsupported("0 0 10 10 re f /Fm0 Do /Im0 Do", "Do", {
-    legacyVectorOutput: true,
+  await expectUnsupportedGroupedForm("0 0 10 10 re f /Fm0 Do /Im0 Do", "Do", {
     formXObjects: new Map([["Fm0", 0]]),
     imageXObjects: new Map([["Im0", 1]])
   });
   await assert.rejects(
-    compile("", { legacyVectorOutput: true, preservePaintOrder: true }),
+    compile("", { output: "unknown" }),
     TypeError
   );
 }
@@ -803,7 +870,7 @@ async function testExtGStateOpacityAndOptionalContent() {
     "6 0 2 2 re f"
   ].join("\n"), {
     extGStates,
-    preservePaintOrder: true,
+    output: "display-program",
     enableInvisibleCull: false
   });
   assert.deepEqual(ordered.paintRunCompositeStates, [
@@ -821,7 +888,7 @@ async function testExtGStateOpacityAndOptionalContent() {
       { resourceName: "Shape", fillAlpha: 0.5, alphaIsShape: true },
       { resourceName: "Opacity", alphaIsShape: false }
     ],
-    preservePaintOrder: true,
+    output: "display-program",
     enableInvisibleCull: false
   });
   assert.deepEqual(
@@ -864,7 +931,7 @@ async function testExtGStateOpacityAndOptionalContent() {
 
 async function testNativeFormXObjects() {
   const scene = await compile("/Footer Do /Footer Do", {
-    preservePaintOrder: true,
+    output: "display-program",
     formXObjects: new Map([["Footer", 7]])
   });
   assert.equal(scene.operatorCount, 2);
@@ -1031,9 +1098,9 @@ async function* delayedChunks(bytes, chunkSize) {
   }
 }
 
-async function expectUnsupported(content, operator, options = {}) {
+async function expectUnsupported(content, operator, options = {}, compiler = compileDensePdfContent) {
   await assert.rejects(
-    compile(content, options),
+    compile(content, options, compiler),
     (error) => {
       assert.ok(
         error instanceof DensePdfUnsupportedError,

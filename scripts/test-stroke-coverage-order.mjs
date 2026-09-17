@@ -5,6 +5,7 @@ import { compileDensePdfContent as compileNative } from "../src/pdf/nativeConten
 
 const nativeSort = Array.prototype.sort;
 const options = {
+  output: "geometry",
   pageMatrix: [1, 0, 0, 1, 0, 0],
   pageBounds: { minX: -100, minY: -100, maxX: 100, maxY: 100 },
   enableSegmentMerge: true,

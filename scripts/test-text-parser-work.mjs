@@ -4,6 +4,7 @@ import { compileDensePdfContent as compileNative } from "../src/pdf/nativeConten
 
 const encoder = new TextEncoder();
 const options = {
+  output: "geometry",
   pageMatrix: [1, 0, 0, 1, 0, 0],
   pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
   textOperatorSink: { applyOperator() {} },

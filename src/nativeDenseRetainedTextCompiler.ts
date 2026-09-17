@@ -1,20 +1,20 @@
 import {
-  DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
-  DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT,
-  DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED,
+  DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+  DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
+  DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
+  DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED,
   DensePdfResourceLimitError,
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
-  compileDensePdfContent,
+  compileRetainedTextContent,
   scanDensePdfResourceReferences,
   type DensePdfBounds,
   type DensePdfColorSpaceDefinition,
   type DensePdfColorSpaceResolver,
   type DensePdfCompiledPage,
   type DensePdfExtGStateDefinition,
-  type DensePdfLegacyVectorOutput,
+  type DensePdfVectorSceneData,
   type DensePdfMarkedContentPropertyDefinition,
   type DensePdfTextOperatorContext
 } from "./pdf/nativeContentCompiler";
@@ -198,12 +198,11 @@ export async function compileNativeDenseRetainedTextPage(
         return emittedTextRuns;
       }
     };
-    const compiled = await compileDensePdfContent(retainedTextContent, {
+    const compiled = await compileRetainedTextContent(retainedTextContent, {
       pageMatrix,
       pageBounds,
       enableSegmentMerge: false,
       enableInvisibleCull: false,
-      legacyVectorOutput: true,
       textOperatorSink,
       extGStates: options.extGStates,
       alwaysVisibleOptionalContentProperties:
@@ -671,13 +670,12 @@ async function compileTextFormOccurrence(input: {
       return emittedTextRuns;
     }
   };
-  const compiled = await compileDensePdfContent(content, {
+  const compiled = await compileRetainedTextContent(content, {
     pageMatrix: transform,
     pageBounds: compilationBounds,
     initialGraphicsState: paint.initialGraphicsState,
     enableSegmentMerge: false,
     enableInvisibleCull: false,
-    legacyVectorOutput: true,
     textOperatorSink,
     extGStates: form.publicForm.extGStates,
     alwaysVisibleOptionalContentProperties:
@@ -738,7 +736,7 @@ function assertCompiledFormIsTextOnly(
   resourceName: string,
   pageIndex: number
 ): void {
-  const sidecar = compiled.legacyVector;
+  const sidecar = compiled.vectorSceneData;
   const nonTextPaint = compiled.pathCount + compiled.fillPathCount +
     compiled.fillSegmentCount + compiled.segmentCount +
     compiled.imageTransforms.length + compiled.formPaints.length;
@@ -783,7 +781,7 @@ function flattenTextFormOccurrences(
   maxGlyphs: number,
   pageIndex: number
 ): { readonly compiled: DensePdfCompiledPage; readonly text: NativeTextCompilation } {
-  const rootSidecar = requireLegacySidecar(rootCompiled, pageIndex, "page");
+  const rootSidecar = requireVectorSceneData(rootCompiled, pageIndex, "page");
   const fallbackResourceName = occurrences[0]?.resourceName ?? "unknown";
   if (rootSidecar.imageIndices.length !== 0) {
     throw unsupportedFormFlatten(
@@ -793,7 +791,7 @@ function flattenTextFormOccurrences(
     );
   }
   const occurrenceSidecars = occurrences.map((occurrence) => {
-    const sidecar = requireLegacySidecar(
+    const sidecar = requireVectorSceneData(
       occurrence.compiled,
       pageIndex,
       `Form /${occurrence.resourceName}`
@@ -818,7 +816,7 @@ function flattenTextFormOccurrences(
   const appendGlyphRun = (
     compiled: DensePdfCompiledPage,
     text: NativeTextCompilation,
-    sidecar: DensePdfLegacyVectorOutput,
+    sidecar: DensePdfVectorSceneData,
     localIndex: number,
     defaultBounds: DensePdfBounds,
     fromForm: boolean,
@@ -843,12 +841,12 @@ function flattenTextFormOccurrences(
     ) ?? [defaultBounds.minX, defaultBounds.minY, defaultBounds.maxX, defaultBounds.maxY]));
     glyphRunFlags.push(
       (sidecar.glyphRunFlags?.[localIndex] ?? 0) |
-      (fromForm ? DENSE_PDF_LEGACY_VECTOR_GLYPH_FLAG_CLIPPED : 0)
+      (fromForm ? DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED : 0)
     );
-    sourceEvents.push(DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, glyphRunMeta.length / 3 - 1);
+    sourceEvents.push(DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, glyphRunMeta.length / 3 - 1);
     // Keep this argument in the validation surface: the run's owner must be
     // the same compilation whose event tape is being flattened.
-    if (compiled.legacyVector !== sidecar) {
+    if (compiled.vectorSceneData !== sidecar) {
       throw unsupportedFormFlatten(pageIndex, resourceName, "has mismatched event ownership");
     }
   };
@@ -879,7 +877,7 @@ function flattenTextFormOccurrences(
         const kind = formSidecar.sourceEvents[offset];
         const localIndex = formSidecar.sourceEvents[offset + 1];
         if (
-          kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT &&
+          kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT &&
           localIndex === 0 &&
           occurrence.compiled.fillPathCount === 0 &&
           occurrence.compiled.fillSegmentCount === 0 &&
@@ -887,12 +885,12 @@ function flattenTextFormOccurrences(
         ) {
           continue;
         }
-        if (kind !== DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH) {
-          const detail = kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FORM
+        if (kind !== DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
+          const detail = kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM
             ? "contains a nested Form event"
-            : kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE
+            : kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE
               ? "contains an image event"
-              : kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT
+              : kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT
                 ? "contains an ordinary paint event"
                 : "contains an unknown event";
           throw unsupportedFormFlatten(pageIndex, occurrence.resourceName, detail);
@@ -931,7 +929,7 @@ function flattenTextFormOccurrences(
   for (let offset = 0; offset < rootSidecar.sourceEvents.length; offset += 2) {
     const kind = rootSidecar.sourceEvents[offset];
     const localIndex = rootSidecar.sourceEvents[offset + 1];
-    if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH) {
+    if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
       if (localIndex >= seenRootGlyphs.length || seenRootGlyphs[localIndex] !== 0) {
         throw unsupportedFormFlatten(
           pageIndex,
@@ -951,12 +949,12 @@ function flattenTextFormOccurrences(
       );
       continue;
     }
-    if (kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FORM) {
+    if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM) {
       appendForm(localIndex);
       continue;
     }
     if (
-      kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT &&
+      kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT &&
       localIndex === 0 &&
       rootCompiled.fillPathCount === 0 &&
       rootCompiled.fillSegmentCount === 0 &&
@@ -966,11 +964,11 @@ function flattenTextFormOccurrences(
       // for source-order accounting. It has no VectorScene payload to splice.
       continue;
     }
-    const detail = kind === DENSE_PDF_LEGACY_VECTOR_EVENT_FORM
+    const detail = kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM
       ? "has duplicate or invalid Form events"
-      : kind === DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE
+      : kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE
         ? "has an image event in retained page text"
-        : kind === DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT
+        : kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT
           ? "has ordinary paint in retained page text"
           : "has an unknown page event";
     throw unsupportedFormFlatten(pageIndex, fallbackResourceName, detail);
@@ -982,7 +980,7 @@ function flattenTextFormOccurrences(
     throw unsupportedFormFlatten(pageIndex, fallbackResourceName, "has an incomplete event tape");
   }
 
-  const legacyVector: DensePdfLegacyVectorOutput = Object.freeze({
+  const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
     glyphRunMeta: Uint32Array.from(glyphRunMeta),
     glyphFillColors: Float32Array.from(glyphFillColors),
@@ -1013,18 +1011,18 @@ function flattenTextFormOccurrences(
       ],
       referencedXObjects: [],
       formPaints: Object.freeze([]),
-      legacyVector
+      vectorSceneData
     }),
     text: accumulator.build()
   });
 }
 
-function requireLegacySidecar(
+function requireVectorSceneData(
   compiled: DensePdfCompiledPage,
   pageIndex: number,
   owner: string
-): DensePdfLegacyVectorOutput {
-  const sidecar = compiled.legacyVector;
+): DensePdfVectorSceneData {
+  const sidecar = compiled.vectorSceneData;
   if (
     !sidecar ||
     sidecar.sourceEvents.length % 2 !== 0 ||
@@ -1033,7 +1031,7 @@ function requireLegacySidecar(
   ) {
     throw new PdfError(
       "invalid-object",
-      `The retained ${owner} compilation has an invalid legacy event tape.`,
+      `The retained ${owner} compilation has an invalid VectorScene event tape.`,
       { pageIndex, details: { reason: "retained-text-form-event-tape" } }
     );
   }

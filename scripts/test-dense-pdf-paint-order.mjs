@@ -19,7 +19,7 @@ const ordered = await compileDensePdfContent(content, {
   pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
   enableSegmentMerge: false,
   enableInvisibleCull: true,
-  preservePaintOrder: true
+  output: "display-program"
 });
 
 assert.deepEqual([...ordered.paintRuns], [
@@ -35,20 +35,21 @@ assert.equal(ordered.genericPathPaints.length, 1);
 assert.ok(ordered.genericPathPaints[0].fill);
 assert.ok(ordered.genericPathPaints[0].stroke);
 
-const legacy = await compileDensePdfContent(content, {
+const geometry = await compileDensePdfContent(content, {
+  output: "geometry",
   pageMatrix: [1, 0, 0, 1, 0, 0],
   pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
   enableSegmentMerge: false,
   enableInvisibleCull: true
 });
-assert.equal(legacy.paintRuns.length, 0);
+assert.equal(geometry.paintRuns.length, 0);
 
 const clipped = await compileDensePdfContent(
     new TextEncoder().encode("0 0 m 20 0 l 10 20 l h W n 0 0 m 20 20 l S\n"),
     {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-      preservePaintOrder: true
+      output: "display-program"
     }
 );
 assert.equal(clipped.clipPaths.length, 1);
@@ -60,7 +61,7 @@ const square = await compileDensePdfContent(
     {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-      preservePaintOrder: true
+      output: "display-program"
     }
 );
 assert.deepEqual([...square.paintRuns], [DENSE_PDF_PAINT_RUN_PATH, 0, 1]);
@@ -71,7 +72,7 @@ const splitComposite = await compileDensePdfContent(
   {
     pageMatrix: [1, 0, 0, 1, 0, 0],
     pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-    preservePaintOrder: true,
+    output: "display-program",
     extGStates: [{
       resourceName: "Split",
       fillAlpha: 0.25,
@@ -97,7 +98,7 @@ const splitSharedComposite = await compileDensePdfContent(
   {
     pageMatrix: [1, 0, 0, 1, 0, 0],
     pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-    preservePaintOrder: true,
+    output: "display-program",
     extGStates: [{
       resourceName: "Shared",
       fillAlpha: 0.5,
@@ -117,7 +118,7 @@ const closeThenCurve = await compileDensePdfContent(
   {
     pageMatrix: [1, 0, 0, 1, 0, 0],
     pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-    preservePaintOrder: true
+    output: "display-program"
   }
 );
 assert.deepEqual(
@@ -131,7 +132,7 @@ const anisotropicStroke = await compileDensePdfContent(
   {
     pageMatrix: [1, 0, 0, 1, 0, 0],
     pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
-    preservePaintOrder: true
+    output: "display-program"
   }
 );
 assert.deepEqual([...anisotropicStroke.paintRuns], [DENSE_PDF_PAINT_RUN_PATH, 0, 1]);

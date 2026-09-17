@@ -28,7 +28,7 @@ try {
     {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 80 },
-      preservePaintOrder: true,
+      output: "display-program",
       enableInvisibleCull: true
     }
   );
@@ -64,7 +64,7 @@ try {
     {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 80 },
-      preservePaintOrder: true,
+      output: "display-program",
       extGStates: [{
         resourceName: "GS1",
         strokeAlpha: 0.5,
@@ -119,7 +119,7 @@ try {
       {
         pageMatrix: [1, 0, 0, 1, 0, 0],
         pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 80 },
-        preservePaintOrder: true
+        output: "display-program"
       }
     ),
     (error) => error instanceof DensePdfUnsupportedError && error.operator === "Tj"

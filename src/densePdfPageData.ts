@@ -190,7 +190,7 @@ export interface DensePdfType3PageData {
  * Move the dense compiler's GPU-ready arrays into the page-native v7 ABI.
  *
  * No geometry is copied. The compiler must have run with
- * `preservePaintOrder: true`; otherwise a non-empty page is rejected rather
+ * `output: "display-program"`; otherwise a non-empty page is rejected rather
  * than grouped into a visually incorrect order.
  */
 export function createHeprPageDataFromDense(
@@ -221,7 +221,7 @@ export function createHeprPageDataFromDense(
     (compiled.segmentCount > 0 || compiled.fillPathCount > 0)
   ) {
     throw new DensePdfUnsupportedError(
-      "Dense PDF geometry has no source-order trace; compile with preservePaintOrder enabled."
+      "Dense PDF geometry has no source-order trace; compile with display-program output."
     );
   }
 

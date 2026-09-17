@@ -3,7 +3,7 @@ import {
   DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE,
   type DensePdfBounds,
   type DensePdfCompiledPage,
-  type DensePdfLegacyVectorOutput
+  type DensePdfVectorSceneData
 } from "./nativeContentCompiler";
 import type { NativeTextCompilation, NativeTextFontResource } from "./nativeText";
 
@@ -19,7 +19,7 @@ const VISIBLE_ALPHA_EPSILON = 1e-3;
 export function callerOrdinaryPaintIsDisjointFromForm(
   compiled: DensePdfCompiledPage,
   text: NativeTextCompilation,
-  sidecar: DensePdfLegacyVectorOutput,
+  sidecar: DensePdfVectorSceneData,
   fontResources: readonly NativeTextFontResource[],
   formClip: Readonly<DensePdfBounds>
 ): boolean {

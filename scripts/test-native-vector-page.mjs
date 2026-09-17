@@ -13,12 +13,12 @@ const hooks = registerHooks({
 try {
   const { buildNativeVectorPage } = await import("../src/pdf/nativeVectorPage.ts");
   const {
-    compileDensePdfContent,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE,
-    DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT,
-    DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED,
-    DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT
+    compileVectorFormContent,
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
+    DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
+    DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED,
+    DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT
   } = await import("../src/pdf/nativeContentCompiler.ts");
 
   const endpoints = new Float32Array([0, 0, 5, 5]);
@@ -30,12 +30,12 @@ try {
   const fillPathMetaC = new Float32Array([0, 0, 0, 1]);
   const fillSegmentsA = new Float32Array([0, 0, 4, 0]);
   const fillSegmentsB = new Float32Array([4, 0, 0, 0]);
-  const legacyVector = {
+  const vectorSceneData = {
     sourceEvents: new Uint32Array([
-      DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0,
-      DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-      DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-      DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 1
+      DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0,
+      DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+      DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+      DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 1
     ]),
     glyphRunMeta: new Uint32Array([
       0, 1, 0,
@@ -77,7 +77,7 @@ try {
     discardedDegenerateCount: 0,
     discardedDuplicateCount: 0,
     discardedContainedCount: 0,
-    legacyVector
+    vectorSceneData
   };
   const textCompilation = {
     transforms: {
@@ -250,18 +250,18 @@ try {
     ...input,
     compiled: {
       ...compiled,
-      legacyVector: {
-        ...legacyVector,
+      vectorSceneData: {
+        ...vectorSceneData,
         sourceEvents: new Uint32Array([
-          DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-          DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-          DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 1,
-          DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0
+          DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+          DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+          DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 1,
+          DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0
         ]),
         imageTransforms: new Float32Array([10, 0, 0, 10, 40, 40]),
         imagePaintOrders: new Uint32Array([1]),
         imageFlags: new Uint8Array([
-          DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT
+          DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT
         ])
       }
     }
@@ -281,10 +281,10 @@ try {
     },
     compiled: {
       ...compiled,
-      legacyVector: {
-        ...legacyVector,
+      vectorSceneData: {
+        ...vectorSceneData,
         imageClipBounds: new Float32Array([5, 5, 8, 8]),
-        imageFlags: new Uint8Array([DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED])
+        imageFlags: new Uint8Array([DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED])
       }
     }
   });
@@ -352,11 +352,11 @@ try {
     },
     compiled: {
       ...compiled,
-      legacyVector: {
-        ...legacyVector,
+      vectorSceneData: {
+        ...vectorSceneData,
         imageTransforms: brochureTransform,
         imageClipBounds: brochureClip,
-        imageFlags: new Uint8Array([DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_CLIPPED])
+        imageFlags: new Uint8Array([DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED])
       }
     }
   });
@@ -385,18 +385,18 @@ try {
       ...input,
       compiled: {
         ...compiled,
-        legacyVector: {
-          ...legacyVector,
+        vectorSceneData: {
+          ...vectorSceneData,
           sourceEvents: new Uint32Array([
-            DENSE_PDF_LEGACY_VECTOR_EVENT_ORDINARY_PAINT, 0,
-            DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 0,
-            DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH, 1,
-            DENSE_PDF_LEGACY_VECTOR_EVENT_IMAGE, 0
+            DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+            DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+            DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 1,
+            DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, 0
           ]),
           imageTransforms: new Float32Array([10, 0, 0, 10, 12, 12]),
           imagePaintOrders: new Uint32Array([1]),
           imageFlags: new Uint8Array([
-            DENSE_PDF_LEGACY_VECTOR_IMAGE_FLAG_LATE_AFTER_TEXT
+            DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT
           ])
         }
       }
@@ -414,8 +414,8 @@ try {
       ...input,
       compiled: {
         ...compiled,
-        legacyVector: {
-          ...legacyVector,
+        vectorSceneData: {
+          ...vectorSceneData,
           glyphClipBounds: new Float32Array([...clip, 0, 0, 100, 80]),
           glyphRunFlags: new Uint8Array([1, 0])
         }
@@ -442,7 +442,7 @@ try {
       ...input,
       compiled: {
         ...compiled,
-        legacyVector: { ...legacyVector, imageFlags: new Uint8Array([1]) }
+        vectorSceneData: { ...vectorSceneData, imageFlags: new Uint8Array([1]) }
       }
     }),
     "an exact rectangular clip containing the whole image is a semantic no-op"
@@ -452,8 +452,8 @@ try {
       ...input,
       compiled: {
         ...compiled,
-        legacyVector: {
-          ...legacyVector,
+        vectorSceneData: {
+          ...vectorSceneData,
           imageClipBounds: new Float32Array([5, 5, 8, 8]),
           imageFlags: new Uint8Array([1])
         }
@@ -464,7 +464,7 @@ try {
     "an interpolated partial-pixel clip still fails instead of changing sampling semantics"
   );
   assert.throws(
-    () => buildNativeVectorPage({ ...input, compiled: { ...compiled, legacyVector: null } }),
+    () => buildNativeVectorPage({ ...input, compiled: { ...compiled, vectorSceneData: null } }),
     (error) => error?.code === "unsupported-content" &&
       error?.details?.reason === "legacy-vector-sidecar-missing"
   );
@@ -487,7 +487,7 @@ try {
     transfer: [repeatedScene.gradientMetaA.buffer]
   }));
 
-  await testCompiledAggregateBounds(buildNativeVectorPage, compileDensePdfContent);
+  await testCompiledAggregateBounds(buildNativeVectorPage, compileVectorFormContent);
   benchmarkPackedBoundsAdaptation(buildNativeVectorPage);
 
   console.log("native direct VectorScene page builder passed");
@@ -504,7 +504,7 @@ function readPixel(layer, x, y) {
   return [...layer.data.subarray(offset, offset + 4)];
 }
 
-async function testCompiledAggregateBounds(buildNativeVectorPage, compileDensePdfContent) {
+async function testCompiledAggregateBounds(buildNativeVectorPage, compileVectorFormContent) {
   const encoder = new TextEncoder();
   const pageBounds = { minX: -100, minY: -100, maxX: 100, maxY: 100 };
   const content = encoder.encode([
@@ -525,13 +525,12 @@ async function testCompiledAggregateBounds(buildNativeVectorPage, compileDensePd
   ];
 
   for (const configuration of configurations) {
-    const compiled = await compileDensePdfContent(content, {
+    const compiled = await compileVectorFormContent(content, {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { ...pageBounds },
-      legacyVectorOutput: true,
       yieldIntervalMs: 1_000,
       ...configuration
-    });
+    }, "grouped");
     const rescanned = rescanPackedGeometryBounds(compiled);
     assert.deepEqual(
       roundBoundsToFloat32(compiled.fillBounds),
@@ -753,7 +752,7 @@ function makeSyntheticCompiledPage(fillPathCount, segmentCount) {
     discardedDegenerateCount: 0,
     discardedDuplicateCount: 0,
     discardedContainedCount: 0,
-    legacyVector: {
+    vectorSceneData: {
       sourceEvents: new Uint32Array(0),
       glyphRunMeta: new Uint32Array(0),
       glyphFillColors: new Float32Array(0),

@@ -42,6 +42,7 @@ export const fastTests = [
   "vector-page-batching",
   "text-parser-work",
   "text-search",
+  "text-selection",
   "text-lod-core",
   "ordered-gradient-paint",
   "deferred-renderer-api",

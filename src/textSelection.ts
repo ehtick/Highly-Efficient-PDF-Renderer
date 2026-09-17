@@ -104,6 +104,8 @@ const LINE_VERTICAL_OVERLAP_FACTOR = 0.5;
  * consecutive rows never merge.
  */
 const LINE_BASELINE_TOLERANCE_FACTOR = 0.5;
+/** Large gaps separate independent fields, even when they share a baseline. */
+const LINE_HORIZONTAL_GAP_FACTOR = 3;
 
 const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
 
@@ -195,6 +197,8 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
   let currentLine: PageLineRun | null = null;
   let currentBaselineY: number | null = null;
   let currentMaxCharHeight = 0;
+  let previousMinX = 0;
+  let previousMaxX = 0;
 
   for (let i = 0; i < charCount; i += 1) {
     if (!computeCharQuad(scene, page, i, quads, i * 4)) {
@@ -227,6 +231,13 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
         const smallerHeight = Math.min(currentLine.maxY - currentLine.minY, charHeight);
         joinsLine = overlap >= smallerHeight * LINE_VERTICAL_OVERLAP_FACTOR;
       }
+      // A PDF can emit the rightmost title-block field before the leftmost
+      // one. Caret scanning assumes left-to-right runs, so never fold that
+      // jump (or a wide gap between fields) into the same line box. Allow
+      // small backwards ink overhangs for kerning and combining marks.
+      const horizontalTolerance = Math.max(charHeight, currentMaxCharHeight);
+      joinsLine &&= minX >= previousMinX - horizontalTolerance * 0.5 &&
+        minX - previousMaxX <= horizontalTolerance * LINE_HORIZONTAL_GAP_FACTOR;
       if (joinsLine) {
         currentLine.endChar = i + 1;
         currentLine.minX = Math.min(currentLine.minX, minX);
@@ -235,6 +246,8 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
         currentLine.maxY = Math.max(currentLine.maxY, maxY);
         currentMaxCharHeight = Math.max(currentMaxCharHeight, charHeight);
         currentBaselineY ??= baselineY;
+        previousMinX = minX;
+        previousMaxX = maxX;
         continue;
       }
       lines.push(currentLine);
@@ -242,6 +255,8 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
     currentLine = { startChar: i, endChar: i + 1, minX, minY, maxX, maxY };
     currentBaselineY = baselineY;
     currentMaxCharHeight = charHeight;
+    previousMinX = minX;
+    previousMaxX = maxX;
   }
   if (currentLine !== null) {
     lines.push(currentLine);
@@ -253,6 +268,36 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
     // Scene space is Y-up: larger center y = visually higher.
     return centerB - centerA || lines[a].minX - lines[b].minX;
   });
+  // Fields in one visual row may use different font sizes/baselines. Order
+  // them left to right instead of letting small ink-center differences put
+  // the drawing number before the project name. Keep a common vertical
+  // overlap for the whole row so staggered boxes cannot chain across rows.
+  for (let start = 0; start < visualOrder.length;) {
+    const first = lines[visualOrder[start]];
+    let minY = first.minY;
+    let maxY = first.maxY;
+    let minHeight = maxY - minY;
+    let end = start + 1;
+    while (end < visualOrder.length) {
+      const line = lines[visualOrder[end]];
+      const overlap = Math.min(maxY, line.maxY) - Math.max(minY, line.minY);
+      const smallerHeight = Math.min(minHeight, line.maxY - line.minY);
+      if (overlap <= 0 || overlap < smallerHeight * LINE_VERTICAL_OVERLAP_FACTOR) {
+        break;
+      }
+      minY = Math.max(minY, line.minY);
+      maxY = Math.min(maxY, line.maxY);
+      minHeight = smallerHeight;
+      end += 1;
+    }
+    if (end > start + 1) {
+      const row = visualOrder.slice(start, end).sort((a, b) => lines[a].minX - lines[b].minX);
+      for (let i = 0; i < row.length; i += 1) {
+        visualOrder[start + i] = row[i];
+      }
+    }
+    start = end;
+  }
   const visualRank = new Array<number>(lines.length);
   for (let rank = 0; rank < visualOrder.length; rank += 1) {
     visualRank[visualOrder[rank]] = rank;
@@ -499,7 +544,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
 
     // Pick the line by vertical distance to its box, breaking ties (e.g. the
     // point sitting inside several overlapping row boxes) by distance to the
-    // line's vertical center, then by horizontal distance — Chrome-like.
+    // line horizontally, then to its vertical center. Separate fields with
+    // different font sizes can overlap vertically; prefer the one under the
+    // pointer rather than a distant field with a slightly closer center.
     let bestLine: PageLineRun | null = null;
     let bestOutside = Number.POSITIVE_INFINITY;
     let bestCenter = Number.POSITIVE_INFINITY;
@@ -513,8 +560,8 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       const horizontal = sceneX < line.minX ? line.minX - sceneX : sceneX > line.maxX ? sceneX - line.maxX : 0;
       if (
         outside < bestOutside ||
-        center < bestCenter ||
-        (center === bestCenter && horizontal < bestHorizontal)
+        horizontal < bestHorizontal ||
+        (horizontal === bestHorizontal && center < bestCenter)
       ) {
         bestOutside = outside;
         bestCenter = center;
@@ -526,6 +573,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       return null;
     }
 
+    const scenePage = scene.textIndex.pages[bestPage];
     let offset = bestLine.endChar;
     for (let i = bestLine.startChar; i < bestLine.endChar; i += 1) {
       const minX = layout.quads[i * 4];
@@ -537,9 +585,19 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         offset = i;
         break;
       }
+      if (sceneX <= layout.quads[i * 4 + 2]) {
+        // The right half of a glyph ends at that character, before any
+        // geometry-free word separator preceding the next visible glyph.
+        offset = i + 1;
+        const ref = scenePage.charInstance[i];
+        while (ref >= 0 && offset < bestLine.endChar &&
+               scenePage.charInstance[offset] === ref) {
+          offset += 1;
+        }
+        break;
+      }
     }
 
-    const scenePage = scene.textIndex.pages[bestPage];
     return { pageIndex: bestPage, offset: snapCaretOutsideLigature(scenePage, offset) };
   }
 

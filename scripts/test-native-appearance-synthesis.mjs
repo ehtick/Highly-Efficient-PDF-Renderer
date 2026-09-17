@@ -460,6 +460,10 @@ async function testSquareAppearanceGeometryAndGuards() {
     ["/BS << /W 2 /S /D /D [2 1] >> /C [0] /IC [1 0 0] /RD [2 3 4 5]", /\[2 1\] 0 d\n3 6 32 10 re B/],
     ["/Border [0 0 2] /RD [0 0 0 0] /BE << >>", /1 1 38 18 re S/],
     ["/Border [0 0 2] /RD 20 0 R /BE 22 0 R", /3 6 32 10 re S/],
+    ["/BS << /S /U >>", /0 G\n1 w\n0\.5 0\.5 m 39\.5 0\.5 l S/],
+    ["/BS << /W 2 /S /U >> /IC [1 0 0]", /1 1 38 18 re f\n1 1 m 39 1 l S/],
+    ["/BS << /W 4 /S /U >> /C [0 0 1] /IC [1 0 0] /RD [2 3 4 5]",
+      /1 0 0 rg\n0 0 1 RG\n4 w\n4 7 30 8 re f\n4 7 m 34 7 l S/],
     ["/BS << /W 0 /S /U >> /IC [1 0 0]", /0 0 40 20 re f/],
     ["/BS << /W 2 /S /U >> /C [] /IC [0 1 0]", /1 1 38 18 re f/]
   ];
@@ -482,8 +486,7 @@ async function testSquareAppearanceGeometryAndGuards() {
   ];
   const unsupportedCases = [
     ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
-    ["/BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"],
-    ["/BS << /W 2 /S /U >> /IC [1 0 0]", "appearance-border-style-unsupported"]
+    ["/BE << /S /Unknown >>", "appearance-square-border-effect-unsupported"]
   ];
   const entries = [
     ...paintingCases.map(([entry]) => entry),
@@ -515,7 +518,11 @@ async function testSquareAppearanceGeometryAndGuards() {
       const appearance = await resolveNext();
       assert(appearance?.synthesized, entry);
       assert.deepEqual(appearance.normalAppearance.form.bbox, [0, 0, 40, 20]);
-      assert.match(decoder.decode(appearance.decodedContent), content, entry);
+      const decodedContent = decoder.decode(appearance.decodedContent);
+      assert.match(decodedContent, content, entry);
+      if (entry.includes("/S /U")) {
+        assert.doesNotMatch(decodedContent, / re [BS]/, "an underline must never stroke all four edges");
+      }
     }
     for (const entry of nonpaintingCases) assert.equal(await resolveNext(), null, entry);
     for (const entry of invalidCases) {

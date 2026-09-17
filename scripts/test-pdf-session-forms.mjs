@@ -123,6 +123,7 @@ try {
   await testSynthesizedCheckbox(openPdf, validateHeprPageData);
   await testSynthesizedLinks(openPdf, validateHeprPageData);
   await testSynthesizedSquares(openPdf, validateHeprPageData);
+  await testSynthesizedSquareUnderlines(openPdf, validateHeprPageData);
   await testFailClosed(openPdf);
   console.log("PDF session Form/annotation display-program tests passed");
 } finally {
@@ -326,7 +327,7 @@ async function testSynthesizedSquares(openPdf, validateHeprPageData) {
 
   for (const [entries, reason] of [
     ["/BS << /W 2 /S /S >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"],
-    ["/BS << /W 2 /S /U >>", "appearance-border-style-unsupported"]
+    ["/BS << /W 2 /S /U >> /BE << /S /C /I 2 >>", "appearance-square-border-effect-unsupported"]
   ]) {
     const failingSession = await openPdf({
       kind: "bytes",
@@ -343,6 +344,53 @@ async function testSynthesizedSquares(openPdf, validateHeprPageData) {
     } finally {
       await failingSession.close();
     }
+  }
+}
+
+async function testSynthesizedSquareUnderlines(openPdf, validateHeprPageData) {
+  const session = await openPdf({
+    kind: "bytes",
+    bytes: squareSessionFixture([
+      "<< /Subtype /Square /Rect [50 10 90 30] /BS << /W 4 /S /U >> /C [0 0 1] /IC [1 0 0] /RD [2 3 4 5] >>",
+      "<< /Subtype /Square /Rect [100 10 140 30] /BS << /S /U >> >>"
+    ])
+  });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+    assert.deepEqual(root.commands.map(({ kind }) => kind), ["invoke-program", "invoke-program"]);
+    const filled = page.displayProgram.programs[root.commands[0].programIndex];
+    const unfilled = page.displayProgram.programs[root.commands[1].programIndex];
+    assert.deepEqual(filled.commands.map(({ source }) => source), ["fill-paths", "stroke-segments"],
+      "the interior is filled before the bottom border is stroked");
+    assert.deepEqual(unfilled.commands.map(({ source }) => source), ["stroke-segments"]);
+    for (const [invocation, program, endpoints, position, style] of [
+      [root.commands[0], filled, [4, 7, 34, 7], [50, 10], [2, 0, 0, 1]],
+      [root.commands[1], unfilled, [0.5, 0.5, 39.5, 0.5], [100, 10], [0.5, 0, 0, 0]]
+    ]) {
+      assert.deepEqual(program.bounds, [0, 0, 40, 20]);
+      assert.deepEqual(readTransform(page, invocation.transformIndex), [1, 0, 0, 1, ...position]);
+      const stroke = program.commands.at(-1);
+      assert.equal(stroke.count, 1, "only the bottom edge is stroked");
+      assert.deepEqual([...page.stores.strokes.endpoints.slice(stroke.first * 4, stroke.first * 4 + 4)], endpoints);
+      assert.deepEqual([...page.stores.strokes.styles.slice(stroke.first * 4, stroke.first * 4 + 4)], style,
+        "the underline retains its half-width and RGB color");
+    }
+    const offset = filled.commands[0].first * 4;
+    assert.deepEqual([
+      page.stores.paths.fillPathMetaA[offset + 2], page.stores.paths.fillPathMetaA[offset + 3],
+      page.stores.paths.fillPathMetaB[offset], page.stores.paths.fillPathMetaB[offset + 1]
+    ], [4, 7, 34, 15], "the rectangular interior retains its /RD and half-border insets");
+
+    // The legacy vector API still rejects all visible annotation appearances.
+    await assert.rejects(
+      session.compileVectorPage(0, { optimization: "none" }),
+      (error) => error?.code === "unsupported-content" &&
+        error?.details?.reason === "vector-annotation-appearance"
+    );
+  } finally {
+    await session.close();
   }
 }
 

@@ -532,12 +532,6 @@ export class NativePdfAppearanceSynthesizer {
         });
       }
     }
-    if (strokeColor && border.style === "underline") {
-      throw synthesisError(annotation, "An underline Square border is not yet synthesizable.", {
-        reason: "appearance-border-style-unsupported",
-        borderStyle: "U"
-      });
-    }
 
     // The border straddles the path, so the path is inset by half of it. A
     // transparent /C still reserves that width: the colour decides what is
@@ -551,11 +545,20 @@ export class NativePdfAppearanceSynthesizer {
         lines.push(`[${border.dash.map(pdfNumber).join(" ")}] 0 d`);
       }
     }
-    lines.push(
+    const rectanglePath =
       `${pdfNumber(rectangle[0] + inset)} ${pdfNumber(rectangle[1] + inset)} ${pdfNumber(width - border.width)} ` +
-      `${pdfNumber(height - border.width)} re ${fillColor ? (strokeColor ? "B" : "f") : "S"}`,
-      "Q"
-    );
+      `${pdfNumber(height - border.width)} re`;
+    if (strokeColor && border.style === "underline") {
+      // Fill the interior separately so only the bottom edge is stroked.
+      if (fillColor) lines.push(`${rectanglePath} f`);
+      lines.push(
+        `${pdfNumber(rectangle[0] + inset)} ${pdfNumber(rectangle[1] + inset)} m ` +
+        `${pdfNumber(rectangle[2] - inset)} ${pdfNumber(rectangle[1] + inset)} l S`
+      );
+    } else {
+      lines.push(`${rectanglePath} ${fillColor ? (strokeColor ? "B" : "f") : "S"}`);
+    }
+    lines.push("Q");
     return this.finishSynthesis(
       annotation,
       geometry,

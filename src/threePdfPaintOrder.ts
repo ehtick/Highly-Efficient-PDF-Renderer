@@ -37,7 +37,13 @@ export function applyThreePdfOverlayPaintOrder(
         const mesh = run.kind === "raster" ? rasterGroup.children[backgrounds + item]
           : run.kind === "gradient-fill" ? nativePaints[item]?.mesh
           : run.kind === "gradient-stroke" ? nativePaints[scene.gradientFillPathCount + item]?.mesh : null;
-        if (mesh) mesh.renderOrder = vectorDrawRunRenderOrder(index + (item - run.first) / run.count, scene.drawRuns!.length);
+        if (mesh) {
+          mesh.renderOrder = vectorDrawRunRenderOrder(index + (item - run.first) / run.count, scene.drawRuns!.length);
+          for (const child of mesh.children) {
+            if (child.userData.heprMultiplyCompletion) child.renderOrder = vectorDrawRunRenderOrder(
+              index + (item - run.first + 0.5) / run.count, scene.drawRuns!.length);
+          }
+        }
       }
     });
     return;

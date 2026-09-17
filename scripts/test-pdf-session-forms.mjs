@@ -383,12 +383,10 @@ async function testSynthesizedSquareUnderlines(openPdf, validateHeprPageData) {
       page.stores.paths.fillPathMetaB[offset], page.stores.paths.fillPathMetaB[offset + 1]
     ], [4, 7, 34, 15], "the rectangular interior retains its /RD and half-border insets");
 
-    // Direct vector capability probes still reject visible annotation appearances.
-    await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
-      (error) => error?.code === "unsupported-content" &&
-        error?.details?.reason === "vector-annotation-appearance"
-    );
+    const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
+    assert.equal(scene.rasterLayers.length, 0, "synthesized annotations retain vector geometry");
+    assert.equal(scene.fillPathCount, 1);
+    assert.equal(scene.endpoints.length / 4, 2);
   } finally {
     await session.close();
   }

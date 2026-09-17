@@ -1,3 +1,4 @@
+import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
 
@@ -55,6 +56,7 @@ export class ThreeMaterialRasterLayer {
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
+  private readonly multiplyMaterials: THREE.Material[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
   private readonly maxRasterTextureDimension: number;
   private rasterTextureResidencyEnabled = false;
@@ -117,6 +119,19 @@ export class ThreeMaterialRasterLayer {
         this.geometry,
         this.vectorClipIndices[this.rasterEntries.length] ?? -1
       );
+      const multiply = scene.drawRuns?.some(run => run.kind === "raster" && run.blendMode === "Multiply" &&
+        rasterIndex >= run.first && rasterIndex < run.first + run.count);
+      if (multiply) {
+        const original = entry.material;
+        entry.mesh.material = entry.material = createThreeMultiplyMaterial(original, 0, true);
+        const second = createThreeMultiplyMaterial(original, 1, true);
+        original.dispose();
+        this.multiplyMaterials.push(second);
+        const completion = new THREE.Mesh(this.geometry, second);
+        completion.frustumCulled = false;
+        completion.userData.heprMultiplyCompletion = true;
+        entry.mesh.add(completion);
+      }
       entry.mesh.visible = false;
       this.entries.push(entry);
       this.rasterEntries.push({
@@ -213,6 +228,8 @@ export class ThreeMaterialRasterLayer {
       entry.material.dispose();
     }
     this.entries.length = 0;
+    for (const material of this.multiplyMaterials) material.dispose();
+    this.multiplyMaterials.length = 0;
 
     this.geometry.dispose();
     this.pageBackgroundGeometry?.dispose();

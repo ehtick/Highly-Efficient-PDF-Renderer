@@ -195,8 +195,8 @@ export class VectorOrderedBatches {
         for (let id = start; id < start + count; id++) this.appendInstance(run, id);
       }
       const previous = this.batches[this.batches.length - 1];
-      if (previous?.kind === run.kind && previous.clipIndex === -2) previous.count += count;
-      else this.batches.push({ kind: run.kind, first, count, clipIndex: -2 });
+      if (previous?.kind === run.kind && previous.clipIndex === -2 && previous.blendMode === run.blendMode) previous.count += count;
+      else this.batches.push({ kind: run.kind, first, count, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) });
     }
     this.floatInstances.set(this.uintInstances.subarray(0, this.instanceCount * 2));
     return true;

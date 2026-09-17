@@ -1,3 +1,4 @@
+import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
@@ -729,7 +730,7 @@ out vec4 outColor;
 
 ${GLSL_OUTPUT_COLOR_HELPERS}
 
-const int MAX_GLYPH_PRIMITIVES = 256;
+const int MAX_GLYPH_PRIMITIVES = 2048;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -1725,6 +1726,8 @@ export class WebGlFloorplanRenderer {
 
   private readonly uHighlightBorderColor: WebGLUniformLocation;
 
+  private multiplyPass: 0 | 1 | null = null;
+  private readonly multiplyUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
   private orderedRunCuller: VectorDrawRunCuller | null = null;
   private orderedCullingBounds: Bounds | null = null;
   private orderedRunsCulled = false;
@@ -1985,8 +1988,8 @@ export class WebGlFloorplanRenderer {
 
     this.gl = context;
 
-    this.segmentProgram = this.createProgram(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
-    this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE);
+    this.segmentProgram = this.createProgram(VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(FRAGMENT_SHADER_SOURCE, true));
+    this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(FILL_FRAGMENT_SHADER_SOURCE, true));
     this.gradientFillProgram = this.createProgram(
       GRADIENT_FILL_VERTEX_SHADER_SOURCE,
       GRADIENT_FILL_FRAGMENT_SHADER_SOURCE
@@ -1995,7 +1998,7 @@ export class WebGlFloorplanRenderer {
       GRADIENT_STROKE_VERTEX_SHADER_SOURCE,
       GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE
     );
-    this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, TEXT_FRAGMENT_SHADER_SOURCE);
+    this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
@@ -3753,6 +3756,12 @@ export class WebGlFloorplanRenderer {
     }
   }
 
+  private setMultiplyBlend(): void {
+    const gl = this.gl;
+    if (this.multiplyPass === 0) gl.blendFuncSeparate(gl.DST_COLOR, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
+    else gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA, gl.ONE, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
   private drawRasterLayerAtIndex(
     layerIndex: number,
     viewportWidth: number,
@@ -3769,7 +3778,8 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     if (!statePrepared) {
       this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
-      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      if (this.multiplyPass != null) this.setMultiplyBlend();
+      else gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
     gl.activeTexture(gl.TEXTURE12);
     gl.bindTexture(gl.TEXTURE_2D, layer.texture);
@@ -3777,7 +3787,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    if (!statePrepared) {
+    if (!statePrepared && this.multiplyPass == null) {
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
   }
@@ -3897,6 +3907,10 @@ export class WebGlFloorplanRenderer {
   }
 
   private bindVectorClip(program: WebGLProgram): void {
+    if (this.multiplyUniforms) {
+      if (!this.multiplyUniforms.has(program)) this.multiplyUniforms.set(program, this.gl.getUniformLocation(program, "uHeprMultiply"));
+      this.gl.uniform1i(this.multiplyUniforms.get(program)!, this.multiplyPass == null ? 0 : 1);
+    }
     if (this.vectorClipIndex === -2 && this.orderedUniformPrograms.has(program)) return;
     const gl = this.gl;
     let locations = this.vectorClipUniforms.get(program);
@@ -3957,7 +3971,7 @@ export class WebGlFloorplanRenderer {
       this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.orderedInstanceBuffer);
       this.gl.bufferData(this.gl.ARRAY_BUFFER, plan.floatInstances.subarray(0, plan.instanceCount * 2), this.gl.DYNAMIC_DRAW);
     }
-    for (const run of plan?.batches ?? runs) {
+    const draw = (run: NonNullable<VectorScene["drawRuns"]>[number]): void => {
       this.vectorClipIndex = run.clipIndex ?? -1;
       if (this.vectorClipIndex !== -2 && this.orderedTextureBindings) this.orderedTextureBindings.length = 0;
       if (run.kind === "fill" && this.fillRenderingEnabled) {
@@ -3983,6 +3997,21 @@ export class WebGlFloorplanRenderer {
           }
         }
       }
+    };
+    for (const run of plan?.batches ?? runs) {
+      if (!run.blendMode) { draw(run); continue; }
+      // Pair both passes for each instance so overlapping instances observe
+      // the fully composed preceding paint, including destination alpha.
+      for (let first = run.first; first < run.first + run.count; first++) {
+        for (const pass of [0, 1] as const) {
+          this.multiplyPass = pass;
+          this.setMultiplyBlend();
+          draw({ ...run, first, count: 1 });
+        }
+      }
+      if (run.kind === "stroke" && this.strokeRenderingEnabled) strokes -= run.count;
+      this.multiplyPass = null;
+      this.gl.blendFuncSeparate(this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA);
     }
     this.vectorClipIndex = -1;
     return strokes;

@@ -1,4 +1,5 @@
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
+import { buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
 import { appendVectorDrawRun, simplifyVectorDrawRuns } from "../vectorDrawOrder";
 import type {
   Bounds,
@@ -33,7 +34,7 @@ import type {
   NativeTextCompilation,
   NativeTextFontResource
 } from "./nativeText";
-import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
+import { DEFAULT_PDF_RESOURCE_LIMITS, PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { NativeTextClipTester } from "./nativeTextClip";
 
 /**
@@ -59,6 +60,7 @@ export interface BuildNativeVectorPageInput {
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** Maximum distinct, nonempty glyph outlines derived for this page. */
   readonly maxPaths: number;
+  readonly maxPathCoordinates?: number;
   readonly signal?: AbortSignal;
 }
 
@@ -179,6 +181,11 @@ export function buildNativeVectorPage(
     pageInfo.sourcePageIndex,
     signal
   );
+  const strokeText = buildNativeVectorTextStrokes(compiled, sidecar, textCompilation, text, fonts,
+    pageBounds, maxPaths, input.maxPathCoordinates ?? DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage, signal);
+  if (strokeText.approximated) input.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning",
+    pageIndex: pageInfo.sourcePageIndex,
+    message: "Stroked glyph curves use vector outlines with a maximum 0.01-point centerline subdivision tolerance." });
   const rasterLayers = buildRasterLayers(
     imageRegistry,
     sidecar,
@@ -303,6 +310,7 @@ export function buildNativeVectorPage(
     for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
       const kind = sidecar.sourceEvents[offset];
       const index = sidecar.sourceEvents[offset + 1];
+      const blendMode = sidecar.sourceBlendModes?.[offset / 2] === 1 ? "Multiply" : undefined;
       const clipIndex = kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT ||
         kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE ? undefined : clipBuilder.add(sidecar.sourceClips?.[offset / 2], signal);
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL || kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) {
@@ -310,16 +318,18 @@ export function buildNativeVectorPage(
           throw invalid("Invalid ordered path range.", pageInfo.sourcePageIndex, "vector-draw-path-range");
         }
         appendVectorDrawRun(runs, kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
-          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex);
+          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         const first = sidecar.glyphRunMeta[index * 3];
         const end = first + sidecar.glyphRunMeta[index * 3 + 1];
         for (let glyph = first; glyph < end; glyph++) {
           const instance = text.glyphToInstance[glyph];
-          if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex);
+          if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode);
+          const strokeInstance = strokeText.glyphToInstance?.[glyph] ?? -1;
+          if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
-        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex);
+        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
           if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1);
@@ -361,11 +371,20 @@ function readVectorSceneData(
     throw invalid("The native VectorScene sidecar uses invalid typed arrays.", pageIndex,
       "legacy-vector-sidecar-arrays");
   }
+  if (sidecar.sourceBlendModes !== undefined && (!(sidecar.sourceBlendModes instanceof Uint8Array) ||
+      sidecar.sourceBlendModes.length !== sidecar.sourceEvents.length / 2 ||
+      sidecar.sourceBlendModes.some(mode => mode > 1))) {
+    throw invalid("Invalid source-event blend metadata.", pageIndex, "vector-blend-modes");
+  }
   if (sidecar.glyphRunMeta.length % 3 !== 0) {
     throw invalid("Native VectorScene glyph-run metadata has an invalid stride.", pageIndex,
       "legacy-vector-glyph-run-stride");
   }
   const glyphRunCount = sidecar.glyphRunMeta.length / 3;
+  if (sidecar.glyphStrokePaints !== undefined && (!Array.isArray(sidecar.glyphStrokePaints) ||
+      sidecar.glyphStrokePaints.length !== glyphRunCount)) {
+    throw invalid("Native glyph stroke paints do not match its runs.", pageIndex, "vector-glyph-stroke-count");
+  }
   if (sidecar.glyphFillColors.length !== glyphRunCount * 4) {
     throw invalid("Native VectorScene glyph colors do not match its runs.", pageIndex,
       "legacy-vector-glyph-color-count");
@@ -699,9 +718,18 @@ function validateTextInputs(
     const renderingMode = sidecar.glyphRunMeta[meta + 2];
     const run = runs[runIndex];
     const runFlags = sidecar.glyphRunFlags?.[runIndex] ?? 0;
+    const compositedOutline = (renderingMode === 1 || renderingMode === 2) &&
+      (runFlags & DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED) !== 0;
+    const vectorOutline = (renderingMode === 1 || renderingMode === 2) &&
+      sidecar.pathPaintRanges !== undefined && sidecar.glyphStrokePaints?.[runIndex] != null;
+    const strokePaint = sidecar.glyphStrokePaints?.[runIndex];
+    if (strokePaint && (!vectorOutline || compositedOutline || !Array.isArray(strokePaint.color) ||
+        strokePaint.color.length !== 4 || strokePaint.color.some(value => !Number.isFinite(value) || value < 0 || value > 1))) {
+      throw invalid("Native VectorScene glyph stroke paint is invalid.", pageIndex, "vector-glyph-stroke-paint");
+    }
     if (
       first !== nextGlyph || count === 0 || first > glyphCount - count ||
-      (renderingMode !== 0 && renderingMode !== 3) ||
+      (renderingMode !== 0 && renderingMode !== 3 && !compositedOutline && !vectorOutline) ||
       !run || run.first !== first || run.count !== count ||
       run.renderingMode !== renderingMode || run.fontIndex >= fonts.length
     ) {
@@ -790,7 +818,7 @@ function buildVectorText(
           maxY: sidecar.glyphClipBounds[clipOffset + 3]
         }
       : null;
-    const visuallyPainted = renderingMode === 0 && alpha > TEXT_VISIBLE_ALPHA_EPSILON;
+    const visuallyPainted = (renderingMode === 0 || renderingMode === 2) && alpha > TEXT_VISIBLE_ALPHA_EPSILON;
     const composited = ((sidecar.glyphRunFlags?.[runIndex] ?? 0) &
       DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED) !== 0;
     const exactClip = sidecar.glyphRunClips?.[runIndex];
@@ -888,7 +916,8 @@ function buildVectorText(
         if (visuallyPainted && geometryIndex >= 0) outOfPageCount += 1;
         continue;
       }
-      if (exactClip && (visuallyPainted || composited)) {
+      if ((exactClip && (visuallyPainted || composited)) ||
+          ((composited || sidecar.glyphStrokePaints?.[runIndex]) && (renderingMode === 1 || renderingMode === 2))) {
         const key = `${fontIndex}:${glyphId}`;
         let ink = glyphInkBounds.get(key);
         if (ink === undefined) {
@@ -898,7 +927,7 @@ function buildVectorText(
         }
         if (ink) {
           const inkBounds = transformedBounds(boundsFromQuad(ink), glyphTransform);
-          if (clipTester.isFullyOutside(inkBounds, exactClip, signal)) continue;
+          if (exactClip && clipTester.isFullyOutside(inkBounds, exactClip, signal)) continue;
           const visibleBounds = intersectVisibleBounds(intersectVisibleBounds(inkBounds, glyphClip), pageBounds);
           if (visibleBounds) indexQuads.set(glyph, [visibleBounds.minX, visibleBounds.minY,
             visibleBounds.maxX, visibleBounds.maxY]);
@@ -1925,7 +1954,8 @@ function validateVectorImage(
     !Number.isSafeInteger(image.height) || image.height <= 0 ||
     !Number.isSafeInteger(expectedBytes) ||
     !(image.data instanceof Uint8Array) || image.data.length !== expectedBytes ||
-    image.format !== HEPR_IMAGE_FORMAT.Rgba8 || image.sourceBitsPerComponent !== 8 ||
+    // The registry has already expanded packed source samples to RGBA8.
+    image.format !== HEPR_IMAGE_FORMAT.Rgba8 ||
     image.imageMask || image.codecRequest !== null ||
     (allowSoftMask
       ? image.softMaskImageIndex < 0 || image.maskKind !== "soft"

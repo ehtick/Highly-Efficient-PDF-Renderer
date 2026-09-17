@@ -99,6 +99,13 @@ that honors them; treating it as separate fixed passes can change overlaps.
 The ordered scenes retain vector geometry; bounded raster layers are used for
 content that requires unsupported compositing or paint features.
 
+An optional `blendMode: "Multiply"` on fill, stroke, text or raster runs applies
+PDF Multiply to that paint and the previously painted backdrop. Absent means
+Normal source-over. Readers must retain this field when batching or merging
+pages, and apply source alpha and antialias coverage to the blend. The native
+and Three renderers use two paired passes per primitive so transparent target
+alpha is also preserved correctly. Gradient runs do not accept this field.
+
 An optional `clipIndex` on a fill, stroke, text or raster run references
 `manifest.scene.clipPaths`. Each clip is `{ "parent": -1, "fillRule": 0,
 "edges": [x0, y0, x1, y1, ...] }`. Coordinates describe directed polygon edges in

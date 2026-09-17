@@ -221,7 +221,9 @@ async function testCompilationContexts() {
   };
   const composite = await compile("/Multiply gs /Fm0 Do", compositeOptions);
   assert.equal(composite.formPaints.length, 1, "the page delegates composite Forms to its adapter");
-  await expectUnsupported("/Multiply gs /Fm0 Do", "Do", compositeOptions, compileVectorFormContent);
+  const multiplyForm = await compile("/Multiply gs /Fm0 Do", compositeOptions, compileVectorFormContent);
+  assert.equal(multiplyForm.formPaints[0].initialGraphicsState.blendMode, "Multiply",
+    "ordered Forms preserve Multiply for their nested paint");
 
   const textOptions = { textOperatorSink, extGStates: [{ resourceName: "OP", fillOverprint: true }] };
   const retained = await compile("BT (label) Tj ET", textOptions, compileRetainedTextContent);

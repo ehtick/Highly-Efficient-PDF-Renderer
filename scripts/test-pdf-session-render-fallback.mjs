@@ -16,8 +16,11 @@ try {
   const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
+  const fallbackAnnotation = fixture({
+    annotations: true, content: "q /G gs 0 0 1 1 re f Q", state: "/ca .5 /AIS true"
+  });
   const cases = [
-    ["annotation", fixture({ annotations: true }), (scene) => {
+    ["annotation after unsupported page paint", fallbackAnnotation, (scene) => {
       assertPixel(scene, 15, 10, [255, 0, 0, 255]);
       assertPixel(scene, 2, 2, [0, 0, 0, 0]);
     }],
@@ -32,13 +35,9 @@ try {
     ["filled and outlined text", fixture({ content: "1 0 0 rg 0 0 1 RG .4 w BT /F 30 Tf 2 Tr 5 5 Td (AB) Tj ET", font: true }), (scene) => {
       const index = scene.textIndex.pages[0];
       assert.equal(index.text.replaceAll(" ", ""), "AB");
-      assert.ok([...index.charInstance].filter(ref => ref !== -1).every(ref => ref <= -2));
-      assert.ok(index.fallbackQuads.length >= 8 && [...index.fallbackQuads].every(Number.isFinite));
-      assert.deepEqual([...index.fallbackQuads.slice(0, 4)], [5, 5, 8, 8], "search highlights use glyph geometry");
-      assert.equal(scene.textInstanceCount, 0, "text is not painted twice");
-      const data = scene.rasterLayerData;
-      assert.ok(data.some((_, i) => i % 4 === 0 && data[i] > 180 && data[i + 2] < 80));
-      assert.ok(data.some((_, i) => i % 4 === 0 && data[i + 2] > 100 && data[i] < 100));
+      assert.ok([...index.charInstance].filter(ref => ref !== -1).every(ref => ref >= 0));
+      assert.equal(scene.textInstanceCount, 4, "two glyph fills and two vector outlines");
+      assert.deepEqual([...scene.textInstanceC], [1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1]);
     }]
   ];
   for (const [name, bytes, check] of cases) {
@@ -46,13 +45,16 @@ try {
     const session = await openPdf({ kind: "bytes", bytes }, { ...fontOptions, onDiagnostic: d => warnings.push(d) });
     try {
       const scene = await session.compileVectorPage(0, { optimization: "none" });
-      assert.equal(scene.rasterLayers.length, 1, name);
+      assert.equal(scene.rasterLayers.length, name === "filled and outlined text" ? 0 : 1, name);
       assert.equal(scene.fillPathCount, 0, name);
-      if (name === "arbitrary image clip") {
+      if (name === "arbitrary image clip" || name === "one-bit image") {
         assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
-        assert.equal(scene.clipPaths.length, 1);
-        assert.equal(scene.rasterLayers[0].width, 1, "the original image is retained without resampling");
+        if (name === "arbitrary image clip") assert.equal(scene.clipPaths.length, 1);
+        assert.equal(scene.rasterLayers[0].width, name === "one-bit image" ? 2 : 1,
+          "the original image is retained without resampling");
         assert.equal(scene.rasterLayers[0].height, 1);
+      } else if (name === "filled and outlined text") {
+        assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
       } else {
         assert.equal(warnings.filter(d => d.code === "page-raster-fallback").length, 1, name);
         assert.equal(warnings.find(d => d.code === "page-raster-fallback").pageIndex, 0);
@@ -69,7 +71,7 @@ try {
     assert.equal(simple.getDiagnostics().length, 0);
   } finally { await simple.close(); }
 
-  const bounded = await openPdf({ kind: "bytes", bytes: fixture({ annotations: true }) });
+  const bounded = await openPdf({ kind: "bytes", bytes: fallbackAnnotation });
   try {
     const scene = await bounded.compileVectorPage(0, { limits: { maxImagePixels: 100, maxImageDimension: 12 } });
     assert.ok(scene.rasterLayerWidth * scene.rasterLayerHeight <= 100);
@@ -78,7 +80,7 @@ try {
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
     await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => error.details?.reason === "vector-annotation-appearance");
+      error => /alpha-as-shape/.test(error.message));
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {

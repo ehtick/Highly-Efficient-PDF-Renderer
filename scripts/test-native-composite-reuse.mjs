@@ -19,7 +19,7 @@ try {
   const { HeprCanvas2dImageSurfaceCache, renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   checkBounds(findRgbaAlphaBounds);
 
-  for (const mode of ["multiply", "Alpha", "Luminosity", "empty"]) {
+  for (const mode of ["screen", "Alpha", "Luminosity", "empty"]) {
     const bytes = fixture(mode);
     const snapshot = bytes.slice();
     const session = await openPdf({ kind: "bytes", bytes });
@@ -37,7 +37,7 @@ try {
           assert.deepEqual(bytes, snapshot);
           const before = baseline.timings.selectiveCompositing;
           const after = result.timings.selectiveCompositing;
-          if (mode === "multiply") {
+          if (mode === "screen") {
             assert.equal(before.renders, 3, "exercise standalone selection and both backdrop passes");
             if (reuseCompositeSurfaces) {
               assert(after.imageSurfaceHits > 0);
@@ -62,7 +62,7 @@ try {
 
   // Exercise the surface budget directly, including unused entries from a
   // previous pass. A cache must not turn a previously valid render into OOM.
-  const session = await openPdf({ kind: "bytes", bytes: fixture("multiply") });
+  const session = await openPdf({ kind: "bytes", bytes: fixture("screen") });
   try {
     const page = await session.compilePage(0);
     const rootIndex = page.displayProgram.rootGroupIndex;
@@ -182,7 +182,7 @@ function checkBounds(findBounds) {
 }
 
 function fixture(mode) {
-  const masked = mode !== "multiply";
+  const masked = mode !== "screen";
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 9 0 R] >>" },
@@ -195,7 +195,7 @@ function fixture(mode) {
       "/Resources << /ExtGState << /Gs 7 0 R >> >>",
     `/Gs gs ${mode === "empty" ? "0 0 0 0 re" : "0.5 0.5 0.5 rg 0.25 0.5 8.75 9 re"} f`) },
     { number: 7, body: masked ? `<< /Type /ExtGState /SMask << /S /${mode === "empty" ? "Alpha" : mode} /G 8 0 R >> >>`
-      : "<< /Type /ExtGState /BM /Multiply /ca 0.5 >>" },
+      : "<< /Type /ExtGState /BM /Screen /ca 0.5 >>" },
     { number: 8, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] " +
       "/Group << /S /Transparency /I true /CS /DeviceRGB >> /Resources << >>",
     "0.2 0.5 0.8 rg 0 0 5 10 re f 1 0 0 rg 5 0 5 10 re f") }

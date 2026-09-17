@@ -150,23 +150,13 @@ async function assertBackdropMultiplyCorrection(openPdf) {
   });
   try {
     const scene = await session.compileVectorPage(0, { optimization: "none" });
-    assert.equal(scene.rasterLayers.length, 2,
-      "the source image and backdrop-aware Form remain two ordered raster layers");
-    const layers = [...scene.rasterLayers].sort((left, right) => left.paintOrder - right.paintOrder);
-    assert.deepEqual(layers.map(({ paintOrder }) => paintOrder), [0, 1]);
-    const background = sampleRasterLayers([layers[0]], 5, 5);
-    const correction = sampleRasterLayer(layers[1], 5, 5);
-    const reconstructed = sampleRasterLayers(layers, 5, 5);
-    assert.deepEqual(background, [200, 100, 50, 255]);
-    assert.ok(correction[3] > 0 && correction[3] < 255,
-      "a half-alpha Multiply paint produces a partial-alpha correction layer");
-    assertRgbaWithin(reconstructed, [150, 75, 38, 255], 1,
-      "source-overing the correction onto its prefix reconstructs the PDF Multiply result");
-    assert.deepEqual(sampleRasterLayers(layers, 15, 15), [200, 100, 50, 255],
-      "pixels outside the selected paint remain unchanged");
-    assert.ok(Array.from({ length: layers[1].width * layers[1].height }, (_, index) =>
-      layers[1].data[index * 4 + 3]
-    ).some((alpha) => alpha === 0), "the cropped correction retains transparent padding");
+    assert.equal(scene.rasterLayers.length, 1, "only the original image remains raster");
+    assert.equal(scene.fillPathCount, 1, "the translucent Multiply Form remains vector");
+    assert.deepEqual(scene.drawRuns.map(run => [run.kind, run.blendMode]),
+      [["raster", undefined], ["fill", "Multiply"]]);
+    assert.equal(scene.fillPathMetaC[3], 0.5, "Multiply retains source alpha");
+    assert.deepEqual(sampleRasterLayers(scene.rasterLayers, 5, 5), [200, 100, 50, 255]);
+    assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
   } finally {
     await session.close();
   }

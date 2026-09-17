@@ -1,3 +1,4 @@
+import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
@@ -648,7 +649,7 @@ struct VsOut {
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
 
-const MAX_GLYPH_PRIMITIVES : i32 = 256;
+const MAX_GLYPH_PRIMITIVES : i32 = 2048;
 const TEXT_PRIMITIVE_QUADRATIC : f32 = 1.0;
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -1425,6 +1426,8 @@ export class WebGpuFloorplanRenderer {
 
   private readonly presentationFormat: string;
 
+  private readonly multiplyPipelines = new Map<any, readonly [any, any]>();
+  private readonly multiplyPipelineFactories = new Map<any, () => readonly [any, any]>();
   private readonly strokePipeline: any;
 
   private readonly fillPipeline: any;
@@ -3275,11 +3278,12 @@ export class WebGpuFloorplanRenderer {
     vertexEntry: string,
     fragmentEntry: string,
     layout: any,
-    premultipliedColor = false
+    premultipliedColor = false,
+    multiplyPass?: 0 | 1
   ): any {
     const shaderModule = this.gpuDevice.createShaderModule({ code: shaderSource });
     const colorSrcFactor = premultipliedColor ? "one" : "src-alpha";
-    return this.gpuDevice.createRenderPipeline({
+    const pipeline = this.gpuDevice.createRenderPipeline({
       layout,
       vertex: {
         module: shaderModule,
@@ -3291,7 +3295,7 @@ export class WebGpuFloorplanRenderer {
         targets: [
           {
             format: this.presentationFormat,
-            blend: {
+            blend: multiplyPass === undefined ? {
               color: {
                 srcFactor: colorSrcFactor,
                 dstFactor: "one-minus-src-alpha",
@@ -3302,7 +3306,7 @@ export class WebGpuFloorplanRenderer {
                 dstFactor: "one-minus-src-alpha",
                 operation: "add"
               }
-            }
+            } : multiplyBlendState(multiplyPass)
           }
         ]
       },
@@ -3310,6 +3314,21 @@ export class WebGpuFloorplanRenderer {
         topology: "triangle-strip"
       }
     });
+    if (multiplyPass === undefined) this.multiplyPipelineFactories.set(pipeline, () => {
+      const source = premultipliedColor ? shaderSource : multiplyFragmentWgsl(shaderSource);
+      return [this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 0),
+        this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 1)];
+    });
+    return pipeline;
+  }
+
+  private multiplyPipeline(pipeline: any, pass: 0 | 1): any {
+    let pair = this.multiplyPipelines.get(pipeline);
+    if (!pair) {
+      pair = this.multiplyPipelineFactories.get(pipeline)!();
+      this.multiplyPipelines.set(pipeline, pair);
+    }
+    return pair[pass];
   }
 
   private maxTextureSize(): number {
@@ -3898,7 +3917,7 @@ export class WebGpuFloorplanRenderer {
     if (plan && rebuilt && plan.instanceCount > 0) {
       this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
     }
-    for (const run of plan?.batches ?? runs) {
+    const draw = (run: NonNullable<VectorScene["drawRuns"]>[number], multiplyPass?: 0 | 1): void => {
       this.vectorClipIndex = run.clipIndex ?? -1;
       const pipeline = run.kind === "fill" && this.fillRenderingEnabled ? this.fillPipeline
         : run.kind === "stroke" && this.strokeRenderingEnabled ? this.strokePipeline
@@ -3906,7 +3925,7 @@ export class WebGpuFloorplanRenderer {
       const bindGroup = run.kind === "fill" ? this.fillBindGroup
         : run.kind === "stroke" ? (plan ? this.vectorLodLevelResources[0]?.bindGroup : null) ?? this.strokeBindGroupAll : this.textBindGroup;
       if (pipeline && bindGroup) {
-        pass.setPipeline(pipeline);
+        pass.setPipeline(multiplyPass === undefined ? pipeline : this.multiplyPipeline(pipeline, multiplyPass));
         this.bindVectorClip(pass);
         pass.setBindGroup(0, bindGroup);
         pass.draw(4, run.count, 0, run.first);
@@ -3916,7 +3935,7 @@ export class WebGpuFloorplanRenderer {
           if (run.kind === "raster" && this.rasterRenderingEnabled) {
             const resource = this.rasterLayerResources[index];
             if (resource) {
-              pass.setPipeline(this.rasterPipeline);
+              pass.setPipeline(multiplyPass === undefined ? this.rasterPipeline : this.multiplyPipeline(this.rasterPipeline, multiplyPass));
               this.bindVectorClip(pass);
               pass.setBindGroup(0, resource.bindGroup);
               pass.draw(4, 1, 0, 0);
@@ -3928,6 +3947,14 @@ export class WebGpuFloorplanRenderer {
           }
         }
       }
+    };
+    for (const run of plan?.batches ?? runs) {
+      if (!run.blendMode) { draw(run); continue; }
+      for (let first = run.first; first < run.first + run.count; first++) {
+        const primitive = { ...run, first, count: 1 };
+        draw(primitive, 0); draw(primitive, 1);
+      }
+      if (run.kind === "stroke" && this.strokeRenderingEnabled) strokes -= run.count;
     }
     this.vectorClipIndex = -1;
     return strokes;

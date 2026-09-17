@@ -22,7 +22,7 @@ try {
 
   await assertVisibleMalformedFormFailsDuringStreamDecode(openPdf);
   await assertHiddenFormStaysLazy(openPdf);
-  await assertAnnotationFailsBeforeAppearanceDecode(openPdf);
+  await assertMalformedAnnotationFailsDuringAppearanceDecode(openPdf);
   await assertShadingKeepsUnusedFontLazy(openPdf);
   await assertReferencedMalformedFontFails(openPdf);
   await assertShadingAfterTextKeepsTextVectors(openPdf);
@@ -66,7 +66,7 @@ async function assertHiddenFormStaysLazy(openPdf) {
   }
 }
 
-async function assertAnnotationFailsBeforeAppearanceDecode(openPdf) {
+async function assertMalformedAnnotationFailsDuringAppearanceDecode(openPdf) {
   const session = await openPdf({
     kind: "bytes",
     bytes: annotationFixture(),
@@ -75,10 +75,8 @@ async function assertAnnotationFailsBeforeAppearanceDecode(openPdf) {
   try {
     await assert.rejects(
       session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
-      (error) => error?.code === "unsupported-content" &&
-        error?.details?.reason === "vector-annotation-appearance" &&
-        error?.details?.annotationCount === 1,
-      "a visible annotation must be rejected without decoding its unusable appearance stream"
+      (error) => error?.code === "unsupported-filter",
+      "vector annotation compilation must surface an unusable appearance stream"
     );
     await assert.rejects(session.compileVectorPage(0),
       error => error.code === "unsupported-filter",

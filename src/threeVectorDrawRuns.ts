@@ -1,3 +1,4 @@
+import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
@@ -12,7 +13,7 @@ export function vectorDrawRunRenderOrder(index: number, count: number): number {
 export class ThreeVectorDrawRuns {
   private readonly entries: { mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
     first: number; count: number; ids: THREE.InstancedBufferAttribute }[] = [];
-  private readonly clipMaterials = new Map<number, THREE.Material>();
+  private readonly clipMaterials = new Map<string, THREE.Material>();
   private readonly visibleIds: Uint8Array;
   private sourceCount: number;
   private sourceVersion = -1;
@@ -34,26 +35,39 @@ export class ThreeVectorDrawRuns {
     this.sourceCount = parent.geometry.instanceCount;
     scene.drawRuns!.forEach((run, index) => {
       if (run.kind !== kind) return;
-      const geometry = new THREE.InstancedBufferGeometry();
-      for (const [name, value] of Object.entries(parent.geometry.attributes)) {
-        if (name !== attribute) geometry.setAttribute(name, value);
-      }
-      geometry.setIndex(parent.geometry.index);
-      const ids = new THREE.InstancedBufferAttribute(new Float32Array(run.count), 1);
-      ids.setUsage(THREE.StreamDrawUsage);
-      geometry.setAttribute(attribute, ids);
-      geometry.instanceCount = run.count;
-      let material = parent.material;
-      if (run.clipIndex !== undefined) {
-        const cached = this.clipMaterials.get(run.clipIndex);
-        material = cached ?? createThreeVectorClipMaterial(parent.material, run.clipIndex);
-        if (!cached) this.clipMaterials.set(run.clipIndex, material);
-      }
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.frustumCulled = false;
-      mesh.renderOrder = vectorDrawRunRenderOrder(index, scene.drawRuns!.length);
-      parent.add(mesh);
-      this.entries.push({ mesh, first: run.first, count: run.count, ids });
+      const create = (first: number, count: number, order: number, pass?: 0 | 1): void => {
+        const geometry = new THREE.InstancedBufferGeometry();
+        for (const [name, value] of Object.entries(parent.geometry.attributes)) {
+          if (name !== attribute) geometry.setAttribute(name, value);
+        }
+        geometry.setIndex(parent.geometry.index);
+        const ids = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
+        ids.setUsage(THREE.StreamDrawUsage);
+        geometry.setAttribute(attribute, ids);
+        geometry.instanceCount = count;
+        const key = `${run.clipIndex ?? -1}:${pass ?? "normal"}`;
+        let material = this.clipMaterials.get(key);
+        if (!material) {
+          material = createThreeVectorClipMaterial(parent.material, run.clipIndex);
+          if (pass !== undefined) {
+            const clipped = material;
+            material = createThreeMultiplyMaterial(clipped, pass);
+            if (clipped !== parent.material) clipped.dispose();
+          }
+          if (material !== parent.material) this.clipMaterials.set(key, material);
+        }
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.frustumCulled = false;
+        mesh.renderOrder = vectorDrawRunRenderOrder(order, scene.drawRuns!.length);
+        parent.add(mesh);
+        this.entries.push({ mesh, first, count, ids });
+      };
+      if (run.blendMode === "Multiply") {
+        for (let item = 0; item < run.count; item++) {
+          create(run.first + item, 1, index + item / run.count, 0);
+          create(run.first + item, 1, index + (item + 0.5) / run.count, 1);
+        }
+      } else create(run.first, run.count, index);
     });
     this.finishUpdate();
   }

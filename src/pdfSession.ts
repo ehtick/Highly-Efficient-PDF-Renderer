@@ -139,10 +139,7 @@ import {
   NATIVE_PDF_ANNOTATION_VIEW_FLAGS,
   NativePdfFormAppearanceRegistry
 } from "./pdf/nativeForms";
-import {
-  NativePdfAppearanceSynthesizer,
-  resolveNativePdfAnnotationAppearanceWithSynthesis
-} from "./pdf/nativeAppearanceSynthesis";
+import { NativePdfAppearanceSynthesizer } from "./pdf/nativeAppearanceSynthesis";
 import {
   buildNativePdfFormDefinitionGraph,
   buildNativePdfResourceFormDefinitionGraph,
@@ -852,19 +849,23 @@ class NativePdfSession implements NativeVectorPdfSession {
         reuse
       );
       let textCompilation = textCompiler.build();
-      let vectorCompiled = compiled;
+      const vectorRoot = appendNativeVectorAnnotationPaints(
+        compiled, formGraph, imageResources.colorSpaceResolver, pageBounds, sourcePageIndex,
+        options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage, signal
+      );
+      let vectorCompiled = vectorRoot;
       let selectiveCompositeFormPaintIndices: readonly number[] = [];
       let selectiveCompositeFormPaintOrders: readonly number[] = [];
       let selectiveImagePaintOrdinalSpans: readonly (readonly [number, number])[] = [];
       let selectivePaintSourceSpans: readonly (readonly [number, number])[] = [];
       let selectivePaintSourceIntervals: readonly (readonly [number, number, number, number])[] = [];
       imageResources.assertReferencedCodecsAvailable(compiled.referencedXObjects);
-      if (compiled.formPaints.length !== 0) {
+      if (vectorRoot.formPaints.length !== 0) {
         const formCompileStartedAt = timings ? nativeVectorTimingNow() : 0;
         const flattened = await flattenNativeVectorFormOccurrences({
           document: this.document,
           graph: formGraph,
-          rootCompiled: compiled,
+          rootCompiled: vectorRoot,
           rootText: textCompilation,
           imageResources,
           options,
@@ -928,6 +929,8 @@ class NativePdfSession implements NativeVectorPdfSession {
         imageRegistry: imageResources.registry,
         maxPaths: options.limits?.maxPathsPerPage ??
           this.document.limits.maxPathsPerPage,
+        maxPathCoordinates: options.limits?.maxPathCoordinatesPerPage ??
+          this.document.limits.maxPathCoordinatesPerPage,
         signal
       });
       const compositeRasterLayers: VectorScene["rasterLayers"] = [];
@@ -1100,14 +1103,6 @@ class NativePdfSession implements NativeVectorPdfSession {
       page,
       signal
     );
-    if (output === "vector-scene") {
-      await assertNoNativeVectorAnnotationAppearances(
-        this.formRegistry,
-        this.appearanceSynthesizer,
-        sourcePageIndex,
-        signal
-      );
-    }
     const fontStartedAt = timings ? nativeVectorTimingNow() : 0;
     const type3Registry = new NativePdfType3Registry(this.document);
     const fontRegistry = new NativePageFontRegistry(
@@ -1151,7 +1146,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       signal
     );
     const hasReferencedForms = xObjectReferences.some(({ kind }) => kind === "Form");
-    const formGraph = output === "vector-scene" && !hasReferencedForms
+    const formGraph = output === "vector-scene" && !hasReferencedForms && page.annotations == null
       ? EMPTY_NATIVE_FORM_DEFINITION_GRAPH
       : await buildNativePdfFormDefinitionGraph(
           this.document,
@@ -1830,13 +1825,6 @@ async function flattenNativeVectorFormOccurrences(
     timings
   } = input;
   signal.throwIfAborted();
-  if (graph.annotationPlacements.length !== 0) {
-    throw vectorFormUnsupported(
-      "Annotation appearances cannot be flattened into the VectorScene.",
-      pageIndex,
-      "vector-form-annotation"
-    );
-  }
 
   const colorScopes = new Map<number, Promise<ScopedColorResolver>>();
   const extGStateScopes = new Map<
@@ -1850,6 +1838,7 @@ async function flattenNativeVectorFormOccurrences(
     Promise<Array<readonly [string, NativeTextFontResource]>>
   >();
   const occurrenceCache = new Map<string, NativeVectorCompiledOccurrence | null>();
+  const emptyTransparencyGroups = new Map<number, boolean>();
 
   const scopedColors = (definition: NativePdfFormDefinition): Promise<ScopedColorResolver> => {
     let pending = colorScopes.get(definition.definitionIndex);
@@ -1949,7 +1938,22 @@ async function flattenNativeVectorFormOccurrences(
         details: { reason: "vector-form-hidden", definitionIndex }
       });
     }
-    if (definition.form.group) {
+    if (definition.form.group && !emptyTransparencyGroups.has(definitionIndex)) {
+      emptyTransparencyGroups.set(definitionIndex,
+        nativeVectorTransparencyGroupIsEmpty(definition.content));
+    }
+    const group = definition.form.group;
+    // A non-isolated group containing one opaque path paint is equivalent to
+    // painting that path with the group's blend/opacity. Restrict this proof to
+    // paths without internal compositing changes, then verify its paint count
+    // after compilation. Multiple paints must retain their offscreen boundary.
+    const singlePaintGroup = group && !emptyTransparencyGroups.get(definitionIndex) &&
+      nativeVectorOrderedPaintEnabled(options) && !group.isolated && !group.knockout &&
+      group.colorSpace === undefined && definition.resourceReferences.extGStates.length === 0 &&
+      definition.resourceReferences.fonts.length === 0 && definition.formResources.size === 0 &&
+      definition.imageResourceNames.length === 0 && definition.preparedContent.images.length === 0 &&
+      (paint.initialGraphicsState.softMaskIndex ?? -1) < 0 && !paint.initialGraphicsState.alphaIsShape;
+    if (group && !emptyTransparencyGroups.get(definitionIndex) && !singlePaintGroup) {
       throw vectorFormUnsupported(
         `Transparency-group Form /${definition.resourceName} requires an offscreen compositing pass.`,
         pageIndex,
@@ -2043,7 +2047,10 @@ async function flattenNativeVectorFormOccurrences(
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
       pageMatrix: transform,
       pageBounds: clipBounds,
-      initialGraphicsState: paint.initialGraphicsState,
+      initialGraphicsState: singlePaintGroup ? {
+        ...paint.initialGraphicsState,
+        strokeAlpha: paint.initialGraphicsState.fillAlpha
+      } : paint.initialGraphicsState,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       ...(nativeVectorOrderedPaintEnabled(options) ? { initialVectorClip: rectangleVectorClip({
@@ -2069,6 +2076,14 @@ async function flattenNativeVectorFormOccurrences(
       totalBytes: definition.content.length,
       signal
     }, nativeVectorOrderedPaintEnabled(options) ? "source" : "grouped");
+    if (singlePaintGroup && !nativeVectorGroupHasSinglePathPaint(compiled)) {
+      throw vectorFormUnsupported(
+        `Transparency-group Form /${definition.resourceName} requires an offscreen compositing pass.`,
+        pageIndex,
+        "vector-form-transparency-group",
+        definition.resourceName
+      );
+    }
     imageResources.assertReferencedCodecsAvailable(compiled.referencedXObjects, images.indexes);
     const text = textCompiler.build();
     if (!nativeVectorOrderedPaintEnabled(options)) assertVectorFormPathsWithinClip(
@@ -2151,11 +2166,13 @@ async function flattenNativeVectorFormOccurrences(
   const geometryOccurrences: NativeVectorCompiledOccurrence[] = [];
   const sourceEvents: number[] = [];
   const sourceClips: (DensePdfTextClip | null)[] = [];
-  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null): void => {
-    sourceEvents.push(kind, index); sourceClips.push(clip);
+  const sourceBlendModes: number[] = [];
+  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null, blendMode = 0): void => {
+    sourceEvents.push(kind, index); sourceClips.push(clip); sourceBlendModes.push(blendMode);
   };
   const glyphRunMeta: number[] = [];
   const glyphFillColors: number[] = [];
+  const glyphStrokePaints: NonNullable<DensePdfVectorSceneData["glyphStrokePaints"]>[number][] = [];
   const glyphClipBounds: number[] = [];
   const glyphRunFlags: number[] = [];
   const glyphRunClips: NonNullable<DensePdfVectorSceneData["glyphRunClips"]>[number][] = [];
@@ -2222,6 +2239,7 @@ async function flattenNativeVectorFormOccurrences(
       const kind = sidecar.sourceEvents[offset];
       const localIndex = sidecar.sourceEvents[offset + 1];
       const vectorClip = sidecar.sourceClips?.[offset / 2] ?? null;
+      const blendMode = sidecar.sourceBlendModes?.[offset / 2] ?? 0;
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
@@ -2242,6 +2260,7 @@ async function flattenNativeVectorFormOccurrences(
           localIndex * 4,
           localIndex * 4 + 4
         ));
+        glyphStrokePaints.push(sidecar.glyphStrokePaints?.[localIndex] ?? null);
         glyphClipBounds.push(...(sidecar.glyphClipBounds?.subarray(
           localIndex * 4,
           localIndex * 4 + 4
@@ -2260,7 +2279,7 @@ async function flattenNativeVectorFormOccurrences(
         glyphRunClips.push(sidecar.glyphRunClips?.[localIndex] ?? null);
         appendSourceEvent(
           DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
-          glyphRunMeta.length / 3 - 1, vectorClip
+          glyphRunMeta.length / 3 - 1, vectorClip, blendMode
         );
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         if (localIndex >= seenImages.length || seenImages[localIndex] !== 0) {
@@ -2304,7 +2323,7 @@ async function flattenNativeVectorFormOccurrences(
             : inheritedFormPaintOrder ?? globalIndex
         );
         imageFlags.push(sidecar.imageFlags[localIndex]);
-        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip);
+        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip, blendMode);
         if (occurrence.formDefinitionIndex === -1) rootPackedFormSinceImage = false;
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM) {
         if (localIndex >= seenForms.length || seenForms[localIndex] !== 0) {
@@ -2412,7 +2431,7 @@ async function flattenNativeVectorFormOccurrences(
         if (!ranges || localIndex * 2 + 1 >= ranges.length || !ownerRecordedGeometry) {
           throw invalidVectorFormEvent(pageIndex, "path", localIndex);
         }
-        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip);
+        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip, blendMode);
         pathPaintRanges.push(ranges[localIndex * 2] +
           (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? fillBase : strokeBase), ranges[localIndex * 2 + 1]);
       } else {
@@ -2449,9 +2468,11 @@ async function flattenNativeVectorFormOccurrences(
   const accumulatedText = textAccumulator.build().compilation;
   const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
+    sourceBlendModes: Uint8Array.from(sourceBlendModes),
     ...(ordered ? { pathPaintRanges: Uint32Array.from(pathPaintRanges), sourceClips } : {}),
     glyphRunMeta: Uint32Array.from(glyphRunMeta),
     glyphFillColors: Float32Array.from(glyphFillColors),
+    ...(glyphStrokePaints.some(paint => paint !== null) ? { glyphStrokePaints: Object.freeze(glyphStrokePaints) } : {}),
     glyphClipBounds: Float32Array.from(glyphClipBounds),
     glyphRunFlags: Uint8Array.from(glyphRunFlags),
     ...(glyphRunClips.some(clip => clip !== null) ? { glyphRunClips: Object.freeze(glyphRunClips) } : {}),
@@ -2622,11 +2643,13 @@ function suppressVectorSelectiveImageSpans(
     imageCheckpoints.push(...checkpoints.subarray(image * 6, image * 6 + 6));
   }
   const sourceEvents: number[] = [];
+  const sourceBlendModes: number[] = [];
   for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
     const kind = sidecar.sourceEvents[offset];
     const index = sidecar.sourceEvents[offset + 1];
     if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE && imageSuppressed[index]) continue;
     sourceEvents.push(kind, kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE ? imageMap[index] : index);
+    sourceBlendModes.push(sidecar.sourceBlendModes?.[offset / 2] ?? 0);
   }
   const reducedFillBounds = aggregateFloat4Bounds(fillMetaA, fillMetaB, 2, 3, 0, 1);
   const reducedStrokeBounds = aggregateFloat4Bounds(
@@ -2660,6 +2683,7 @@ function suppressVectorSelectiveImageSpans(
       vectorSceneData: {
         ...sidecar,
         sourceEvents: Uint32Array.from(sourceEvents),
+        sourceBlendModes: Uint8Array.from(sourceBlendModes),
         imageIndices: Uint32Array.from(imageIndices),
         imageTransforms: Float32Array.from(imageTransforms),
         imageClipBounds: Float32Array.from(imageClipBounds),
@@ -2723,6 +2747,7 @@ function isSelectiveCompositeCandidateError(error: unknown): boolean {
   if (error instanceof DensePdfUnsupportedError) {
     return error.message === "VectorScene output cannot represent alpha-as-shape compositing." ||
       error.message === "VectorScene output cannot represent a soft mask." ||
+      /^VectorScene output supports only fill and invisible text, not rendering mode [12]\.$/.test(error.message) ||
       /^VectorScene output cannot represent \/.+ blending\.$/.test(error.message);
   }
   if (!(error instanceof PdfError) || error.code !== "unsupported-content") return false;
@@ -3042,10 +3067,12 @@ function nativeSelectiveCompositeScale(
   const cappedScale = pagePixels > 0
     ? Math.sqrt(NATIVE_SELECTIVE_MAX_CANVAS_PIXELS / pagePixels)
     : NATIVE_SELECTIVE_BASE_SCALE;
-  return Math.max(
-    NATIVE_SELECTIVE_BASE_SCALE,
-    Math.min(scale, cappedScale)
-  );
+  scale = Math.min(scale, cappedScale);
+  // Large sheets can require a scale below the preferred minimum. Account for
+  // integer canvas dimensions too, so backdrop correction respects its budget.
+  while (Math.ceil(page.pageInfo.width * scale) * Math.ceil(page.pageInfo.height * scale) >
+      NATIVE_SELECTIVE_MAX_CANVAS_PIXELS) scale *= 0.99;
+  return scale;
 }
 
 function collectHeprBackdropGroups(
@@ -3367,6 +3394,44 @@ function cropVisibleRgba(
     data.set(source.subarray(start, start + cropWidth * 4), y * cropWidth * 4);
   }
   return { x: minX, y: minY, width: cropWidth, height: cropHeight, data };
+}
+
+/**
+ * Empty groups have no source alpha and therefore cannot change their backdrop.
+ * Restrict this proof to balanced saved-state wrappers and PDF comments/white
+ * space; zero-opacity paints or invisible text can still affect group shape.
+ * The ordinary compiler still processes these operators and enforces limits.
+ */
+function nativeVectorTransparencyGroupIsEmpty(content: Uint8Array): boolean {
+  let depth = 0;
+  for (let offset = 0; offset < content.length; offset += 1) {
+    const byte = content[offset];
+    if (byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32) continue;
+    if (byte === 37) {
+      while (offset + 1 < content.length && content[offset + 1] !== 10 && content[offset + 1] !== 13) offset += 1;
+      continue;
+    }
+    if (byte === 113) depth += 1;
+    else if (byte === 81 && depth > 0) depth -= 1;
+    else return false;
+    const next = content[offset + 1];
+    if (next !== undefined && next !== 0 && next !== 9 && next !== 10 &&
+        next !== 12 && next !== 13 && next !== 32 && next !== 37) return false;
+  }
+  return depth === 0;
+}
+
+function nativeVectorGroupHasSinglePathPaint(compiled: DensePdfCompiledPage): boolean {
+  const events = compiled.vectorSceneData?.sourceEvents;
+  if (!events) return false;
+  let paints = 0;
+  for (let offset = 0; offset < events.length; offset += 2) {
+    const kind = events[offset];
+    if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) continue;
+    if (kind !== DENSE_PDF_VECTOR_SCENE_EVENT_FILL && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) return false;
+    paints += 1;
+  }
+  return paints === 1;
 }
 
 function nativeVectorFormOccurrenceCacheKey(
@@ -6529,36 +6594,75 @@ async function loadMarkedContentProperties(
   return definitions;
 }
 
-async function assertNoNativeVectorAnnotationAppearances(
-  registry: NativePdfFormAppearanceRegistry,
-  synthesizer: NativePdfAppearanceSynthesizer,
+function appendNativeVectorAnnotationPaints(
+  compiled: DensePdfCompiledPage,
+  graph: NativePdfFormDefinitionGraph,
+  resolver: DensePdfColorSpaceResolver,
+  pageBounds: DensePdfBounds,
   pageIndex: number,
+  maxCommands: number,
   signal: AbortSignal
-): Promise<void> {
-  const annotations = await registry.listPageAnnotations(pageIndex, signal);
-  let visibleAppearanceCount = 0;
-  for (const annotation of annotations) {
-    signal.throwIfAborted();
-    const appearance = await resolveNativePdfAnnotationAppearanceWithSynthesis(
-      registry,
-      synthesizer,
-      annotation,
-      signal
-    );
-    if (appearance) visibleAppearanceCount += 1;
+): DensePdfCompiledPage {
+  if (graph.annotationPlacements.length === 0) return compiled;
+  const sidecar = compiled.vectorSceneData!;
+  const formPaints = [...compiled.formPaints];
+  const sourceEvents = Array.from(sidecar.sourceEvents);
+  const sourceBlendModes = Array.from(sidecar.sourceBlendModes ?? new Uint8Array(sidecar.sourceEvents.length / 2));
+  const sourceClips = sidecar.sourceClips ? [...sidecar.sourceClips] : undefined;
+  const formPaintOrders = Array.from(sidecar.formPaintOrders ?? []);
+  const defaultState = createDefaultInitialGraphicsState(resolver);
+  const pageClip = rectangleVectorClip(pageBounds, [1, 0, 0, 1, 0, 0], null);
+  // Annotation appearances paint after page content and start with a fresh
+  // graphics state. Their invocation order also matches the display program's
+  // appended annotation Forms, allowing the existing selective fallback to
+  // rasterize only an appearance that needs compositing.
+  let nextPaintOrder = compiled.operatorCount;
+  for (const orders of [sidecar.imagePaintOrders, sidecar.formPaintOrders, sidecar.selectivePaintOrdinalSpans]) {
+    for (const order of orders ?? []) nextPaintOrder = Math.max(nextPaintOrder, order + 1);
   }
-  if (visibleAppearanceCount === 0) return;
-  throw new PdfError(
-    "unsupported-content",
-    "Visible annotation appearances are not yet representable by the direct VectorScene path.",
-    {
-      pageIndex,
-      details: {
-        reason: "vector-annotation-appearance",
-        annotationCount: visibleAppearanceCount
-      }
+  let annotationCount = 0;
+  for (const placement of graph.annotationPlacements) {
+    signal.throwIfAborted();
+    const definition = graph.definitions[placement.definitionIndex];
+    if (!definition || !definition.defaultVisible) continue;
+    if ((placement.annotation.flags &
+        (NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoZoom | NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoRotate)) !== 0) {
+      throw vectorFormUnsupported(
+        "An annotation appearance requires a view-dependent transform.",
+        pageIndex, "vector-annotation-view-transform", placement.resourceName
+      );
     }
-  );
+    annotationCount += 1;
+    if (compiled.operatorCount + annotationCount > maxCommands || nextPaintOrder > 0xffff_ffff) {
+      throw new PdfError("resource-limit", "Annotation appearances exceed the page command limit.", { pageIndex });
+    }
+    sourceEvents.push(DENSE_PDF_VECTOR_SCENE_EVENT_FORM, formPaints.length);
+    sourceBlendModes.push(0);
+    sourceClips?.push(null);
+    formPaintOrders.push(nextPaintOrder++);
+    formPaints.push(Object.freeze({
+      definitionIndex: placement.definitionIndex,
+      transform: placement.invocationMatrix,
+      clipBounds: pageBounds,
+      clipIsDefault: true,
+      clipIsExactRectangle: true,
+      vectorClip: pageClip,
+      initialGraphicsState: defaultState
+    }));
+  }
+  if (annotationCount === 0) return compiled;
+  return {
+    ...compiled,
+    operatorCount: compiled.operatorCount + annotationCount,
+    formPaints: Object.freeze(formPaints),
+    vectorSceneData: {
+      ...sidecar,
+      sourceEvents: Uint32Array.from(sourceEvents),
+      sourceBlendModes: Uint8Array.from(sourceBlendModes),
+      ...(sourceClips ? { sourceClips } : {}),
+      formPaintOrders: Uint32Array.from(formPaintOrders)
+    }
+  };
 }
 
 function formOptionalContentForScope(

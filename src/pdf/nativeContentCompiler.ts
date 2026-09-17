@@ -480,6 +480,18 @@ export const DENSE_PDF_VECTOR_SCENE_EVENT_STROKE = 5;
 /** A flattened root Form rendered as a bounded composite; index is its paint ordinal. */
 export const DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE = 6;
 
+/** Stroke width/dashes live in graphics-state user space, independently of Tm/Tz. */
+export interface DensePdfVectorGlyphStroke {
+  readonly transform: DensePdfMatrix;
+  readonly color: readonly [number, number, number, number];
+  readonly width: number;
+  readonly lineCap: 0 | 1 | 2;
+  readonly lineJoin: 0 | 1 | 2;
+  readonly miterLimit: number;
+  readonly dashArray: readonly number[];
+  readonly dashPhase: number;
+}
+
 /**
  * Compact paint metadata for the VectorScene adapter, including ordered draw ranges.
  * Packed fill and stroke geometry remains in `DensePdfCompiledPage` itself.
@@ -489,6 +501,8 @@ export interface DensePdfVectorSceneData {
   /** Optional first/count pairs addressed by FILL/STROKE source events. */
   readonly pathPaintRanges?: Uint32Array;
   readonly sourceClips?: readonly (DensePdfTextClip | null)[];
+  /** One blend per source event: 0 Normal, 1 Multiply. */
+  readonly sourceBlendModes?: Uint8Array;
   /**
    * Source-ordered kind/index pairs for glyph runs, image invocations, Form
    * invocations, and the first ordinary-paint barrier. Kind-local indexes
@@ -501,6 +515,7 @@ export interface DensePdfVectorSceneData {
   readonly glyphRunMeta: Uint32Array;
   /** One sRGB nonstroking RGBA tuple per glyph triple. */
   readonly glyphFillColors: Float32Array;
+  readonly glyphStrokePaints?: readonly (DensePdfVectorGlyphStroke | null)[];
   /** Four exact page-space clip bounds per glyph run. */
   readonly glyphClipBounds?: Float32Array;
   /** Per-run DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_* bits. */
@@ -1254,6 +1269,8 @@ class DenseContentCompiler {
 
   readonly vectorGlyphFillColors: number[] = [];
 
+  readonly vectorGlyphStrokePaints: (DensePdfVectorGlyphStroke | null)[] = [];
+
   readonly vectorGlyphClipBounds: number[] = [];
 
   readonly vectorGlyphRunFlags: number[] = [];
@@ -1281,6 +1298,7 @@ class DenseContentCompiler {
 
   readonly vectorSourceEvents: number[] = [];
   readonly vectorSourceClipIndices: number[] = [];
+  readonly vectorSourceBlendModes: number[] = [];
   readonly vectorFormClipIndices: number[] = [];
   readonly vectorPathPaintRanges: number[] = [];
 
@@ -1607,11 +1625,13 @@ class DenseContentCompiler {
       this.vectorSourceEvents.every((value, i) => i % 2 !== 0 ||
         value === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT || value === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) &&
       this.vectorSourceClipIndices.every(index => index === this.vectorSourceClipIndices[0]) &&
+      this.vectorSourceBlendModes.every(mode => mode === 0) &&
       this.strokes.hasUniformOpaqueColor();
     const strokeResult = await this.strokes.finalize(checkpoint, compactOrderedStrokes);
     if (compactOrderedStrokes) {
       const clipIndex = this.vectorSourceClipIndices[0] ?? -1;
       this.vectorSourceClipIndices.length = 0;
+      this.vectorSourceBlendModes.length = 0;
       this.vectorSourceEvents.length = 0;
       this.vectorPathPaintRanges.length = 0;
       const count = strokeResult.endpoints.length / 4;
@@ -1620,6 +1640,7 @@ class DenseContentCompiler {
           DENSE_PDF_VECTOR_SCENE_EVENT_STROKE, 0);
         this.vectorPathPaintRanges.push(0, count);
         this.vectorSourceClipIndices.push(clipIndex, clipIndex);
+        this.vectorSourceBlendModes.push(0, 0);
       }
     }
     const fillPathMetaA = this.fillPathMetaA.toTypedArray();
@@ -1666,12 +1687,15 @@ class DenseContentCompiler {
       ...(this.policy.vectorScene === true ? {
         vectorSceneData: {
           sourceEvents: Uint32Array.from(this.vectorSourceEvents),
+          sourceBlendModes: Uint8Array.from(this.vectorSourceBlendModes),
           ...(this.policy.orderedPaint ? {
             pathPaintRanges: Uint32Array.from(this.vectorPathPaintRanges),
             sourceClips: this.vectorSourceClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null)
           } : {}),
           glyphRunMeta: Uint32Array.from(this.vectorGlyphRunMeta),
           glyphFillColors: Float32Array.from(this.vectorGlyphFillColors),
+          ...(this.vectorGlyphStrokePaints.some(paint => paint !== null)
+            ? { glyphStrokePaints: Object.freeze(this.vectorGlyphStrokePaints) } : {}),
           glyphClipBounds: Float32Array.from(this.vectorGlyphClipBounds),
           glyphRunFlags: Uint8Array.from(this.vectorGlyphRunFlags),
           ...(textClips.length === 0 && !this.options.initialVectorClip ? {} : {
@@ -3298,7 +3322,8 @@ class DenseContentCompiler {
         operator
       );
     }
-    if (this.state.blendMode !== "Normal") {
+    if (this.state.blendMode !== "Normal" &&
+        !(this.policy.orderedPaint && this.state.blendMode === "Multiply")) {
       throw new DensePdfUnsupportedError(
         `VectorScene output cannot represent /${this.state.blendMode} blending.`,
         operator
@@ -3364,6 +3389,7 @@ class DenseContentCompiler {
     }
     this.vectorSourceEvents.push(kind, index);
     this.vectorSourceClipIndices.push(this.state.clipIndex);
+    this.vectorSourceBlendModes.push(this.state.blendMode === "Multiply" ? 1 : 0);
   }
 
   private recordVectorOrdinaryPaintBarrier(operator: string): void {
@@ -3553,20 +3579,31 @@ class DenseContentCompiler {
         "Tj"
       );
     }
-    if (renderingMode !== 0 && renderingMode !== 3) {
+    const outlined = renderingMode === 1 || renderingMode === 2;
+    const vectorOutline = outlined && this.policy.orderedPaint && this.state.lineWidth > 0 &&
+      !this.state.strokeAdjustment;
+    if (outlined && !vectorOutline && this.policy.selectiveRaster) {
+      this.assertVectorSceneComposite("stroke", "Tj");
+      if (renderingMode === 2) this.assertVectorSceneComposite("nonstroke", "Tj");
+      this.recordVectorCompositeGlyphPaintRun(start, count, renderingMode);
+      return;
+    }
+    if (renderingMode !== 0 && renderingMode !== 3 && !vectorOutline) {
       throw new DensePdfUnsupportedError(
         `VectorScene output supports only fill and invisible text, not rendering mode ${renderingMode}.`,
         "Tr"
       );
     }
-    if (renderingMode === 0 && this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON) {
+    const visibleFill = (renderingMode === 0 || renderingMode === 2) && this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON;
+    const visibleStroke = vectorOutline && this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON;
+    if (visibleFill || visibleStroke) {
       if (!this.state.textKnockout) {
         throw new DensePdfUnsupportedError(
           "VectorScene output cannot represent text knockout disabled.",
           "Tj"
         );
       }
-      if (this.state.fillPatternColorSpace) {
+      if ((visibleFill && this.state.fillPatternColorSpace) || (visibleStroke && this.state.strokePatternColorSpace)) {
         throw new DensePdfUnsupportedError(
           "VectorScene output cannot represent pattern-colored text.",
           "Tj"
@@ -3575,25 +3612,7 @@ class DenseContentCompiler {
       if (!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
         if (this.policy.selectiveRaster === true) {
           this.assertVectorSceneComposite("nonstroke", "Tj");
-          const ordinal = this.nextVectorPaintOrdinal("Tj");
-          this.vectorSelectivePaintSourceSpans.push(
-            this.operatorSourceOffset,
-            this.operatorSourceLength
-          );
-          this.recordVectorSelectivePaint(ordinal);
-          const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
-          this.vectorGlyphRunMeta.push(start, count, renderingMode);
-          this.vectorGlyphFillColors.push(0, 0, 0, 0);
-          const clip = this.state.clipBounds ?? this.options.pageBounds;
-          this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
-          this.vectorGlyphRunFlags.push(DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED |
-            DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED);
-          this.vectorGlyphClipIndices.push(this.state.clipIndex);
-          this.recordVectorSourceEvent(
-            DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
-            glyphRunIndex,
-            "Tj"
-          );
+          this.recordVectorCompositeGlyphPaintRun(start, count, renderingMode);
           return;
         }
         throw new DensePdfUnsupportedError(
@@ -3601,7 +3620,8 @@ class DenseContentCompiler {
           "Tj"
         );
       }
-      this.recordVectorOrdinaryPaint("nonstroke", "Tj");
+      if (visibleFill) this.recordVectorOrdinaryPaint("nonstroke", "Tj");
+      if (visibleStroke) this.recordVectorOrdinaryPaint("stroke", "Tj");
     }
     const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
     this.vectorGlyphRunMeta.push(start, count, renderingMode);
@@ -3612,12 +3632,22 @@ class DenseContentCompiler {
       this.state.fillB,
       this.state.fillAlpha
     );
+    this.vectorGlyphStrokePaints.push(vectorOutline ? Object.freeze({
+      transform: [...this.state.matrix] as DensePdfMatrix,
+      color: [this.state.strokeR, this.state.strokeG, this.state.strokeB, this.state.strokeAlpha] as const,
+      width: this.state.lineWidth,
+      lineCap: this.state.lineCap as 0 | 1 | 2,
+      lineJoin: this.state.lineJoin,
+      miterLimit: this.state.miterLimit,
+      dashArray: [...this.state.lineDash],
+      dashPhase: this.state.dashPhase
+    }) : null);
     const clip = this.state.clipBounds ?? this.options.pageBounds;
     this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
     this.vectorGlyphRunFlags.push(
       this.state.clipIsDefault ? 0 : DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED
     );
-    if (renderingMode === 0 && this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON) {
+    if (visibleFill || visibleStroke) {
       this.vectorSawVisibleText = true;
     }
     this.recordVectorSourceEvent(
@@ -3625,6 +3655,24 @@ class DenseContentCompiler {
       glyphRunIndex,
       "Tj"
     );
+  }
+
+  private recordVectorCompositeGlyphPaintRun(start: number, count: number, renderingMode: number): void {
+    const ordinal = this.nextVectorPaintOrdinal("Tj");
+    this.vectorSelectivePaintSourceSpans.push(this.operatorSourceOffset, this.operatorSourceLength);
+    this.recordVectorSelectivePaint(ordinal);
+    const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
+    this.vectorGlyphRunMeta.push(start, count, renderingMode);
+    // Keep search/selection geometry while the display program paints the
+    // complete glyph appearance into a bounded layer, without duplicate ink.
+    this.vectorGlyphFillColors.push(0, 0, 0, 0);
+    this.vectorGlyphStrokePaints.push(null);
+    const clip = this.state.clipBounds ?? this.options.pageBounds;
+    this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
+    this.vectorGlyphRunFlags.push(DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED |
+      DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED);
+    this.vectorGlyphClipIndices.push(this.state.clipIndex);
+    this.recordVectorSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, glyphRunIndex, "Tj");
   }
 
   private commitTextClip(): void {

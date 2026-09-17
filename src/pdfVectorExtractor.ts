@@ -89,6 +89,7 @@ export interface VectorClipPath {
 
 /** Consecutive instances painted together, in PDF source order. */
 export interface VectorDrawRun {
+  blendMode?: "Multiply";
   clipIndex?: number;
   kind: "fill" | "stroke" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
   first: number;
@@ -1246,7 +1247,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       };
       for (const run of scene.drawRuns ?? defaultVectorDrawRuns({ ...scene, rasterLayers: listSceneRasterLayers(scene) })) {
         appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count,
-          run.clipIndex === undefined ? undefined : run.clipIndex + clipBase);
+          run.clipIndex === undefined ? undefined : run.clipIndex + clipBase, run.blendMode);
       }
     }
 

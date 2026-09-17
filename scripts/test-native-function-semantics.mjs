@@ -283,12 +283,9 @@ async function testExponentialAndStitchingFunctions() {
   closeTo(registry.evaluate(joined, [0.5])[0], 10);
   closeTo(registry.evaluate(joined, [1])[0], 20);
 
-  // ISO 32000-1 7.10.4 orders Bounds by increasing value, and producers do
-  // repeat one. That is an empty subdomain, not a disordered array: selection
-  // takes the first bound strictly above the input, so the segment between two
-  // equal bounds can never be chosen and its subfunction is never evaluated.
-  // Here that unreachable segment is `high`, whose outputs start at 10, so
-  // picking it up would be unmistakable.
+  // Repeated interior bounds are a compatibility tolerance beyond ISO 32000-1
+  // 7.10.4's strict ordering. Selection skips the empty interval; its `high`
+  // subfunction would produce values >= 10 if it were selected accidentally.
   const plateau = await registry.add(stitching({
     range: [0, 20],
     functions: [low, high, low],
@@ -298,6 +295,40 @@ async function testExponentialAndStitchingFunctions() {
   closeTo(registry.evaluate(plateau, [0.25])[0], 0.5);
   closeTo(registry.evaluate(plateau, [0.5])[0], 0);
   closeTo(registry.evaluate(plateau, [1])[0], 1);
+
+  // A longer run must resume at the next non-empty interval, not the last one.
+  const longPlateau = await registry.add(stitching({
+    range: [0, 20],
+    functions: [low, low, high, high, low, high],
+    bounds: [0.25, 0.5, 0.5, 0.5, 0.75],
+    encode: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  }));
+  for (const [input, expected] of [[0.375, 0.5], [0.5, 0], [0.625, 0.5], [0.75, 10], [1, 20]]) {
+    closeTo(registry.evaluate(longPlateau, [input])[0], expected);
+  }
+
+  // Also tolerate an empty first interval, including inputs clipped to Domain[0].
+  const emptyFirst = await registry.add(stitching({
+    domain: [2, 4],
+    range: [0, 20],
+    functions: [high, low],
+    bounds: [2],
+    encode: [0, 1, 0, 1]
+  }));
+  for (const [input, expected] of [[1, 0], [2, 0], [3, 0.5], [4, 1], [5, 1]]) {
+    closeTo(registry.evaluate(emptyFirst, [input])[0], expected);
+  }
+
+  for (const bounds of [[0.75, 0.5], [0.5, 0.5, 0.25]]) {
+    await rejectsCode(
+      () => registry.add(stitching({
+        functions: Array.from({ length: bounds.length + 1 }, () => low),
+        bounds,
+        encode: Array.from({ length: bounds.length + 1 }, () => [0, 1]).flat()
+      })),
+      "invalid-object"
+    );
+  }
 
   const oneDegenerate = await registry.add(stitching({
     domain: [1, 1],

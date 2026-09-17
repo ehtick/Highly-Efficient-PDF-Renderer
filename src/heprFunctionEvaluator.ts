@@ -534,9 +534,10 @@ function decodeRecord(
     for (let boundIndex = 0; boundIndex < bounds.length; boundIndex += 1) {
       const bound = bounds[boundIndex];
       const last = boundIndex === bounds.length - 1;
-      // Repeated bounds describe an empty subdomain, not disorder: selection
-      // above takes the first bound strictly greater than the input, so that
-      // segment is unreachable. Only a decreasing bound is disorder.
+      // ISO 32000-1 7.10.4 requires strict ordering, except that the last bound
+      // may equal Domain[1]. Match the parser's compatibility tolerance for
+      // repeated interior bounds and a first bound at Domain[0]: the strict <
+      // selection skips their empty intervals. Decreasing bounds still reject.
       if (!(bound >= previous && (bound < domain[1] || (last && bound === domain[1])))) {
         invalidFunction(path, "stitching bounds are unordered");
       }

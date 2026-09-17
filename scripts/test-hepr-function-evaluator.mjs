@@ -208,13 +208,26 @@ try {
     bounds: [0.5],
     encode: [0, 1, 0, 1]
   }));
-  // Repeated Bounds describe an empty subdomain, which selection can never
-  // reach. The unreachable segment here is `high`, whose outputs start at 10.
+  // Compatibility tolerance for repeated interior bounds, beyond the ISO strict
+  // ordering rule. The unreachable segment is `high`, whose outputs start at 10.
   const plateau = await registry.add(stitching({
     range: [0, 20],
     functions: [low, high, low],
     bounds: [0.5, 0.5],
     encode: [0, 1, 0, 1, 0, 1]
+  }));
+  const longPlateau = await registry.add(stitching({
+    range: [0, 20],
+    functions: [low, low, high, high, low, high],
+    bounds: [0.25, 0.5, 0.5, 0.5, 0.75],
+    encode: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  }));
+  const emptyFirst = await registry.add(stitching({
+    domain: [2, 4],
+    range: [0, 20],
+    functions: [high, low],
+    bounds: [2],
+    encode: [0, 1, 0, 1]
   }));
 
   const conditional = await registry.add(calculator(
@@ -262,6 +275,8 @@ try {
     [clampedExponential, [[-100], [0], [0.5], [1], [100]]],
     [joined, [[0], [0.25], [0.5], [0.75], [1]]],
     [plateau, [[0], [0.25], [0.5], [0.75], [1]]],
+    [longPlateau, [[0], [0.375], [0.5], [0.625], [0.75], [1]]],
+    [emptyFirst, [[1], [2], [3], [4], [5]]],
     [conditional, [[0], [0.25], [0.5], [0.75], [1]]],
     [nestedConditional, [[0], [0.5], [1]]],
     [arithmetic, [[0]]],
@@ -272,6 +287,25 @@ try {
     for (const input of inputs) {
       closeArrays(evaluator.evaluate(index, input), registry.evaluate(index, input));
     }
+  }
+
+  // Check known outputs as well as parity: both evaluators could share a bug.
+  for (const [input, expected] of [[0.375, 1], [0.5, 0], [0.625, 1], [0.75, 10], [1, 20]]) {
+    closeArrays(evaluator.evaluate(longPlateau, [input]), [expected]);
+  }
+  for (const [input, expected] of [[1, 0], [2, 0], [3, 1], [4, 2], [5, 2]]) {
+    closeArrays(evaluator.evaluate(emptyFirst, [input]), [expected]);
+  }
+
+  // Bypass parser validation to check rejection in the retained-store evaluator.
+  const boundsOffset = store.parameterOffsets[longPlateau] + 3 + 6; // header + child indices
+  for (const bounds of [[0.25, 0.5, 0.375, 0.5, 0.75], [0.25, 0.5, 0.5, 0.375, 0.75]]) {
+    const decreasingBounds = cloneStore(store);
+    decreasingBounds.parameters.set(bounds, boundsOffset);
+    throwsCode(
+      () => new HeprFunctionEvaluator(decreasingBounds).evaluate(longPlateau, [0.625]),
+      HEPR_FUNCTION_EVALUATION_CODES.InvalidFunction
+    );
   }
 
   assert.deepEqual([...evaluator.evaluate(clampedExponential, [-100])], [0, 4]);

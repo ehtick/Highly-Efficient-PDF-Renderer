@@ -43,6 +43,7 @@ try {
   await testIdentityAndVerticalResourceLaziness();
   await testBundledPredefinedCMaps();
   await testCidUnicodeFallbackAndRos();
+  await testCidSystemInfoStringRejections();
   await testUseCMapCyclesAndDepth();
   await testSimpleEncodingAndUnicodeSeparation();
   await testCidToGidBounds();
@@ -358,6 +359,54 @@ async function testCidUnicodeFallbackAndRos() {
     ),
     hasPdfError("resource-limit", /font-cid-unicode-mapping-limit/)
   );
+}
+
+async function testCidSystemInfoStringRejections() {
+  // Only trailing NUL padding may be discarded. Exercise each field separately
+  // so an invalid Registry cannot hide an invalid Ordering, or vice versa.
+  for (const [key, valid] of [["Registry", "Adobe"], ["Ordering", "Japan1"]]) {
+    for (const [label, value, reason] of [
+      ["all-NUL", "\0\0", "at least one non-NUL byte"],
+      ["leading NUL", `\0${valid}`, "printable ASCII"],
+      ["embedded NUL", `${valid[0]}\0${valid.slice(1)}\0`, "printable ASCII"],
+      ["control byte", `${valid}\t\0`, "printable ASCII"],
+      ["DEL byte", `${valid}\x7f\0`, "printable ASCII"],
+      ["non-ASCII byte", `${valid}\x80\0`, "printable ASCII"]
+    ]) {
+      const bytes = Uint8Array.from(value, (character) => character.charCodeAt(0));
+      const evidence = new RegExp(`/CIDSystemInfo /${key} must contain ${reason}\\.`);
+      const systemInfo = cidSystemInfo("Japan1", 7);
+      systemInfo.set(key, { kind: "string", bytes, hex: false });
+      await assert.rejects(
+        parseNativePdfFont(
+          compositeFont(name("Identity-H"), cidFont("Japan1", 7, [["CIDSystemInfo", systemInfo]])),
+          identityResolver
+        ),
+        hasPdfError("unsupported-font", evidence),
+        `CID font /${key} must reject ${label}`
+      );
+
+      for (const representation of ["hex", "literal"]) {
+        const encoded = representation === "hex"
+          ? `<${Buffer.from(bytes).toString("hex")}>`
+          : `(${[...bytes].map((byte) => `\\${byte.toString(8).padStart(3, "0")}`).join("")})`;
+        const encoding = stream(`
+          /CIDSystemInfo 3 dict dup begin
+            /Registry ${key === "Registry" ? encoded : "(Adobe)"} def
+            /Ordering ${key === "Ordering" ? encoded : "(Japan1)"} def
+            /Supplement 7 def
+          end def
+          1 begincodespacerange <00> <ff> endcodespacerange
+          1 begincidchar <41> 633 endcidchar
+        `);
+        await assert.rejects(
+          parseNativePdfFont(compositeFont(encoding, cidFont("Japan1", 7)), identityResolver),
+          hasPdfError("unsupported-font", evidence),
+          `Embedded CMap /${key} ${representation} string must reject ${label}`
+        );
+      }
+    }
+  }
 }
 
 async function testUseCMapCyclesAndDepth() {

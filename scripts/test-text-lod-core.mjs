@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
-import { pathToFileURL } from "node:url";
 
 import {
   buildTextLod,
@@ -24,8 +23,8 @@ const corePath = new URL("../src/textLodCore.ts", import.meta.url);
 const projectionPath = new URL("../src/planarProjection.ts", import.meta.url);
 const greekPath = new URL("../src/textGreekLod.ts", import.meta.url);
 const coreSource = (await readFile(corePath, "utf8"))
-  .replaceAll('"./planarProjection"', JSON.stringify(pathToFileURL(projectionPath.pathname).href))
-  .replaceAll('"./textGreekLod"', JSON.stringify(pathToFileURL(greekPath.pathname).href));
+  .replaceAll('"./planarProjection"', JSON.stringify(projectionPath.href))
+  .replaceAll('"./textGreekLod"', JSON.stringify(greekPath.href));
 const coreModule = await import(
   `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(coreSource, {mode: "strip"})).toString("base64")}`
 );

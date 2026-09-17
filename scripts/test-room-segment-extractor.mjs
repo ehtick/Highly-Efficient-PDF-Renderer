@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { gunzipSync } from "node:zlib";
 
@@ -31,7 +32,7 @@ try {
   const script = new URL("./extract-segments.mjs", import.meta.url);
   await execute(process.execPath, [
     "--experimental-strip-types",
-    script.pathname,
+    fileURLToPath(script),
     "--root",
     temporary,
     "--out",

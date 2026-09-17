@@ -1,3 +1,4 @@
+import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import {
   HEPR_COLOR_SPACE_KIND,
   HEPR_GRADIENT_KIND,
@@ -122,6 +123,8 @@ export interface HeprCanvas2dBackendOptions {
   /** Painted behind the completed transparent page, never into transparency groups. */
   readonly background?: readonly [red: number, green: number, blue: number, alpha: number] | null;
   readonly surfaceFactory: HeprCanvas2dSurfaceFactory;
+  /** Reports bounded visual approximations, including gradient tolerance misses. */
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   readonly imageDecoder?: HeprCanvas2dImageDecoder;
   readonly signal?: AbortSignal;
   readonly maxCanvasPixels?: number;
@@ -270,6 +273,7 @@ interface ResolvedBackendOptions {
   readonly surfaceFactory: HeprCanvas2dSurfaceFactory;
   readonly imageDecoder: HeprCanvas2dImageDecoder | undefined;
   readonly signal: AbortSignal | undefined;
+  readonly onDiagnostic: ((diagnostic: PdfDiagnostic) => void) | undefined;
   readonly maxCanvasPixels: number;
   readonly maxWorkingPixels: number;
   readonly maxGradientStops: number;
@@ -1930,27 +1934,35 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       );
     }
     const cache = new Map<number, GradientStop>();
+    let samples = 0;
+    const sampleInput = (offset: number, inputOffset = offset): GradientStop => {
+      if (++samples > this.options.maxGradientStops) {
+        throw canvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit,
+          `Gradient ${metadata.gradientIndex} exceeds the adaptive stop limit ${this.options.maxGradientStops}.`, path);
+      }
+      const input = metadata.domain![0] + inputOffset * (metadata.domain![1] - metadata.domain![0]);
+      const components = this.evaluateFunctions(metadata.functionIndices, [input], path);
+      return { offset, rgb: this.convertColorToSrgb(metadata.colorSpaceIndex, components, path), alpha: 1 };
+    };
     const sample = (offset: number): GradientStop => {
       const cached = cache.get(offset);
       if (cached) return cached;
-      if (cache.size >= this.options.maxGradientStops) {
-        throw canvasError(
-          HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit,
-          `Gradient ${metadata.gradientIndex} exceeds the adaptive stop limit ${this.options.maxGradientStops}.`,
-          path
-        );
-      }
-      const input = metadata.domain![0] + offset * (metadata.domain![1] - metadata.domain![0]);
-      const components = this.evaluateFunctions(metadata.functionIndices, [input], path);
-      const stop: GradientStop = {
-        offset,
-        rgb: this.convertColorToSrgb(metadata.colorSpaceIndex, components, path),
-        alpha: 1
-      };
+      const stop = sampleInput(offset);
       cache.set(offset, stop);
       return stop;
     };
     const output: GradientStop[] = [sample(0)];
+    let warned = false;
+    const warnTolerance = (error: number): void => {
+      if (warned) return;
+      warned = true;
+      this.options.onDiagnostic?.({
+        code: "gradient-approximation", severity: "warning",
+        pageIndex: this.page.pageInfo.sourcePageIndex,
+        message: `Gradient ${metadata.gradientIndex} uses a bounded approximation; colors may differ.`,
+        details: { gradientIndex: metadata.gradientIndex, error, tolerance: this.options.gradientColorTolerance }
+      });
+    };
     const subdivide = (low: GradientStop, high: GradientStop, depth: number): void => {
       this.options.signal?.throwIfAborted();
       const middleOffset = (low.offset + high.offset) / 2;
@@ -1971,16 +1983,44 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         subdivide(middle, high, depth + 1);
         return;
       }
-      if (error > this.options.gradientColorTolerance) {
-        throw canvasError(
-          HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit,
-          `Gradient ${metadata.gradientIndex} cannot meet its color tolerance within the subdivision limit.`,
-          path
-        );
-      }
+      if (error > this.options.gradientColorTolerance) warnTolerance(error);
       output.push(high);
     };
-    subdivide(output[0], sample(1), 0);
+    // Split at stitching boundaries before adaptive sampling. Coincident stops
+    // preserve a hard color step instead of chasing it with endless subdivision.
+    const boundaries = new Set<number>([1]);
+    try {
+      for (const functionIndex of metadata.functionIndices) {
+        for (const input of this.functionEvaluator!.breakpoints(
+          functionIndex, this.options.maxGradientStops, this.options.signal
+        )) {
+          const offset = (input - metadata.domain[0]) / (metadata.domain[1] - metadata.domain[0]);
+          if (offset > 0 && offset <= 1) boundaries.add(offset);
+        }
+      }
+    } catch (cause) {
+      this.options.signal?.throwIfAborted();
+      throw canvasError(
+        cause instanceof HeprFunctionEvaluationError && cause.code === HEPR_FUNCTION_EVALUATION_CODES.ResourceLimit
+          ? HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit : HEPR_CANVAS_2D_ERROR_CODES.UnsupportedPaint,
+        "Gradient stitching boundaries could not be sampled within the function limits.", path, cause
+      );
+    }
+    const ordered = [...boundaries].sort((a, b) => a - b);
+    // Use one-sided colors on BOTH sides: a reversed /Encode reverses which
+    // branch owns the exact boundary. A few ulps also survive nested mappings.
+    const edge = (offset: number, direction: number, gap: number): GradientStop =>
+      sampleInput(offset, offset + direction * Math.min(gap / 4, Number.EPSILON * 16));
+    let low = edge(0, 1, ordered[0]);
+    output[0] = low;
+    for (let i = 0; i < ordered.length; i += 1) {
+      const offset = ordered[i];
+      const left = edge(offset, -1, offset - low.offset);
+      subdivide(low, left, 0);
+      const right = offset === 1 ? sample(1) : edge(offset, 1, ordered[i + 1] - offset);
+      if (right.rgb.some((component, index) => component !== left.rgb[index])) output.push(right);
+      low = right;
+    }
     return output;
   }
 
@@ -3177,6 +3217,7 @@ function resolveOptions(options: HeprCanvas2dBackendOptions): ResolvedBackendOpt
     surfaceFactory: options.surfaceFactory,
     imageDecoder: options.imageDecoder,
     signal: options.signal,
+    onDiagnostic: options.onDiagnostic,
     maxCanvasPixels: positiveSafeInteger(
       options.maxCanvasPixels ?? DEFAULT_MAX_CANVAS_PIXELS,
       "maxCanvasPixels"

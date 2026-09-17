@@ -53,7 +53,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
 | `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
-| `onDiagnostic` | — | Receive PDF diagnostics, including `icc-engine-fallback` and `icc-alternate-used` warnings with zero-based `pageIndex`. |
+| `onDiagnostic` | — | Receive PDF diagnostics, including raster fallback, visual approximation, and ICC warnings with zero-based `pageIndex`. |
 
 Page selections are deduplicated and composed in document order. Invalid selections
 reject with `RangeError`. HEP files preserve their saved page selection and layout;
@@ -137,6 +137,44 @@ Node hosts can install the optional `@napi-rs/canvas` backend for PDF operations
 that need Canvas2D, image encoding, and encoded HEP image decoding. See the
 [conversion examples](examples.md), [builder types](../src/hepBuilder.ts), and
 [HEP format specification](HEP_CONTAINER.md).
+
+### Rendering compatibility and diagnostics
+
+PDF loading and PDF-to-HEP conversion prefer opening a usable document over
+rejecting a page because the optimized vector representation cannot express it.
+The existing selective image layers remain the first fallback. When that cannot
+preserve clipping or paint order, HEPR tries the retained-page renderer and
+stores the affected page as one image layer. Other pages keep their vector output.
+
+The page image targets 2 pixels per PDF point (144 dpi for ordinary pages), capped
+at 16 million pixels and 16,384 pixels per dimension. Parser image and decoded-byte
+limits can lower these ceilings. Rasterized pages lose vector sharpness and geometry
+needed for features such as room detection. Their extracted text index is retained
+separately for search and selection; no text is painted twice. HEP stores the image
+and text using its existing format, with no source PDF needed when reopening it.
+
+`onDiagnostic` receives these warnings (also retained by `PdfSession.getDiagnostics()`):
+
+| Code | Meaning |
+| --- | --- |
+| `page-raster-fallback` | A whole page became an image; details include the original reason, pixel dimensions, and scale. |
+| `compositing-approximation` | Unsupported group/stroke behavior was approximated for screen output. |
+| `gradient-approximation` | Adaptive gradient sampling reached its depth limit before meeting the color tolerance. |
+| `extgstate-approximation` | A print color/halftone setting or nonidentity transfer function was omitted for screen output. |
+
+Stitching-function boundaries are sampled as hard color transitions. Gradient
+color-tolerance misses are nonfatal, but stop-count and other hard resource limits
+remain enforced. `/BG2`, `/UCR2`, and `/TR2` take precedence over their older entries.
+Default resets are accepted; unsupported custom functions use the screen defaults
+with a warning. In particular, BG/UCR can affect RGB-to-CMYK conversion inside a
+transparency group, so their omission is an approximation even for RGB output.
+
+The low-level Canvas2D renderer also accepts `onDiagnostic` for gradient warnings.
+Cancellation, malformed required data, custom resolver errors, and hard resource
+limits are not converted into successful output. Fallback uses HEPR's own renderer,
+so features that it cannot compile or render can still fail. Node raster fallback
+requires the existing optional `@napi-rs/canvas` backend; no dependency is installed
+automatically. The CLI prints warning diagnostics.
 
 ### ICC colors
 

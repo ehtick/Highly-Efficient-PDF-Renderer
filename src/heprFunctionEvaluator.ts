@@ -153,6 +153,53 @@ export class HeprFunctionEvaluator {
     return this.evaluateInternal(index, inputValues, 0, new Set(), options.signal);
   }
 
+  /** Potential hard transitions, including nested/reversed stitching encodings. */
+  breakpoints(index: number, maxPoints: number, signal?: AbortSignal): readonly number[] {
+    this.assertIndex(index, "functions");
+    if (!Number.isSafeInteger(maxPoints) || maxPoints < 2) {
+      throw evaluationError(HEPR_FUNCTION_EVALUATION_CODES.ResourceLimit,
+        "Function breakpoints require a budget of at least two points.", `functions[${index}]`);
+    }
+    if (!this.validatedGraphRoots.has(index)) {
+      this.validateGraph(index, signal);
+      this.validatedGraphRoots.add(index);
+    }
+    const memo = new Map<number, readonly number[]>();
+    let work = 0;
+    const visit = (current: number): readonly number[] => {
+      checkAbort(signal);
+      const cached = memo.get(current);
+      if (cached) return cached;
+      const record = this.record(current, signal);
+      const points = new Set<number>(record.domain);
+      const add = (value: number): void => {
+        if (++work > maxPoints * this.limits.maxFunctionDepth || (!points.has(value) && points.size >= maxPoints)) {
+          throw evaluationError(HEPR_FUNCTION_EVALUATION_CODES.ResourceLimit,
+            "Gradient function breakpoints exceed the sampling budget.", `functions[${current}]`);
+        }
+        points.add(value);
+      };
+      if (record.kind === "stitching") {
+        for (const bound of record.bounds) add(bound);
+        for (let segment = 0; segment < record.childIndices.length; segment += 1) {
+          const low = segment === 0 ? record.domain[0] : record.bounds[segment - 1];
+          const high = segment === record.bounds.length ? record.domain[1] : record.bounds[segment];
+          const e0 = record.encode[segment * 2];
+          const e1 = record.encode[segment * 2 + 1];
+          if (low === high || e0 === e1) continue;
+          for (const childPoint of visit(record.childIndices[segment])) {
+            const fraction = (childPoint - e0) / (e1 - e0);
+            if (fraction > 0 && fraction < 1) add(low + fraction * (high - low));
+          }
+        }
+      }
+      const result = [...points].sort((a, b) => a - b);
+      memo.set(current, result);
+      return result;
+    };
+    return visit(index);
+  }
+
   private evaluateInternal(
     index: number,
     inputs: readonly number[],

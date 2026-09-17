@@ -116,9 +116,12 @@ async function assertTypedFormFailure(openPdf, bytes, reason) {
   const session = await openPdf({ kind: "bytes", bytes });
   try {
     await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none" }),
+      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" && error?.details?.reason === reason
     );
+    const scene = await session.compileVectorPage(0, { optimization: "none" });
+    assert.equal(scene.rasterLayers.length, 1);
+    assert.ok(session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
   } finally {
     await session.close();
   }
@@ -251,10 +254,11 @@ async function assertUnsafeOverlappingInterleavedText(openPdf) {
   );
   try {
     await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none" }),
+      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" &&
         error?.details?.reason === "vector-form-interleaved-paint"
     );
+    assert.equal((await session.compileVectorPage(0)).rasterLayers.length, 1);
   } finally {
     await session.close();
   }
@@ -379,11 +383,12 @@ async function assertArbitraryTextClipFailure(openPdf) {
   );
   try {
     await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none" }),
+      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" &&
         error?.details?.operator === "Tj" &&
         /arbitrary clipped visible text run/.test(error.message)
     );
+    assert.equal((await session.compileVectorPage(0)).rasterLayers.length, 1);
   } finally {
     await session.close();
   }

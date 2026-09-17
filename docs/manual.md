@@ -62,10 +62,16 @@ The returned object is a `THREE.Group`. Position, scale, and rotate it like
 other scene objects. Frame your camera using the object's bounds; the
 [examples](examples.md) include a complete setup.
 
-PDF extraction uses HEPR's native parser. Encrypted documents, unsupported
-visible content, and unrecoverable malformed resources reject the load with
-typed PDF errors. Display load errors in your application so users can tell
-when a document could not be opened.
+PDF extraction uses HEPR's native parser and prefers usable output over refusing
+a document. Content stays vector-based where possible. When a page cannot be
+represented safely as vectors, HEPR can render it as a bounded image while
+retaining searchable text. Such pages lose vector sharpness and drawing geometry.
+Some unsupported color and gradient behavior is approximated with warnings.
+Use `onDiagnostic` to display these warnings; see [rendering compatibility](api.md#rendering-compatibility-and-diagnostics).
+
+Encrypted documents, unrecoverable malformed resources, resource-limit violations,
+and features unsupported by both paths can still reject the load. Display load
+errors in your application so users can tell when a document could not be opened.
 
 ### Selecting and arranging pages
 

@@ -89,7 +89,7 @@ HEP skips PDF extraction; loading still prepares LOD and GPU resources. See the 
 
 Use a modern browser with WebGL2, or WebGPU support for the WebGPU backend. The browser package uses browser canvas APIs; Node PDF conversion may also need the optional `@napi-rs/canvas` dependency.
 
-HEPR prepares all selected pages before returning a document. Encrypted PDFs are unsupported, and unsupported visible content produces an error. See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md) for platform and format details.
+HEPR prepares all selected pages before returning a document. It prefers usable output over rejecting a PDF: supported content stays vector-based, while some pages use bounded raster fallback or diagnosed visual approximations. Rasterized pages lose vector sharpness and drawing geometry; searchable text is retained where available. Encrypted PDFs and features unsupported by both compilation and rendering still produce errors. See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md) for platform and format details.
 
 ## Contributing
 

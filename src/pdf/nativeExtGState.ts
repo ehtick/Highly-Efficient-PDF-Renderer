@@ -22,7 +22,7 @@ import {
   type NativePdfResourceOrigin,
   type NativePdfTransparencyGroup
 } from "./nativeForms";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import type { HeprCompositeGroup, PdfBlendMode } from "../heprDocumentData";
 
 export type NativePdfBlendModeName = PdfBlendMode | "Compatible";
@@ -117,6 +117,7 @@ export interface NativePdfExtGStateDescription {
 }
 
 export interface NativePdfExtGStateOptions {
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** May lower, but never raise, the document recursion ceiling. */
   readonly maxExtGStateDepth?: number;
   /** May lower, but never raise, the document cached-object ceiling. */
@@ -200,18 +201,14 @@ const RENDERING_INTENTS: ReadonlySet<string> = new Set([
 
 const SUPPORTED_KEYS: ReadonlySet<string> = new Set([
   "Type", "LW", "LC", "LJ", "ML", "D", "RI", "OP", "op", "OPM", "TR", "TR2",
-  "FL", "SM", "SA", "BM", "SMask", "CA", "ca", "AIS", "TK"
+  "FL", "SM", "SA", "BM", "SMask", "CA", "ca", "AIS", "TK",
+  "BG", "BG2", "UCR", "UCR2", "HT"
 ]);
 const SOFT_MASK_KEYS: ReadonlySet<string> = new Set(["Type", "S", "G", "BC", "TR"]);
 const TRANSPARENCY_GROUP_KEYS: ReadonlySet<string> = new Set(["Type", "S", "CS", "I", "K"]);
 
 const UNSUPPORTED_KEYS: ReadonlyMap<string, string> = new Map([
-  ["Font", "extgstate-font-unsupported"],
-  ["BG", "extgstate-black-generation-unsupported"],
-  ["BG2", "extgstate-black-generation-unsupported"],
-  ["UCR", "extgstate-undercolor-removal-unsupported"],
-  ["UCR2", "extgstate-undercolor-removal-unsupported"],
-  ["HT", "extgstate-halftone-unsupported"]
+  ["Font", "extgstate-font-unsupported"]
 ]);
 
 /**
@@ -238,6 +235,8 @@ export class NativePdfExtGStateRegistry {
   private readonly softMaskObjectCache = new WeakMap<object, Map<number, Promise<ParsedSoftMaskForm>>>();
   private readonly streamByForm = new WeakMap<NativePdfForm, PdfStream>();
   private readonly decodedFormCache = new WeakMap<NativePdfForm, Promise<Uint8Array>>();
+  private readonly diagnostics: PdfDiagnostic[] = [];
+  private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   private nextScopeId = 1;
   private nextObjectId = 1;
 
@@ -247,6 +246,7 @@ export class NativePdfExtGStateRegistry {
     options: NativePdfExtGStateOptions = {}
   ) {
     this.document = document;
+    this.onDiagnostic = options.onDiagnostic;
     this.colors = colors ?? new NativePdfColorRegistry(document);
     this.functions = this.colors.functions;
     this.maxDepth = boundedOption(
@@ -259,6 +259,23 @@ export class NativePdfExtGStateRegistry {
       document.limits.maxCachedObjects,
       "maxExtGStates"
     );
+  }
+
+  getDiagnostics(): readonly PdfDiagnostic[] {
+    return Object.freeze([...this.diagnostics]);
+  }
+
+  private warnApproximation(entry: string, label: string): void {
+    const diagnostic: PdfDiagnostic = {
+      code: "extgstate-approximation",
+      severity: "warning",
+      message: entry === "HT"
+        ? `${label} /HT halftoning is omitted for continuous-tone screen output.`
+        : `${label} /${entry} is approximated using the default screen conversion; colors may differ.`,
+      details: { feature: "ext-gstate", entry, reason: "screen-output-approximation" }
+    };
+    this.diagnostics.push(diagnostic);
+    this.onDiagnostic?.(diagnostic);
   }
 
   get size(): number {
@@ -587,6 +604,7 @@ export class NativePdfExtGStateRegistry {
     const smoothnessTolerance = await optionalBoundedNumber(this.document, dictionary, "SM", 0, 1, label, signal);
     const strokeAdjustment = await optionalBoolean(this.document, dictionary, "SA", label, signal);
     const transferIsIdentity = await this.readTopLevelTransfer(dictionary, label, signal);
+    await this.readPrintParameters(dictionary, label, signal);
     const softMask = await this.readSoftMask(dictionary, resources, stack, label, signal);
 
     const lineWidth = await optionalMinimumNumber(this.document, dictionary, "LW", 0, label, signal);
@@ -725,28 +743,53 @@ export class NativePdfExtGStateRegistry {
     label: string,
     signal?: AbortSignal
   ): Promise<boolean | null> {
-    let present = false;
-    if (dictionary.has("TR")) {
-      present = true;
-      const transfer = await this.document.resolveValue(dictionary.get("TR"), signal);
-      if (!isPdfName(transfer, "Identity")) {
-        throw extGStateError(`${label} /TR is not the identity transfer.`, {
-          reason: "extgstate-transfer-unsupported",
-          entry: "TR"
-        });
+    // The newer entry overrides the older one, including an identity/default reset.
+    const entry = dictionary.has("TR2") ? "TR2" : dictionary.has("TR") ? "TR" : null;
+    if (entry === null) return null;
+    const transfer = await this.document.resolveValue(dictionary.get(entry), signal);
+    if (isPdfName(transfer, "Identity") || (entry === "TR2" && isPdfName(transfer, "Default"))) {
+      return true;
+    }
+    const functions = Array.isArray(transfer) ? transfer : [transfer];
+    if (Array.isArray(transfer) && transfer.length !== 4) {
+      throw invalidEntry(label, entry, "must contain four transfer functions", "extgstate-transfer-invalid");
+    }
+    let approximated = false;
+    for (const value of functions) {
+      const resolved = await this.document.resolveValue(value, signal);
+      if (!isPdfName(resolved, "Identity")) {
+        await this.assertFunctionValue(resolved, label, entry, signal);
+        approximated = true;
       }
     }
-    if (dictionary.has("TR2")) {
-      present = true;
-      const transfer = await this.document.resolveValue(dictionary.get("TR2"), signal);
-      if (!isPdfName(transfer, "Identity") && !isPdfName(transfer, "Default")) {
-        throw extGStateError(`${label} /TR2 is not an identity/default transfer.`, {
-          reason: "extgstate-transfer-unsupported",
-          entry: "TR2"
-        });
+    if (approximated) this.warnApproximation(entry, label);
+    // Describes the effective transfer retained by the renderer, not the source function.
+    return true;
+  }
+
+  private async readPrintParameters(dictionary: PdfDictionary, label: string, signal?: AbortSignal): Promise<void> {
+    for (const entry of [dictionary.has("BG2") ? "BG2" : "BG", dictionary.has("UCR2") ? "UCR2" : "UCR", "HT"]) {
+      if (!dictionary.has(entry)) continue;
+      const value = await this.document.resolveValue(dictionary.get(entry), signal);
+      if (isPdfName(value, "Default")) continue;
+      if (entry === "HT") {
+        if (!isPdfName(value) && !isPdfDictionary(value) && !isPdfStream(value)) {
+          throw invalidEntry(label, entry, "must be a halftone dictionary, stream, or name", "extgstate-halftone-invalid");
+        }
+      } else {
+        await this.assertFunctionValue(value, label, entry, signal);
       }
+      // BG/UCR can affect conversion inside CMYK transparency groups even on
+      // an RGB display. Their omission is an approximation, not a claim of inertness.
+      this.warnApproximation(entry, label);
     }
-    return present ? true : null;
+  }
+
+  private async assertFunctionValue(value: PdfValue | undefined, label: string, entry: string, signal?: AbortSignal): Promise<void> {
+    const dictionary = isPdfStream(value) ? value.dictionary : value;
+    if (!isPdfDictionary(dictionary) || !Number.isInteger(await this.document.resolveValue(dictionary.get("FunctionType"), signal))) {
+      throw invalidEntry(label, entry, "must be a function", "extgstate-function-invalid");
+    }
   }
 
   private async readLineDash(

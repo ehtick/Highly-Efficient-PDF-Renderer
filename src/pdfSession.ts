@@ -1,3 +1,4 @@
+import { buildNativeRasterPage } from "./pdf/nativeRasterPage";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
 import { loadNodeCanvas } from "./nodeCanvas";
 import {
@@ -189,6 +190,8 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
+  readonly vectorFallback?: "raster" | "error";
   readonly enableSegmentMerge?: boolean;
   readonly enableInvisibleCull?: boolean;
 }
@@ -937,7 +940,8 @@ class NativePdfSession implements NativeVectorPdfSession {
           signal,
           timings,
           reuseCompositeSurfaces,
-          boundCompositeWork
+          boundCompositeWork,
+          (diagnostic) => this.appendDiagnostics([diagnostic])
         ));
         if (timings) timings.selectiveRasterMs = nativeVectorTimingNow() - rasterStartedAt;
         const primary = scene.rasterLayers[0];
@@ -953,7 +957,62 @@ class NativePdfSession implements NativeVectorPdfSession {
       }
       return scene;
     } catch (error) {
-      throw normalizeCompileError(error, sourcePageIndex);
+      signal.throwIfAborted();
+      const normalized = normalizeCompileError(error, sourcePageIndex);
+      if (options.vectorFallback === "error" || !isNativeVectorRepresentationFailure(normalized)) throw normalized;
+      return await this.compileRasterPageUnlocked(sourcePageIndex, options, signal, normalized);
+    }
+  }
+
+  private async compileRasterPageUnlocked(
+    sourcePageIndex: number,
+    options: NativeVectorCompileOptions,
+    signal: AbortSignal,
+    reason: Error
+  ): Promise<VectorScene> {
+    const page = await this.compilePageUnlocked(sourcePageIndex, options, signal);
+    const limits = { ...this.document.limits, ...options.limits };
+    const maxPixels = Math.min(NATIVE_SELECTIVE_MAX_CANVAS_PIXELS, limits.maxImagePixels,
+      Math.floor(limits.maxDecodedStreamBytes / 4));
+    if (maxPixels < 1) throw new PdfError("resource-limit", "No pixel budget for page fallback.");
+    const maxDimension = Math.min(16_384, limits.maxImageDimension);
+    const { width, height } = page.pageInfo;
+    let scale = Math.min(2, maxDimension / width, maxDimension / height,
+      Math.sqrt(maxPixels / (width * height)));
+    // Account for rounding each dimension up to an integer pixel.
+    while (scale > 0 && Math.ceil(width * scale) * Math.ceil(height * scale) > maxPixels) scale *= 0.99;
+    if (!(scale > 0)) throw new PdfError("resource-limit", "No pixel budget for page fallback.");
+    const surfaceFactory = await createNativeCompositeSurfaceFactory();
+    const { renderHeprPageToCanvas2d, HEPR_CANVAS_2D_ERROR_CODES } = await import("./heprCanvas2dRenderer");
+    const onDiagnostic = (diagnostic: PdfDiagnostic) => this.appendDiagnostics([diagnostic]);
+    const renderOptions = { scale, surfaceFactory, signal, onDiagnostic,
+      maxCanvasPixels: maxPixels, maxWorkingPixels: Math.min(64_000_000, Math.floor(limits.maxDecodedStreamBytes / 4)) };
+    try {
+      let pixels;
+      try {
+        pixels = await renderNativeCompositePixels(page, renderOptions, renderHeprPageToCanvas2d);
+      } catch (renderError) {
+        signal.throwIfAborted();
+        const code = (renderError as { code?: string })?.code;
+        if (code !== HEPR_CANVAS_2D_ERROR_CODES.UnsupportedComposite &&
+            code !== HEPR_CANVAS_2D_ERROR_CODES.UnsupportedStroke) throw renderError;
+        const approximate = createSelectiveCompositePage(page,
+          page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands);
+        approximate.displayProgram = { ...approximate.displayProgram, groups:
+          approximate.displayProgram.groups.map(group => ({ ...group, knockout: false })) };
+        pixels = await renderNativeCompositePixels(approximate, renderOptions, renderHeprPageToCanvas2d);
+        onDiagnostic({ code: "compositing-approximation", severity: "warning", pageIndex: sourcePageIndex,
+          message: "Page compositing uses an sRGB approximation; overlapping colors may differ.",
+          details: { reason: renderError instanceof Error ? renderError.message : String(renderError) } });
+      }
+      const scene = buildNativeRasterPage(page, pixels, signal);
+      onDiagnostic({ code: "page-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
+        message: "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable.",
+        details: { reason: reason.message, width: pixels.width, height: pixels.height, scale } });
+      signal.throwIfAborted();
+      return scene;
+    } finally {
+      surfaceFactory.releaseAll();
     }
   }
 
@@ -2578,7 +2637,8 @@ async function renderNativeSelectiveCompositeLayers(
   signal: AbortSignal,
   timings?: NativeVectorCompileTimings,
   reuseCompositeSurfaces = true,
-  boundCompositeWork = true
+  boundCompositeWork = true,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void
 ): Promise<NativeSelectiveRasterLayer[]> {
   signal.throwIfAborted();
   const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
@@ -2717,7 +2777,7 @@ async function renderNativeSelectiveCompositeLayers(
     surface => surfaceFactory.retain(surface.canvas),
     surface => surfaceFactory.release(surface.canvas)
   ) : undefined;
-  const renderInternals = { timings: compositeTimings, imageSurfaces, boundSoftMasks: boundCompositeWork };
+  const renderInternals = { timings: compositeTimings, imageSurfaces, boundSoftMasks: boundCompositeWork, onDiagnostic };
   try {
     for (const { first, last, paintOrder } of coalescedRanges) {
       signal.throwIfAborted();
@@ -3077,11 +3137,15 @@ async function renderNativeCompositePixels(
   },
   render: NativeCompositeRenderer,
   internal: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals & {
+    readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
     readonly readback?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
   } = {}
 ) {
   try {
-    const { surface, width, height, scale } = await render(page, options, internal);
+    const { surface, width, height, scale } = await render(page, {
+      ...options, onDiagnostic: options.onDiagnostic ?? internal.onDiagnostic
+    }, internal);
+    options.signal?.throwIfAborted();
     // getImageData owns its pixels. Release scratch surfaces after extraction;
     // immutable cached images survive only until this page operation finishes.
     const startedAt = internal.timings ? nativeVectorTimingNow() : 0;
@@ -6028,7 +6092,7 @@ async function loadPageImages(
   });
   const shadings = new NativePdfShadingRegistry(document, colors);
   const patterns = new NativePdfPatternRegistry(document, shadings);
-  const extGStates = new NativePdfExtGStateRegistry(document, colors);
+  const extGStates = new NativePdfExtGStateRegistry(document, colors, { onDiagnostic });
   const shadingIndexes = new Map<string, number>();
   const patternDefinitions = await loadPatternDefinitions(
     patterns,
@@ -6447,6 +6511,14 @@ function normalizePageIndexes(
     indexes.push(value);
   }
   return Object.freeze(indexes);
+}
+
+function isNativeVectorRepresentationFailure(error: unknown): error is PdfError {
+  if (!(error instanceof PdfError) ||
+      (error.code !== "unsupported-content" && error.code !== "unsupported-image")) return false;
+  const reason = String(error.details?.reason ?? "");
+  return /^(legacy-vector-|vector-|selective-)/.test(reason) ||
+    /^(Legacy vector|The legacy VectorScene)/i.test(error.message);
 }
 
 function normalizeCompileError(error: unknown, sourcePageIndex: number): unknown {

@@ -383,9 +383,9 @@ async function testSynthesizedSquareUnderlines(openPdf, validateHeprPageData) {
       page.stores.paths.fillPathMetaB[offset], page.stores.paths.fillPathMetaB[offset + 1]
     ], [4, 7, 34, 15], "the rectangular interior retains its /RD and half-border insets");
 
-    // The legacy vector API still rejects all visible annotation appearances.
+    // Direct vector capability probes still reject visible annotation appearances.
     await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none" }),
+      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" &&
         error?.details?.reason === "vector-annotation-appearance"
     );

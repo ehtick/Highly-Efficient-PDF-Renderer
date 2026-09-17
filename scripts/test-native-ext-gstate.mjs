@@ -186,22 +186,12 @@ try {
     registry.resolvePageExtGState(0, "BadFont"),
     hasPdfError("unsupported-font", "extgstate-font-unsupported")
   );
-  await assert.rejects(
-    registry.resolvePageExtGState(0, "BadHalftone"),
-    hasPdfError("unsupported-content", "extgstate-halftone-unsupported")
-  );
-  await assert.rejects(
-    registry.resolvePageExtGState(0, "BadBlackGeneration"),
-    hasPdfError("unsupported-content", "extgstate-black-generation-unsupported")
-  );
-  await assert.rejects(
-    registry.resolvePageExtGState(0, "BadUndercolor"),
-    hasPdfError("unsupported-content", "extgstate-undercolor-removal-unsupported")
-  );
-  await assert.rejects(
-    registry.resolvePageExtGState(0, "BadTransfer"),
-    hasPdfError("unsupported-content", "extgstate-transfer-unsupported")
-  );
+  await registry.resolvePageExtGState(0, "BadHalftone");
+  for (const name of ["BadBlackGeneration", "BadUndercolor", "BadTransfer"]) {
+    await registry.resolvePageExtGState(0, name);
+  }
+  assert.deepEqual(registry.getDiagnostics().map(diagnostic => diagnostic.details.entry), ["BG", "UCR", "TR"]);
+  assert.ok(registry.getDiagnostics().every(diagnostic => diagnostic.severity === "warning"));
   await assert.rejects(
     registry.resolvePageExtGState(0, "BadMaskSubtype"),
     hasPdfError("unsupported-content", "soft-mask-subtype-unsupported")
@@ -369,8 +359,8 @@ function fixture() {
       },
       { number: 54, body: "<< /BM [/VendorBlend /Screen] >>" },
       { number: 55, body: "<< /HT /Default >>" },
-      { number: 56, body: "<< /BG /Identity >>" },
-      { number: 57, body: "<< /UCR /Identity >>" },
+      { number: 56, body: "<< /BG 32 0 R >>" },
+      { number: 57, body: "<< /UCR 32 0 R >>" },
       { number: 80, body: "81 0 R" },
       { number: 81, body: "<< /ca .1 >>" },
       { number: 82, body: "83 0 R" },

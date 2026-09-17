@@ -25,6 +25,7 @@ export const fastTests = [
   "native-parser-fuzz",
   "pdf-range-transport",
   "pdf-session",
+  "pdf-session-render-fallback",
   "pdf-session-worker",
   "pdf-node-worker-runtime",
   "native-content-compiler",

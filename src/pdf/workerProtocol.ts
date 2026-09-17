@@ -85,6 +85,7 @@ export interface PdfWorkerCompileOptions {
 }
 
 export interface PdfWorkerVectorCompileOptions extends PdfWorkerCompileOptions {
+  readonly vectorFallback?: NativeVectorCompileOptions["vectorFallback"];
   readonly enableSegmentMerge?: NativeVectorCompileOptions["enableSegmentMerge"];
   readonly enableInvisibleCull?: NativeVectorCompileOptions["enableInvisibleCull"];
 }

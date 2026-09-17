@@ -563,7 +563,8 @@ class PdfWorkerConnection {
         limits: options.limits,
         optimization: options.optimization,
         enableSegmentMerge: options.enableSegmentMerge,
-        enableInvisibleCull: options.enableInvisibleCull
+        enableInvisibleCull: options.enableInvisibleCull,
+        ...(options.vectorFallback ? { vectorFallback: options.vectorFallback } : {})
       }
     }, [], signal, options.onProgress) as Promise<CompileVectorSuccess>).then((response) => {
       this.replaceDiagnostics(response.diagnostics);

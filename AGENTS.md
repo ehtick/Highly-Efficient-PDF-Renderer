@@ -18,6 +18,10 @@
 
 ## Working Style
 
+- Prefer opening a PDF with an approximate appearance or visual glitches over refusing to open it because a rendering feature is unsupported.
+- Preserve accurate vector output where possible; use bounded raster fallback and visual approximations when needed to keep a document usable. Emit diagnostics when fidelity or capabilities are reduced instead of silently omitting visible content.
+- Treat this compatibility preference as the default development direction, including PDF parsing, viewing, and PDF-to-HEP conversion. It does not override cancellation, resource limits, or validation needed to process data safely.
+
 - Make focused, minimal changes that directly address the task.
 - Prefer explaining assumptions before making broad changes.
 - Preserve existing code style and project conventions.

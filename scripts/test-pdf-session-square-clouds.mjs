@@ -145,7 +145,7 @@ async function render(entries, rectangle = [20, 20, 140, 80]) {
     assert.deepEqual(program.bounds, [0, 0, rectangle[2] - rectangle[0], rectangle[3] - rectangle[1]]);
     const offset = invocation.transformIndex * 6;
     assert.deepEqual([...page.stores.transforms.values.slice(offset, offset + 6)], [1, 0, 0, 1, rectangle[0], rectangle[1]]);
-    await assert.rejects(session.compileVectorPage(0, { optimization: "none" }),
+    await assert.rejects(session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" && error?.details?.reason === "vector-annotation-appearance");
     return await renderHeprPageToCanvas2d(page, {
       scale: 4,

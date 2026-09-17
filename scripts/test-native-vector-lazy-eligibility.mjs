@@ -74,12 +74,15 @@ async function assertAnnotationFailsBeforeAppearanceDecode(openPdf) {
   });
   try {
     await assert.rejects(
-      session.compileVectorPage(0, { optimization: "none" }),
+      session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" }),
       (error) => error?.code === "unsupported-content" &&
         error?.details?.reason === "vector-annotation-appearance" &&
         error?.details?.annotationCount === 1,
       "a visible annotation must be rejected without decoding its unusable appearance stream"
     );
+    await assert.rejects(session.compileVectorPage(0),
+      error => error.code === "unsupported-filter",
+      "normal fallback still surfaces an unusable appearance stream");
   } finally {
     await session.close();
   }

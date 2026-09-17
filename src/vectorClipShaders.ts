@@ -12,6 +12,13 @@ float heprVectorClip(vec2 point) {
   for (int depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
     if (index < 0) return 1.0;
     vec4 node = heprClipTexel(index);
+    if (node.z < 0.0) {
+      vec4 bounds = heprClipTexel(int(node.y));
+      // Match polygon winding at boundaries: include min, exclude max.
+      if (any(lessThan(point, bounds.xy)) || any(greaterThanEqual(point, bounds.zw))) return 0.0;
+      index = int(node.x);
+      continue;
+    }
     int winding = 0;
     for (int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
       if (edge >= int(node.z)) break;
@@ -35,6 +42,13 @@ fn heprVectorClip(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>
   for (var depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
     if (index < 0) { return 1.0; }
     let node = textureLoad(clipTexture, vec2<i32>(index % width, index / width), 0);
+    if (node.z < 0.0) {
+      let offset = i32(node.y);
+      let bounds = textureLoad(clipTexture, vec2<i32>(offset % width, offset / width), 0);
+      if (any(point < bounds.xy) || any(point >= bounds.zw)) { return 0.0; }
+      index = i32(node.x);
+      continue;
+    }
     var winding = 0;
     for (var edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
       if (edge >= i32(node.z)) { break; }

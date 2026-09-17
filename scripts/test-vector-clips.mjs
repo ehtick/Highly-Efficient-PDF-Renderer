@@ -37,6 +37,7 @@ try {
     try {
       const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
       validateVectorDrawRuns(scene);
+      comparePackedClips(scene.clipPaths, packVectorClips(scene.clipPaths));
       assert.equal(scene.rasterLayers.length, 0, `fixture ${fixtureIndex} retains vector Forms`);
       assert(scene.fillPathCount > 0 && scene.clipPaths.length > 0);
       assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
@@ -88,7 +89,7 @@ try {
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: deep }), /nesting/);
   const packed = packVectorClips(sample.clipPaths);
   assert.equal(packed[1], sample.clipPaths.length, "the clip texture contains coordinates, not a sampled mask");
-  assert.deepEqual(packed.subarray(packed[1] * 4, packed[1] * 4 + original.length), original);
+  testClipPacking(packVectorClips);
 
   // Degenerate paths must clip everything; open paths are implicitly closed.
   const builder = new NativeVectorClipBuilder();
@@ -117,8 +118,97 @@ try {
   assert.notEqual(nodeA.fragmentNode, nodeB.fragmentNode);
   for (const material of [raw, rawA, rawB, node, nodeA, nodeB]) material.dispose();
   texture.dispose();
-  console.log("Vector clips preserve winding, nested Forms, images, transforms and scale-independent geometry");
+  console.log("Vector clips preserve winding, nested Forms, images, transforms and exact rectangle intersections");
 } finally { hooks.deregister(); }
+
+function testClipPacking(pack) {
+  const polygon = (points, parent = -1, fillRule = 0) => ({ parent, fillRule,
+    edges: new Float32Array(points.flatMap((point, i) => [...point, ...points[(i + 1) % points.length]])) });
+  const rectangle = (x0, y0, x1, y1, parent = -1) => polygon([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], parent);
+  const orientations = [];
+  for (const fillRule of [0, 1]) for (const reverse of [false, true]) for (let start = 0; start < 4; start++) {
+    const points = [[-10, -20], [50, -20], [50, 60], [-10, 60]];
+    if (reverse) points.reverse();
+    orientations.push(polygon([...points.slice(start), ...points.slice(0, start)], -1, fillRule));
+  }
+  const compact = pack(orientations);
+  assert.equal(compact.length, orientations.length * 8, "each rectangle needs only a header and bounds texel");
+  for (let i = 0; i < orientations.length; i++) {
+    assert.equal(compact[i * 4 + 2], -1);
+    const offset = compact[i * 4 + 1] * 4;
+    assert.deepEqual([...compact.subarray(offset, offset + 4)], [-10, -20, 50, 60]);
+  }
+  comparePackedClips(orientations, compact);
+
+  const clips = [
+    rectangle(-10, -20, 50, 60),
+    rectangle(40, 70, 0, -30, 0),
+    rectangle(5, 2, 35, 50, 1),
+    polygon([[0, 0], [30, 0], [0, 30]], 2),
+    rectangle(0, 0, 12, 12, 3),
+    rectangle(6, 4, 50, 50, 4),
+    rectangle(70, 70, 80, 80, 2), // Disjoint intersection.
+    rectangle(35, 2, 40, 50, 2), // Touching intersection has no interior.
+    rectangle(5, 2, 5, 50), // Degenerate edges must not become a rectangle.
+    polygon([], 0),
+    polygon([[0, 0], [10, 0], [10 + 2 ** -18, 10], [2 ** -18, 10]]), // Small shear.
+    { parent: -1, fillRule: 0, edges: new Float32Array([0, 0, 10, 0, 10, 1, 10, 10, 10, 10, 0, 10, 0, 10, 0, 0]) },
+    { parent: -1, fillRule: 1, edges: new Float32Array([...rectangle(0, 0, 40, 40).edges, ...rectangle(10, 10, 30, 30).edges]) },
+    { parent: -1, fillRule: 0, edges: new Float32Array([...rectangle(0, 0, 40, 40).edges, ...rectangle(10, 10, 30, 30).edges]) }
+  ];
+  const original = structuredClone(clips), data = pack(clips);
+  assert.deepEqual(clips, original, "upload optimization does not mutate retained clip geometry");
+  assert.equal(data[2 * 4], -1, "three nested rectangles collapse into one intersection");
+  assert.equal(data[5 * 4], 3, "rectangle intersections retain the nearest polygon ancestor");
+  for (const [index, bounds] of [[2, [5, 2, 35, 50]], [5, [6, 4, 12, 12]]]) {
+    const offset = data[index * 4 + 1] * 4;
+    assert.deepEqual([...data.subarray(offset, offset + 4)], bounds);
+  }
+  for (const index of [3, 8, 9, 10, 11, 12, 13]) {
+    const clip = clips[index], offset = data[index * 4 + 1] * 4;
+    assert.deepEqual([...data.subarray(index * 4, index * 4 + 4)],
+      [clip.parent, offset / 4, clip.edges.length / 4, clip.fillRule], `polygon ${index} retains its header`);
+    assert.deepEqual(data.subarray(offset, offset + clip.edges.length), clip.edges);
+  }
+  comparePackedClips(clips, data);
+  assert.deepEqual(pack(), new Float32Array(4), "empty scenes retain a valid texture");
+}
+
+// Compare the uploaded representation against the original shader's directed-edge
+// winding rule, including exact boundaries where Canvas uses different semantics.
+function comparePackedClips(clips, packed) {
+  const xs = new Set([0]), ys = new Set([0]);
+  for (const clip of clips) for (let i = 0; i < clip.edges.length; i += 2) {
+    for (const delta of [-0.125, 0, 0.125]) {
+      xs.add(Math.fround(clip.edges[i] + delta)); ys.add(Math.fround(clip.edges[i + 1] + delta));
+    }
+  }
+  // Keep dense curve fixtures bounded while checking every corner of small polygons.
+  const sample = values => [...values].sort((a, b) => a - b).filter((_, i) => i % Math.ceil(values.size / 65) === 0);
+  for (let root = 0; root < clips.length; root++) for (const x of sample(xs)) for (const y of sample(ys)) {
+    let expected = true;
+    for (let index = root; index >= 0; index = clips[index].parent) {
+      if (!windingContains(clips[index].edges, clips[index].fillRule, x, y)) { expected = false; break; }
+    }
+    let actual = true;
+    for (let index = root; index >= 0; index = packed[index * 4]) {
+      const header = index * 4, offset = packed[header + 1] * 4, count = packed[header + 2];
+      const inside = count < 0
+        ? x >= packed[offset] && y >= packed[offset + 1] && x < packed[offset + 2] && y < packed[offset + 3]
+        : windingContains(packed.subarray(offset, offset + count * 4), packed[header + 3], x, y);
+      if (!inside) { actual = false; break; }
+    }
+    assert.equal(actual, expected, `packed clip ${root} at (${x}, ${y})`);
+  }
+}
+function windingContains(edges, fillRule, x, y) {
+  let winding = 0;
+  for (let i = 0; i < edges.length; i += 4) {
+    const x0 = edges[i], y0 = edges[i + 1], x1 = edges[i + 2], y1 = edges[i + 3];
+    if ((y0 > y) !== (y1 > y) && x0 + (y - y0) / (y1 - y0) * (x1 - x0) > x) winding += y1 > y0 ? 1 : -1;
+  }
+  return fillRule ? Math.abs(winding) % 2 !== 0 : winding !== 0;
+}
 
 function surfaceFactory(width, height) {
   const canvas = createCanvas(width, height); return { canvas, context: canvas.getContext("2d") };

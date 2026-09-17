@@ -13,10 +13,10 @@ export default defineConfig(({ mode }) => {
       build: {
         lib: {
           entry: {
-            index: resolve(__dirname, "src/index.ts"),
-            node: resolve(__dirname, "src/nodePdfSource.ts"),
-            "dense-pdf-worker": resolve(__dirname, "src/densePdfNodeWorkerEntry.ts"),
-            "pdf-worker": resolve(__dirname, "src/pdf/pdfWorkerEntry.ts")
+            index: resolve(import.meta.dirname, "src/index.ts"),
+            node: resolve(import.meta.dirname, "src/nodePdfSource.ts"),
+            "dense-pdf-worker": resolve(import.meta.dirname, "src/densePdfNodeWorkerEntry.ts"),
+            "pdf-worker": resolve(import.meta.dirname, "src/pdf/pdfWorkerEntry.ts")
           },
           formats: ["es"],
           fileName: (_format, entryName) => `${entryName}.js`
@@ -34,7 +34,7 @@ export default defineConfig(({ mode }) => {
     plugins: [{
       name: "package-version-label",
       transformIndexHtml(html) {
-        const { version } = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf8"));
+        const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"));
         return html.replaceAll("%HEPR_PACKAGE_VERSION%", version);
       }
     }],
@@ -44,9 +44,9 @@ export default defineConfig(({ mode }) => {
     build: {
       rollupOptions: {
         input: {
-          main: resolve(__dirname, "index.html"),
-          three: resolve(__dirname, "three-example.html"),
-          roomOverlay: resolve(__dirname, "room-overlay-demo.html")
+          main: resolve(import.meta.dirname, "index.html"),
+          three: resolve(import.meta.dirname, "three-example.html"),
+          roomOverlay: resolve(import.meta.dirname, "room-overlay-demo.html")
         }
       }
     }

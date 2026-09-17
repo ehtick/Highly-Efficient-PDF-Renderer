@@ -14,12 +14,17 @@ import {
   NativePdfFunctionRegistry,
   type NativePdfFunctionLimits
 } from "./nativeFunctions";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import {
   DEFAULT_MAX_ICC_TRANSFORM_BYTES,
+  NATIVE_ICC_GRID_POINTS,
   createNativeIccTransformRequest,
   resolveNativeIccTransformThroughCaller,
   sampleNativeIccTransform,
+  validateIccEngine,
+  normalizeIccComponents,
+  normalizeNativeIccTransformResult,
+  type PdfIccOptions,
   type NativeIccComponentCount,
   type NativeIccProfileMetadata,
   type NativeIccTransformKernel,
@@ -30,6 +35,7 @@ import {
   HEPR_COLOR_SPACE_KIND,
   type HeprColorStore
 } from "../heprDocumentData";
+import { IccEngineError, iccMemoryError } from "./nativeIccWasm";
 import { convertDeviceCmykToSrgb } from "./deviceCmyk";
 
 export type NativePdfColorSpaceKind =
@@ -52,10 +58,10 @@ export type {
   NativeIccTransformResult
 } from "./nativeIcc";
 
-export interface NativePdfColorOptions {
+export interface NativePdfColorOptions extends PdfIccOptions {
   readonly functionLimits?: Partial<NativePdfFunctionLimits>;
   readonly iccKernel?: NativeIccTransformKernel;
-  readonly iccTransformResolver?: NativeIccTransformResolver;
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   readonly maxIccProfileBytes?: number;
   readonly maxIccTransformBytes?: number;
   readonly maxDeviceNComponents?: number;
@@ -80,6 +86,14 @@ export interface NativePdfColorSpaceDescription {
 interface ColorRecord extends NativePdfColorSpaceDescription {
   readonly highValue: number;
   readonly iccTransform: Readonly<NativeIccTransformResult> | null;
+  readonly iccTransformMode?: number;
+  readonly iccEngineUsed?: "qcms" | "lcms";
+  readonly iccEngineFailures?: readonly IccEngineFailure[];
+}
+
+interface IccEngineFailure {
+  readonly engine: "qcms" | "lcms";
+  readonly reason: IccEngineError["reason"];
 }
 
 interface ColorParseStack {
@@ -103,6 +117,9 @@ export class NativePdfColorRegistry {
   private readonly document: NativePdfDocument;
   private readonly iccKernel?: NativeIccTransformKernel;
   private readonly iccTransformResolver?: NativeIccTransformResolver;
+  private readonly iccEngine: NonNullable<PdfIccOptions["iccEngine"]>;
+  private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  private readonly reportedIccFallbacks = new Set<number>();
   private readonly maxIccProfileBytes: number;
   private readonly maxIccTransformBytes: number;
   private readonly maxDeviceNComponents: number;
@@ -130,6 +147,8 @@ export class NativePdfColorRegistry {
     this.functions = functions ?? new NativePdfFunctionRegistry(document, options.functionLimits);
     this.iccKernel = options.iccKernel;
     this.iccTransformResolver = options.iccTransformResolver;
+    this.iccEngine = validateIccEngine(options.iccEngine);
+    this.onDiagnostic = options.onDiagnostic;
     this.maxIccProfileBytes = positiveLimit(
       options.maxIccProfileBytes ?? document.limits.maxIccProfileBytes ?? DEFAULT_MAX_ICC_PROFILE_BYTES,
       "maxIccProfileBytes"
@@ -272,9 +291,17 @@ export class NativePdfColorRegistry {
     throwIfAborted(signal);
     let profileValueCount = 0;
     let lookupValueCount = 0;
+    let iccValueCount = 0;
+    const iccTransforms: (Readonly<NativeIccTransformResult> | null)[] = [];
     for (let index = 0; index < this.records.length; index += 1) {
       if ((index & 0x3fff) === 0) throwIfAborted(signal);
       const record = this.records[index];
+      const transformBytes = record.iccTransform?.samples.length ?? (
+        record.kind === "ICCBased" && this.iccKernel
+          ? 3 * NATIVE_ICC_GRID_POINTS[record.componentCount as NativeIccComponentCount] ** record.componentCount
+          : 0
+      );
+      iccValueCount = checkedStoreLength(iccValueCount, transformBytes, this.maxStoreBytes, "ICC transform");
       profileValueCount = checkedStoreLength(
         profileValueCount,
         record.profile.length,
@@ -287,6 +314,13 @@ export class NativePdfColorRegistry {
         this.maxStoreBytes,
         "lookup"
       );
+      checkedStoreLength(profileValueCount + lookupValueCount, iccValueCount, this.maxStoreBytes, "color byte");
+      // Bound aggregate kernel output before materializing another lattice.
+      const transform = this.retainedIccTransform(record, signal);
+      if (record.kind === "ICCBased" && !transform && record.iccTransformMode !== 1) {
+        throw new PdfError("unsupported-color", "ICCBased page data requires an available ICC engine or resolver.");
+      }
+      iccTransforms.push(transform);
     }
 
     // Allocate final typed stores once. Building large ICC stores through
@@ -341,6 +375,10 @@ export class NativePdfColorRegistry {
       "Indexed lookup store"
     );
 
+    const iccModes = allocateStore(() => new Uint8Array(this.records.length), "ICC modes");
+    const iccTransformOffsets = allocateStore(() => new Uint32Array(this.records.length + 1), "ICC transform offsets");
+    const iccTransformSamples = allocateStore(() => new Uint8Array(iccValueCount), "ICC transform samples");
+    let iccOffset = 0;
     let parameterOffset = 0;
     let nameOffset = 0;
     let profileOffset = 0;
@@ -348,6 +386,11 @@ export class NativePdfColorRegistry {
     for (let index = 0; index < this.records.length; index += 1) {
       throwIfAborted(signal);
       const record = this.records[index];
+      const transform = iccTransforms[index];
+      iccModes[index] = transform ? (record.iccTransformMode || 2) : (record.iccTransformMode ?? 0);
+      this.reportIccFallback(index, record);
+      if (transform) iccOffset = copyByteValues(iccTransformSamples, iccOffset, transform.samples, signal);
+      iccTransformOffsets[index + 1] = iccOffset;
       componentCounts[index] = record.componentCount;
       alternateSpaceIndices[index] = record.alternateSpaceIndex;
       functionIndices[index] = record.functionIndex;
@@ -373,7 +416,8 @@ export class NativePdfColorRegistry {
       profileOffsets,
       profiles,
       lookupOffsets,
-      lookupBytes
+      lookupBytes,
+      iccModes, iccTransformOffsets, iccTransformSamples
     };
   }
 
@@ -796,26 +840,51 @@ export class NativePdfColorRegistry {
     const iccMetadata = parseIccMetadata(decodedProfile);
     validatePdfIccMetadata(iccMetadata, count);
     const profile = decodedProfile.slice(0, iccMetadata.declaredSize);
-    const iccTransform = this.iccTransformResolver
-      ? await resolveNativeIccTransformThroughCaller(
-          this.iccTransformResolver,
-          createNativeIccTransformRequest(
-            profile,
-            iccMetadata,
-            count as NativeIccComponentCount,
-            this.maxIccTransformBytes,
-            signal
-          ),
-          this.maxIccTransformBytes,
-          signal
-        )
-      : null;
+    let iccTransform: Readonly<NativeIccTransformResult> | null = null;
+    let iccTransformMode = 0;
+    let iccEngineUsed: "qcms" | "lcms" | undefined;
+    const iccEngineFailures: IccEngineFailure[] = [];
+    if (this.iccTransformResolver || (!this.iccKernel && (this.iccEngine === "qcms" || this.iccEngine === "lcms"))) {
+      const request = createNativeIccTransformRequest(
+        profile, iccMetadata, count as NativeIccComponentCount, this.maxIccTransformBytes, signal
+      );
+      if (this.iccTransformResolver) {
+        iccTransform = await resolveNativeIccTransformThroughCaller(
+          this.iccTransformResolver, request, this.maxIccTransformBytes, signal
+        );
+        iccTransformMode = 2;
+      } else {
+        const engines: readonly ("qcms" | "lcms")[] = this.iccEngine === "lcms" ? ["lcms", "qcms"] : ["qcms", "lcms"];
+        for (const engine of engines) {
+          throwIfAborted(signal);
+          try {
+            let resolver: NativeIccTransformResolver;
+            try {
+              resolver = engine === "lcms"
+                ? (await import("./nativeIccLcms")).resolveLcmsTransform
+                : (await import("./nativeIccQcms")).resolveQcmsTransform;
+            } catch (cause) {
+              if (cause instanceof PdfError) throw cause;
+              if (cause instanceof RangeError) throw iccMemoryError(cause);
+              throw new IccEngineError("engine-load-failed", cause);
+            }
+            const result = await resolver(request, signal);
+            iccTransform = normalizeNativeIccTransformResult(result, request, this.maxIccTransformBytes, signal);
+            iccTransformMode = iccMetadata.dataColorSpace === "Lab " ? 4 : 3;
+            iccEngineUsed = engine;
+            break;
+          } catch (cause) {
+            throwIfAborted(signal);
+            if (!(cause instanceof IccEngineError)) throw cause;
+            iccEngineFailures.push({ engine, reason: cause.reason });
+          }
+        }
+      }
+    }
+    if (!iccTransform && !this.iccKernel && this.iccEngine !== "none") iccTransformMode = 1;
     return {
       ...colorRecord("ICCBased", count, range),
-      alternateSpaceIndex,
-      profile,
-      iccMetadata,
-      iccTransform
+      alternateSpaceIndex, profile, iccMetadata, iccTransform, iccTransformMode, iccEngineUsed, iccEngineFailures
     };
   }
 
@@ -1051,27 +1120,38 @@ export class NativePdfColorRegistry {
         break;
       }
       case "ICCBased": {
-        const normalized = normalizePairs(components, record.parameters);
         if (record.iccTransform) {
           rgb = sampleNativeIccTransform(
             record.iccTransform,
             record.componentCount as NativeIccComponentCount,
-            normalized,
+            normalizeIccComponents(components, record.parameters, record.iccTransformMode ?? 2),
             signal
           );
+          this.reportIccFallback(index, record);
           break;
         }
         if (!this.iccKernel || !record.iccMetadata) {
+          if (record.iccTransformMode === 1) {
+            // ISO 32000-1 Table 66: preserve source values in the alternate
+            // space, clipping to its range. Normalized ICC kernel inputs are
+            // unsuitable here, especially for Lab and non-default /Range.
+            const values = components.map((value, component) => clamp(
+              value, record.parameters[component * 2], record.parameters[component * 2 + 1]
+            ));
+            rgb = this.convertInternal(record.alternateSpaceIndex, values, next, depth + 1, signal);
+            this.reportIccFallback(index, record);
+            break;
+          }
           throw new PdfError(
             "unsupported-color",
-            "ICCBased color conversion requires a caller-owned ICC transform resolver.",
+            "ICCBased color conversion requires an available ICC engine or resolver.",
             { details: { componentCount: record.componentCount } }
           );
         }
         try {
           rgb = validateKernelRgb(this.iccKernel.convertToSrgb(
             record.profile,
-            normalized,
+            normalizePairs(components, record.parameters),
             record.iccMetadata
           ));
         } catch (cause) {
@@ -1143,7 +1223,7 @@ export class NativePdfColorRegistry {
     );
     const nextBytes = checkedStoreLength(
       this.storedByteCount,
-      record.profile.length + record.lookup.length,
+      record.profile.length + record.lookup.length + (record.iccTransform?.samples.length ?? 0),
       this.maxStoreBytes,
       "byte"
     );
@@ -1153,6 +1233,56 @@ export class NativePdfColorRegistry {
     this.storedByteCount = nextBytes;
     this.records.push(Object.freeze(record) as ColorRecord);
     return index;
+  }
+
+  private reportIccFallback(index: number, record: ColorRecord): void {
+    const alternate = record.iccTransformMode === 1;
+    const failures = record.iccEngineFailures ?? [];
+    const effectiveEngine = alternate ? "alternate" : record.iccEngineUsed;
+    if (!effectiveEngine || (!alternate && failures.length === 0)) return;
+    if (this.reportedIccFallbacks.has(index)) return;
+    this.reportedIccFallbacks.add(index);
+    const reasons = failures.map(({ engine, reason }) =>
+      `${engine === "lcms" ? "Little CMS" : "qcms"} ${reason === "engine-load-failed" ? "could not load" : "could not convert this ICC profile"}`
+    ).join("; ");
+    this.onDiagnostic?.({
+      code: alternate ? "icc-alternate-used" : "icc-engine-fallback", severity: "warning",
+      message: `${reasons ? `${reasons}. ` : ""}${alternate
+        ? "Using alternate colors because the ICC profile was not applied; colors may differ from the intended appearance."
+        : `Using ${record.iccEngineUsed === "lcms" ? "Little CMS" : "qcms"} instead.`}`,
+      details: {
+        colorSpaceIndex: index, componentCount: record.componentCount,
+        ...(alternate ? { alternateColorSpace: this.getRecord(record.alternateSpaceIndex).kind } : {}),
+        engine: this.iccEngine, effectiveEngine,
+        reason: failures[0]?.reason ?? "alternate-selected",
+        qcmsFailureReason: failures.find(failure => failure.engine === "qcms")?.reason ?? null,
+        lcmsFailureReason: failures.find(failure => failure.engine === "lcms")?.reason ?? null
+      }
+    });
+  }
+
+  private retainedIccTransform(record: ColorRecord, signal?: AbortSignal): Readonly<NativeIccTransformResult> | null {
+    if (record.iccTransform || record.kind !== "ICCBased" || !this.iccKernel || !record.iccMetadata) {
+      return record.iccTransform;
+    }
+    // The legacy synchronous kernel remains exact for immediate paints. Retained
+    // shadings need a transferable lattice rather than a non-cloneable callback.
+    const request = createNativeIccTransformRequest(record.profile, record.iccMetadata,
+      record.componentCount as NativeIccComponentCount, this.maxIccTransformBytes, signal);
+    const samples = allocateStore(() => new Uint8Array(request.sampleCount * 3), "ICC kernel transform");
+    for (let index = 0; index < request.sampleCount; index += 1) {
+      if ((index & 1023) === 0) throwIfAborted(signal);
+      const components = Array.from(request.inputSamples.subarray(
+        index * record.componentCount, (index + 1) * record.componentCount), value => value / 255);
+      let rgb: readonly number[];
+      try { rgb = validateKernelRgb(this.iccKernel.convertToSrgb(record.profile, components, record.iccMetadata)); }
+      catch (cause) {
+        if (cause instanceof PdfError) throw cause;
+        throw new PdfError("unsupported-color", "The ICC color kernel rejected a profile.", { cause });
+      }
+      for (let component = 0; component < 3; component += 1) samples[index * 3 + component] = Math.round(clamp01(rgb[component]) * 255);
+    }
+    return { samples, sampleCount: request.sampleCount, outputComponents: 3, bitsPerComponent: 8 };
   }
 
   private getRecord(index: number): ColorRecord {

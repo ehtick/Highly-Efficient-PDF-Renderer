@@ -37,6 +37,19 @@ try {
   await testCloneWorkerMalformed(openPdfWithWorkerEndpoint, attachPdfWorkerRuntime);
   await testCloneWorkerCancellation(openPdfWithWorkerEndpoint, attachPdfWorkerRuntime);
   await testNodeWorkerResolution(openPdfInNodeWorker);
+  await testFallbackPolicy(openPdf);
+  await testFallbackPolicy((source, options) => openPdfInNodeWorker(source, {
+    ...options, workerUrl: sourceWorkerBootstrapUrl(new URL("../src/pdf/pdfWorkerEntry.ts", import.meta.url))
+  }));
+  const [host, worker] = linkedCloneEndpoints();
+  const fallbackRuntime = attachPdfWorkerRuntime(worker);
+  try {
+    // One endpoint connection per session, so use a single session here.
+    await testFallbackDiagnostics((source, options) => openPdfWithWorkerEndpoint(source, options, host));
+  } finally {
+    await fallbackRuntime.close();
+  }
+  await testPublicColorOptions();
 
   console.log("Direct, browser-style, and Node ICC transform resolver tests passed.");
 } finally {
@@ -284,17 +297,96 @@ async function testNodeWorkerResolution(openPdfInNodeWorker) {
   }
 }
 
-function iccFixture() {
+async function testFallbackPolicy(openSession) {
+  await testFallbackDiagnostics(openSession);
+  const imageDiagnostics = [];
+  const imageSession = await openSession({ kind: "bytes", bytes: iccFixture({ image: true }) }, {
+    onDiagnostic: diagnostic => imageDiagnostics.push(diagnostic)
+  });
+  try {
+    const page = await imageSession.compilePage(0);
+    assert.deepEqual([...page.stores.images.data], [26, 204, 128, 255, 26, 204, 128, 255],
+      "image Decode must retain ICC /Range values before alternate conversion");
+    assert.equal(imageDiagnostics.filter(d => d.code === "icc-alternate-used").length, 1);
+  } finally {
+    await imageSession.close();
+  }
+  const strict = await openSession({ kind: "bytes", bytes: iccFixture() }, { iccEngine: "none" });
+  try {
+    await assert.rejects(strict.compilePage(0), error => error?.code === "unsupported-color");
+    assert.equal(strict.getDiagnostics().some(d => d.code === "icc-alternate-used"), false);
+  } finally {
+    await strict.close();
+  }
+}
+
+async function testFallbackDiagnostics(openSession) {
+  const diagnostics = [];
+  const session = await openSession({ kind: "bytes", bytes: iccFixture({ lab: true }) }, {
+    onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+  });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    assertRgb(pagePaintRgb(page), [0.46632662, 0.46632661, 0.46632660], 1e-6);
+    const scene = await session.compileVectorPage(0, { optimization: "none" });
+    assert.equal(scene.fillPathCount, 1);
+    assertRgb([...scene.fillPathMetaB.subarray(2, 4), scene.fillPathMetaC[2]],
+      [0.46632662, 0.46632661, 0.46632660], 1e-6);
+    for (const entries of [diagnostics, session.getDiagnostics()]) {
+      const warnings = entries.filter(d => d.code === "icc-alternate-used");
+      assert.equal(warnings.length, 1, "recompiling a page must not duplicate the warning");
+      assert.equal(warnings[0].pageIndex, 0);
+      assert.equal(warnings[0].details.alternateColorSpace, "Lab");
+    }
+  } finally {
+    await session.close();
+  }
+}
+
+async function testPublicColorOptions() {
+  const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
+  for (const pdfFastPath of ["auto", "off"]) {
+    const diagnostics = [];
+    const loaded = await loadPdfSceneFromSource(iccFixture(), {
+      pdfFastPath, onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+    });
+    assert.equal(loaded.scene.fillPathCount, 1);
+    assert.equal(diagnostics.filter(d => d.code === "icc-alternate-used").length, 1);
+    await assert.rejects(loadPdfSceneFromSource(iccFixture(), { pdfFastPath, iccEngine: "none" }),
+      error => error?.code === "unsupported-color");
+    let calls = 0;
+    diagnostics.length = 0;
+    const resolved = await loadPdfSceneFromSource(iccFixture(), {
+      pdfFastPath, iccEngine: "alternate", onDiagnostic: diagnostic => diagnostics.push(diagnostic),
+      iccTransformResolver(request) {
+        calls += 1;
+        return transformResult(request.inputSamples.map(value => 255 - value), request.sampleCount);
+      }
+    });
+    assert.equal(calls, 1);
+    assertRgb([...resolved.scene.fillPathMetaB.subarray(2, 4), resolved.scene.fillPathMetaC[2]], [0, 1, 1]);
+    assert.equal(diagnostics.some(d => d.code === "icc-alternate-used"), false);
+  }
+}
+
+function iccFixture({ lab = false, image = false } = {}) {
   const profile = createRgbIccHeader();
+  if (lab) writeAscii(profile, 16, "Lab ");
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     {
       number: 3,
-      body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /ICC [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>"
+      body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /ICC [/ICCBased 5 0 R] >> /XObject << /Im 6 0 R >> >> /Contents 4 0 R >>"
     },
-    { number: 4, body: tinyPdfStream("", "/ICC cs 1 0 0 sc 0 0 10 10 re f") },
-    { number: 5, body: tinyPdfStream("/N 3 /Alternate /DeviceRGB", profile) }
+    { number: 4, body: tinyPdfStream("", image ? "/Im Do" : `/ICC cs ${lab ? "50 0 0" : "1 0 0"} sc 0 0 10 10 re f`) },
+    { number: 5, body: tinyPdfStream(lab
+      ? "/N 3 /Range [0 100 -128 127 -128 127] /Alternate [/Lab << /WhitePoint [0.95047 1 1.08883] >>]"
+      : `/N 3 /Alternate /DeviceRGB ${image ? "/Range [0.1 0.9 0.2 0.8 0.3 0.7]" : ""}`, profile) },
+    { number: 6, body: tinyPdfStream(
+      "/Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /ICC /BitsPerComponent 8",
+      Uint8Array.of(0, 255, 128, 0, 255, 128)
+    ) }
   ] });
 }
 

@@ -51,6 +51,9 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `pdfFastPath` | `"auto"` | Try the specialized dense-vector parser; `"off"` uses the full parser. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
+| `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
+| `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
+| `onDiagnostic` | — | Receive PDF diagnostics, including `icc-engine-fallback` and `icc-alternate-used` warnings with zero-based `pageIndex`. |
 
 Page selections are deduplicated and composed in document order. Invalid selections
 reject with `RangeError`. HEP files preserve their saved page selection and layout;
@@ -118,7 +121,7 @@ extension. Import it from `@soadzoor/hepr` in either a browser or Node.
 
 | Input | Options |
 | --- | --- |
-| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `pages`, `maxPagesPerRow`, `segmentMerge`, and `invisibleCull`. |
+| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options, optional `sourcePdf` and `sourcePdfPages` for image fallback. |
 
 Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`),
@@ -134,6 +137,67 @@ Node hosts can install the optional `@napi-rs/canvas` backend for PDF operations
 that need Canvas2D, image encoding, and encoded HEP image decoding. See the
 [conversion examples](examples.md), [builder types](../src/hepBuilder.ts), and
 [HEP format specification](HEP_CONTAINER.md).
+
+### ICC colors
+
+PDF loading and PDF-source `buildHep` calls default to **Mozilla qcms**. Both
+engines ship as separate WASM assets with HEPR. The preferred engine loads only
+when page compilation needs an ICC profile; the second loads only on fallback.
+The choice applies per profile, so one unsupported profile does not change the
+preferred engine for other profiles. The available settings are:
+
+| `iccEngine` | Conversion order |
+| --- | --- |
+| `"qcms"` (default) | qcms → Little CMS → alternate colors |
+| `"lcms"` | Little CMS → qcms → alternate colors |
+| `"alternate"` | Skip both engines and use alternate colors, with an approximation warning. |
+| `"none"` | Disable built-in conversion and approximation; reject ICC content requiring conversion unless a custom resolver is supplied. |
+
+Fallback occurs when an engine cannot load or cannot convert the profile;
+metadata-only parsing and PDFs without ICC colors load neither. Browser assets
+are fetched relative to the HEPR package, and Node reads the packaged files.
+There are no new runtime npm dependencies or third-party CDN requests.
+
+```ts
+const hep = await buildHep(pdfBytes, {
+  iccEngine: "qcms", // optional; this is the default
+  onDiagnostic: diagnostic => console.warn(diagnostic.message)
+});
+```
+
+These options also apply to `openPdf`, worker sessions, and PDF scene loading.
+An `icc-engine-fallback` warning identifies a switch to the other engine; this
+alone does not mean alternate colors were used. If both engines fail, or
+`"alternate"` was selected, an `icc-alternate-used` warning explains that colors
+may differ from the intended appearance. Warnings are emitted once per affected
+color space per page, not per pixel or paint operation. Their `details` include
+the requested `engine`, `effectiveEngine`, and `qcmsFailureReason` /
+`lcmsFailureReason` (`engine-load-failed`, `profile-unsupported`, or `null` when
+that engine did not fail).
+Selecting `"alternate"` on a PDF without ICC colors produces no ICC warning.
+
+Little CMS supports Gray, RGB, CMYK, and Lab inputs; the bundled qcms adapter
+supports Gray, RGB, and CMYK, with ICC Lab profiles falling back to Little CMS.
+Both engines use relative-colorimetric sRGB and bounded RGB8 lookup tables, so
+this is not a print-proofing pipeline.
+
+For a caller-owned engine, supply `iccTransformResolver`. This overrides
+`iccEngine` (including `"none"`) and prevents either built-in engine from loading.
+HEPR sends isolated profile bytes and normalized sample batches, and expects
+packed sRGB samples; see the exported `NativeIccTransformResolver`,
+`NativeIccTransformRequest`, and `NativeIccTransformResult` types. The existing
+custom-resolver contract is unchanged: `/Range` endpoints map to zero and one.
+Built-in engines instead clip source values to `/Range` and encode the profile's
+native color model, including ICC Lab8. Caller-resolver errors, malformed profile
+headers, cancellation, and resource-limit failures still reject.
+
+The `PDFtoHEP.js` CLI accepts `--icc-engine=qcms|lcms|alternate|none` and prints
+fallback warnings. The former `iccFallback` API option and `--icc-fallback` CLI
+flag have been removed; use `iccEngine` alone. Retained page data uses version 8,
+which includes prepared ICC transforms and fallback decisions
+for gradients and compositing. Version 7 retained pages must be regenerated;
+the HEP container and saved scene formats are unchanged. Existing HEP files keep
+their saved colors, and opening them never loads an ICC engine.
 
 ## Search and selection
 

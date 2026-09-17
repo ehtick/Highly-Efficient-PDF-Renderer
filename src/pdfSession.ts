@@ -115,7 +115,7 @@ import {
   type NativeInlineImageResult
 } from "./pdf/nativeInlineImage";
 import { NativePdfColorRegistry } from "./pdf/nativeColor";
-import type { NativeIccTransformResolver } from "./pdf/nativeIcc";
+import { validateIccEngine, type NativeIccTransformResolver, type PdfIccOptions } from "./pdf/nativeIcc";
 import { NativePdfShadingRegistry } from "./pdf/nativeShadings";
 import {
   NativePdfExtGStateRegistry,
@@ -153,7 +153,7 @@ import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
 
 export const computePageGeometry = computeNativePdfPageGeometry;
 
-export interface OpenPdfOptions {
+export interface OpenPdfOptions extends PdfIccOptions {
   /** Strict parsing always runs first. `safe` allows one bounded xref repair scan. */
   readonly repair?: "off" | "safe";
   readonly limits?: Partial<PdfResourceLimits>;
@@ -164,8 +164,6 @@ export interface OpenPdfOptions {
   readonly missingFontResolver?: NativeMissingFontResolver;
   /** Focused decoder bridge returning validated packed image samples. */
   readonly imageCodecResolver?: NativeImageCodecResolver;
-  /** Caller-owned batched ICC-to-sRGB transform bridge. */
-  readonly iccTransformResolver?: NativeIccTransformResolver;
 }
 
 export interface ParsePdfOptions extends OpenPdfOptions {
@@ -323,7 +321,8 @@ export async function openPdf(
       options.missingFontResolver,
       options.imageCodecResolver,
       options.iccTransformResolver,
-      optionalContent
+      optionalContent,
+      options.iccEngine
     );
   } catch (error) {
     if (document) await document.close().catch(() => undefined);
@@ -386,6 +385,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private readonly missingFontResolver?: NativeMissingFontResolver;
   private readonly imageCodecResolver?: NativeImageCodecResolver;
   private readonly iccTransformResolver?: NativeIccTransformResolver;
+  private readonly iccEngine: NonNullable<PdfIccOptions["iccEngine"]>;
   private operationTail: Promise<void> = Promise.resolve();
   private closePromise: Promise<void> | null = null;
   private closed = false;
@@ -398,7 +398,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     missingFontResolver?: NativeMissingFontResolver,
     imageCodecResolver?: NativeImageCodecResolver,
     iccTransformResolver?: NativeIccTransformResolver,
-    optionalContent?: NativeOptionalContentRegistry
+    optionalContent?: NativeOptionalContentRegistry,
+    iccEngine?: PdfIccOptions["iccEngine"]
   ) {
     this.document = document;
     if (!optionalContent) {
@@ -421,6 +422,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.missingFontResolver = missingFontResolver;
     this.imageCodecResolver = imageCodecResolver;
     this.iccTransformResolver = iccTransformResolver;
+    this.iccEngine = validateIccEngine(iccEngine);
   }
 
   async compilePage(
@@ -1049,7 +1051,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       signal,
       this.optionalContent,
       this.imageCodecResolver,
-      this.iccTransformResolver,
+      { iccTransformResolver: this.iccTransformResolver, iccEngine: this.iccEngine },
+      (diagnostic) => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }]),
       options.limits
     );
     const xObjectReferences = imageResources.xObjectReferences;
@@ -5940,7 +5943,8 @@ async function loadPageImages(
   signal: AbortSignal,
   optionalContentRegistry: NativeOptionalContentRegistry,
   imageCodecResolver?: NativeImageCodecResolver,
-  iccTransformResolver?: NativeIccTransformResolver,
+  iccOptions: PdfIccOptions = {},
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void,
   limits?: Partial<PdfResourceLimits>
 ): Promise<LoadedPageImages> {
   const colorSpaceValue = resources.get("ColorSpace");
@@ -5948,7 +5952,8 @@ async function loadPageImages(
     ? undefined
     : await document.resolveDictionary(colorSpaceValue, signal);
   const colors = new NativePdfColorRegistry(document, undefined, {
-    iccTransformResolver,
+    ...iccOptions,
+    onDiagnostic,
     maxIccProfileBytes: limits?.maxIccProfileBytes ?? document.limits.maxIccProfileBytes,
     maxIccTransformBytes: limits?.maxIccTransformBytes ?? document.limits.maxIccTransformBytes
   });

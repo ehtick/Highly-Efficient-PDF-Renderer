@@ -6,7 +6,7 @@
  * resource references are page-local, zero-based indexes. `-1` is the only
  * sentinel value and always means "none".
  *
- * This v7 page model is separate from the v6 scene schema persisted in HEP
+ * This v8 page model is separate from the v6 scene schema persisted in HEP
  * container v1. A page is self-contained: rendering it never requires the source
  * PDF or another page.
  */
@@ -23,7 +23,7 @@ export type {
   PdfResourceLimits
 } from "./pdf/nativeTypes";
 
-export const HEPR_DOCUMENT_DATA_VERSION = 7 as const;
+export const HEPR_DOCUMENT_DATA_VERSION = 8 as const;
 
 export type HeprDocumentDataVersion = typeof HEPR_DOCUMENT_DATA_VERSION;
 
@@ -472,6 +472,11 @@ export interface HeprColorStore {
   profiles: Uint8Array;
   lookupOffsets: Uint32Array;
   lookupBytes: Uint8Array;
+  /** 0 = unavailable/non-ICC, 1 = alternate, 2 = /Range lattice, 3 = device lattice, 4 = Lab8 lattice. */
+  iccModes: Uint8Array;
+  /** Packed RGB8 lattices with 256, 33^3 or 17^4 samples for 1, 3 or 4 inputs. */
+  iccTransformOffsets: Uint32Array;
+  iccTransformSamples: Uint8Array;
 }
 
 export interface HeprPaintStore {
@@ -863,7 +868,10 @@ export function createEmptyHeprPageStores(): HeprPageStores {
       profileOffsets: new Uint32Array([0]),
       profiles: new Uint8Array(0),
       lookupOffsets: new Uint32Array([0]),
-      lookupBytes: new Uint8Array(0)
+      lookupBytes: new Uint8Array(0),
+      iccModes: new Uint8Array(0),
+      iccTransformOffsets: new Uint32Array([0]),
+      iccTransformSamples: new Uint8Array(0)
     },
     paints: {
       kinds: new Uint8Array(0),

@@ -342,10 +342,11 @@ async function testColors(functions) {
   deviceNColor.forEach((component) => closeTo(component, 0.25));
   const icc = await colors.add([{ kind: "name", value: "ICCBased" }, ref(11)]);
   assert.equal(colors.describe(icc).iccMetadata.dataColorSpace, "RGB ");
-  assert.throws(
-    () => colors.convertToSrgb(icc, [0, 0, 0]),
-    (error) => error instanceof PdfError && error.code === "unsupported-color"
-  );
+  assert.deepEqual(colors.convertToSrgb(icc, [0.25, 0.5, 0.75]), [0.25, 0.5, 0.75]);
+  const strictColors = new NativePdfColorRegistry(document, undefined, { iccEngine: "none" });
+  const strictIcc = await strictColors.add([{ kind: "name", value: "ICCBased" }, ref(11)]);
+  assert.throws(() => strictColors.convertToSrgb(strictIcc, [0, 0, 0]),
+    error => error instanceof PdfError && error.code === "unsupported-color");
   const kernelColors = new NativePdfColorRegistry(document, undefined, {
     iccKernel: {
       convertToSrgb(_profile, components) {

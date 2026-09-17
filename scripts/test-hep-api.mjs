@@ -1,5 +1,9 @@
 // Synthetic scenes only: no PDF conversion, corpus assets, or servers.
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+import { sourceFunction } from "./lib/sourceFunction.mjs";
+import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { registerHooks } from "node:module";
 import { HepArchive, hasHepSignature } from "../src/hepContainer.ts";
 
@@ -10,6 +14,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 } });
 
 try {
+  await testPdfColorOptionForwarding();
   const builder = await import("../src/hepBuilder.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
@@ -88,4 +93,26 @@ try {
   console.log("HEP API passed: native formats, source forms, clean API break, progress, and cancellation.");
 } finally {
   hooks.deregister();
+}
+
+async function testPdfColorOptionForwarding() {
+  const source = await readFile(new URL("../src/hepBuilder.ts", import.meta.url), "utf8");
+  const stopBeforeConversion = new Error("stop after checking PDF loader options");
+  for (const iccEngine of [undefined, "qcms", "lcms", "alternate", "none"]) {
+    const iccTransformResolver = () => {};
+    const onDiagnostic = () => {};
+    const context = vm.createContext({
+      createLoadProgressReporter,
+      loadPdfSceneFromSource: async (_source, options) => {
+        assert.equal(options.iccEngine, iccEngine);
+        assert.equal(options.iccTransformResolver, iccTransformResolver);
+        assert.equal(options.onDiagnostic, onDiagnostic);
+        throw stopBeforeConversion;
+      }
+    });
+    vm.runInContext(sourceFunction(source, "buildHepFromPdf"), context);
+    await assert.rejects(context.buildHepFromPdf(new Uint8Array(), {
+      iccEngine, iccTransformResolver, onDiagnostic
+    }), error => error === stopBeforeConversion);
+  }
 }

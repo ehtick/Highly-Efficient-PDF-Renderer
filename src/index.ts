@@ -176,6 +176,15 @@ export type {
 export { buildHep } from "./hepBuilder";
 
 export type {
+  PdfIccOptions,
+  NativeIccTransformResolver,
+  NativeIccTransformRequest,
+  NativeIccTransformResult,
+  NativeIccProfileMetadata
+} from "./pdf/nativeIcc";
+export type { PdfDiagnostic } from "./pdf/nativeTypes";
+
+export type {
   BuildHepFromPdfOptions,
   BuildHepFromSceneOptions,
   HepCompression,

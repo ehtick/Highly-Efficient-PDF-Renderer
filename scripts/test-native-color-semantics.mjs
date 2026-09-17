@@ -146,7 +146,7 @@ function iccSpace({
   range,
   profile = iccProfile()
 } = {}) {
-  const entries = { N: count, Alternate: alternate };
+  const entries = alternate === null ? { N: count } : { N: count, Alternate: alternate };
   if (range !== undefined) entries.Range = range;
   return [name("ICCBased"), stream(entries, profile)];
 }
@@ -383,7 +383,7 @@ async function testIccProfilesAndKernelBoundary() {
     "unsupported-color"
   );
 
-  const colors = new NativePdfColorRegistry(document);
+  const colors = new NativePdfColorRegistry(document, undefined, { iccEngine: "none" });
   const indirect = await colors.add(ref(15));
   const indirectDescription = colors.describe(indirect);
   assert.equal(indirectDescription.kind, "ICCBased");
@@ -432,6 +432,7 @@ async function testIccProfilesAndKernelBoundary() {
 
   let received = null;
   const kernelColors = new NativePdfColorRegistry(document, undefined, {
+    iccEngine: "alternate",
     iccKernel: {
       convertToSrgb(profile, components, metadata) {
         received = { profile, components: [...components], metadata };
@@ -448,16 +449,62 @@ async function testIccProfilesAndKernelBoundary() {
   assert.equal(received.metadata.dataColorSpace, "RGB ");
 
   const invalidKernel = new NativePdfColorRegistry(document, undefined, {
+    iccEngine: "alternate",
     iccKernel: { convertToSrgb() { return [0, Number.NaN, 0]; } }
   });
   const invalidKernelIcc = await invalidKernel.add(iccSpace());
   throwsCode(() => invalidKernel.convertToSrgb(invalidKernelIcc, [0, 0, 0]), "unsupported-color");
 
   const throwingKernel = new NativePdfColorRegistry(document, undefined, {
+    iccEngine: "alternate",
     iccKernel: { convertToSrgb() { throw new Error("bad profile"); } }
   });
   const throwingKernelIcc = await throwingKernel.add(iccSpace());
   throwsCode(() => throwingKernel.convertToSrgb(throwingKernelIcc, [0, 0, 0]), "unsupported-color");
+}
+
+async function testIccAlternateFallback() {
+  const diagnostics = [];
+  const colors = new NativePdfColorRegistry(document, undefined, {
+    onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+  });
+  for (const [spec, input, expected] of [
+    [{}, [0.25, 0.5, 0.75], [0.25, 0.5, 0.75]],
+    [{ alternate: null }, [1, 0, 0], [1, 0, 0]],
+    [{ count: 1, alternate: null, profile: iccProfile({ dataColorSpace: "GRAY" }) }, [0.4], [0.4, 0.4, 0.4]],
+    [{ count: 4, alternate: null, profile: iccProfile({ dataColorSpace: "CMYK" }) },
+      [0, 1, 1, 0], convertDeviceCmykToSrgb(0, 1, 1, 0)],
+    [{ range: [0.1, 0.9, 0.2, 0.8, 0.3, 0.7] }, [-1, 2, 0.5], [0.1, 0.8, 0.5]],
+    [{ range: [0.5, 0.5, 0, 1, 0, 1] }, [0.9, 0.25, 0.75], [0.5, 0.25, 0.75]],
+    [{ range: [-2, 2, -2, 2, -2, 2] }, [-1, 2, 0.5], [0, 1, 0.5]],
+    [{ alternate: lab(), range: [0, 100, -128, 127, -128, 127],
+      profile: iccProfile({ dataColorSpace: "Lab " }) }, [50, 0, 0],
+      [0.46632662, 0.46632661, 0.46632660]]
+  ]) {
+    const index = await colors.add(iccSpace(spec));
+    const before = diagnostics.length;
+    closeRgb(colors.convertToSrgb(index, input), expected);
+    closeRgb(colors.convertToSrgb(index, input), expected);
+    assert.equal(diagnostics.length, before + 1, "warn once per used ICC space, not per pixel");
+    assert.equal(diagnostics.at(-1).code, "icc-alternate-used");
+    assert.equal(diagnostics.at(-1).severity, "warning");
+  }
+  const before = diagnostics.length;
+  const unused = await colors.add(iccSpace());
+  assert.equal(diagnostics.length, before, "merely parsing an ICC profile must not report fallback");
+  const controller = new AbortController();
+  controller.abort();
+  throwsCode(() => colors.convertToSrgb(unused, [1, 0, 0], controller.signal), "aborted");
+  assert.equal(diagnostics.length, before);
+  await rejectsCode(() => colors.add(iccSpace({ profile: iccProfile({ signature: "bad!" }) })), "unsupported-color");
+  const limited = new NativePdfColorRegistry(document, undefined, {
+    iccEngine: "alternate", maxIccProfileBytes: 128
+  });
+  await rejectsCode(() => limited.add(iccSpace({ profile: iccProfile({ byteLength: 129 }) })), "resource-limit");
+  assert.throws(() => new NativePdfColorRegistry(document, undefined, { iccEngine: "typo" }), /iccEngine/);
+  const strict = new NativePdfColorRegistry(document, undefined, { iccEngine: "none" });
+  const strictIndex = await strict.add(iccSpace());
+  throwsCode(() => strict.convertToSrgb(strictIndex, [1, 0, 0]), "unsupported-color");
 }
 
 async function testIndexedSpaces() {
@@ -727,6 +774,7 @@ try {
   await testDeviceSpacesAndScopedDefaults();
   await testCalibratedSpaces();
   await testIccProfilesAndKernelBoundary();
+  await testIccAlternateFallback();
   await testIndexedSpaces();
   await testSeparationAndDeviceN();
   await testPatternBasesLimitsCancellationAndStore();

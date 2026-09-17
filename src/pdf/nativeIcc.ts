@@ -50,13 +50,48 @@ export interface NativeIccTransformResult {
 }
 
 /**
- * Caller-owned boundary intended for a future pinned qcms WASM adapter. HEPR
- * itself does not bundle or imply a particular color-management library.
+ * Caller-owned override for the bundled ICC engines. Its input normalization
+ * contract is unchanged: PDF /Range endpoints map to zero and one.
  */
 export type NativeIccTransformResolver = (
   request: Readonly<NativeIccTransformRequest>,
   signal?: AbortSignal
 ) => NativeIccTransformResult | Promise<NativeIccTransformResult>;
+
+/** ICC conversion controls shared by PDF loading and compilation APIs. */
+export interface PdfIccOptions {
+  /**
+   * Preferred built-in engine, loaded only for ICC conversion. If unavailable
+   * or unable to convert a profile, try the other engine, then alternate colors.
+   * Fallback emits a diagnostic. `alternate` skips engines and warns that colors
+   * may differ; `none` disables both built-in conversion and approximation.
+   * Malformed headers, cancellation, and resource limits still reject.
+   * @default "qcms"
+   */
+  readonly iccEngine?: "qcms" | "lcms" | "alternate" | "none";
+  /** Caller-owned bridge; overrides iccEngine. Its errors reject without fallback. */
+  readonly iccTransformResolver?: NativeIccTransformResolver;
+}
+
+export function validateIccEngine(value: PdfIccOptions["iccEngine"]): NonNullable<PdfIccOptions["iccEngine"]> {
+  if (value !== undefined && value !== "qcms" && value !== "lcms" && value !== "alternate" && value !== "none") {
+    throw new TypeError('iccEngine must be "qcms", "lcms", "alternate", or "none".');
+  }
+  return value ?? "qcms";
+}
+
+/** Retained transform domains: 2 = caller /Range, 3 = device, 4 = ICC Lab8. */
+export function normalizeIccComponents(
+  components: readonly number[], range: ArrayLike<number>, mode: number
+): number[] {
+  return components.map((value, index) => {
+    const low = range[index * 2], high = range[index * 2 + 1];
+    const clipped = Math.max(low, Math.min(high, value));
+    if (mode === 2) return high === low ? 0 : (clipped - low) / (high - low);
+    if (mode === 4) return index === 0 ? clipped / 100 : (clipped + 128) / 255;
+    return clipped;
+  });
+}
 
 export const NATIVE_ICC_GRID_POINTS: Readonly<Record<NativeIccComponentCount, number>> =
   Object.freeze({ 1: 256, 3: 33, 4: 17 });

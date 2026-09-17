@@ -2373,7 +2373,10 @@ export function createHeprPageDataFromDense(
     profileOffsets: appendEmptyOffsets(baseColors.profileOffsets, addedColorCount),
     profiles: baseColors.profiles,
     lookupOffsets: appendEmptyOffsets(baseColors.lookupOffsets, addedColorCount),
-    lookupBytes: baseColors.lookupBytes
+    lookupBytes: baseColors.lookupBytes,
+    iccModes: appendFilledUint8(baseColors.iccModes, addedColorCount, 0),
+    iccTransformOffsets: appendEmptyOffsets(baseColors.iccTransformOffsets, addedColorCount),
+    iccTransformSamples: baseColors.iccTransformSamples
   };
   stores.paints = {
     kinds: Uint8Array.from(paintKinds),

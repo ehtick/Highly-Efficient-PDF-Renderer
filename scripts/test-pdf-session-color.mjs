@@ -159,7 +159,17 @@ try {
       { number: 5, body: tinyPdfStream("/N 3 /Alternate /DeviceRGB", profile) }
     ]
   });
-  await assertCompileCode(openPdf, iccBytes, "unsupported-color");
+  await assertCompileCode(openPdf, iccBytes, "unsupported-color", { iccEngine: "none" });
+  const fallbackSession = await openPdf({ kind: "bytes", bytes: iccBytes });
+  try {
+    const page = await fallbackSession.compilePage(0);
+    validateHeprPageData(page);
+    const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+    assertRgb(paintRgb(page, root.commands[0].paintIndex), [1, 0, 0]);
+    assert.equal(fallbackSession.getDiagnostics().filter(d => d.code === "icc-alternate-used").length, 1);
+  } finally {
+    await fallbackSession.close();
+  }
 
   const patternBytes = simplePagePdf(
     "/Resources << /ColorSpace << /P [/Pattern /DeviceRGB] >> >>",
@@ -208,8 +218,8 @@ function simplePagePdf(resourceEntries, content, extraObjects = []) {
   });
 }
 
-async function assertCompileCode(openPdf, bytes, code) {
-  const session = await openPdf({ kind: "bytes", bytes });
+async function assertCompileCode(openPdf, bytes, code, options) {
+  const session = await openPdf({ kind: "bytes", bytes }, options);
   try {
     await assert.rejects(session.compilePage(0), (error) => error?.code === code);
   } finally {

@@ -1217,7 +1217,7 @@ function validateStores(
     [
       "spaceKinds", "componentCounts", "alternateSpaceIndices", "functionIndices",
       "parameterOffsets", "parameters", "nameOffsets", "names", "profileOffsets",
-      "profiles", "lookupOffsets", "lookupBytes"
+      "profiles", "lookupOffsets", "lookupBytes", "iccModes", "iccTransformOffsets", "iccTransformSamples"
     ],
     `${path}.colors`
   );
@@ -1226,7 +1226,8 @@ function validateStores(
   for (const [name, array, constructor] of [
     ["componentCounts", colors.componentCounts, Uint8Array],
     ["alternateSpaceIndices", colors.alternateSpaceIndices, Int32Array],
-    ["functionIndices", colors.functionIndices, Int32Array]
+    ["functionIndices", colors.functionIndices, Int32Array],
+    ["iccModes", colors.iccModes, Uint8Array]
   ] as const) {
     requireTypedArray(array, constructor, `${path}.colors.${name}`);
     requireLength(array.length, colorCount, `${path}.colors.${name}`);
@@ -1237,7 +1238,8 @@ function validateStores(
   for (const [offsetName, payloadName, payload, constructor] of [
     ["parameterOffsets", "parameters", colors.parameters, Float32Array],
     ["profileOffsets", "profiles", colors.profiles, Uint8Array],
-    ["lookupOffsets", "lookupBytes", colors.lookupBytes, Uint8Array]
+    ["lookupOffsets", "lookupBytes", colors.lookupBytes, Uint8Array],
+    ["iccTransformOffsets", "iccTransformSamples", colors.iccTransformSamples, Uint8Array]
   ] as const) {
     const offsets: Uint32Array = colors[offsetName];
     requireTypedArray<Uint32Array>(offsets, Uint32Array, `${path}.colors.${offsetName}`);
@@ -1378,6 +1380,33 @@ function validateStores(
         `${path}.colors.componentCounts[${index}]`,
         `color space requires ${fixedComponents} components`
       );
+    }
+    const mode = colors.iccModes[index];
+    const transformBytes = colors.iccTransformOffsets[index + 1] - colors.iccTransformOffsets[index];
+    const componentCount = colors.componentCounts[index];
+    const isIcc = kind === HEPR_COLOR_SPACE_KIND.IccBased;
+    const grid = componentCount === 1 ? 256 : componentCount === 3 ? 33 : componentCount === 4 ? 17 : 0;
+    if (mode > 4 || (!isIcc && mode !== 0) || (isIcc && grid === 0) ||
+        (mode === 4 && componentCount !== 3) ||
+        transformBytes !== (mode >= 2 ? 3 * grid ** componentCount : 0)) {
+      fail(HEPR_DATA_VALIDATION_CODES.InvalidCardinality, `${path}.colors.iccModes[${index}]`,
+        "ICC mode and transform lattice must match the color space");
+    }
+    if (isIcc) {
+      const start = colors.parameterOffsets[index], end = colors.parameterOffsets[index + 1];
+      if (end - start !== 2 * componentCount) {
+        fail(HEPR_DATA_VALIDATION_CODES.InvalidCardinality, `${path}.colors.parameters`, "ICC Range must have two bounds per component");
+      }
+      for (let component = 0; component < componentCount; component += 1) {
+        if (colors.parameters[start + component * 2] > colors.parameters[start + component * 2 + 1]) {
+          fail(HEPR_DATA_VALIDATION_CODES.InvalidNumber, `${path}.colors.parameters`, "ICC Range is reversed");
+        }
+      }
+      if (mode === 1 && (colors.alternateSpaceIndices[index] < 0 ||
+          colors.componentCounts[colors.alternateSpaceIndices[index]] !== componentCount)) {
+        fail(HEPR_DATA_VALIDATION_CODES.InvalidReference, `${path}.colors.alternateSpaceIndices[${index}]`,
+          "ICC fallback requires a compatible alternate color space");
+      }
     }
     validateOptionalIndex(colors.alternateSpaceIndices[index], colorCount, `${path}.colors.alternateSpaceIndices[${index}]`);
     validateOptionalIndex(colors.functionIndices[index], functionCount, `${path}.colors.functionIndices[${index}]`);
@@ -2309,7 +2338,7 @@ export function validateHeprPageData(
     fail(
       HEPR_DATA_VALIDATION_CODES.IncompatibleVersion,
       "page.version",
-      `expected ${HEPR_DOCUMENT_DATA_VERSION}; v6 and older data must be regenerated`
+      `expected ${HEPR_DOCUMENT_DATA_VERSION}; v7 and older data must be regenerated`
     );
   }
   validatePageInfo(page.pageInfo, "page.pageInfo");
@@ -2342,7 +2371,7 @@ export function validateHeprDocumentData(
     fail(
       HEPR_DATA_VALIDATION_CODES.IncompatibleVersion,
       "document.version",
-      `expected ${HEPR_DOCUMENT_DATA_VERSION}; v6 and older data must be regenerated`
+      `expected ${HEPR_DOCUMENT_DATA_VERSION}; v7 and older data must be regenerated`
     );
   }
   requireRecord(document.info, "document.info");

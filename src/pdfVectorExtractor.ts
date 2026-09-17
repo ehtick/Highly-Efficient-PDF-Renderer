@@ -13,6 +13,8 @@ import {
 } from "./densePdfFastWorkerClient";
 
 import type { PdfProgress } from "./heprDocumentData";
+import { validateIccEngine, type PdfIccOptions } from "./pdf/nativeIcc";
+import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
 import type { NativeVectorPdfSession, PdfSession } from "./pdfSession";
 
@@ -160,7 +162,8 @@ export interface VectorScene {
   textContent?: SceneTextItem[];
 }
 
-export interface VectorExtractOptions {
+export interface VectorExtractOptions extends PdfIccOptions {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
   /** Use the content-gated dense-vector PDF compiler when available. Default `"auto"`. */
@@ -259,6 +262,7 @@ export async function extractPdfPageScenes(
   signal?: AbortSignal
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
+  validateIccEngine(options.iccEngine);
   const progress = createLoadProgressReporter(options.onProgress);
   if (options.pdfFastPath === "off") {
     return extractPdfPageScenesWithNativeTier(
@@ -441,6 +445,9 @@ async function extractPdfPageScenesWithNative(
       repair: "safe",
       signal,
       missingFontResolver,
+      iccTransformResolver: options.iccTransformResolver,
+      iccEngine: options.iccEngine,
+      onDiagnostic: options.onDiagnostic,
       onProgress: reportProgress
     } as const;
     session = isNodeRuntime()

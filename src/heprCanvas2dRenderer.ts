@@ -38,6 +38,9 @@ import {
   HeprPatchTessellationError,
   tessellateHeprPatchMesh
 } from "./heprPatchMeshTessellator";
+import {
+  NATIVE_ICC_GRID_POINTS, normalizeIccComponents, sampleNativeIccTransform, type NativeIccComponentCount
+} from "./pdf/nativeIcc";
 import { convertDeviceCmykToSrgb } from "./pdf/deviceCmyk";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
 
@@ -2697,12 +2700,27 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         ], parameters.subarray(0, 3));
         break;
       }
-      case HEPR_COLOR_SPACE_KIND.IccBased:
-        throw canvasError(
-          HEPR_CANVAS_2D_ERROR_CODES.UnsupportedColor,
-          "ICCBased shading conversion requires the pinned renderer qcms kernel.",
-          path
-        );
+      case HEPR_COLOR_SPACE_KIND.IccBased: {
+        const mode = colors.iccModes[index];
+        if (parameters.length !== componentCount * 2) return this.unsupportedColorMetadata(index, path);
+        if (mode === 1) {
+          const next = new Set(active);
+          next.add(index);
+          return this.convertColorToSrgb(colors.alternateSpaceIndices[index], values.map((value, component) =>
+            clampRange(value, parameters[component * 2], parameters[component * 2 + 1])), path, next, depth + 1);
+        }
+        if (mode >= 2 && mode <= 4 && [1, 3, 4].includes(componentCount)) {
+          const samples = colors.iccTransformSamples.subarray(colors.iccTransformOffsets[index], colors.iccTransformOffsets[index + 1]);
+          if (samples.length !== 3 * NATIVE_ICC_GRID_POINTS[componentCount as NativeIccComponentCount] ** componentCount) {
+            return this.unsupportedColorMetadata(index, path);
+          }
+          rgb = sampleNativeIccTransform({ samples, sampleCount: samples.length / 3, outputComponents: 3, bitsPerComponent: 8 },
+            componentCount as NativeIccComponentCount, normalizeIccComponents(values, parameters, mode), this.options.signal);
+          break;
+        }
+        throw canvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedColor,
+          "ICCBased shading has no prepared transform or permitted fallback.", path);
+      }
       case HEPR_COLOR_SPACE_KIND.Indexed: {
         if (parameters.length !== 1) return this.unsupportedColorMetadata(index, path);
         const alternate = colors.alternateSpaceIndices[index];

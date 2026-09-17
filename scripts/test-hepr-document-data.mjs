@@ -87,7 +87,10 @@ denseFillPage.stores.colors = {
   profileOffsets: new Uint32Array([0, 0]),
   profiles: new Uint8Array(0),
   lookupOffsets: new Uint32Array([0, 0]),
-  lookupBytes: new Uint8Array(0)
+  lookupBytes: new Uint8Array(0),
+    iccModes: new Uint8Array(1),
+    iccTransformOffsets: new Uint32Array([0, 0]),
+    iccTransformSamples: new Uint8Array(0)
 };
 denseFillPage.stores.paints = {
   kinds: new Uint8Array([HEPR_PAINT_KIND.SolidColor]),

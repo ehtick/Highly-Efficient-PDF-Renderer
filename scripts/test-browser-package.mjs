@@ -44,7 +44,7 @@ const result = await build({
     assetsInlineLimit: 0,
     reportCompressedSize: false,
     rollupOptions: {
-      input: `${libDir}index.js`,
+      input: { index: `${libDir}index.js`, pdfWorker: `${libDir}pdf-worker.js` },
       preserveEntrySignatures: "strict",
       external: id => id === "three" || id.startsWith("three/") || id.startsWith("node:"),
       output: { format: "es" }
@@ -58,14 +58,16 @@ for (const chunk of chunks) {
   assert.ok(Object.keys(chunk.modules).every(id => !id.includes("/@napi-rs/canvas")),
     "browser chunks must not contain native canvas modules");
 }
-const entry = chunks.find(file => file.isEntry);
+const entry = chunks.find(file => file.isEntry && file.facadeModuleId === `${libDir}index.js`);
+const pdfWorkerEntry = chunks.find(file => file.isEntry && file.facadeModuleId === `${libDir}pdf-worker.js`);
+assert(pdfWorkerEntry, "the parser worker must participate in browser packaging checks");
 assert.ok(entry?.exports.includes("pdfObjectGenerator"));
 assert.ok(entry.exports.includes("detectRooms"), "the root package must retain its room detection API");
 
 const chunksByName = new Map(chunks.map(chunk => [chunk.fileName, chunk]));
-function collectReachableChunks(includeDynamicImports) {
+function collectReachableChunks(includeDynamicImports, rootChunk = entry) {
   const reachable = new Set();
-  const pending = [entry.fileName];
+  const pending = [rootChunk.fileName];
   while (pending.length) {
     const fileName = pending.pop();
     if (reachable.has(fileName)) continue;
@@ -84,6 +86,23 @@ const detectorChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id
 assert.ok(detectorChunks.length > 0, "the package must emit the room detector as a separate chunk");
 const staticChunks = collectReachableChunks(false);
 const allReachableChunks = collectReachableChunks(true);
+const workerStaticChunks = collectReachableChunks(false, pdfWorkerEntry);
+const workerReachableChunks = collectReachableChunks(true, pdfWorkerEntry);
+for (const engine of ["Lcms", "Qcms"]) {
+  const engineChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
+    new RegExp(`/nativeIcc${engine}(?:-[^/]+)?\\.js$`).test(id)
+  ));
+  assert(engineChunks.length > 0, `${engine} must ship as a separate lazy adapter`);
+  for (const chunk of engineChunks) {
+    assert(!staticChunks.has(chunk.fileName), `${engine} must stay out of the initial module graph`);
+    assert(!workerStaticChunks.has(chunk.fileName), `${engine} must stay out of the initial parser worker graph`);
+    assert(workerReachableChunks.has(chunk.fileName), `${engine} must remain reachable on demand in the parser worker`);
+    assert(!chunk.code.includes("data:application/wasm"), "ICC WASM must not be inlined in JavaScript");
+    const other = engine === "Lcms" ? "Qcms" : "Lcms";
+    assert(!Object.keys(chunk.modules).some(id => id.includes(`nativeIcc${other}`)),
+      "selecting one engine must not include the other engine's adapter");
+  }
+}
 for (const chunk of detectorChunks) {
   assert.ok(!staticChunks.has(chunk.fileName),
     "importing the root package must not eagerly load the room detector");
@@ -98,6 +117,10 @@ console.log(`All-exports entry: ${size(entry.code)}`);
 console.log(`All ${chunks.length} JavaScript chunks: ${(chunks.reduce((sum, file) => sum + Buffer.byteLength(file.code), 0) / 1000).toFixed(1)} kB / ${(chunks.reduce((sum, file) => sum + gzipSync(file.code).length, 0) / 1000).toFixed(1)} kB gzip (sum per chunk).`);
 console.log("Worker files and fonts are separate assets, excluded from these JavaScript totals.");
 const assets = (await readdir(`${libDir}assets`)).sort();
+for (const engine of ["lcms", "qcms"]) {
+  assert(assets.some(name => new RegExp(`^${engine}-.*\\.wasm$`).test(name)),
+    `${engine} must ship as a package-relative WASM asset`);
+}
 assert.ok(assets.some(name => /^roomDetectorWorker-.*\.js$/.test(name)),
   "the package must ship the browser room detector worker");
 for (const name of assets) {

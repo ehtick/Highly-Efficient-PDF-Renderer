@@ -2,7 +2,7 @@
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
 version **1** wraps the existing **scene schema version 6**, recorded in
-`manifest.json`. These version numbers evolve independently. The page-based v7
+`manifest.json`. These version numbers evolve independently. The page-based v8
 document model is not this container's scene schema. Legacy ZIP-based files must
 be converted with `node scripts/repack-heps.mjs` or regenerated from their PDF.
 

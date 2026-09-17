@@ -219,6 +219,36 @@ try {
   await packageSession.close();
 }
 
+// Exercise package-relative WASM URLs through the emitted worker, with a real
+// profile whose linear gray differs visibly from the DeviceRGB alternate.
+const iccProfile = new Uint8Array(await readFile(new URL("./fixtures/icc/linear-rgb.icc", import.meta.url)));
+const packageIccFixture = writeTinyPdf({ objects: [
+  { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+  { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+  { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ColorSpace << /ICC [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>" },
+  { number: 4, body: tinyPdfStream("", "/ICC cs 0.5 0.5 0.5 sc 0 0 20 20 re f") },
+  { number: 5, body: tinyPdfStream("/N 3 /Alternate /DeviceRGB", iccProfile) }
+] });
+for (const iccEngine of [undefined, "qcms", "lcms", "alternate", "none"]) {
+  const session = await openPdfInNodeWorker({ kind: "bytes", bytes: packageIccFixture }, {
+    iccEngine
+  });
+  try {
+    if (iccEngine === "none") {
+      await assert.rejects(session.compilePage(0), error => error.code === "unsupported-color");
+      continue;
+    }
+    const page = await session.compilePage(0, { optimization: "none" });
+    const command = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands[0];
+    const colorIndex = page.stores.paints.resourceIndices[command.paintIndex];
+    const colors = page.stores.colors;
+    const rgb = colors.parameters.subarray(colors.parameterOffsets[colorIndex], colors.parameterOffsets[colorIndex + 1]);
+    const expected = iccEngine === "alternate" ? 127.5 : 188;
+    assert(rgb.every(value => Math.abs(value * 255 - expected) < 2), `${iccEngine} package color conversion`);
+    assert.equal(session.getDiagnostics().some(d => d.code === "icc-alternate-used"), iccEngine === "alternate");
+  } finally { await session.close(); }
+}
+
 console.log(
   `dense PDF package worker resolution passed ` +
   `(${workerReference}, ${nativeRetainedTextChunkMatch[2]}, ${browserWorkerReference})`

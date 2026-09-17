@@ -65,6 +65,19 @@ assert.throws(
   /exactly one/
 );
 
+for (const policy of ["error", "alternate"]) {
+  assert.throws(() => parsePdfToHepArguments([`--icc-fallback=${policy}`, "plan.pdf"]), /Unknown option/);
+}
+
+for (const engine of ["qcms", "lcms", "alternate", "none"]) {
+  assert.equal(parsePdfToHepArguments([`--icc-engine=${engine}`, "plan.pdf"]).iccEngine, engine);
+  const args = pdfToHepWorkerArguments("plan.pdf", false, 8192, undefined, engine);
+  const options = parsePdfToHepArguments(args.slice(2));
+  assert.equal(options.iccEngine, engine);
+}
+assert.throws(() => parsePdfToHepArguments(["--icc-engine=typo", "plan.pdf"]), /icc-engine/);
+assert.throws(() => parsePdfToHepArguments(["--icc-engine=qcms", "--icc-engine=none", "plan.pdf"]), /exactly one/);
+
 assert.equal(sanitizeHepSourceName("Level 1.pdf"), "Level_1");
 assert.equal(sanitizeHepSourceName("Mürrieta 楼.pdf"), "M_rrieta_");
 assert.equal(sanitizeHepSourceName(".pdf"), "floorplan");
@@ -141,7 +154,7 @@ assert.equal(workerArguments.at(-3), "--force");
 assert.equal(workerArguments.at(-2), "--");
 assert.equal(workerArguments.at(-1), unusualWorkerPdf);
 const workerOutputDirectory = path.resolve("heps with spaces");
-const redirectedWorkerArguments = pdfToHepWorkerArguments(unusualWorkerPdf, true, 8_192, workerOutputDirectory);
+const redirectedWorkerArguments = pdfToHepWorkerArguments(unusualWorkerPdf, true, 8_192, workerOutputDirectory, "qcms");
 assert.equal(
   parsePdfToHepArguments(redirectedWorkerArguments.slice(2)).outputDirectory,
   workerOutputDirectory,
@@ -160,7 +173,7 @@ class FakeChild extends EventEmitter {
 }
 const fakeChild = new FakeChild();
 const fakeWorker = startPdfToHepWorker(
-  { pdfPath: unusualWorkerPdf, fileNumber: 2, fileCount: 5, outputDirectory: workerOutputDirectory },
+  { pdfPath: unusualWorkerPdf, fileNumber: 2, fileCount: 5, outputDirectory: workerOutputDirectory, iccEngine: "qcms" },
   true,
   8_192,
   (command, args, options) => {

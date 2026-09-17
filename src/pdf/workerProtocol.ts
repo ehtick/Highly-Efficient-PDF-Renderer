@@ -25,14 +25,15 @@ import type {
   NativeImageCodecResult
 } from "./nativeImage";
 import type {
+  PdfIccOptions,
   NativeIccTransformRequest,
   NativeIccTransformResult
 } from "./nativeIcc";
 
-// Version 6 transports the established renderer's independent merge/cull
-// controls for internal VectorScene compilation. Bumping prevents an older
-// emitted worker from silently changing scene semantics.
-export const PDF_WORKER_PROTOCOL_VERSION = 6 as const;
+// Version 9 replaces iccFallback with four ICC engine modes and automatic fallback.
+// Retained page color stores remain at version 8.
+// Older workers must not silently ignore the requested color behavior.
+export const PDF_WORKER_PROTOCOL_VERSION = 9 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -67,6 +68,7 @@ export type PdfWorkerSource =
     };
 
 export interface PdfWorkerOpenOptions {
+  readonly iccEngine?: PdfIccOptions["iccEngine"];
   readonly repair?: "off" | "safe";
   readonly limits?: Partial<PdfResourceLimits>;
   /** The worker should proxy missing-font requests to its owning host. */

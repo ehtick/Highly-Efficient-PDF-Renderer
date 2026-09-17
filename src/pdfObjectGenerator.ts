@@ -9,6 +9,8 @@ import { hasHepSignature, hasLegacyZipSignature } from "./hepContainer";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 import { waitForLoad } from "./loadCancellation";
+import type { PdfIccOptions } from "./pdf/nativeIcc";
+import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -24,7 +26,10 @@ export type PdfObjectSourceKind = "pdf" | "hep";
 /**
  * Options used while loading and parsing a source into HEPR scene data.
  */
-export interface PdfObjectGeneratorOptions {
+export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+
   /** Cancel source reading, parsing, LOD preparation, and object creation. */
   signal?: AbortSignal;
 
@@ -148,6 +153,9 @@ async function loadPdfSceneFromSourceInternal(
 
   if (sourceKind === "pdf") {
     const extractOptions: VectorExtractOptions = {
+      iccTransformResolver: options.iccTransformResolver,
+      iccEngine: options.iccEngine,
+      onDiagnostic: options.onDiagnostic,
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
       pdfFastPath: options.pdfFastPath ?? "auto",

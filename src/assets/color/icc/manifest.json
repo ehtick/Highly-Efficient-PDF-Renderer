@@ -1,0 +1,20 @@
+{
+  "lcms": {
+    "sourcePackage": "lcms-wasm@1.0.4",
+    "sourceCommit": "4edc5cdbfa5d883a8e4c844168ec2aa9bafb6c1f",
+    "engineCommit": "c2a54017d73080f97c5cd34a78ff2fb51564aade",
+    "upstreamSha256": "dbcbee3fb3a49459a60bb6b29d6ab25fe7c219b0cc0c2b9579c0cc78f7390ddd",
+    "sha256": "184a91d6b762fb5eef8f30a3678081501ee69dec3583906303a80a5ced8eaa91",
+    "byteLength": 315909,
+    "maximumMemoryBytes": 268435456
+  },
+  "qcms": {
+    "sourcePackage": "pdfjs-dist@6.3.289",
+    "sourceCommit": "1c8020a7d4e43668ac287a3ecf9a8dbea17e4c56",
+    "bindingCommit": "2ae4ee72334782928210ba4050e3e77d9b2d35be",
+    "upstreamSha256": "663d86126d5f5fcb1c61490f94353e2a8375660b8c5498ab3ebab5a34b08800e",
+    "sha256": "88fff6258a16a9114c0ffce048a836c13c02d66b884cfe8e877f8988132a492e",
+    "byteLength": 96591,
+    "maximumMemoryBytes": 268435456
+  }
+}

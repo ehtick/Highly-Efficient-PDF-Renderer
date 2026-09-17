@@ -15,6 +15,8 @@ import {
   type PDFLoadProgress
 } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
+import type { PdfIccOptions } from "./pdf/nativeIcc";
+import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 /** Compression algorithm used inside a generated HEP file. */
 export type HepCompression = "deflate" | "store";
@@ -38,7 +40,10 @@ export interface HepEncodingOptions {
 }
 
 /** Options when building parsed data directly from an accepted PDF source. */
-export interface BuildHepFromPdfOptions extends HepEncodingOptions {
+export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
+  /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+
   /** Merge compatible adjacent vector stroke segments during parsing. @default true */
   segmentMerge?: boolean;
 
@@ -104,6 +109,9 @@ async function buildHepFromPdf(
   const progress = createLoadProgressReporter(options.onProgress);
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
   const loaded = await loadPdfSceneFromSource(source, {
+    iccTransformResolver: options.iccTransformResolver,
+    iccEngine: options.iccEngine,
+    onDiagnostic: options.onDiagnostic,
     segmentMerge: options.segmentMerge,
     invisibleCull: options.invisibleCull,
     pages: options.pages,

@@ -260,6 +260,7 @@ export async function openPdfWithWorkerEndpoint(
     if (source.kind === "range") connection.serveRange(source);
     const response = await connection.open(prepared.source, {
       repair: options.repair,
+      iccEngine: options.iccEngine,
       limits: options.limits,
       hasMissingFontResolver: options.missingFontResolver !== undefined,
       hasImageCodecResolver: options.imageCodecResolver !== undefined,

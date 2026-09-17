@@ -36,6 +36,12 @@ Options:
   -f, --force  Replace existing regular HEP files after conversion succeeds.
   -h, --help   Show this help text.
   --output-dir=<directory>  Write all HEP files into this directory.
+  --icc-engine=qcms|lcms|alternate|none  ICC conversion (default: qcms).
+      qcms/lcms: load the preferred engine only when needed; if unavailable or
+                 unsupported, try the other engine, then alternate colors.
+      alternate: skip engines and use approximate colors, with a warning.
+      none:      disable built-in conversion and approximation; reject ICC content.
+      Fallback warnings identify affected pages and the engine used.
 
 Examples:
   node PDFtoHEP.js ./Level1.pdf
@@ -63,6 +69,7 @@ export function parsePdfToHepArguments(args) {
   let positionalOnly = false;
   let inputPath;
   let outputDirectory;
+  let iccEngine;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -85,6 +92,14 @@ export function parsePdfToHepArguments(args) {
       outputDirectory = path.resolve(value);
       continue;
     }
+    if (!positionalOnly && argument.startsWith("--icc-engine=")) {
+      const value = argument.slice("--icc-engine=".length);
+      if (iccEngine !== undefined || !["qcms", "lcms", "alternate", "none"].includes(value)) {
+        throw new Error("Pass exactly one --icc-engine=qcms, --icc-engine=lcms, --icc-engine=alternate, or --icc-engine=none.");
+      }
+      iccEngine = value;
+      continue;
+    }
     if (!positionalOnly && argument.startsWith("-")) {
       throw new Error(`Unknown option: ${argument}`);
     }
@@ -98,7 +113,11 @@ export function parsePdfToHepArguments(args) {
     throw new Error("Pass a PDF file or directory.");
   }
 
-  return { force, help, inputPath, ...(outputDirectory === undefined ? {} : { outputDirectory }) };
+  return {
+    force, help, inputPath,
+    ...(outputDirectory === undefined ? {} : { outputDirectory }),
+    ...(iccEngine === undefined ? {} : { iccEngine })
+  };
 }
 
 export async function discoverPdfFiles(inputPath) {
@@ -234,12 +253,13 @@ function parseWorkerHeapMb(value, label) {
   return heapMb;
 }
 
-export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory) {
+export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory, iccEngine) {
   return [
     `--max-old-space-size=${heapMb}`,
     scriptPath,
     ...(force ? ["--force"] : []),
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
+    ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),
     "--",
     pdfPath
   ];
@@ -487,7 +507,7 @@ export function startPdfToHepWorker(
   const workerToken = randomUUID();
   const child = spawnImplementation(
     process.execPath,
-    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory),
+    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine),
     {
       stdio: "inherit",
       shell: false,
@@ -754,6 +774,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         pdfPath,
         outputPath,
         outputDirectory: options.outputDirectory,
+        iccEngine: options.iccEngine,
         fileNumber: index + 1,
         fileCount: pdfPaths.length
       });
@@ -819,6 +840,12 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         const hepBlob = await builder.buildHep(pdfBytes, {
           sourceLabel,
           signal: abortController.signal,
+          iccEngine: options.iccEngine,
+          onDiagnostic: (diagnostic) => {
+            if (diagnostic.severity !== "warning") return;
+            const page = diagnostic.pageIndex === undefined ? "" : ` page ${diagnostic.pageIndex + 1}`;
+            console.warn(`${sourceLabel}${page}: [${diagnostic.code}] ${diagnostic.message}`);
+          },
           onProgress: createProgressLogger(sourceLabel, itemNumber, itemCount)
         });
         abortController.signal.throwIfAborted();

@@ -9,7 +9,7 @@ Start with a live viewer, then adapt the examples below to your application.
 | Native WebGL / WebGPU | [Open demo](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/) | [main.ts](../src/main.ts) |
 | three.js WebGL / WebGPU | [Open demo](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/three-example.html) | [three-example.ts](../src/three-example.ts) |
 
-Both viewers support PDF and HEP loading, text search, text selection, and rendering diagnostics. For the optional room overlay workflow, see [room-overlay-demo.ts](../src/room-overlay-demo.ts).
+Both viewers support PDF and HEP loading, PDF layer controls, text search, text selection, and rendering diagnostics. The [room overlay demo](../room-overlay-demo.html) also includes the shared PDF Layers panel; its room and TSV overlays have separate visibility controls. See [room-overlay-demo.ts](../src/room-overlay-demo.ts) for that workflow.
 
 ## Responsive three.js viewer
 

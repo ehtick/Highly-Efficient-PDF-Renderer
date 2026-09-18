@@ -6,6 +6,7 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 import {
   buildHep,
   createThreePrimitiveInteractionController,
+  createThreePdfLayerControls,
   createTextSelectionController,
   pdfObjectGenerator,
   prebuildTextLod,
@@ -59,6 +60,7 @@ const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-selec
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
+const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -103,6 +105,7 @@ if (
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
   !drawingSelectionContainer ||
+  !pdfLayersContainer ||
   !touchRotateRow ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -276,6 +279,7 @@ const exampleDropdown = createExampleDropdown({
 });
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
+  getLayerName: id => currentPdfObject?.sceneData.optionalContent?.groups.find(group => group.id === id)?.name,
   createController: callbacks => createThreePrimitiveInteractionController({
     ...callbacks,
     getCanvas: () => canvasElement,
@@ -288,6 +292,17 @@ const drawingSelection = createDrawingSelectionControls({
     textSelectionCheckboxElement.disabled = enabled;
     if (enabled || !textSelectionCheckboxElement.checked) textSelection.disable();
     else textSelection.enable();
+  }
+});
+const layerControls = createThreePdfLayerControls({
+  container: pdfLayersContainer,
+  getPdfObject: () => currentPdfObject,
+  requestRender,
+  onVisibilityChange: () => {
+    textSelection.clearSelection();
+    refreshSearchAvailability();
+    runSearch(textSearchInputElement.value, false);
+    drawingSelection.onFrame();
   }
 });
 
@@ -893,6 +908,7 @@ function disposeExample(): void {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
+  layerControls.dispose();
   drawingSelection.dispose();
   textSelection.dispose();
   controls.dispose();
@@ -1068,9 +1084,6 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       { ...objectOptions, rendererType: backend },
       controller.signal
     );
-    await waitForLoad(nextObject.setLayerVisibilities(previousObject.getLayers()
-      .filter(layer => layer.visible !== layer.defaultVisible)
-      .map(({ id, visible }) => ({ id, visible }))), controller.signal);
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
     if (activeLoadToken !== loadToken) {
@@ -1086,6 +1099,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       return;
     }
 
+    await layerControls.prepareReplacement(nextObject, controller.signal);
+    controller.signal.throwIfAborted();
     replacePdfObject(nextObject, { fitCamera: false });
     targetInstalled = true;
     const installedObject = nextObject;
@@ -1164,6 +1179,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
+  layerControls.objectChanged();
   scene.add(nextObject);
   resetFpsMeter();
   refreshDropIndicator();
@@ -1201,6 +1217,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   const clearMetrics = options.clearMetrics !== false;
   const previousObject = currentPdfObject;
   currentPdfObject = null;
+  layerControls.objectChanged();
   drawingSelection.sceneChanged();
   releasePdfObject(previousObject);
   lastNativeDrawStats = null;

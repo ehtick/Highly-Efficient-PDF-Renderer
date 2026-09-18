@@ -225,6 +225,8 @@ export { createLayerVisibilityController } from "./layerVisibility";
 export type { LayerVisibilityController, LayerVisibilityOptions } from "./layerVisibility";
 export { createPdfLayerControls } from "./pdfLayerControls";
 export type { PdfLayerControlsOptions } from "./pdfLayerControls";
+export { createThreePdfLayerControls } from "./threePdfLayerControls";
+export type { ThreePdfLayerControlsOptions } from "./threePdfLayerControls";
 export { isSceneTextCharVisible } from "./optionalContentText";
 export type { PrimitiveColorInput, PrimitiveOverride } from "./primitiveAppearance";
 export { createPrimitiveInteractionController } from "./primitiveInteraction";

@@ -11,13 +11,16 @@ export interface PdfLayerControlsOptions {
 export function createPdfLayerControls({ container, controller }: PdfLayerControlsOptions) {
   const document = container.ownerDocument;
   container.innerHTML = `<details class="pdf-layers"><summary>PDF Layers</summary>
+    <fieldset>
     <label class="pdf-layers-all" title="Show or hide all available layers, including filtered-out layers. Locked layers stay unchanged; mutually exclusive layers keep their current choice."><input type="checkbox" />All</label>
     <label class="pdf-layers-filter">Filter layers<input type="search" placeholder="Layer name" aria-label="Filter PDF layers" /></label>
     <div class="pdf-layers-list"></div>
     <button type="button">Reset to PDF defaults</button>
+    </fieldset>
     <div class="pdf-layers-status" role="status" aria-live="polite"></div>
     <progress max="100" hidden aria-label="Preparing PDF layers"></progress></details>`;
   const all = container.querySelector<HTMLInputElement>(".pdf-layers-all input")!;
+  const fieldset = container.querySelector<HTMLFieldSetElement>("fieldset")!;
   const filter = container.querySelector<HTMLInputElement>('input[type="search"]')!;
   const list = container.querySelector<HTMLDivElement>(".pdf-layers-list")!;
   const reset = container.querySelector<HTMLButtonElement>("button")!;
@@ -39,8 +42,7 @@ export function createPdfLayerControls({ container, controller }: PdfLayerContro
         status.textContent = `Layer change failed: ${error instanceof Error ? error.message : String(error)}. Try again or reset to PDF defaults.`;
       }
     } finally {
-      operations--;
-      if (!disposed && token === generation) render();
+      if (!disposed && token === generation) { operations--; render(); }
     }
   }
 
@@ -109,7 +111,16 @@ export function createPdfLayerControls({ container, controller }: PdfLayerContro
   const unsubscribe = controller.subscribeLayerVisibility(render);
   render();
   return {
-    refresh(): void { generation++; filter.value = ""; status.textContent = ""; render(); },
+    refresh({ resetFilter = true } = {}): void {
+      if (disposed) return;
+      generation++;
+      operations = 0;
+      if (resetFilter) filter.value = "";
+      status.textContent = "";
+      progress.hidden = true; progress.value = 0;
+      render();
+    },
+    setEnabled(enabled: boolean): void { if (!disposed) fieldset.disabled = !enabled; },
     setProgress(percentage: number | null): void {
       if (disposed) return;
       progress.hidden = percentage === null;

@@ -155,10 +155,18 @@ async function testDemoLifetime() {
     const result = Promise.withResolvers();
     let applied = 0;
     let called = false;
+    let layerDetachments = 0;
+    let pdfDisposed = false;
     const context = vm.createContext({
       AbortController, isBusy: false, roomDetectionToken: 0, roomDetectionController: null,
-      currentPdfObject: { sceneData: {}, sourceLabel: "tiny", renderer: { setInteractionViewportProvider() {} }, dispose() {} },
+      currentPdfObject: { sceneData: {}, sourceLabel: "tiny", renderer: { setInteractionViewportProvider() {} },
+        dispose() { assert.equal(layerDetachments, 1); pdfDisposed = true; } },
       drawingSelection: { sceneChanged() {} },
+      layerControls: { objectChanged() {
+        assert.equal(context.currentPdfObject, null);
+        assert.equal(pdfDisposed, false, "detach layer subscriptions before releasing the PDF");
+        layerDetachments++;
+      } },
       currentPdfCoordinateTransform: {}, detectRoomsSpinner: { hidden: true }, pdfValue: { textContent: "tiny" },
       scene: { remove() {} }, setStatus() {}, requestRender() {}, syncControlsEnabled() {},
       setBusy(value) { context.isBusy = value; }, yieldForLoad: async () => {},
@@ -184,6 +192,7 @@ async function testDemoLifetime() {
     await pending;
     assert.equal(applied, outcome === "success" ? 1 : 0);
     assert.equal(context.roomDetectionController, null);
+    assert.equal(layerDetachments, outcome === "dispose" ? 1 : 0);
     if (outcome !== "dispose") assert.equal(context.isBusy, false, "restore controls after success or failure");
   }
 }

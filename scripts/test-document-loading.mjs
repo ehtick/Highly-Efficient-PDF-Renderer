@@ -214,11 +214,19 @@ async function testRoomDocumentReplacement() {
   const source = await readFile(new URL("../src/room-overlay-demo.ts", import.meta.url), "utf8");
   const host = demoHost();
   const objects = new Map();
+  const previous = host.currentPdfObject;
+  const layerBindings = [];
   Object.assign(host, {
     currentPdfCoordinateTransform: { id: "A" }, currentGeneratedTsv: null, pdfValue: {},
+    roomDetectionToken: 0, roomDetectionController: null, currentParsedTsv: null,
+    clearRoomOverlay: noop, createIdentityPdfCoordinateTransform: () => ({ id: "identity" }),
     drawingSelection: { sceneChanged: noop },
+    layerControls: { objectChanged: () => {
+      layerBindings.push(host.currentPdfObject?.id ?? null);
+      if (!host.currentPdfObject) assert.equal(previous.disposals, 0, "Detach the old layer panel before disposing its object");
+    } },
     isHepFile: () => false, setBusy: noop, syncControlsEnabled: noop,
-    updatePdfLoadProgress: noop, fitCameraToObject: noop, scene: { add: noop },
+    updatePdfLoadProgress: noop, fitCameraToObject: noop, scene: { add: noop, remove: noop },
     renderer: { domElement: { getBoundingClientRect: () => ({}) } },
     pdfObjectGenerator: async (file, options) => {
       options.signal.throwIfAborted();
@@ -229,30 +237,29 @@ async function testRoomDocumentReplacement() {
     readFirstPageCoordinateTransform: async (file) => {
       if (file.name === "B") throw new Error("coordinate read failed");
       return { id: file.name };
-    },
-    clearCurrentPdfObject: () => {
-      host.currentPdfObject.dispose();
-      host.currentPdfObject = null;
     }
   });
   vm.createContext(host);
-  vm.runInContext(sourceFunction(source, "loadSceneSource"), host);
-  const previous = host.currentPdfObject;
+  for (const name of ["loadSceneSource", "clearCurrentPdfObject"]) vm.runInContext(sourceFunction(source, name), host);
   assert.equal(await host.loadSceneSource({ name: "B" }), false);
   assert.equal(host.currentPdfObject, previous);
   assert.equal(host.currentPdfCoordinateTransform.id, "A");
   assert.equal(objects.get("B").disposals, 1);
   assert.equal(previous.disposals, 0);
+  assert.deepEqual(layerBindings, [], "Failed document preparation preserves the current layer panel");
   assert.equal(await host.loadSceneSource({ name: "C" }), true);
   assert.equal(host.currentPdfObject.id, "C");
   assert.equal(host.currentPdfCoordinateTransform.id, "C");
   assert.equal(previous.disposals, 1);
   assert.equal(objects.get("C").disposals, 0);
+  assert.deepEqual(layerBindings, [null, "C"], "The room demo detaches old layer controls and attaches the committed document");
 }
 
 async function testThreeBackendReplacement() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  for (const failRenderer of [false, true]) {
+  for (const failure of ["none", "renderer", "layers"]) {
+    const failRenderer = failure === "renderer";
+    const failed = failure !== "none";
     const host = demoHost();
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
@@ -264,10 +271,19 @@ async function testThreeBackendReplacement() {
     ];
     const replacement = { ...demoObject("replacement"), sceneData: canonicalScene, setFrameListener: noop };
     let layerReplays = 0;
+    let layerResets = 0;
+    let layerBindings = 0;
+    const backendChanges = [];
+    replacement.resetLayerVisibility = async () => {
+      assert.equal(host.currentPdfObject, previous, "Restore target PDF defaults before installing the replacement");
+      layerResets++;
+    };
     replacement.setLayerVisibilities = async changes => {
       assert.equal(JSON.stringify(changes), JSON.stringify([{ id: "hidden", visible: true }]));
       assert.equal(host.currentPdfObject, previous, "prepare layer state before installing replacement");
+      assert.equal(layerResets, 1, "Replay nondefault choices after restoring the PDF defaults");
       layerReplays++;
+      if (failure === "layers") throw new Error("Layer replay failed");
     };
     let sceneResets = 0;
     let stateReplays = 0;
@@ -290,8 +306,28 @@ async function testThreeBackendReplacement() {
       },
       ensureThreeRendererBackend: async (backend, options) => {
         assert.equal(options.disposeCurrentPdfObject, false);
+        backendChanges.push(backend);
         if (failRenderer) throw new Error("Backend unavailable");
         host.activeThreeRendererBackend = backend;
+      },
+      layerControls: {
+        prepareReplacement: async (target, signal) => {
+          assert.equal(target, replacement);
+          assert.equal(host.currentPdfObject, previous);
+          assert.equal(previous.disposals, 0);
+          assert.equal(target.sceneData, previous.sceneData);
+          assert.equal(signal, host.sourceLoadController.signal);
+          signal.throwIfAborted();
+          await target.resetLayerVisibility();
+          const changes = previous.getLayers().filter(layer => layer.visible !== layer.defaultVisible)
+            .map(({ id, visible }) => ({ id, visible }));
+          if (changes.length) await target.setLayerVisibilities(changes);
+        },
+        objectChanged: () => {
+          assert.equal(host.currentPdfObject, replacement);
+          assert.equal(previous.disposals, 0, "Rebind the layer panel before disposing the previous PDF object");
+          layerBindings++;
+        }
       },
       drawingSelection: {
         sceneChanged: () => { sceneResets += 1; },
@@ -315,12 +351,16 @@ async function testThreeBackendReplacement() {
       vm.runInContext(sourceFunction(source, name), host);
     }
     await host.reloadSourceWithBackend("webgpu");
-    assert.equal(layerReplays, 1, "same-scene backend changes replay nondefault PDF layer choices");
+    assert.equal(layerResets, failRenderer ? 0 : 1);
+    assert.equal(layerReplays, failRenderer ? 0 : 1, "Replay current PDF layer choices only after the target renderer is ready");
+    assert.equal(layerBindings, failed ? 0 : 1, "Only a successfully prepared replacement becomes the panel's current object");
     assert.equal(sceneResets, 0, "Same-scene renderer replacements must retain selection and colors");
-    assert.equal(stateReplays, failRenderer ? 0 : 1);
-    assert.equal(host.currentPdfObject, failRenderer ? previous : replacement);
-    assert.equal(previous.disposals, failRenderer ? 0 : 1);
-    assert.equal(replacement.disposals, failRenderer ? 1 : 0);
+    assert.equal(stateReplays, failed ? 0 : 1);
+    assert.equal(host.currentPdfObject, failed ? previous : replacement);
+    assert.equal(previous.disposals, failed ? 0 : 1);
+    assert.equal(replacement.disposals, failed ? 1 : 0);
+    assert.deepEqual(backendChanges, failure === "layers" ? ["webgpu", "webgl"] : ["webgpu"]);
+    assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : "webgpu", "A layer replay failure rolls the renderer back with the old document intact");
   }
 }
 

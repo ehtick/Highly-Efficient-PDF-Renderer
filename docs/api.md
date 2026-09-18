@@ -110,6 +110,7 @@ The object supports normal Three.js transforms. `sceneData` contains its parsed
 | `getAllLayerVisibility(layerIds?)` | Read `{ checked, indeterminate, disabled }` for a bulk-toggle control from applied visibility. |
 | `resetLayerVisibility()` | Restore the PDF's original visibility defaults. |
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
+| `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
 | `setPageBackgroundColor(r, g, b, alpha)` | Set normalized page background components. |
 | `setVectorColorOverride(r, g, b, opacity)` | Set normalized vector override components. |
@@ -293,7 +294,42 @@ preparation callback; use the native wrapper when retained raster replay is need
 for either a PDF object or native controller. Connect native preparation progress
 to its `setProgress()`, call `refresh()` after document replacement, and `dispose()`
 at teardown. The panel exposes CSS classes under `.pdf-layers`; the standalone
-viewer stylesheet is a styling example. Only the main demo mounts it by default.
+viewer stylesheet is a styling example. All three demos mount the panel.
+
+For Three.js hosts that replace PDF objects, `createThreePdfLayerControls()` shares
+the binding and subscription lifecycle used by the Three.js and room demos:
+
+```ts
+const layers = createThreePdfLayerControls({
+  container: document.querySelector<HTMLElement>("#pdf-layers")!,
+  getPdfObject: () => currentPdfObject,
+  requestRender,
+  onVisibilityChange: () => {
+    // Refresh host search results and text selection for the applied visibility.
+  }
+});
+
+// After assigning a loaded PDF object (or null), before disposing its predecessor:
+layers.objectChanged();
+
+// For a backend replacement built from the same sceneData object:
+await layers.prepareReplacement(replacementPdf, abortController.signal);
+const previousPdf = currentPdfObject;
+currentPdfObject = replacementPdf;
+layers.objectChanged();
+previousPdf?.dispose();
+
+// At host teardown; PDF objects remain owned by the host:
+layers.dispose();
+```
+
+The binding forwards preparation progress, requests frames after applied changes,
+and ignores callbacks from detached objects. `prepareReplacement()` temporarily
+disables panel changes, waits for pending panel operations, and applies the latest
+visibility to the replacement before installation. It only transfers between
+objects sharing the exact same `sceneData`; new documents use their PDF defaults.
+The host remains responsible for its Three.js scene membership and renderer/canvas
+lifecycle. Use the shared `pdfLayerControls.css` as the panel styling example.
 
 Layer changes do not modify scene definitions, source geometry, or exports.
 HEP stores initially hidden content and the original PDF visibility defaults.

@@ -221,7 +221,8 @@ or handle their own events with `pick()`, `getPrimitive()`, `setHover()`,
 
 ## PDF layers
 
-The main viewer's collapsible **PDF Layers** panel displays the PDF's optional
+The native viewer, Three.js example, and room-detection demo share a collapsible
+**PDF Layers** panel that displays the PDF's optional
 content groups in their original hierarchy. Filter by name, toggle visibility,
 use **All** to show or hide all editable layers (including layers hidden by the
 filter), or choose **Reset to PDF defaults**. **All** shows a mixed state when some
@@ -351,9 +352,15 @@ they are not an automatic continuous FPS benchmark. Profiling itself has overhea
 unchanged by the capture, and the HUD text updates at most ten times per second
 while camera and interaction processing continue every frame.
 
-The Three.js and room demos share the rendering and API support, but only the
-main viewer currently mounts the panel. Hosts can mount `createPdfLayerControls()`
-or use the [layer APIs](api.md#pdf-layers-optional-content) with their own controls.
+The Three.js example preserves applied layer visibility when switching WebGL/WebGPU
+backends, including a panel change still finishing when the switch begins. Layer
+changes refresh search and clear stale text selections without moving the camera.
+In the room-detection demo, PDF layers control the drawing; detected rooms and TSV
+overlays retain their separate visibility controls. Layer toggles do not rerun room
+detection. Opening another document resets the layer panel to that PDF's defaults.
+Hosts can mount `createThreePdfLayerControls()` for an object that may be replaced,
+mount `createPdfLayerControls()` directly, or use the
+[layer APIs](api.md#pdf-layers-optional-content) with their own controls.
 
 ## HEP files
 

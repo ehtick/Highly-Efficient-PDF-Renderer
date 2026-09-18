@@ -343,6 +343,8 @@ export class HeprThreePdfObject extends THREE.Group {
 
   private readonly primitiveAppearance: PrimitiveAppearanceState;
   private readonly layerVisibility: OptionalContentController;
+  private layerVisibilityProgress: number | null = null;
+  private readonly layerVisibilityProgressListeners = new Set<(percentage: number | null) => void>();
   private readonly paintVisibility: ScenePaintVisibility;
   private readonly retainedReplay: RetainedPageReplay | null;
   private primitivePicker: ScenePrimitivePicker | null = null;
@@ -530,6 +532,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.retainedReplay = this.sceneData.retainedPages?.length ? new RetainedPageReplay(this.sceneData) : null;
     this.layerVisibility = new OptionalContentController(this.sceneData, {
       onChange: snapshot => this.applyLayerVisibility(snapshot),
+      onProgress: percentage => this.reportLayerVisibilityProgress(percentage),
       prepare: async (snapshot, context) => {
         const prepared = await this.retainedReplay?.prepare(snapshot, context);
         if (!prepared) return;
@@ -571,6 +574,23 @@ export class HeprThreePdfObject extends THREE.Group {
   getAllLayerVisibility(layerIds?: readonly string[]) { return this.layerVisibility.getAllLayerVisibility(layerIds); }
   resetLayerVisibility(): Promise<void> { return this.layerVisibility.resetLayerVisibility(); }
   subscribeLayerVisibility(listener: OptionalContentListener): () => void { return this.layerVisibility.subscribe(listener); }
+
+  /** Observe layer preparation; immediately reports the current percentage or null when idle. */
+  subscribeLayerVisibilityProgress(listener: (percentage: number | null) => void): () => void {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    this.layerVisibilityProgressListeners.add(listener);
+    try { listener(this.layerVisibilityProgress); } catch { /* Observers cannot interrupt preparation. */ }
+    return () => { this.layerVisibilityProgressListeners.delete(listener); };
+  }
+
+  private reportLayerVisibilityProgress(percentage: number | null): void {
+    if (this.layerVisibilityProgress === percentage) return;
+    this.layerVisibilityProgress = percentage;
+    for (const listener of this.layerVisibilityProgressListeners) {
+      try { listener(percentage); } catch { /* Observers cannot interrupt preparation. */ }
+    }
+  }
+
   isPrimitiveVisible(ref: PrimitiveRef): boolean {
     validatePrimitiveRef(this.sceneData, ref);
     return isScenePrimitiveVisible(this.sceneData, ref, condition => this.layerVisibility.isVisible(condition));
@@ -1434,6 +1454,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.reportPrimitivePreparationProgress(null);
     this.primitivePreparationListeners.clear();
     this.layerVisibility.dispose();
+    this.layerVisibilityProgressListeners.clear();
     this.retainedReplay?.dispose();
     this.isDisposed = true;
     this.primitiveAppearance.dispose();

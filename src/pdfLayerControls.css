@@ -1,5 +1,6 @@
 .pdf-layers { border-top: 1px solid #c8ccd4; margin-top: 0.6rem; padding-top: 0.5rem; }
 .pdf-layers summary { cursor: pointer; font-weight: 600; }
+.pdf-layers fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .pdf-layers-all { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.6rem; font-weight: 600; }
 .pdf-layers-filter { display: grid; gap: 0.25rem; margin: 0.6rem 0; }
 .pdf-layers-list { max-height: 18rem; overflow: auto; margin-bottom: 0.5rem; }

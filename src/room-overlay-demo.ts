@@ -3,6 +3,7 @@ import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
+  createThreePdfLayerControls,
   createThreePrimitiveInteractionController,
   detectRooms,
   pdfObjectGenerator,
@@ -177,6 +178,7 @@ let isBusy = false;
 
 const drawingSelection = createDrawingSelectionControls({
   container: requireElement<HTMLDivElement>("#drawing-selection"),
+  getLayerName: id => currentPdfObject?.sceneData.optionalContent?.groups.find(group => group.id === id)?.name,
   createController: (callbacks) => createThreePrimitiveInteractionController({
     ...callbacks,
     getCanvas: () => canvas,
@@ -185,6 +187,13 @@ const drawingSelection = createDrawingSelectionControls({
     requestRender,
     onError: (error) => setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`)
   })
+});
+
+const layerControls = createThreePdfLayerControls({
+  container: requireElement<HTMLDivElement>("#pdf-layers"),
+  getPdfObject: () => currentPdfObject,
+  requestRender,
+  onVisibilityChange: () => drawingSelection.onFrame()
 });
 
 const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
@@ -556,6 +565,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     pdfValue.textContent = pdfObject.sourceLabel;
     fitCameraToObject(pdfObject);
     drawingSelection.sceneChanged();
+    layerControls.objectChanged();
     setStatus(`${file.name} loaded. Add a TSV overlay.`);
     return true;
   } catch (error) {
@@ -1248,6 +1258,7 @@ function clearCurrentPdfObject(): void {
   const previousPdfObject = currentPdfObject;
   currentPdfObject = null;
   drawingSelection.sceneChanged();
+  layerControls.objectChanged();
   previousPdfObject.renderer.setInteractionViewportProvider(null);
   scene.remove(previousPdfObject);
   previousPdfObject.dispose();
@@ -1560,6 +1571,7 @@ function disposeDemo(): void {
     animationFrameId = 0;
   }
   controls.dispose();
+  layerControls.dispose();
   drawingSelection.dispose();
   clearCurrentPdfObject();
   renderer.dispose();

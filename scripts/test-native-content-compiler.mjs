@@ -5,6 +5,7 @@ import {
   DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
   DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
   DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+  DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT,
   DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
   DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT,
   DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_LATE_AFTER_TEXT,
@@ -213,6 +214,11 @@ async function testCompilationContexts() {
   assert.deepEqual([...shading.vectorSceneData.sourceEvents], [DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, 0]);
   assert.equal(shading.vectorSceneData.selectivePaintSourceSpans.length, 2);
   await expectUnsupported("/Sh0 sh", "sh", shadingOptions, compileVectorFormContent);
+  const vectorShading = await compile("/Sh0 sh", { ...shadingOptions, vectorShadings: new Set([0]) },
+    compileVectorFormContent);
+  assert.deepEqual([...vectorShading.vectorSceneData.sourceEvents], [DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT, 0]);
+  assert.equal(vectorShading.vectorSceneData.selectivePaintSourceSpans.length, 0,
+    "supported Form shading retains its analytic gradient paint");
 
   const compositeOptions = {
     output: "vector-scene",
@@ -525,10 +531,12 @@ async function testVectorSceneOutput() {
       alphaIsShape: true
     }]
   });
-  await expectUnsupportedGroupedForm("/Half gs /Im0 Do", "Do", {
+  const translucentImage = await compileGroupedForm("/Half gs /Im0 Do", {
     imageXObjects: new Map([["Im0", 1]]),
     extGStates: [{ resourceName: "Half", fillAlpha: 0.5 }]
   });
+  assert.deepEqual([...translucentImage.vectorSceneData.imageOpacities], [0.5],
+    "constant image alpha is retained per paint without rasterizing the Form");
   await expectUnsupportedGroupedForm("/Multiply gs /Fm0 Do", "Do", {
     formXObjects: new Map([["Fm0", 0]]),
     extGStates: [{ resourceName: "Multiply", blendMode: "Multiply" }]

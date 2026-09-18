@@ -21,7 +21,7 @@ try {
     { kind: "stroke", first: 40, count: 20, clipIndex: 0 },
     { kind: "text", first: 0, count: 1 }
   ];
-  // Coincident strokes in different paints must remain independently clipped
+  // Nearly coincident strokes in different paints must remain independently clipped
   // and retain their order relative to the intervening opaque fill.
   const levels = buildVectorStrokeLodScenes(scene);
   assert(levels.length > 1);
@@ -211,6 +211,111 @@ try {
   }), 6);
   assert.deepEqual(calls, expected);
 
+  // Visibility-only paint graphs retain the same native instancing fast path.
+  // The view owns its visibility plan; canonical draw runs and geometry stay intact.
+  const layerScene = makeScene(4);
+  layerScene.drawRuns = [
+    { kind: "stroke", first: 0, count: 2, optionalContent: 0 },
+    { kind: "stroke", first: 2, count: 2, optionalContent: 1 }
+  ];
+  layerScene.optionalContent = {
+    groups: ["a", "b"].map(id => ({ id, name: id, defaultVisible: true, locked: false, usedInView: true })),
+    conditions: [{ kind: "group", groupId: "a" }, { kind: "group", groupId: "b" }], order: [], radioGroups: []
+  };
+  layerScene.paintGraph = { roots: [{ kind: "group", alpha: 1, isolated: false, knockout: false,
+    blendMode: "Normal", optionalContent: 0, children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] };
+  const originalRuns = structuredClone(layerScene.drawRuns);
+  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+    const plan = new VectorOrderedBatches(layerScene, null);
+    const draws = [], uploads = [];
+    const instance = Object.assign(Object.create(Renderer.prototype), {
+      scene: layerScene, orderedBatches: plan, zoom: 1,
+      optionalContentVisibility: { revision: 0, conditions: Uint8Array.of(1, 1), layers: [] },
+      vectorLodLevels: [], vectorLodLevelResources: [], orderedTextureBindings: [],
+      strokeRenderingEnabled: true, fillRenderingEnabled: false, textRenderingEnabled: false, rasterRenderingEnabled: false,
+      strokePipeline: "stroke", strokeBindGroupAll: "exact", vectorClipBindGroups: ["instances", "none"],
+      gl: { bindBuffer() {}, bufferData(_target, data) { uploads.push([...data]); } },
+      gpuDevice: { queue: { writeBuffer(_buffer, _offset, data) { uploads.push([...data]); } } },
+      drawPageBackgroundContentIntoPass() {},
+      drawVisibleSegments(_w, _h, _x, _y, _zoom, range) { draws.push(range.count); return range.count; },
+      destroyVectorMinifyResources() {}, requestFrame() {}
+    });
+    const pass = { setPipeline() {}, setBindGroup() {}, draw(_vertices, count) { draws.push(count); } };
+    const render = () => Renderer === WebGlFloorplanRenderer
+      ? instance.drawSourceOrderedContent(100, 100, 50, 50, 1) : instance.drawSourceOrderedContentIntoPass(pass);
+    assert.equal(render(), 4);
+    assert.deepEqual(draws, [4], "a passthrough graph batches separately conditioned strokes in one draw");
+    assert.equal(uploads.length, 1);
+    assert.equal(instance.paintCompositor, undefined, "layer-only graphs allocate no composite surfaces");
+    draws.length = 0;
+    assert.equal(render(), 4);
+    assert.equal(uploads.length, 1, "unchanged layer visibility reuses the instance upload");
+    instance.setOptionalContentVisibility({ revision: 1, conditions: Uint8Array.of(1, 0), layers: [] });
+    draws.length = 0;
+    assert.equal(render(), 2);
+    assert.deepEqual(draws, [2]);
+    assert.equal(uploads.length, 2, "a committed layer change refreshes its native instance data once");
+    assert.deepEqual([...plan.uintInstances.subarray(0, 4)], [0, 0, 1, 0]);
+    instance.setOptionalContentVisibility({ revision: 2, conditions: Uint8Array.of(0, 1), layers: [] });
+    draws.length = 0;
+    assert.equal(render(), 0, "hidden enclosing groups suppress their children");
+    assert.deepEqual(draws, []);
+    assert.deepEqual(layerScene.drawRuns, originalRuns, "render-time batching preserves canonical layer associations");
+  }
+
+  // Render-time redundancy restores canonical IDs when a cover stops painting.
+  const redundantScene = makeScene(2);
+  redundantScene.endpoints.set([5, 0, 15, 0], 4);
+  redundantScene.primitiveMeta.set([15, 0, 0, 1], 4);
+  redundantScene.primitiveBounds.set([5, 0, 15, 0], 4);
+  redundantScene.drawRuns = [
+    { kind: "stroke", first: 0, count: 1, optionalContent: 0 },
+    { kind: "stroke", first: 1, count: 1, optionalContent: 1 }
+  ];
+  redundantScene.optionalContent = structuredClone(layerScene.optionalContent);
+  const canonical = structuredClone(redundantScene);
+  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+    const plan = new VectorOrderedBatches(redundantScene, null);
+    const uploads = [], counts = [];
+    const instance = Object.assign(Object.create(Renderer.prototype), {
+      scene: redundantScene, orderedBatches: plan, zoom: 1,
+      optionalContentVisibility: { revision: 0, conditions: Uint8Array.of(1, 1), layers: [] },
+      vectorLodLevels: [], vectorLodLevelResources: [], orderedTextureBindings: [],
+      strokeRenderingEnabled: true, fillRenderingEnabled: false, textRenderingEnabled: false, rasterRenderingEnabled: false,
+      strokePipeline: "stroke", strokeBindGroupAll: "exact", vectorClipBindGroups: ["instances", "none"],
+      gl: { bindBuffer() {}, bufferData(_target, data) { uploads.push([...data]); } },
+      gpuDevice: { queue: { writeBuffer(_buffer, _offset, data) { uploads.push([...data]); } } },
+      drawPageBackgroundContentIntoPass() {},
+      drawVisibleSegments(_w, _h, _x, _y, _zoom, range) { counts.push(range.count); return range.count; },
+      destroyVectorMinifyResources() {}, requestFrame() {}
+    });
+    const pass = { setPipeline() {}, setBindGroup() {}, draw(_vertices, count) { counts.push(count); } };
+    const render = () => Renderer === WebGlFloorplanRenderer
+      ? instance.drawSourceOrderedContent(100, 100, 50, 50, 1) : instance.drawSourceOrderedContentIntoPass(pass);
+    assert.equal(render(), 1, "both native dispatchers omit the covered opaque stroke");
+    assert.equal(instance.getRedundantSegmentCount(), 1);
+    assert.equal(instance.orderedRunsCulled, true);
+    assert.equal(plan.uintInstances[0], 0);
+    assert.equal(render(), 1);
+    assert.equal(uploads.length, 1, "unchanged native frames do not reupload temporary culling results");
+    instance.setOptionalContentVisibility({ revision: 1, conditions: Uint8Array.of(0, 1), layers: [] });
+    assert.equal(render(), 1);
+    assert.equal(plan.uintInstances[0], 1, "hiding the covering layer restores the covered canonical ID");
+    assert.equal(instance.getRedundantSegmentCount(), 0);
+    instance.setOptionalContentVisibility({ revision: 2, conditions: Uint8Array.of(1, 1), layers: [] });
+    assert.equal(render(), 1);
+    plan.setColorCommutationEnabled(false);
+    assert.equal(render(), 2, "temporary solid colors restore the complete visible stroke set");
+    assert.equal(instance.getRedundantSegmentCount(), 0);
+    plan.setColorCommutationEnabled(true);
+    assert.equal(render(), 1);
+    instance.orderedRunCuller = { select() { return [redundantScene.drawRuns[1]]; } };
+    assert.equal(render(), 1);
+    assert.equal(plan.uintInstances[0], 1, "a cover omitted by viewport culling cannot suppress a visible candidate");
+    assert.equal(instance.getRedundantSegmentCount(), 0);
+    assert.deepEqual(redundantScene, canonical);
+  }
+
   // The native entry points must enable LOD for ordered scenes, and mode off
   // must keep instanced batching while returning to the original geometry.
   const previousUsage = globalThis.GPUBufferUsage;
@@ -291,7 +396,9 @@ try {
     scene.maxHalfWidth = 0.5;
     for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) scene[key] = new Float32Array(count * 4);
     for (let i = 0; i < count; i++) {
-      const x = spread ? (i % 400) * 2.5 : 0, y = spread ? Math.floor(i / 400) * 2.5 : 0;
+      // Distinct parallel lines keep these ordering/LOD fixtures independent
+      // of opaque duplicate suppression, which is exercised separately below.
+      const x = spread ? (i % 400) * 2.5 : 0, y = spread ? Math.floor(i / 400) * 2.5 : i * 0.00001;
       scene.endpoints.set([x, y, x + 20, y], i * 4);
       scene.primitiveMeta.set([x + 20, y, 0, 1], i * 4);
       scene.primitiveBounds.set([x, y, x + 20, y], i * 4);

@@ -1,12 +1,14 @@
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
+import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
+import { ScenePaintVisibility } from "./scenePaintVisibility";
 
 import {
   CORE_RASTER_FRAGMENT_SHADER_SOURCE,
   CORE_RASTER_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
-import type { VectorScene } from "./pdfVectorExtractor";
+import type { RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import {
   HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND,
   HEPR_THREE_LAYER_ORDER_RASTER
@@ -33,11 +35,13 @@ interface RasterLayerEntry {
 }
 
 interface ResidentRasterLayerEntry extends RasterLayerEntry {
+  run?: VectorDrawRun;
   texture: THREE.Texture;
   resident: boolean;
 }
 
 interface RasterLayerSource {
+  opacity?: number;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
@@ -45,6 +49,8 @@ interface RasterLayerSource {
 }
 
 export class ThreeMaterialRasterLayer {
+  private readonly visibility: ScenePaintVisibility;
+  private snapshot: OptionalContentSnapshot;
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly vectorClipIndices: number[];
   readonly group: THREE.Group;
@@ -58,8 +64,9 @@ export class ThreeMaterialRasterLayer {
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
   private readonly multiplyMaterials: THREE.Material[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
-  private readonly maxRasterTextureDimension: number;
+  private maxRasterTextureDimension: number;
   private rasterTextureResidencyEnabled = false;
+  private disposed = false;
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
@@ -68,6 +75,9 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.visibility = new ScenePaintVisibility(scene);
+    this.snapshot = createDefaultOptionalContentSnapshot(scene);
+    this.visibility.setVisibility(this.snapshot);
     this.vectorClipTexture = createThreeVectorClipTexture(scene);
     this.vectorClipIndices = Array(scene.rasterLayers.length).fill(-1);
     for (const run of scene.drawRuns ?? []) {
@@ -99,6 +109,7 @@ export class ThreeMaterialRasterLayer {
         this.pageBackgroundGeometry
       );
       this.entries.push(entry);
+      entry.mesh.userData.heprPageBackground = true;
       this.group.add(entry.mesh);
     }
 
@@ -117,9 +128,11 @@ export class ThreeMaterialRasterLayer {
         source.matrix,
         HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
         this.geometry,
-        this.vectorClipIndices[this.rasterEntries.length] ?? -1
+        this.vectorClipIndices[this.rasterEntries.length] ?? -1,
+        source.opacity ?? 1
       );
-      const multiply = scene.drawRuns?.some(run => run.kind === "raster" && run.blendMode === "Multiply" &&
+      entry.mesh.userData.heprDrawRun = { kind: "raster", first: rasterIndex, count: 1 };
+      const multiply = !scene.paintGraph && scene.drawRuns?.some(run => run.kind === "raster" && run.blendMode === "Multiply" &&
         rasterIndex >= run.first && rasterIndex < run.first + run.count);
       if (multiply) {
         const original = entry.material;
@@ -136,6 +149,8 @@ export class ThreeMaterialRasterLayer {
       this.entries.push(entry);
       this.rasterEntries.push({
         ...entry,
+        run: scene.drawRuns?.find(run => run.kind === "raster" && rasterIndex >= run.first &&
+          rasterIndex < run.first + run.count),
         texture,
         resident: false
       });
@@ -147,8 +162,81 @@ export class ThreeMaterialRasterLayer {
     this.group.visible = visible;
   }
 
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    this.snapshot = snapshot;
+    this.visibility.setVisibility(snapshot);
+    for (const entry of this.rasterEntries) entry.mesh.visible = entry.resident &&
+      this.isEntryVisible(entry);
+  }
+
+  private isEntryVisible(entry: ResidentRasterLayerEntry): boolean {
+    if (!entry.run) return true;
+    return this.visibility.requiresCompositing
+      ? entry.run.optionalContent === undefined || this.snapshot.conditions[entry.run.optionalContent] !== 0
+      : this.visibility.isRunVisible(entry.run);
+  }
+
   getMaxRasterTextureDimension(): number {
     return this.maxRasterTextureDimension;
+  }
+
+  /** Stage replacement pixels without uploading resources on a dormant material path. */
+  prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): { commit(): void; dispose(): void } {
+    if (this.disposed) throw new Error("Raster material layer has been disposed.");
+    for (const [index, layer] of updates) {
+      if (!Number.isInteger(index) || index < 0 || index >= this.rasterEntries.length ||
+          !Number.isInteger(layer.width) || !Number.isInteger(layer.height) || layer.width < 1 || layer.height < 1 ||
+          !(layer.data instanceof Uint8Array) || layer.data.length !== layer.width * layer.height * 4 ||
+          !(layer.matrix instanceof Float32Array) || layer.matrix.length !== 6 ||
+          !layer.matrix.every(Number.isFinite) || !Number.isFinite(layer.opacity ?? 1) ||
+          (layer.opacity ?? 1) < 0 || (layer.opacity ?? 1) > 1) {
+        throw new Error("Invalid staged raster layer update.");
+      }
+    }
+    const staged: { index: number; layer: RasterLayer; texture: THREE.DataTexture }[] = [];
+    try {
+      for (const [index, layer] of updates) staged.push({ index, layer, texture: createRasterTexture(layer) });
+    } catch (error) {
+      for (const item of staged) item.texture.dispose();
+      throw error;
+    }
+    let finished = false;
+    return {
+      commit: () => {
+        if (finished) return;
+        if (this.disposed) {
+          for (const item of staged) item.texture.dispose();
+          finished = true;
+          throw new Error("Raster material layer has been disposed.");
+        }
+        finished = true;
+        for (const { index, layer, texture } of staged) {
+          const entry = this.rasterEntries[index];
+          const previous = entry.texture;
+          entry.texture = texture;
+          this.ownedTextures.add(texture);
+          this.ownedTextures.delete(previous);
+          previous.dispose();
+          if (entry.webGpuState) entry.webGpuState.updateSource(texture, layer.matrix, layer.opacity ?? 1);
+          else {
+            const uniforms = (entry.material as THREE.RawShaderMaterial).uniforms;
+            uniforms.uRasterTex.value = texture;
+            uniforms.uRasterMatrixABCD.value.set(layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
+            uniforms.uRasterMatrixEF.value.set(layer.matrix[4], layer.matrix[5]);
+            uniforms.uRasterOpacity.value = layer.opacity ?? 1;
+          }
+          this.maxRasterTextureDimension = Math.max(this.maxRasterTextureDimension, layer.width, layer.height);
+          entry.resident = this.rasterTextureResidencyEnabled;
+          entry.mesh.visible = entry.resident &&
+            this.isEntryVisible(entry);
+        }
+      },
+      dispose: () => {
+        if (finished) return;
+        finished = true;
+        for (const item of staged) item.texture.dispose();
+      }
+    };
   }
 
   /** Allocate or release only raster GPU textures, retaining their CPU pixel data. */
@@ -161,7 +249,7 @@ export class ThreeMaterialRasterLayer {
       for (const entry of this.rasterEntries) {
         entry.texture.needsUpdate = true;
         entry.resident = true;
-        entry.mesh.visible = true;
+        entry.mesh.visible = this.isEntryVisible(entry);
       }
       return;
     }
@@ -222,6 +310,7 @@ export class ThreeMaterialRasterLayer {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.vectorClipTexture.dispose();
     for (const entry of this.entries) {
       this.group.remove(entry.mesh);
@@ -255,13 +344,15 @@ export class ThreeMaterialRasterLayer {
     matrixSource: Float32Array,
     renderOrder: number,
     geometry: THREE.BufferGeometry = this.geometry,
-    clipIndex = -1
+    clipIndex = -1,
+    opacity = 1
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
 
     if (this.materialBackend === "webgpu") {
       const state = createThreeWebGpuRasterMaterial({
         colorCompositing: this.colorCompositing,
+        opacity,
         texture,
         matrixABCD: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]),
         matrixEF: new THREE.Vector2(matrix[4], matrix[5]),
@@ -298,6 +389,7 @@ export class ThreeMaterialRasterLayer {
       blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
       uniforms: {
         uRasterTex: { value: texture },
+        uRasterOpacity: { value: opacity },
         uRasterMatrixABCD: { value: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]) },
         uRasterMatrixEF: { value: new THREE.Vector2(matrix[4], matrix[5]) },
         uViewport: { value: this.viewportUniform },
@@ -454,6 +546,7 @@ function getSceneRasterLayers(scene: VectorScene): RasterLayerSource[] {
         width,
         height,
         data: layer.data,
+        opacity: layer.opacity,
         matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix)
       });
     }

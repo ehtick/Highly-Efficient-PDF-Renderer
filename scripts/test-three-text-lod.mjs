@@ -64,7 +64,7 @@ assert.match(object, /textLodLayer\.getRenderScene\(\)/, "the Three text mesh mu
 assert.match(object, /updateTextLodSelection/, "camera frames must update clustered selection");
 assert.match(
   object,
-  /const replacementScene = this\.textLodLayer\?\.setMode\(nextMode, this\.sceneData\)[\s\S]*?createThreeTextMaterialLayer\(replacementScene\)[\s\S]*?replaceThreeTextMaterialLayer\(replacementLayer\)/,
+  /const replacementScene = this\.textLodLayer\?\.setMode\(this\.primitiveAppearance\.hasOverrides\("text"\) \? "off" : nextMode, this\.sceneData\)[\s\S]*?createThreeTextMaterialLayer\(replacementScene\)[\s\S]*?replaceThreeTextMaterialLayer\(replacementLayer\)/,
   "Off-to-Auto must safely swap the exact material for the lazily built combined material"
 );
 assert.match(

@@ -243,6 +243,9 @@ export async function preflightNativeDensePdfDocument(
         "Interactive forms and widget annotations are not supported by the dense compiler."
       );
     }
+    if (options.retainOptionalContent && nativeDocument.catalog.get("OCProperties") != null) {
+      throw new PreflightRejection("optional-content", "Interactive layers require the full native compiler.");
+    }
     const optionalContent = await inspectAlwaysVisibleOptionalContent(nativeDocument);
     const privatePages: NativeDensePrivatePage[] = [];
     for (const sourcePageNumber of sourcePageNumbers) {

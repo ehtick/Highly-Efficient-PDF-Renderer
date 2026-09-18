@@ -1,5 +1,8 @@
 import "./style.css";
 import "./drawingSelectionControls.css";
+import "./pdfLayerControls.css";
+import { createLayerVisibilityController } from "./layerVisibility";
+import { createPdfLayerControls } from "./pdfLayerControls";
 import { waitForLoad } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
@@ -17,8 +20,7 @@ import { buildHep } from "./index";
 import {
   listSceneRasterLayers,
   loadSceneFromHep,
-  prepareSceneForHepRendering,
-  tryReadSourcePdfBytesFromExistingHep
+  prepareSceneForHepRendering
 } from "./hep";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
@@ -261,6 +263,8 @@ textSearchController = createTextSearchController({
 });
 
 function applyTextSearchScene(scene: VectorScene): void {
+  layerVisibility.sceneChanged();
+  pdfLayerControls.refresh();
   drawingSelection.sceneChanged();
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
@@ -272,6 +276,7 @@ const textSelection = createTextSelectionController({
   enabled: textSelectionCheckbox.checked,
   adapter: {
     getScene: () => lastParsedScene,
+    getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
     clientToScenePoint: (clientX, clientY) => renderer.clientToScenePoint?.(clientX, clientY) ?? null,
     sceneToClientPoint: (sceneX, sceneY) => renderer.sceneToClientPoint?.(sceneX, sceneY) ?? null,
     setSelectionHighlights: (rects) => renderer.setTextSelectionHighlights?.(rects),
@@ -294,6 +299,7 @@ textSelectionCheckbox.addEventListener("change", () => {
 textSelectionCheckbox.disabled = false;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
+  getLayerName: id => lastParsedScene?.optionalContent?.groups.find(group => group.id === id)?.name,
   createController: callbacks => createPrimitiveInteractionController({
     ...callbacks,
     getCanvas: () => canvasElement,
@@ -310,6 +316,20 @@ const drawingSelection = createDrawingSelectionControls({
   }
 });
 
+const layerVisibility = createLayerVisibilityController({
+  getScene: () => lastParsedScene,
+  getRenderer: () => renderer,
+  onProgress: percentage => pdfLayerControls.setProgress(percentage),
+  onChange: () => {
+    textSearchController.refreshVisibility();
+    textSelection.clearSelection();
+    drawingSelection.onFrame();
+  }
+});
+const pdfLayerControls = createPdfLayerControls({
+  container: document.querySelector<HTMLDivElement>("#pdf-layers")!, controller: layerVisibility
+});
+
 function onRendererFrame(stats: DrawStats): void {
   updateFpsMetric();
   textSelection.updateOverlay();
@@ -323,8 +343,10 @@ function onRendererFrame(stats: DrawStats): void {
   const vectorLodSuffix = vectorLodStats ? ` | ${vectorLodStats}` : "";
   const textLodStats = formatTextLodStats(renderer.getTextLodStats?.() ?? null);
   const textLodSuffix = textLodStats ? ` | text: ${textLodStats}` : "";
+  const redundancySuffix = stats.redundantSegments
+    ? ` | redundant strokes omitted: ${stats.redundantSegments.toLocaleString()}` : "";
   runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}`;
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}${redundancySuffix}`;
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
@@ -436,6 +458,7 @@ backendSwitcher = createBackendSwitcher({
   getRenderer: () => renderer,
   setRenderer: (nextRenderer) => {
     renderer = nextRenderer;
+    layerVisibility.rendererChanged();
     // Highlights live in renderer-owned GPU buffers; re-apply after a switch.
     renderer.setSearchHighlights?.(lastSearchHighlights);
     textSelection.refreshHighlights();
@@ -508,6 +531,8 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 
 window.addEventListener("beforeunload", () => {
   drawingSelection.dispose();
+  pdfLayerControls.dispose();
+  layerVisibility.dispose();
   activeHepExportController?.abort();
   sourceLoadController?.abort();
 }, { once: true });
@@ -808,11 +833,9 @@ async function loadHepFile(file: File): Promise<void> {
       return;
     }
     const bytes = cloneSourceBytes(buffer);
-    const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingHep(bytes, signal), signal);
-    if (!isCurrentSourceLoad(sourceLoadToken)) return;
     await loadHepBuffer(createParseBuffer(bytes), file.name, {
       source: { kind: "hep", bytes, label: file.name },
-      downloadablePdf: sourcePdfBytes?.length ? { label: file.name, bytes: sourcePdfBytes } : null,
+      downloadablePdf: null,
       signal,
       preserveView: false
     });
@@ -1471,12 +1494,7 @@ async function downloadHep(): Promise<boolean> {
 
   const scene = lastParsedScene;
   const label = lastParsedSceneLabel;
-  const sourcePdf =
-    lastLoadedSource?.kind === "pdf"
-      ? lastLoadedSource.bytes
-      : lastDownloadablePdf?.bytes ??
-        lastDownloadablePdf?.blob ??
-        lastDownloadablePdf?.url;
+
   const previousStatusText = statusTextElement.textContent;
 
   const exportController = new AbortController();
@@ -1499,8 +1517,7 @@ async function downloadHep(): Promise<boolean> {
         if (activeHepExportController === exportController) {
           updateParsingLoaderProgress(progress);
         }
-      },
-      sourcePdf
+      }
     });
 
     if (activeHepExportController !== exportController) {

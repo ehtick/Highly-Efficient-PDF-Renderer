@@ -1,3 +1,4 @@
+import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
@@ -15,9 +16,11 @@ export interface ThreeWebGpuRasterMaterialState {
   material: THREE.Material;
   zoomUniform: MutableUniform<number>;
   useLocalToClipUniform: MutableUniform<number>;
+  updateSource(texture: THREE.Texture, matrix: Float32Array, opacity: number): void;
 }
 
 interface ThreeWebGpuRasterMaterialOptions {
+  opacity?: number;
   colorCompositing: ThreeColorCompositing;
   texture: THREE.Texture;
   matrixABCD: THREE.Vector4;
@@ -76,7 +79,8 @@ fn heprRasterClipPosition(
 `);
 
 const rasterFragmentFns = createThreeWebGpuOutputFragmentFns(`
-fn heprRasterFragment(color: vec4<f32>) -> vec4<f32> {
+fn heprRasterFragment(inputColor: vec4<f32>, opacity: f32, shapeOnly: f32) -> vec4<f32> {
+  let color = inputColor * mix(opacity, 1.0, shapeOnly);
   if (color.a <= 0.001) {
     discard;
   }
@@ -103,6 +107,8 @@ export function createThreeWebGpuRasterMaterial(
   material.blendSrcAlpha = THREE.OneFactor;
   material.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
 
+  const shapeOnlyUniform = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnlyUniform);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const corner = TSL.attribute("aCorner", "vec2");
@@ -112,6 +118,8 @@ export function createThreeWebGpuRasterMaterial(
     matrixEF: TSL.uniform(options.matrixEF)
   }));
   const rasterPackValue = rasterPack as { zw: unknown };
+  const textureNode = TSL.texture(options.texture, rasterPackValue.zw as never);
+  const opacityUniform = TSL.uniform(options.opacity ?? 1);
 
   material.vertexNode = callNode(rasterClipFn, {
     rasterPack,
@@ -122,7 +130,9 @@ export function createThreeWebGpuRasterMaterial(
     localToClip: TSL.uniform(options.localToClip)
   });
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
-    color: TSL.texture(options.texture, rasterPackValue.zw as never)
+    inputColor: textureNode,
+    opacity: opacityUniform,
+    shapeOnly: shapeOnlyUniform
   });
 
   registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy);
@@ -130,6 +140,12 @@ export function createThreeWebGpuRasterMaterial(
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
-    useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>
+    useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
+    updateSource(texture, matrix, opacity) {
+      textureNode.value = texture;
+      options.matrixABCD.set(matrix[0], matrix[1], matrix[2], matrix[3]);
+      options.matrixEF.set(matrix[4], matrix[5]);
+      opacityUniform.value = opacity;
+    }
   };
 }

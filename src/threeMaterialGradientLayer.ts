@@ -1,5 +1,10 @@
+import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
+import { buildGradientMeshRenderData } from "./gradientMesh";
+import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
+import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
+import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 
 import {
@@ -8,7 +13,7 @@ import {
   CORE_STROKE_FRAGMENT_SHADER_SOURCE,
   CORE_STROKE_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
-import type { VectorScene } from "./pdfVectorExtractor";
+import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import type { ThreePdfOrderedPaintMesh } from "./threePdfPaintOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
@@ -82,6 +87,10 @@ interface GradientLayerEntry extends ThreePdfOrderedPaintMesh {
 const GRADIENT_LUT_WIDTH = 1024;
 
 export class ThreeMaterialGradientLayer {
+  private readonly scene: VectorScene;
+  private readonly visibility: ScenePaintVisibility;
+  private readonly fillRuns: (VectorDrawRun | undefined)[];
+  private readonly strokeRuns: (VectorDrawRun | undefined)[];
   readonly group: THREE.Group;
   private readonly vectorClipTexture: THREE.DataTexture | null;
   private readonly fillClipIndices: number[];
@@ -100,6 +109,10 @@ export class ThreeMaterialGradientLayer {
   private readonly colorCompositing: ThreeColorCompositing;
 
   constructor(scene: VectorScene, options: GradientLayerOptions) {
+    this.scene = scene;
+    this.visibility = new ScenePaintVisibility(scene);
+    this.fillRuns = Array(scene.gradientFillPathCount);
+    this.strokeRuns = Array(scene.gradientStrokeRunCount);
     this.group = new THREE.Group();
     this.group.visible = false;
     this.colorCompositing = options.colorCompositing ?? "linear";
@@ -112,6 +125,8 @@ export class ThreeMaterialGradientLayer {
       const indices = run.kind === "gradient-fill" ? this.fillClipIndices
         : run.kind === "gradient-stroke" ? this.strokeClipIndices : undefined;
       if (indices && run.clipIndex !== undefined) indices.fill(run.clipIndex, run.first, run.first + run.count);
+      const runs = run.kind === "gradient-fill" ? this.fillRuns : run.kind === "gradient-stroke" ? this.strokeRuns : undefined;
+      runs?.fill(run, run.first, run.first + run.count);
     }
 
     const source = scene as VectorScene & GradientVectorSceneContract;
@@ -128,6 +143,17 @@ export class ThreeMaterialGradientLayer {
     const materialBackend = options.materialBackend ?? "webgl";
     this.createFillEntries(source, gradientTextures, materialBackend);
     this.createStrokeEntries(source, gradientTextures, materialBackend, options.strokeCurveEnabled);
+    this.setOptionalContentVisibility(createDefaultOptionalContentSnapshot(scene));
+  }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    this.visibility.setVisibility(snapshot);
+    for (const entry of this.entries) {
+      const run = (entry.primitiveKind === "gradient-fill" ? this.fillRuns : this.strokeRuns)[entry.primitiveIndex];
+      entry.mesh.visible = !run || (this.visibility.requiresCompositing
+        ? run.optionalContent === undefined || snapshot.conditions[run.optionalContent] !== 0
+        : this.visibility.isRunVisible(run));
+    }
   }
 
   getOrderedPaintMeshes(): readonly ThreePdfOrderedPaintMesh[] {
@@ -257,19 +283,22 @@ export class ThreeMaterialGradientLayer {
     const segmentA = this.own(createFloatTexture(scene.gradientFillSegmentsA, segmentCount, segmentSize.width, segmentSize.height));
     const segmentB = this.own(createFloatTexture(scene.gradientFillSegmentsB, segmentCount, segmentSize.width, segmentSize.height));
 
+    const meshes = this.scene.gradientMeshIndices?.length ? buildGradientMeshRenderData(this.scene) : null;
     for (let pathIndex = 0; pathIndex < pathCount; pathIndex += 1) {
       const paintOffset = pathIndex * 4;
       const sourceGradientIndex = readIndex(scene.gradientFillPaintMeta, paintOffset, -1);
       const maskGradientIndex = readIndex(scene.gradientFillPaintMeta, paintOffset + 1, -1);
       const paintOrder = readFinite(scene.gradientFillPaintMeta?.[paintOffset + 2], pathIndex);
       const pageIndex = readFinite(scene.gradientFillPaintMeta?.[paintOffset + 3], 0);
-      const geometry = createFillGeometry(pathIndex);
+      const meshCount = meshes?.ranges[pathIndex * 2 + 1] ?? 0;
+      const geometry = meshCount ? createMeshGeometry(meshes!.vertices, meshes!.ranges[pathIndex * 2], meshCount, pathIndex) : createFillGeometry(pathIndex);
       const primitiveColor = new THREE.Vector4();
 
       let material: THREE.Material;
       let fillState: ThreeWebGpuGradientFillMaterialState | undefined;
       if (materialBackend === "webgpu") {
         fillState = createThreeWebGpuGradientFillMaterial({
+          mesh: meshCount > 0,
           fillPathMetaTextureA: pathMetaA,
           fillPathMetaTextureB: pathMetaB,
           fillPathMetaTextureC: pathMetaC,
@@ -294,12 +323,29 @@ export class ThreeMaterialGradientLayer {
           sourceGradientIndex,
           maskGradientIndex
         );
+        if (meshCount) {
+          const raw = material as THREE.RawShaderMaterial;
+          raw.vertexShader = raw.vertexShader
+            .replace("layout(location = 0) in vec2 aCorner;", "in vec2 aMeshPosition;\nin vec4 aMeshColor;\nout vec4 vMeshColor;\nlayout(location = 0) in vec2 aCorner;")
+            .replace("void main() {", "void main() {\n  vMeshColor = aMeshColor;")
+            .replace("vec2 world = mix(minBounds, maxBounds, corner01);", "vec2 world = aMeshPosition;");
+          raw.fragmentShader = raw.fragmentShader
+            .replace("uniform vec4 uVectorOverride;", "in vec4 vMeshColor;\nuniform vec4 uVectorOverride;")
+            .replace("vec4 sourcePaint = heprSamplePdfGradient(vLocal, uSourceGradientIndex);", "vec4 sourcePaint = vMeshColor * heprSamplePdfGradient(vLocal, uSourceGradientIndex).a;");
+        }
       }
 
-      if (material instanceof THREE.RawShaderMaterial) material.uniforms.uPrimitiveColor = { value: primitiveColor };
+      if (material instanceof THREE.RawShaderMaterial) {
+        material.uniforms.uPrimitiveColor = { value: primitiveColor };
+        material.uniforms.uPdfShapeOnly = { value: 0 };
+        material.vertexShader = pdfShapeCoverageGlsl(material.vertexShader);
+        material.fragmentShader = pdfShapeCoverageGlsl(material.fragmentShader)
+          .replace(/sourcePaint.a \* maskPaint.a/g, "sourcePaint.a * mix(maskPaint.a, 1.0, uPdfShapeOnly)");
+      }
       material = this.clipMaterial(material, this.fillClipIndices[pathIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
+      mesh.userData.heprDrawRun = { kind: "gradient-fill", first: pathIndex, count: 1, clipIndex: this.fillClipIndices[pathIndex] };
       const entry: GradientLayerEntry = {
         mesh,
         geometry,
@@ -388,10 +434,17 @@ export class ThreeMaterialGradientLayer {
         );
       }
 
-      if (material instanceof THREE.RawShaderMaterial) material.uniforms.uPrimitiveColor = { value: primitiveColor };
+      if (material instanceof THREE.RawShaderMaterial) {
+        material.uniforms.uPrimitiveColor = { value: primitiveColor };
+        material.uniforms.uPdfShapeOnly = { value: 0 };
+        material.vertexShader = pdfShapeCoverageGlsl(material.vertexShader);
+        material.fragmentShader = pdfShapeCoverageGlsl(material.fragmentShader)
+          .replace(/sourcePaint.a \* maskPaint.a/g, "sourcePaint.a * mix(maskPaint.a, 1.0, uPdfShapeOnly)");
+      }
       material = this.clipMaterial(material, this.strokeClipIndices[runIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
+      mesh.userData.heprDrawRun = { kind: "gradient-stroke", first: runIndex, count: 1, clipIndex: this.strokeClipIndices[runIndex] };
       const entry: GradientLayerEntry = {
         mesh,
         geometry,
@@ -547,6 +600,8 @@ function createWebGlGradientUniforms(
 }
 
 const GLSL_GRADIENT_DECLARATIONS = `
+${GRADIENT_PARAMETER_GLSL}
+${GRADIENT_BACKGROUND_GLSL}
 uniform sampler2D uGradientMetaTexA;
 uniform sampler2D uGradientMetaTexB;
 uniform sampler2D uGradientMetaTexC;
@@ -576,37 +631,10 @@ vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
   if (metaA.y >= 0.5 && (q.x < metaE.x || q.y < metaE.y || q.x > metaE.z || q.y > metaE.w)) {
     return vec4(0.0);
   }
-  vec2 p0 = metaC.zw;
-  vec2 p1 = metaD.xy;
-  float t;
-  if (metaA.x < 0.5) {
-    vec2 axis = p1 - p0;
-    float denom = dot(axis, axis);
-    if (denom <= 1e-10) { return vec4(0.0); }
-    t = dot(q - p0, axis) / denom;
-  } else {
-    vec2 centerDelta = p1 - p0;
-    float radiusDelta = metaD.w - metaD.z;
-    vec2 fromStart = q - p0;
-    float qa = dot(centerDelta, centerDelta) - radiusDelta * radiusDelta;
-    float qb = -2.0 * (dot(fromStart, centerDelta) + metaD.z * radiusDelta);
-    float qc = dot(fromStart, fromStart) - metaD.z * metaD.z;
-    if (abs(qa) <= 1e-10) {
-      if (abs(qb) <= 1e-10) { return vec4(0.0); }
-      t = -qc / qb;
-      if (metaD.z + t * radiusDelta < 0.0) { return vec4(0.0); }
-    } else {
-      float discriminant = qb * qb - 4.0 * qa * qc;
-      if (discriminant < 0.0) { return vec4(0.0); }
-      float root = sqrt(max(discriminant, 0.0));
-      float t0 = (-qb - root) / (2.0 * qa);
-      float t1 = (-qb + root) / (2.0 * qa);
-      bool valid0 = metaD.z + t0 * radiusDelta >= 0.0;
-      bool valid1 = metaD.z + t1 * radiusDelta >= 0.0;
-      if (!valid0 && !valid1) { return vec4(0.0); }
-      t = valid0 && (!valid1 || t0 >= t1) ? t0 : t1;
-    }
-  }
+  if (metaA.x > 1.5) return vec4(1.0);
+  vec2 parameter = heprGradientParameter(metaA, metaC, metaD, q);
+  if (parameter.y < 0.5) return heprGradientBackground(metaA.w);
+  float t = parameter.x;
   float sampleX = clamp(t, 0.0, 1.0) * 1023.0;
   int x0 = int(floor(sampleX));
   int x1 = min(x0 + 1, 1023);
@@ -629,11 +657,9 @@ function buildGradientFillFragmentShader(): string {
       `  baseColor = mix(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a);\n` +
       `  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));`
     )
-    .replace("float alpha = inside ? vAlpha : 0.0;", "float alpha = inside ? vAlpha * paintAlpha : 0.0;")
-    .replace(
-      "float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;",
-      "float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha * paintAlpha;"
-    );
+    .replace(/float alpha = inside \? ([^;]+) : 0\.0;/, "float alpha = inside ? ($1) * paintAlpha : 0.0;")
+    .replace(/float alpha = (heprThreeLinearCoverageToOutputAlpha\(coverage\) \* [^;]+);/,
+      "float alpha = $1 * paintAlpha;");
 }
 
 function buildGradientStrokeFragmentShader(): string {
@@ -650,6 +676,16 @@ function buildGradientStrokeFragmentShader(): string {
       `  if (paintedAlpha <= 0.001) { discard; }\n` +
       `  outColor = heprThreeEncodeOutputColor(vec4(color, paintedAlpha));`
     );
+}
+
+function createMeshGeometry(vertices: Float32Array, first: number, count: number, pathIndex: number): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry();
+  const buffer = new THREE.InterleavedBuffer(vertices.subarray(first * 6, (first + count) * 6), 6);
+  geometry.setAttribute("aMeshPosition", new THREE.InterleavedBufferAttribute(buffer, 2, 0));
+  geometry.setAttribute("aMeshColor", new THREE.InterleavedBufferAttribute(buffer, 4, 2));
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  geometry.setAttribute("aFillPathIndex", new THREE.Float32BufferAttribute(new Float32Array(count).fill(pathIndex), 1));
+  return geometry;
 }
 
 function createFillGeometry(pathIndex: number): THREE.InstancedBufferGeometry {

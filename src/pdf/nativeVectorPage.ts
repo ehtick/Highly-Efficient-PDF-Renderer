@@ -1,3 +1,4 @@
+import type { SceneOptionalContent } from "../optionalContentData";
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
@@ -61,6 +62,7 @@ export interface BuildNativeVectorPageInput {
   readonly imageRegistry: VectorSceneImageRegistry;
   readonly shadingRegistry?: NativePdfShadingRegistry;
   readonly compositeRasterLayers?: readonly RasterLayer[];
+  readonly optionalContent?: SceneOptionalContent;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** Maximum distinct, nonempty glyph outlines derived for this page. */
   readonly maxPaths: number;
@@ -228,6 +230,7 @@ export function buildNativeVectorPage(
     maxY: pageBounds.maxY
   };
   const scene: VectorScene = {
+    ...(input.optionalContent ? { optionalContent: input.optionalContent } : {}),
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([
@@ -296,6 +299,8 @@ export function buildNativeVectorPage(
       const kind = sidecar.sourceEvents[offset];
       const index = sidecar.sourceEvents[offset + 1];
       const blendMode = sidecar.sourceBlendModes?.[offset / 2] === 1 ? "Multiply" : undefined;
+      const condition = sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1;
+      const optionalContent = condition >= 0 ? condition : undefined;
       const clipIndex = kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT ||
         kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE ? undefined : clipBuilder.add(sidecar.sourceClips?.[offset / 2], signal);
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL || kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) {
@@ -303,23 +308,23 @@ export function buildNativeVectorPage(
           throw invalid("Invalid ordered path range.", pageInfo.sourcePageIndex, "vector-draw-path-range");
         }
         appendVectorDrawRun(runs, kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
-          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode);
+          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode, optionalContent);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         const first = sidecar.glyphRunMeta[index * 3];
         const end = first + sidecar.glyphRunMeta[index * 3 + 1];
         for (let glyph = first; glyph < end; glyph++) {
           const instance = text.glyphToInstance[glyph];
-          if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode);
+          if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode, optionalContent);
           const strokeInstance = strokeText.glyphToInstance?.[glyph] ?? -1;
-          if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode);
+          if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode, optionalContent);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
-        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode);
+        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode, optionalContent);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
-        appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode);
+        appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode, optionalContent);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
-          if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1);
+          if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1, undefined, undefined, optionalContent);
         }
       }
     }
@@ -387,6 +392,10 @@ function readVectorSceneData(
       "legacy-vector-glyph-clip-count");
   }
   const imageCount = sidecar.imageIndices.length;
+  if (sidecar.imageOpacities !== undefined && (!(sidecar.imageOpacities instanceof Float32Array) ||
+      sidecar.imageOpacities.length !== imageCount || !sidecar.imageOpacities.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) {
+    throw invalid("Invalid image paint opacity metadata.", pageIndex, "vector-image-opacity");
+  }
   if (
     sidecar.imageTransforms.length !== imageCount * 6 ||
     sidecar.imageClipBounds.length !== imageCount * 4 ||
@@ -787,6 +796,12 @@ function buildVectorText(
   const clipTester = new NativeTextClipTester();
   const glyphInkBounds = new Map<string, readonly number[] | null>();
   const indexQuads = new Map<number, readonly number[]>();
+  const glyphConditions = sidecar.sourceOptionalContentIndices ? new Int32Array(compilation.glyphs.glyphIds.length).fill(-1) : undefined;
+  if (glyphConditions) for (let event = 0; event < sidecar.sourceEvents.length; event += 2) {
+    if (sidecar.sourceEvents[event] !== DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) continue;
+    const run = sidecar.sourceEvents[event + 1], first = sidecar.glyphRunMeta[run * 3];
+    glyphConditions.fill(sidecar.sourceOptionalContentIndices![event / 2], first, first + sidecar.glyphRunMeta[run * 3 + 1]);
+  }
   const geometryByKey = new Map<string, number>();
   const geometries: GlyphGeometry[] = [];
   const clipRects: number[] = [];
@@ -1022,7 +1037,8 @@ function buildVectorText(
       glyphIndexable,
       indexQuads,
       pageIndex,
-      signal
+      signal,
+      glyphConditions
     )
   };
 }
@@ -1150,7 +1166,7 @@ function deriveGlyphGeometry(
 }
 
 /** Bounded cubic approximation shared with the established VectorScene glyph ABI. */
-function emitCubicAsQuadratics(
+export function emitCubicAsQuadratics(
   x0: number,
   y0: number,
   x1: number,
@@ -1239,7 +1255,8 @@ function convertTextIndex(
   glyphIndexable: Uint8Array,
   indexQuads: ReadonlyMap<number, readonly number[]>,
   pageIndex: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  glyphConditions?: Int32Array
 ): PageTextIndex {
   const source = compilation.textIndex;
   const builder = new VectorPageTextIndexBuilder();
@@ -1314,7 +1331,8 @@ function convertTextIndex(
       penStartY,
       penEndX,
       penEndY,
-      emHeight
+      emHeight,
+      glyphConditions?.[reference] ?? -1
     );
     index = end;
   }
@@ -1334,6 +1352,7 @@ class VectorPageTextIndexBuilder {
   private readonly chars: string[] = [];
 
   private readonly references: number[] = [];
+  private readonly conditions: number[] = [];
 
   private readonly fallbackQuads: number[] = [];
 
@@ -1359,7 +1378,8 @@ class VectorPageTextIndexBuilder {
     penStartY: number,
     penEndX: number,
     penEndY: number,
-    emHeight: number
+    emHeight: number,
+    condition = -1
   ): void {
     const needsFallback = instance < 0;
     if (
@@ -1388,10 +1408,12 @@ class VectorPageTextIndexBuilder {
     if (this.separatorPending && this.chars.length !== 0) {
       this.chars.push(" ");
       this.references.push(-1);
+      this.conditions.push(-1);
     }
     this.separatorPending = false;
     for (let index = 0; index < unicode.length; index += 1) {
       this.chars.push(unicode[index]);
+      this.conditions.push(condition);
       if (needsFallback) {
         const fallbackIndex = this.fallbackQuads.length / 4;
         this.fallbackQuads.push(
@@ -1417,6 +1439,7 @@ class VectorPageTextIndexBuilder {
     return {
       text: this.chars.join(""),
       charInstance: Int32Array.from(this.references),
+      ...(this.conditions.some(index => index >= 0) ? { optionalContent: Int32Array.from(this.conditions) } : {}),
       fallbackQuads: Float32Array.from(this.fallbackQuads)
     };
   }
@@ -1723,6 +1746,8 @@ function buildRasterLayers(
       height: layerHeight,
       data: layerData,
       matrix: layerMatrix,
+      ...(sidecar.imageOpacities?.[invocation] === undefined || sidecar.imageOpacities[invocation] === 1
+        ? {} : { opacity: sidecar.imageOpacities[invocation] }),
       paintOrder: sidecar.imagePaintOrders[invocation],
       pageIndex: 0
     });
@@ -1770,7 +1795,7 @@ function clipVectorNearestImage(
   // rendered the original transform onto a native-resolution device grid,
   // retained two pixels around the placement, and let the clip make excluded
   // pixels transparent. Reproduce that representation here without changing
-  // the renderer-facing VectorScene/HEP v6 ABI.
+  // the renderer-facing VectorScene/HEP v7 ABI.
   const placement = intersectVisibleBounds(imageBounds, pageBounds);
   if (!placement || placement.maxX <= placement.minX || placement.maxY <= placement.minY) {
     throw invalid("A clipped image has no on-page placement.", pageIndex,

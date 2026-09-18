@@ -1,3 +1,10 @@
+import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
+import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
+import { buildGradientMeshRenderData } from "./gradientMesh";
+import { GRADIENT_MESH_WGSL, GRADIENT_MESH_VERTEX_LAYOUT } from "./gradientMeshShaders";
+import { pdfShapeCoverageWgsl } from "./pdfShapeCoverage";
+import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
+import { ScenePaintVisibility } from "./scenePaintVisibility";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGradientColors } from "./nativePrimitiveColors";
 import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
@@ -7,7 +14,7 @@ import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 import { packVectorClips } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import {
   buildOrderedGradientPaintCommands,
   GRADIENT_LUT_WIDTH,
@@ -367,7 +374,6 @@ struct VsOut {
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
 
-const MAX_FILL_PATH_PRIMITIVES : i32 = 2048;
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
 const QUAD_WINDING_SUBDIVISIONS : i32 = 6;
 
@@ -554,7 +560,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   var winding = 0;
   var crossings = 0;
 
-  for (var i = 0; i < MAX_FILL_PATH_PRIMITIVES; i = i + 1) {
+  for (var i = 0; i < inData.segmentCount; i = i + 1) {
     if (i >= inData.segmentCount) {
       break;
     }
@@ -1222,7 +1228,7 @@ ${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  let color = textureSample(uRasterTex, uRasterSampler, inData.uv);
+  let color = textureSample(uRasterTex, uRasterSampler, inData.uv) * uRaster.matrixB.z;
   if (color.a <= 0.001) {
     discard;
   }
@@ -1436,6 +1442,12 @@ export class WebGpuFloorplanRenderer {
   private readonly fillPipeline: any;
 
   private readonly gradientFillPipeline: any;
+  private gradientMeshPipeline: any = null;
+  private gradientMeshBuffer: any = null;
+  private gradientMeshRanges: Uint32Array = new Uint32Array(0);
+  private readonly paintPipelineRecipes = new Map<any, { shaderSource: string; vertexEntry: string; fragmentEntry: string;
+    layout: any; premultipliedColor: boolean; multiplyPass?: 0 | 1; vertices?: any[] }>();
+  private readonly shapePipelines = new Map<any, any>();
 
   private readonly gradientStrokePipeline: any;
 
@@ -1624,6 +1636,12 @@ export class WebGpuFloorplanRenderer {
   private orderedBatches: VectorOrderedBatches | null = null;
   private orderedInstanceBuffer: any = null;
   private scene: VectorScene | null = null;
+  private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
+  private paintCompositor: WebGpuPaintCompositor | null = null;
+  private paintViewportWidth = 1;
+  private paintViewportHeight = 1;
+  private optionalContentVisibility: OptionalContentSnapshot | null = null;
+  private scenePaintVisibility: ScenePaintVisibility | null = null;
   private primitiveColors: NativePrimitiveColors | null = null;
   private primitiveHighlights: WebGpuPrimitiveHighlights | null = null;
   private readonly primitiveGradientLayout: any;
@@ -2033,7 +2051,7 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 1,
-          visibility: gpuShaderStage.VERTEX,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
           buffer: { type: "uniform", minBindingSize: RASTER_UNIFORM_BUFFER_BYTES }
         },
         {
@@ -2501,6 +2519,8 @@ export class WebGpuFloorplanRenderer {
     this.vectorLodRuntime?.setForceExact(this.primitiveColors.has("stroke"));
     this.textLodRuntime?.setMode(this.primitiveColors.has("text") ? "off" : this.textLodMode);
     this.selectedTextInstanceCount = 0;
+    this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors.has("stroke") &&
+      !this.primitiveColors.has("fill") && !this.primitiveColors.has("text"));
     this.orderedBatches?.invalidate();
     this.panCacheValid = false;
     this.destroyVectorMinifyResources();
@@ -2528,6 +2548,10 @@ export class WebGpuFloorplanRenderer {
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
+  }
+
+  getVectorColorOverride(): readonly [number, number, number, number] {
+    return [...this.vectorOverrideColor, this.vectorOverrideOpacity];
   }
 
   setInteractionViewportProvider(
@@ -2592,11 +2616,77 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  getRasterLayerUpdates(): ReadonlyMap<number, RasterLayer> { return this.rasterLayerUpdates; }
+
+  prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates {
+    updates = new Map(updates);
+    const source = this.scene;
+    if (!source || this.isDisposed) throw new Error("No active scene for raster replacement.");
+    validateRasterLayerUpdates(source, updates, this.maxTextureSize());
+    const prepared = new Map<number, WebGpuRasterLayerResource>();
+    let finished = false;
+    const release = (): void => {
+      for (const value of prepared.values()) { value.texture.destroy(); value.uniformBuffer.destroy(); }
+      prepared.clear();
+    };
+    let uploaded = false;
+    const stage = (): void => {
+      for (const [index, layer] of updates) {
+        if ((this.rasterLayerUpdates.get(index) ?? source.rasterLayers[index]) !== layer) {
+          const texture = this.createRgba8Texture(layer.width, layer.height, premultiplyRgba(layer.data));
+          try { prepared.set(index, this.createRasterLayerResource(layer.matrix, texture, layer.paintOrder, layer.pageIndex, layer.opacity)); }
+          catch (error) { texture.destroy(); throw error; }
+        }
+      }
+      uploaded = true;
+    };
+    try { if (this.rasterTextureResidency) stage(); }
+    catch (error) { release(); throw error; }
+    return {
+      commit: () => {
+        if (finished || this.isDisposed || this.scene !== source) {
+          release(); finished = true;
+          throw new DOMException("Raster update superseded.", "AbortError");
+        }
+        if (!this.rasterTextureResidency) release();
+        else if (!uploaded) {
+          try { stage(); } catch (error) { release(); finished = true; throw error; }
+        }
+        for (const [index, next] of prepared) {
+          const value = this.rasterLayerResources[index];
+          if (value) { value.texture.destroy(); value.uniformBuffer.destroy(); }
+          this.rasterLayerResources[index] = next;
+        }
+        prepared.clear();
+        for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
+        finished = true;
+        this.panCacheValid = false; this.destroyVectorMinifyResources(); this.requestFrame();
+      },
+      dispose: () => { if (!finished) { finished = true; release(); } }
+    };
+  }
+
+  getOptionalContentVisibility(): OptionalContentSnapshot | null { return this.optionalContentVisibility; }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    if (this.isDisposed || this.optionalContentVisibility === snapshot) return;
+    this.optionalContentVisibility = snapshot;
+    this.scenePaintVisibility?.setVisibility(snapshot);
+    this.orderedBatches?.invalidate();
+    this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setScene(scene: VectorScene): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
     }
     if (this.scene !== scene) {
+      this.rasterLayerUpdates.clear();
+      this.paintCompositor?.dispose(); this.paintCompositor = null;
+      this.optionalContentVisibility = createDefaultOptionalContentSnapshot(scene);
       this.primitiveColors = null;
       this.primitiveHighlights?.dispose();
       this.primitiveHighlights = null;
@@ -2604,6 +2694,8 @@ export class WebGpuFloorplanRenderer {
       this.primitiveGradientColors = null;
     }
     validateVectorDrawRuns(scene);
+    this.scenePaintVisibility = new ScenePaintVisibility(scene);
+    this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
     this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
@@ -3265,6 +3357,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   dispose(): void {
+    this.paintCompositor?.dispose(); this.paintCompositor = null;
     this.orderedInstanceBuffer?.destroy();
     this.orderedInstanceBuffer = null;
     this.orderedBatches = null;
@@ -3282,6 +3375,7 @@ export class WebGpuFloorplanRenderer {
     this.primitiveGradientColors?.dispose();
     this.primitiveGradientColors = null;
     this.orderedRunCuller = null;
+    this.scenePaintVisibility = null;
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
@@ -3354,7 +3448,8 @@ export class WebGpuFloorplanRenderer {
     this.gpuContext.configure({
       device: this.gpuDevice,
       format: this.presentationFormat,
-      alphaMode: "opaque"
+      alphaMode: "opaque",
+      usage: 0x10 | 0x04 // RENDER_ATTACHMENT | TEXTURE_BINDING (compositor backdrop)
     });
   }
 
@@ -3364,7 +3459,8 @@ export class WebGpuFloorplanRenderer {
     fragmentEntry: string,
     layout: any,
     premultipliedColor = false,
-    multiplyPass?: 0 | 1
+    multiplyPass?: 0 | 1,
+    vertices?: any[]
   ): any {
     const shaderModule = this.gpuDevice.createShaderModule({ code: shaderSource });
     const colorSrcFactor = premultipliedColor ? "one" : "src-alpha";
@@ -3372,7 +3468,8 @@ export class WebGpuFloorplanRenderer {
       layout,
       vertex: {
         module: shaderModule,
-        entryPoint: vertexEntry
+        entryPoint: vertexEntry,
+        ...(vertices ? { buffers: vertices } : {})
       },
       fragment: {
         module: shaderModule,
@@ -3396,15 +3493,27 @@ export class WebGpuFloorplanRenderer {
         ]
       },
       primitive: {
-        topology: "triangle-strip"
+        topology: vertices ? "triangle-list" : "triangle-strip"
       }
     });
     if (multiplyPass === undefined) this.multiplyPipelineFactories.set(pipeline, () => {
       const source = premultipliedColor ? shaderSource : multiplyFragmentWgsl(shaderSource);
-      return [this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 0),
-        this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 1)];
+      return [this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 0, vertices),
+        this.createPipeline(source, vertexEntry, fragmentEntry, layout, true, 1, vertices)];
     });
+    this.paintPipelineRecipes.set(pipeline, { shaderSource, vertexEntry, fragmentEntry, layout, premultipliedColor, multiplyPass, vertices });
     return pipeline;
+  }
+
+  private getPaintShapePipeline(pipeline: any): any {
+    let shape = this.shapePipelines.get(pipeline);
+    if (shape) return shape;
+    const recipe = this.paintPipelineRecipes.get(pipeline);
+    if (!recipe) return pipeline;
+    shape = this.createPipeline(pdfShapeCoverageWgsl(recipe.shaderSource), recipe.vertexEntry, recipe.fragmentEntry,
+      recipe.layout, recipe.premultipliedColor, undefined, recipe.vertices);
+    this.shapePipelines.set(pipeline, shape);
+    return shape;
   }
 
   private multiplyPipeline(pipeline: any, pass: 0 | 1): any {
@@ -3606,7 +3715,7 @@ export class WebGpuFloorplanRenderer {
 
       const view = this.gpuContext.getCurrentTexture().createView();
       const encoder = this.gpuDevice.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
+      const pass = beginPdfManagedRenderPass(encoder, {
         colorAttachments: [
           {
             view,
@@ -3635,6 +3744,7 @@ export class WebGpuFloorplanRenderer {
       this.frameListener?.({
         renderedSegments,
         totalSegments: this.segmentCount,
+        redundantSegments: this.getRedundantSegmentCount(),
         usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
         zoom: this.zoom
       });
@@ -3643,7 +3753,7 @@ export class WebGpuFloorplanRenderer {
 
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+    const pass = beginPdfManagedRenderPass(encoder, {
       colorAttachments: [
         {
           view,
@@ -3663,9 +3773,15 @@ export class WebGpuFloorplanRenderer {
     this.frameListener?.({
       renderedSegments,
       totalSegments: this.segmentCount,
+      redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     });
+  }
+
+  private getRedundantSegmentCount(): number {
+    return this.strokeRenderingEnabled && !this.scenePaintVisibility?.requiresCompositing
+      ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -3733,7 +3849,7 @@ export class WebGpuFloorplanRenderer {
 
     const effectiveZoom = this.computeVectorMinifyZoom(viewportWidth, viewportHeight);
     const encoder = this.gpuDevice.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+    const pass = beginPdfManagedRenderPass(encoder, {
       colorAttachments: [
         {
           view: this.vectorMinifyTexture.createView(),
@@ -3816,7 +3932,7 @@ export class WebGpuFloorplanRenderer {
       this.needsVisibleSetUpdate = false;
 
       const encoder = this.gpuDevice.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
+      const pass = beginPdfManagedRenderPass(encoder, {
         colorAttachments: [
           {
             view: this.panCacheTexture.createView(),
@@ -3838,7 +3954,7 @@ export class WebGpuFloorplanRenderer {
       pass.end();
       this.gpuDevice.queue.submit([encoder.finish()]);
 
-      this.panCacheUsedCulling = !this.usingAllSegments;
+      this.panCacheUsedCulling = this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments;
       this.panCacheValid = true;
 
       sampleScale = 1;
@@ -3851,6 +3967,7 @@ export class WebGpuFloorplanRenderer {
     this.frameListener?.({
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
+      redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
@@ -3923,12 +4040,16 @@ export class WebGpuFloorplanRenderer {
     if (!data || !this.gradientFillBindGroup || pathIndex < 0 || pathIndex >= data.gradientFillPathCount) {
       return;
     }
-    pass.setPipeline(this.gradientFillPipeline);
+    const meshCount = this.gradientMeshRanges?.[pathIndex * 2 + 1] ?? 0;
+    pass.setPipeline(meshCount ? this.gradientMeshPipeline : this.gradientFillPipeline);
     this.bindVectorClip(pass);
     pass.setBindGroup(0, this.gradientFillBindGroup);
     this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
     pass.setBindGroup(2, this.primitiveGradientColors.bindGroup("gradient-fill", pathIndex));
-    pass.draw(4, 1, pathIndex * 4, 0);
+    if (meshCount) {
+      pass.setVertexBuffer(0, this.gradientMeshBuffer);
+      pass.draw(meshCount, 1, this.gradientMeshRanges[pathIndex * 2], pathIndex);
+    } else pass.draw(4, 1, pathIndex * 4, 0);
   }
 
   private drawGradientStrokeIntoPass(pass: any, runIndex: number): void {
@@ -4001,10 +4122,15 @@ export class WebGpuFloorplanRenderer {
     this.vectorClipIndex = -1;
     this.drawPageBackgroundContentIntoPass(pass);
     let strokes = 0;
-    const runs = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const candidates = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const visibility = this.optionalContentVisibility;
+    const paintVisibility = this.scenePaintVisibility ??= new ScenePaintVisibility(this.scene!);
+    paintVisibility.setVisibility(visibility);
+    const runs = paintVisibility.select(candidates);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
-    const plan = this.orderedBatches;
+    const plan = paintVisibility.requiresCompositing ? null : this.orderedBatches;
     const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
+    this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {
       this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
     }
@@ -4039,6 +4165,22 @@ export class WebGpuFloorplanRenderer {
         }
       }
     };
+    if (paintVisibility.requiresCompositing) {
+      this.paintCompositor ??= new WebGpuPaintCompositor(this.gpuDevice, this.presentationFormat);
+      const parentPass = pass;
+      try {
+        this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
+          (run, target, shapeOnly) => {
+            pass = shapeOnly ? new Proxy(target, { get: (object, key) => key === "setPipeline"
+              ? (pipeline: any) => object.setPipeline(this.getPaintShapePipeline(pipeline))
+              : typeof object[key] === "function" ? object[key].bind(object) : object[key] }) : target;
+            const previous = strokes;
+            draw(run);
+            if (shapeOnly) strokes = previous;
+          }, condition => condition === undefined || visibility?.conditions[condition] === 1);
+      } finally { pass = parentPass; this.vectorClipIndex = -1; }
+      return strokes;
+    }
     for (const run of plan?.batches ?? runs) {
       if (!run.blendMode) { draw(run); continue; }
       for (let first = run.first; first < run.first + run.count; first++) {
@@ -4133,6 +4275,7 @@ export class WebGpuFloorplanRenderer {
         textLodProjection?.zoom ?? zoomValue
       );
     }
+    this.paintViewportWidth = viewportWidth; this.paintViewportHeight = viewportHeight;
     const data = new Float32Array(CAMERA_UNIFORM_FLOATS);
     data[0] = viewportWidth;
     data[1] = viewportHeight;
@@ -4225,7 +4368,7 @@ export class WebGpuFloorplanRenderer {
 
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+    const pass = beginPdfManagedRenderPass(encoder, {
       colorAttachments: [
         {
           view,
@@ -4555,6 +4698,8 @@ export class WebGpuFloorplanRenderer {
     this.vectorLodStats = null;
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+    this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
+      !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
     this.orderedInstanceBuffer?.destroy();
     const usage = (globalThis as any).GPUBufferUsage;
     this.orderedInstanceBuffer = this.gpuDevice.createBuffer({
@@ -4741,7 +4886,7 @@ export class WebGpuFloorplanRenderer {
         const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
         try {
           this.rasterLayerResources.push(
-            this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex)
+            this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex, source.opacity)
           );
         } catch (error) {
           texture.destroy();
@@ -4757,6 +4902,18 @@ export class WebGpuFloorplanRenderer {
   private configureGradientPaint(scene: VectorScene, maxTextureSize: number): void {
     const data = readGradientSceneData(scene);
     this.gradientData = data;
+    this.gradientMeshBuffer?.destroy(); this.gradientMeshBuffer = null;
+    this.gradientMeshRanges = new Uint32Array(0);
+    if (data.gradientMeshIndices?.length) {
+      const mesh = buildGradientMeshRenderData(data);
+      this.gradientMeshRanges = mesh.ranges;
+      const usage = (globalThis as any).GPUBufferUsage;
+      this.gradientMeshBuffer = this.gpuDevice.createBuffer({ size: Math.max(24, mesh.vertices.byteLength), usage: usage.VERTEX | usage.COPY_DST });
+      this.gpuDevice.queue.writeBuffer(this.gradientMeshBuffer, 0, mesh.vertices);
+      this.gradientMeshPipeline ??= this.createPipeline(GRADIENT_MESH_WGSL, "vsMain", "fsMain",
+        this.gpuDevice.createPipelineLayout({ bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout] }),
+        false, undefined, GRADIENT_MESH_VERTEX_LAYOUT);
+    }
     const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
     const fillSegmentDims = chooseTextureDimensions(data.gradientFillSegmentCount, maxTextureSize);
@@ -4867,6 +5024,7 @@ export class WebGpuFloorplanRenderer {
   private getSceneRasterLayers(
     scene: VectorScene
   ): Array<{
+    opacity?: number;
     width: number;
     height: number;
     data: Uint8Array<ArrayBufferLike>;
@@ -4875,6 +5033,7 @@ export class WebGpuFloorplanRenderer {
     pageIndex: number;
   }> {
     const out: Array<{
+      opacity?: number;
       width: number;
       height: number;
       data: Uint8Array<ArrayBufferLike>;
@@ -4883,7 +5042,8 @@ export class WebGpuFloorplanRenderer {
       pageIndex: number;
     }> = [];
     if (Array.isArray(scene.rasterLayers)) {
-      for (const layer of scene.rasterLayers) {
+      for (let index = 0; index < scene.rasterLayers.length; index++) {
+        const layer = this.rasterLayerUpdates.get(index) ?? scene.rasterLayers[index];
         const width = Math.max(0, Math.trunc(layer?.width ?? 0));
         const height = Math.max(0, Math.trunc(layer?.height ?? 0));
         if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
@@ -4893,6 +5053,7 @@ export class WebGpuFloorplanRenderer {
           width,
           height,
           data: layer.data,
+          opacity: layer.opacity,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
           pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
@@ -4964,7 +5125,8 @@ export class WebGpuFloorplanRenderer {
     matrix: Float32Array,
     texture: any,
     paintOrder = 0,
-    pageIndex = 0
+    pageIndex = 0,
+    opacity = 1
   ): WebGpuRasterLayerResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
@@ -4974,7 +5136,7 @@ export class WebGpuFloorplanRenderer {
     rasterUniforms[3] = matrix[3];
     rasterUniforms[4] = matrix[4];
     rasterUniforms[5] = matrix[5];
-    rasterUniforms[6] = 0;
+    rasterUniforms[6] = opacity;
     rasterUniforms[7] = 0;
     assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
 
@@ -5229,7 +5391,7 @@ export class WebGpuFloorplanRenderer {
   private clearToScreen(): void {
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+    const pass = beginPdfManagedRenderPass(encoder, {
       colorAttachments: [
         {
           view,
@@ -5314,6 +5476,8 @@ export class WebGpuFloorplanRenderer {
     this.gradientFillTextures = [];
     this.gradientStrokeTextures = [];
     this.gradientData = null;
+    this.gradientMeshBuffer?.destroy(); this.gradientMeshBuffer = null;
+    this.gradientMeshRanges = new Uint32Array(0);
     this.orderedGradientPaintCommands = [];
     this.gradientPaintRequiresDirectRendering = false;
   }

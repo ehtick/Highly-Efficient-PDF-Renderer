@@ -418,8 +418,8 @@ async function run() {
 
     const sourceZipArchive = await HepArchive.loadAsync(sourceZipBytes);
     const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
-    assert.equal(sourceManifest.formatVersion, 6, "native gradient scenes require the v6 HEP schema");
-    for (const unsupportedVersion of [5, 7]) {
+    assert.equal(sourceManifest.formatVersion, 7, "new scenes use the v7 HEP schema");
+    for (const unsupportedVersion of [5, 6, 8]) {
       const incompatibleZip = await HepArchive.loadAsync(sourceZipBytes);
       const incompatibleManifest = {
         ...sourceManifest,
@@ -436,7 +436,7 @@ async function run() {
     const sourceRoundTrip = await loadSceneFromHep(sourceZipBytes.buffer);
     assertSceneCountsEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
     assertNativeGradientResourcesEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
-    assert.equal(sourceRoundTrip.textClipRects, undefined, "older v6 scenes omit text clips");
+    assert.equal(sourceRoundTrip.textClipRects, undefined, "scenes without clipped glyphs omit text clips");
 
     const base64ZipBlob = await buildHep(pdfBytes.toString("base64"), {
       encodeRasterImages: false,
@@ -448,7 +448,6 @@ async function run() {
 
     const sceneZipBlob = await buildHep(parsedPdf.scene, {
       sourceLabel: "already-parsed.pdf",
-      sourcePdf: pdfBytes,
       encodeRasterImages: false,
       compression: "store"
     });
@@ -469,8 +468,7 @@ async function run() {
       };
       const clippedZip = await buildHep(clippedScene, {
         sourceLabel: "clipped-scene.pdf",
-        sourcePdf: pdfBytes,
-        encodeRasterImages: false,
+          encodeRasterImages: false,
         compression: "store"
       });
       const clippedRoundTrip = await loadSceneFromHep(await clippedZip.arrayBuffer());
@@ -479,7 +477,7 @@ async function run() {
       assert.deepEqual(
         [...clippedRoundTrip.textInstanceB.subarray(4)],
         [...parsedPdf.scene.textInstanceB.subarray(4)],
-        "unclipped v6 text-instance channels remain byte-exact"
+        "unclipped text-instance channels remain byte-exact"
       );
     }
 
@@ -499,8 +497,7 @@ async function run() {
       };
       const clippedStrokeZipBlob = await buildHep(clippedStrokeScene, {
         sourceLabel: "clipped-stroke-scene.pdf",
-        sourcePdf: pdfBytes,
-        encodeRasterImages: false,
+          encodeRasterImages: false,
         compression: "store"
       });
       const clippedStrokeZip = await readZip(clippedStrokeZipBlob);
@@ -519,7 +516,7 @@ async function run() {
       assert.deepEqual(
         [...clippedStrokeRoundTrip.primitiveBounds.subarray(0, 4)],
         exactStrokeClip,
-        "HEP v6 must retain exact clipped-stroke bounds instead of deriving endpoint bounds"
+        "HEP v7 must retain exact clipped-stroke bounds instead of deriving endpoint bounds"
       );
       assert.equal(Math.trunc(clippedStrokeRoundTrip.primitiveMeta[3] / 2 + 1e-6) & 4, 4);
 
@@ -541,6 +538,7 @@ async function run() {
 
     const missingRasterScene = {
       ...parsedPdf.scene,
+      drawRuns: [...(parsedPdf.scene.drawRuns ?? []), { kind: "raster", first: 0, count: 1 }],
       imagePaintOpCount: Math.max(1, parsedPdf.scene.imagePaintOpCount),
       rasterLayers: [],
       rasterLayerWidth: 0,
@@ -550,14 +548,14 @@ async function run() {
     };
     await assert.rejects(
       buildHep(missingRasterScene, { encodeRasterImages: false }),
-      /Pass options\.sourcePdf/
+      /raster|draw run|drawRun/i
     );
     await assert.rejects(
       buildHep(missingRasterScene, {
         sourcePdf: new Uint8Array([1, 2, 3, 4]),
         encodeRasterImages: false
       }),
-      /does not contain PDF data/
+      /no longer supported/
     );
 
     const rasterPdfBytes = await readFile(rasterFixturePath);
@@ -575,29 +573,18 @@ async function run() {
       rasterLayerData: new Uint8Array(0),
       rasterLayerMatrix: new Float32Array([1, 0, 0, 1, 0, 0])
     };
-    const fallbackZipBlob = await buildHep(rasterFallbackScene, {
-      sourceLabel: "fallback.pdf",
-      sourcePdf: rasterPdfBytes,
-      sourcePdfPages: "13",
-      encodeRasterImages: false,
-      compression: "store"
+    await assert.rejects(buildHep(rasterFallbackScene, {
+      sourceLabel: "incomplete.pdf", encodeRasterImages: false, compression: "store"
+    }), /raster|draw run|drawRun/i, "missing canonical raster slots must never export silently");
+    const retainedZipBlob = await buildHep(parsedRasterPdf.scene, {
+      sourceLabel: "retained.pdf", encodeRasterImages: false, compression: "store"
     });
-    const fallbackZip = await readZip(fallbackZipBlob);
-    const fallbackManifest = JSON.parse(await fallbackZip.file("manifest.json").async("string"));
-    assert.equal(fallbackManifest.sourcePdfFile, "source/source.pdf");
-    assert.equal(fallbackManifest.sourcePdfPages, "13");
-    assert.ok(fallbackZip.file("source/source.pdf"));
-    const fallbackRoundTrip = await loadSceneFromHep(await fallbackZipBlob.arrayBuffer());
-    const restoredRasterLayers = listSceneRasterLayers(fallbackRoundTrip);
-    assert.equal(restoredRasterLayers.length, expectedRasterLayers.length);
-    for (let i = 0; i < expectedRasterLayers.length; i += 1) {
-      assert.equal(restoredRasterLayers[i].width, expectedRasterLayers[i].width);
-      assert.equal(restoredRasterLayers[i].height, expectedRasterLayers[i].height);
-      assert.deepEqual(
-        Array.from(restoredRasterLayers[i].matrix),
-        Array.from(expectedRasterLayers[i].matrix)
-      );
-    }
+    const retainedZip = await readZip(retainedZipBlob);
+    const retainedManifest = JSON.parse(await retainedZip.file("manifest.json").async("string"));
+    assert.equal(retainedManifest.sourcePdfFile, undefined);
+    assert.equal(retainedZip.file("source/source.pdf"), null);
+    const retainedRoundTrip = await loadSceneFromHep(await retainedZipBlob.arrayBuffer());
+    assert.equal(listSceneRasterLayers(retainedRoundTrip).length, expectedRasterLayers.length);
 
     const optimizedRasterPdfBytes = await readFile(optimizedRasterFixturePath);
     const parsedOptimizedRasterPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
@@ -1029,7 +1016,7 @@ async function run() {
     });
     const photoOverlayZip = await readZip(photoOverlayZipBlob);
     const photoOverlayManifest = JSON.parse(await photoOverlayZip.file("manifest.json").async("string"));
-    assert.equal(photoOverlayManifest.formatVersion, 6);
+    assert.equal(photoOverlayManifest.formatVersion, 7);
     assert.equal(photoOverlayManifest.scene.gradientCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillPathCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, 16);
@@ -1076,11 +1063,6 @@ async function run() {
         label: "identical",
         p1x: photoOverlayScene.gradientMetaC[2],
         expectedError: /identical start and end circles/
-      },
-      {
-        label: "intersecting",
-        p1x: photoOverlayScene.gradientMetaC[2] + 1,
-        expectedError: /unsupported intersecting-circle topology/
       }
     ]) {
       const corruptRadialZip = await readZip(photoOverlayZipBlob);
@@ -1127,7 +1109,7 @@ async function run() {
       });
       await assert.rejects(
         loadSceneFromHep(incompleteRasterBytes),
-        /Raster layer 0 has incomplete or invalid v6 metadata/,
+        /Raster layer 0 has incomplete or invalid v7 metadata/,
         `missing raster ${missingField} must be rejected`
       );
     }

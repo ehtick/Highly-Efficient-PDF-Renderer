@@ -9,6 +9,7 @@ try {
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { VectorDrawRunCuller } = await import("../src/vectorDrawRunCulling.ts");
   const { setStrokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
+  const { compositePdfPixel } = await import("../src/pdfComposite.ts");
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
 
@@ -217,6 +218,151 @@ try {
     fresh.update(nearbyScene.drawRuns, scale);
     assert.deepEqual(paints(nearby), paints(fresh), "projection changes restore the correct paint order");
   }
+
+  // Equal RGB commutes under Normal source-over, including unequal coverage,
+  // layer conditions and clips. References and the source arrays never change.
+  const monochrome = makePages([0]);
+  monochrome.drawRuns.pop();
+  monochrome.fillPathMetaB.set([10, 10, 0.25, 0.25]);
+  monochrome.fillPathMetaC = Float32Array.of(0, 0, 0.25, 0.4);
+  monochrome.textInstanceC = Float32Array.of(0.25, 0.25, 0.25, 0.7);
+  for (let index = 0; index < 2; index++) monochrome.styles.set([0.25, 0.25, 0.25, 0.25], index * 4);
+  monochrome.clipPaths = [rectangle(0, 0, 5, 10), rectangle(2, 0, 10, 10)];
+  monochrome.drawRuns.forEach((run, index) => { run.optionalContent = index; run.clipIndex = index % 2; });
+  const unchanged = structuredClone(monochrome);
+  const monochromePlan = new VectorOrderedBatches(monochrome, null);
+  monochromePlan.update(monochrome.drawRuns, 0.1);
+  assert.equal(monochromePlan.batches.length, 3, "overlapping same-color strokes batch through fills from different layers");
+  assert.deepEqual(paints(monochromePlan), ["stroke:0:1", "stroke:1:1", "fill:0:2", "text:0:2"]);
+  monochromePlan.setColorCommutationEnabled(false);
+  assert(monochromePlan.update(monochrome.drawRuns, 0.1), "an override invalidates the cached schedule even at the same scale");
+  assert.equal(monochromePlan.batches.length, 4, "temporary primitive colors restore overlap dependencies");
+  monochromePlan.setColorCommutationEnabled(false);
+  assert.equal(monochromePlan.update(monochrome.drawRuns, 0.1), false, "unchanged override state keeps the instance upload");
+  monochromePlan.setColorCommutationEnabled(true);
+  assert(monochromePlan.update(monochrome.drawRuns, 0.1));
+  assert.equal(monochromePlan.batches.length, 3, "clearing overrides restores color batching");
+  monochromePlan.update(monochrome.drawRuns.filter((_, index) => index !== 1), 0.1);
+  assert.deepEqual(paints(monochromePlan), ["stroke:0:1", "stroke:1:1", "text:0:2"], "hidden paints keep their canonical identities");
+  assert.deepEqual(monochrome, unchanged);
+  for (const backdrop of [[0, 0, 0, 0], [0.1, 0.2, 0.3, 0.5], [1, 1, 1, 1]]) {
+    for (const tint of [0, 0.3, 1]) {
+      const rgb = [0.25, 0.25, 0.25].map((channel, index) => channel * (1 - tint) + [1, 0, 0.5][index] * tint);
+      const layers = [0.17, 0.4, 0.81].map(alpha => [...rgb.map(channel => channel * alpha), alpha]);
+      const forward = layers.reduce((result, layer) => compositePdfPixel(result, layer), backdrop);
+      const reverse = layers.slice().reverse().reduce((result, layer) => compositePdfPixel(result, layer), backdrop);
+      forward.forEach((channel, index) => assert(Math.abs(channel - reverse[index]) < 1e-12,
+        "equal RGB commutes with alpha/AA coverage, translucent backdrops, and global tint"));
+    }
+  }
+  for (const change of [
+    scene => { scene.fillPathMetaC[2] += 0.000001; },
+    scene => { scene.drawRuns[1].blendMode = "Multiply"; },
+    scene => { scene.fillPathMetaC[2] = NaN; }
+  ]) {
+    const different = structuredClone(monochrome);
+    change(different);
+    const differentPlan = new VectorOrderedBatches(different, null);
+    differentPlan.update(different.drawRuns, 0.1);
+    assert.equal(differentPlan.batches.length, 4, "different/unknown RGB and blend modes remain ordered barriers");
+  }
+  const multicolor = structuredClone(monochrome);
+  multicolor.textInstanceCount = 2;
+  multicolor.textInstanceA = Float32Array.from([1, 0, 0, 1, 1, 0, 0, 1]);
+  multicolor.textInstanceB = new Float32Array(8);
+  multicolor.textInstanceC = Float32Array.from([0.25, 0.25, 0.25, 1, 1, 0, 0, 1]);
+  multicolor.drawRuns = [multicolor.drawRuns[0], { kind: "text", first: 0, count: 2 }, multicolor.drawRuns[2]];
+  const multicolorPlan = new VectorOrderedBatches(multicolor, null);
+  multicolorPlan.update(multicolor.drawRuns, 0.1);
+  assert.equal(multicolorPlan.batches.length, 3, "every glyph's color must match before a text run can commute");
+  const quantized = structuredClone(monochrome);
+  quantized.drawRuns = [quantized.drawRuns[0], quantized.drawRuns[3], quantized.drawRuns[2]];
+  quantized.drawRuns.forEach(run => { delete run.clipIndex; });
+  quantized.textInstanceA.set([10, 0, 0, 10]);
+  quantized.textInstanceC.fill(0.501);
+  for (let index = 0; index < 2; index++) quantized.styles.set([0.25, 0.501, 0.501, 0.501], index * 4);
+  const quantizedPlan = new VectorOrderedBatches(quantized, null);
+  quantizedPlan.update(quantized.drawRuns, 0.1);
+  assert.equal(quantizedPlan.batches.length, 3, "matching source RGB cannot commute when byte text colors round differently from float strokes");
+  const byteColor = Math.fround(128 / 255);
+  for (let index = 0; index < 2; index++) quantized.styles.set([0.25, byteColor, byteColor, byteColor], index * 4);
+  const matchingBytePlan = new VectorOrderedBatches(quantized, null);
+  matchingBytePlan.update(quantized.drawRuns, 0.1);
+  assert.equal(matchingBytePlan.batches.length, 2, "matching uploaded RGB permits text batching after byte quantization");
+  const changedLod = { ...monochrome, styles: monochrome.styles.slice() };
+  changedLod.styles[5] = 0.75;
+  setStrokePaintOrigins(changedLod, Uint32Array.of(0, 1));
+  const colorRuntime = { levels: [monochrome, changedLod].map((scene, index) => ({ scene, tolerance: index,
+    segmentCount: 2, visibleSegmentIds: Uint32Array.of(0, 1), visibleSegmentCount: index ? 0 : 2 })) };
+  const lodColorPlan = new VectorOrderedBatches(monochrome, colorRuntime);
+  lodColorPlan.update(monochrome.drawRuns, 0.1);
+  assert.equal(lodColorPlan.batches.length, 4, "dormant LOD colors must also agree before reusing a paint schedule");
+
+  const longMonochrome = makePages(Array.from({ length: 256 }, () => 0));
+  longMonochrome.pageRects = Float32Array.of(0, 0, 10, 10);
+  longMonochrome.drawRuns = longMonochrome.drawRuns.filter(run => run.kind !== "raster" && run.kind !== "text");
+  longMonochrome.fillPathMetaC = new Float32Array(256 * 4);
+  for (let index = 0; index < 256; index++) {
+    longMonochrome.fillPathMetaB.set([10, 10, 0.25, 0.25], index * 4);
+    longMonochrome.fillPathMetaC.set([0, 0, 0.25, 0.4], index * 4);
+    for (const stroke of [index * 2, index * 2 + 1]) longMonochrome.styles.set([0.25, 0.25, 0.25, 0.25], stroke * 4);
+  }
+  const longPlan = new VectorOrderedBatches(longMonochrome, null);
+  longPlan.update(longMonochrome.drawRuns, 0.1);
+  assert.equal(longPlan.batches.length, 2, "long equal-color spans batch in linear time without the overlap lookahead limit");
+  assert.deepEqual(paints(longPlan).filter(paint => paint.startsWith("stroke:")),
+    Array.from({ length: 512 }, (_, index) => `stroke:${index}:0`), "equal-color grouping retains canonical order within each kind");
+  longPlan.setColorCommutationEnabled(false);
+  longPlan.update(longMonochrome.drawRuns, 0.1);
+  assert.equal(longPlan.batches.length, 513, "overrides restore the long span's original overlap dependencies");
+  longPlan.setColorCommutationEnabled(true);
+  longPlan.update(longMonochrome.drawRuns.filter((_, index) => index % 7 !== 0), 0.1);
+  assert.equal(longPlan.batches.length, 2, "layer/culling subsets retain compact equal-color groups");
+
+  // Dense drawings alternate overlapping local stroke/fill operations. Distant
+  // clusters may commute even across OCGs, including past blocked same-kind
+  // paints; exhausting a small search budget used to leave the tail unbatched.
+  const dense = makePages(Array.from({ length: 512 }, (_, index) => index * 20));
+  dense.pageRects = Float32Array.of(0, 0, 512 * 20, 10);
+  dense.drawRuns = dense.drawRuns.filter(run => run.kind === "stroke" || run.kind === "fill");
+  dense.fillPathMetaC = new Float32Array(512 * 4);
+  for (let index = 0; index < 512; index++) {
+    dense.fillPathMetaB.set([index * 20 + 10, 10, 1, 0], index * 4);
+    dense.fillPathMetaC[index * 4 + 3] = 1;
+  }
+  dense.drawRuns.forEach((run, index) => { run.optionalContent = index % 7; });
+  const denseSource = structuredClone(dense);
+  const densePlan = new VectorOrderedBatches(dense, null);
+  densePlan.update(dense.drawRuns);
+  const denseOriginal = paints(densePlan);
+  let denseSchedules = 0;
+  const compactDense = densePlan.scheduler.compact.bind(densePlan.scheduler);
+  densePlan.scheduler.compact = runs => { denseSchedules++; return compactDense(runs); };
+  densePlan.update(dense.drawRuns, 0.1);
+  assert(densePlan.batches.length <= 32, "batching continues throughout a dense interleaved drawing");
+  assertOverlapOrder(densePlan, denseOriginal, dense);
+  const denseTemplate = paints(densePlan);
+  for (const selected of [dense.drawRuns.filter(run => run.optionalContent < 3),
+    dense.drawRuns.slice(700, 1000), [], dense.drawRuns.slice(100, 400), dense.drawRuns]) {
+    densePlan.update(selected, 0.1);
+    const keys = new Set(selected.map(run => `${run.kind}:${run.first}:0`));
+    assert.deepEqual(paints(densePlan), denseTemplate.filter(paint => keys.has(paint)),
+      "large viewport/layer changes and reentry filter the complete valid schedule");
+    assert.equal(denseSchedules, 1, "panning and layer toggles never repeat the dense scheduling search");
+  }
+  densePlan.update(dense.drawRuns, 0.2);
+  assert.equal(denseSchedules, 2, "changed AA coverage invalidates the full-scene template");
+  densePlan.setColorCommutationEnabled(false);
+  densePlan.update(dense.drawRuns, 0.2);
+  assert.equal(denseSchedules, 3, "primitive recoloring invalidates dense color equivalence");
+  densePlan.setColorCommutationEnabled(true);
+  densePlan.update(dense.drawRuns, 0.2);
+  assert.equal(denseSchedules, 4, "clearing overrides rebuilds the original color schedule");
+  densePlan.update(dense.drawRuns, null);
+  assert.deepEqual(paints(densePlan), denseOriginal, "unknown projection scales retain canonical paint order");
+  densePlan.update(dense.drawRuns, 0.1);
+  assert.equal(denseSchedules, 5);
+  assert.deepEqual(dense, denseSource, "render batching never changes source geometry, ranges, or layer membership");
 
   // Exercise both production dispatchers, including disabling scheduling for
   // GL's arbitrary local-to-clip projection. These checks need no GPU/server.

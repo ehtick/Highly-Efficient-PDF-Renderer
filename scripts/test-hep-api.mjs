@@ -18,7 +18,7 @@ try {
   const builder = await import("../src/hepBuilder.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
-  const { tryReadSourcePdfBytesFromExistingHep } = await import("../src/hep.ts");
+  const { loadSceneFromHep } = await import("../src/hep.ts");
   assert.equal(builder.buildParsedDataZip, undefined, "the old builder has no compatibility alias");
   const scene = composeVectorScenesInGrid([], 1);
   for (const compression of ["store", "deflate"]) {
@@ -62,6 +62,9 @@ try {
     }
   }
   await assert.rejects(builder.buildHep(scene, { compression: "gzip" }), /compression must be/);
+  await assert.rejects(builder.buildHep(scene, { sourcePdf: new Uint8Array() }), /no longer supported/);
+  await assert.rejects(builder.buildHep(scene, { sourcePdfPages: "1" }), /no longer supported/);
+  await assert.rejects(builder.buildHep({ ...scene, drawRuns: [{ kind: "raster", first: 0, count: 1 }] }), /raster|drawRun|draw run/i);
   for (const stage of ["hep-build", "complete"]) {
     const lateController = new AbortController();
     const lateReason = new Error(`cancel at ${stage}`);
@@ -84,11 +87,11 @@ try {
   fallback.file("source/source.pdf", "%PDF-synthetic-source");
   fallback.file("manifest.json", JSON.stringify({ formatVersion: 6, sourcePdfFile: "source/source.pdf" }));
   const fallbackBytes = await fallback.generateAsync({ type: "uint8array" });
-  assert.equal(new TextDecoder().decode(await tryReadSourcePdfBytesFromExistingHep(fallbackBytes)), "%PDF-synthetic-source");
+  await assert.rejects(loadSceneFromHep(fallbackBytes), /format v6 is not supported/);
   const controller = new AbortController();
-  const reason = new Error("cancel source recovery");
+  const reason = new Error("cancel HEP load");
   controller.abort(reason);
-  await assert.rejects(tryReadSourcePdfBytesFromExistingHep(fallbackBytes, controller.signal), error => error === reason);
+  await assert.rejects(loadSceneFromHep(fallbackBytes, { signal: controller.signal }), error => error === reason);
   await assert.rejects(builder.buildHep(scene, { signal: controller.signal }), error => error === reason);
   console.log("HEP API passed: native formats, source forms, clean API break, progress, and cancellation.");
 } finally {

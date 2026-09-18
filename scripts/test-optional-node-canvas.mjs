@@ -64,12 +64,17 @@ try {
     assert.equal(canvasAttempts, attempts, "clipped images no longer need a canvas backend");
     assert.equal(clipped.clipPaths.length, 1);
     assert.equal(clipped.rasterLayers[0].width, 2);
-    // Exercise the retained compatibility compositor explicitly.
-    await assert.rejects(rasterSession.compileVectorPage(0, { preserveDrawingOrder: false }),
-      error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
+    assert.equal((await rasterSession.compileVectorPage(0, { preserveDrawingOrder: false })).rasterLayers[0].width, 2,
+      "explicit legacy ordering also keeps directly representable clipped images");
   } finally {
     await rasterSession.close();
   }
+
+  const stencilSession = await openPdf({ kind: "bytes", bytes: fixture("stencil") });
+  try {
+    await assert.rejects(stencilSession.compileVectorPage(0),
+      error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
+  } finally { await stencilSession.close(); }
 
   const processDescriptor = Object.getOwnPropertyDescriptor(globalThis, "process");
   const attemptsBeforeBrowser = canvasAttempts;
@@ -97,7 +102,7 @@ try {
     "raw RGBA is still preferred when it is smaller than the encoded image");
   assert.equal(warnings.length, 1, "working codecs and size-based RGBA selection must not warn");
 
-  const installedSession = await openPdf({ kind: "bytes", bytes: fixture(true) });
+  const installedSession = await openPdf({ kind: "bytes", bytes: fixture("stencil") });
   try {
     const scene = await installedSession.compileVectorPage(0, { preserveDrawingOrder: false });
     assert.equal(scene.rasterLayers.length, 1);
@@ -119,7 +124,9 @@ function fixture(raster) {
     { number: 4, body: tinyPdfStream("", raster
       ? "q 5 5 10 10 re W n 0 20 -20 0 20 0 cm /Im Do Q"
       : "1 0 0 rg 1 2 3 4 re f") },
-    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8",
-      Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0)) }
+    { number: 5, body: raster === "stencil"
+      ? tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true /BitsPerComponent 1", Uint8Array.of(0, 0))
+      : tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0)) }
   ] });
 }

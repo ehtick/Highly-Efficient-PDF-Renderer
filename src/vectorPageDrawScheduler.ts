@@ -2,7 +2,13 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 const kinds = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
-const PAINT_LOOKAHEAD = 32;
+const PAINT_LOOKAHEAD = 128;
+// Dense interleaved drawings otherwise exhaust the search halfway through the
+// page. This remains a linear work bound; it is paid only when replanning.
+const PAINT_CHECKS_PER_RUN = 128;
+// A source-wide schedule avoids replanning whenever a new paint enters the view.
+// Small scenes retain subset scheduling, where its cost and draw count are low.
+const FULL_SCHEDULE_MIN_RUNS = 1024;
 // Large visibility changes should regroup draws instead of retaining a sparse schedule.
 const MIN_CACHED_PAINT_FRACTION = 0.875;
 
@@ -12,6 +18,7 @@ export class VectorPageDrawScheduler {
   private readonly bounds: VectorDrawRunCuller;
   private readonly pageForRun: Uint16Array;
   private readonly kindForRun: Uint8Array;
+  private readonly colorForRun: Int32Array;
   private readonly components: Int32Array;
   private readonly pageBounds: Float64Array;
   private readonly paintBounds: Float64Array;
@@ -20,14 +27,17 @@ export class VectorPageDrawScheduler {
   private readonly next: Int32Array;
   private readonly ordered: number[] = [];
   private readonly compacted: number[] = [];
+  private readonly colorGrouped: number[] = [];
   private readonly skipped = new Int32Array(PAINT_LOOKAHEAD);
   private readonly previousPaints: Uint32Array;
   private readonly selectedPaints: Uint8Array;
+  private readonly allPaints: readonly number[] | null;
   private readonly filtered: number[] = [];
   private previousPaintCount = -1;
   private scheduleDirty = true;
   private padding = NaN;
   private enabled = false;
+  private colorCommutationEnabled = true;
 
   static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
     const pages = scene.pageRects.length / 4;
@@ -43,6 +53,7 @@ export class VectorPageDrawScheduler {
     this.bounds = new VectorDrawRunCuller(scene, { scene: strokes, sourceRuns });
     this.pageForRun = new Uint16Array(runs.length);
     this.kindForRun = new Uint8Array(runs.length);
+    this.colorForRun = uniformPaintColors(scene, strokes, sourceRuns);
     this.components = new Int32Array(pages);
     this.pageBounds = new Float64Array(pages * 4);
     this.paintBounds = new Float64Array(runs.length * 4);
@@ -51,6 +62,8 @@ export class VectorPageDrawScheduler {
     this.next = new Int32Array(runs.length);
     this.previousPaints = new Uint32Array(runs.length);
     this.selectedPaints = new Uint8Array(runs.length);
+    this.allPaints = runs.length >= FULL_SCHEDULE_MIN_RUNS
+      ? Array.from({ length: runs.length }, (_, index) => index) : null;
     const box = [0, 0, 0, 0];
     runs.forEach((run, index) => {
       this.kindForRun[index] = kinds.indexOf(run.kind);
@@ -67,6 +80,14 @@ export class VectorPageDrawScheduler {
       // actual paint bounds below, including content outside the page rect.
       this.pageForRun[index] = nearest;
     });
+  }
+
+  /** Temporary primitive colors can invalidate source-color equivalence. */
+  setColorCommutationEnabled(enabled: boolean): boolean {
+    if (this.colorCommutationEnabled === enabled) return false;
+    this.colorCommutationEnabled = enabled;
+    this.scheduleDirty = true;
+    return true;
   }
 
   /** null disables reordering for projections without a conservative pixel scale. */
@@ -129,6 +150,17 @@ export class VectorPageDrawScheduler {
 
   schedule(runs: readonly number[]): readonly number[] {
     if (!this.enabled) return runs;
+    if (this.allPaints) {
+      // Removing paints from a valid order preserves every dependency, including
+      // when hidden layers or previously culled paints become visible again.
+      // Bounds include all LOD levels, so only AA scale and color overrides
+      // invalidate this template, not viewport membership or selected stroke IDs.
+      if (this.scheduleDirty) {
+        this.scheduleDirty = false;
+        this.schedulePaints(this.allPaints);
+      }
+      return runs.length === this.allPaints.length ? this.compacted : this.filterSchedule(runs);
+    }
     // Dependency bounds include every LOD level, so changing primitive IDs
     // within the same paints does not invalidate this order.
     if (!this.scheduleDirty && runs.length <= this.previousPaintCount &&
@@ -142,16 +174,24 @@ export class VectorPageDrawScheduler {
       // that reenter the view can reuse it too; new paints still require scheduling.
       if (cursor === runs.length) {
         if (runs.length === this.previousPaintCount) return this.compacted;
-        this.selectedPaints.fill(0);
-        for (const run of runs) this.selectedPaints[run] = 1;
-        this.filtered.length = 0;
-        for (const run of this.compacted) if (this.selectedPaints[run]) this.filtered.push(run);
-        return this.filtered;
+        return this.filterSchedule(runs);
       }
     }
     this.previousPaints.set(runs);
     this.previousPaintCount = runs.length;
     this.scheduleDirty = false;
+    return this.schedulePaints(runs);
+  }
+
+  private filterSchedule(runs: readonly number[]): readonly number[] {
+    this.selectedPaints.fill(0);
+    for (const run of runs) this.selectedPaints[run] = 1;
+    this.filtered.length = 0;
+    for (const run of this.compacted) if (this.selectedPaints[run]) this.filtered.push(run);
+    return this.filtered;
+  }
+
+  private schedulePaints(runs: readonly number[]): readonly number[] {
     if (this.independentGroups <= 1) return this.compact(runs);
     this.heads.fill(-1); this.tails.fill(-1); this.ordered.length = 0;
     for (const run of runs) {
@@ -178,13 +218,14 @@ export class VectorPageDrawScheduler {
     return this.compact(this.ordered);
   }
 
-  /** Pull matching paints forward only across paints with disjoint bounds. */
+  /** Disjoint paints and equal-RGB Normal paints commute under source-over. */
   private compact(runs: readonly number[]): readonly number[] {
+    if (this.colorCommutationEnabled) runs = this.groupUniformColors(runs);
     this.compacted.length = 0;
     for (let index = 0; index < runs.length; index++) this.next[runs[index]] = runs[index + 1] ?? -1;
     let head = runs[0] ?? -1;
     // Bound rebuild work when a document has many mutually overlapping paints.
-    let checksLeft = Math.max(8192, runs.length * 8);
+    let checksLeft = Math.max(8192, runs.length * PAINT_CHECKS_PER_RUN);
     while (head >= 0) {
       const kind = this.kindForRun[head];
       this.compacted.push(head);
@@ -197,7 +238,7 @@ export class VectorPageDrawScheduler {
         let movable = this.kindForRun[cursor] === kind;
         if (movable) {
           for (let index = 0; index < skippedCount; index++) {
-            if (checksLeft-- <= 0 || this.overlaps(cursor, this.skipped[index])) { movable = false; break; }
+            if (checksLeft-- <= 0 || this.dependsOn(cursor, this.skipped[index])) { movable = false; break; }
           }
         }
         if (movable) {
@@ -214,6 +255,37 @@ export class VectorPageDrawScheduler {
     return this.compacted;
   }
 
+  /** Long monochrome drawing spans need linear grouping, not bounded swaps. */
+  private groupUniformColors(runs: readonly number[]): readonly number[] {
+    this.colorGrouped.length = 0;
+    for (let first = 0; first < runs.length;) {
+      const color = this.colorForRun[runs[first]];
+      let end = first + 1;
+      if (color > 0) while (end < runs.length && this.colorForRun[runs[end]] === color) end++;
+      if (end === first + 1) this.colorGrouped.push(runs[first]);
+      else {
+        // At most three passes through a span. Keep each kind's canonical
+        // order and leave different colors, blends and images as barriers.
+        for (let kind = 0; kind < 3; kind++) {
+          for (let index = first; index < end; index++) {
+            const run = runs[index];
+            if (this.kindForRun[run] === kind) this.colorGrouped.push(run);
+          }
+        }
+      }
+      first = end;
+    }
+    return this.colorGrouped;
+  }
+
+  private dependsOn(first: number, second: number): boolean {
+    // Alpha, antialiasing, and clipping change coverage, but equal RGB still
+    // gives C * (a + b - a*b) over the same backdrop in either paint order.
+    const color = this.colorForRun[first];
+    if (this.colorCommutationEnabled && color > 0 && color === this.colorForRun[second]) return false;
+    return this.overlaps(first, second);
+  }
+
   private overlaps(first: number, second: number): boolean {
     const a = first * 4, b = second * 4, bounds = this.paintBounds;
     return !(bounds[a] > bounds[a + 2] || bounds[a + 1] > bounds[a + 3] ||
@@ -221,4 +293,48 @@ export class VectorPageDrawScheduler {
       bounds[a + 2] < bounds[b] || bounds[b + 2] < bounds[a] ||
       bounds[a + 3] < bounds[b + 1] || bounds[b + 3] < bounds[a + 1]);
   }
+}
+
+/** Exact uploaded RGB only; blending modes and images retain overlap order. */
+function uniformPaintColors(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array): Int32Array {
+  const runs = scene.drawRuns!;
+  const ids = new Int32Array(runs.length);
+  const colors = new Float32Array(runs.length * 3);
+  const palette = new Map<string, number>();
+  const include = (run: number, red: number, green: number, blue: number): void => {
+    if (ids[run] < 0) return;
+    const offset = run * 3;
+    if (!Number.isFinite(red) || !Number.isFinite(green) || !Number.isFinite(blue)) { ids[run] = -1; return; }
+    if (ids[run] > 0) {
+      if (colors[offset] !== red || colors[offset + 1] !== green || colors[offset + 2] !== blue) ids[run] = -1;
+      return;
+    }
+    colors[offset] = red; colors[offset + 1] = green; colors[offset + 2] = blue;
+    const key = `${red},${green},${blue}`;
+    let id = palette.get(key);
+    if (id === undefined) { id = palette.size + 1; palette.set(key, id); }
+    ids[run] = id;
+  };
+  runs.forEach((run, index) => {
+    if (run.blendMode || (run.kind !== "stroke" && run.kind !== "fill" && run.kind !== "text")) { ids[index] = -1; return; }
+    if (run.kind === "stroke") return;
+    for (let primitive = run.first; primitive < run.first + run.count && ids[index] >= 0; primitive++) {
+      const offset = primitive * 4;
+      if (run.kind === "fill") include(index, scene.fillPathMetaB[offset + 2], scene.fillPathMetaB[offset + 3], scene.fillPathMetaC[offset + 2]);
+      // Text colors use RGBA8_UNORM, while fills/strokes retain float32 RGB.
+      // Equal source numbers alone do not establish equal shader colors.
+      else include(index, textColor(scene.textInstanceC[offset]), textColor(scene.textInstanceC[offset + 1]), textColor(scene.textInstanceC[offset + 2]));
+    }
+  });
+  // Include all LOD levels, even dormant ones, so tile/zoom changes can reuse
+  // the schedule without assuming simplification preserves the original RGB.
+  for (let index = 0; index < strokes.segmentCount; index++) {
+    const offset = index * 4;
+    include(sourceRuns[index], strokes.styles[offset + 1], strokes.styles[offset + 2], strokes.styles[offset + 3]);
+  }
+  return ids;
+}
+
+function textColor(value: number): number {
+  return Number.isFinite(value) ? Math.fround(Math.round(Math.max(0, Math.min(1, value)) * 255) / 255) : NaN;
 }

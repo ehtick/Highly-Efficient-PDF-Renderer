@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { createCanvas, ImageData as NodeImageData } from "@napi-rs/canvas";
 import { HepArchive, crc32 } from "../src/hepContainer.ts";
@@ -170,13 +167,6 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
   }
 }
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRootDir = path.resolve(scriptDir, "..");
-const seedHepPath = path.join(
-  repoRootDir,
-  "public/examples/heps/LK_Office_Level_1-parsed-data.hep"
-);
-
 // Resolve TypeScript imports directly; no Vite middleware or server is needed.
 const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) &&
@@ -193,10 +183,8 @@ try {
 
   await assertRasterWebpQualityParity(rasterImageCodec);
 
-  const seedBytes = await readFile(seedHepPath);
-  const seedScene = await parsedData.loadSceneFromHep(
-    seedBytes.buffer.slice(seedBytes.byteOffset, seedBytes.byteOffset + seedBytes.byteLength)
-  );
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const seedScene = createEmptyVectorScene();
 
   const width = 64;
   const height = 64;
@@ -220,7 +208,7 @@ try {
   );
   const encodedEntry = encodedManifest.scene.rasterLayers[0];
 
-  assert.equal(encodedManifest.formatVersion, 6);
+  assert.equal(encodedManifest.formatVersion, 7);
   assert.equal(encodedManifest.scene.rasterLayers.length, 1);
   assert.ok(encodedEntry.encoding === "webp" || encodedEntry.encoding === "png");
   assert.equal("textureWidth" in encodedEntry, false);
@@ -273,10 +261,10 @@ try {
     parsedData.loadSceneFromHep(
       await mismatchedArchive.generateAsync({ type: "arraybuffer", compression: "STORE" })
     ),
-    /header dimensions do not match its v6 metadata/
+    /header dimensions do not match its v7 metadata/
   );
 
-  console.log("Synthetic v6 raster archive smoke test passed.");
+  console.log("Synthetic v7 raster archive smoke test passed.");
 } finally {
   hooks.deregister();
 }

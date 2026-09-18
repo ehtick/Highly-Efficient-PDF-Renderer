@@ -1,3 +1,4 @@
+import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
@@ -319,6 +320,10 @@ export class ThreeMaterialTextLayer {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
     this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex");
+  }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    this.orderedRuns?.setOptionalContentVisibility(snapshot);
   }
 
   setVisible(visible: boolean): void {

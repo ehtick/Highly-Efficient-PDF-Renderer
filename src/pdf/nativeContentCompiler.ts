@@ -298,6 +298,9 @@ export interface DensePdfContentCompileOptions {
   patterns?: ReadonlyMap<string, Readonly<DensePdfPatternDefinition>>;
   /** Pre-resolved page `/ColorSpace` resources plus DefaultGray/RGB/CMYK handling. */
   colorSpaceResolver?: DensePdfColorSpaceResolver;
+  /** Keep paint in initially hidden layers for interactive VectorScene output. */
+  retainOptionalContent?: boolean;
+  combineOptionalContent?: (parent: number, own: number) => number;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
   /** Exact inherited page-space clip for vector Form specialization. */
@@ -522,6 +525,7 @@ export interface DensePdfVectorSceneData {
    * and COMPOSITE paint ordinals.
    */
   readonly sourceEvents: Uint32Array;
+  readonly sourceOptionalContentIndices?: Int32Array;
   /** Glyph triples: page glyph start, glyph count, and PDF rendering mode. */
   readonly glyphRunMeta: Uint32Array;
   /** One sRGB nonstroking RGBA tuple per glyph triple. */
@@ -545,6 +549,8 @@ export interface DensePdfVectorSceneData {
   readonly formPaintOrders?: Uint32Array;
   /** Bit field per image invocation; see DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_*. */
   readonly imageFlags: Uint8Array;
+  /** Constant nonstroking alpha for each image paint, separate from image pixels. */
+  readonly imageOpacities?: Float32Array;
   /** Six values per image: fill start/end, stroke start/end, span/image paint ordinals. */
   readonly imagePathSpanCheckpoints?: Uint32Array;
   /** Four values per image: first-path offset/length and image offset/length. */
@@ -1298,6 +1304,7 @@ class DenseContentCompiler {
   readonly vectorFormPaintOrders: number[] = [];
 
   readonly vectorImageFlags: number[] = [];
+  readonly vectorImageOpacities: number[] = [];
 
   readonly vectorImagePathSpanCheckpoints: number[] = [];
 
@@ -1308,6 +1315,7 @@ class DenseContentCompiler {
   readonly vectorSelectivePaintSourceSpans: number[] = [];
 
   readonly vectorSourceEvents: number[] = [];
+  readonly vectorSourceOptionalContentIndices: number[] = [];
   readonly vectorShadingPaints: DensePdfVectorShadingPaint[] = [];
   readonly vectorSourceClipIndices: number[] = [];
   readonly vectorSourceBlendModes: number[] = [];
@@ -1634,6 +1642,7 @@ class DenseContentCompiler {
     // Uniform opaque, stroke-only pages can retain the established containment
     // optimization. Mixed paints keep every source range stable.
     const compactOrderedStrokes = this.policy.orderedPaint === true &&
+      !this.vectorSourceOptionalContentIndices.some(index => index >= 0) &&
       this.vectorSourceEvents.every((value, i) => i % 2 !== 0 ||
         value === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT || value === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) &&
       this.vectorSourceClipIndices.every(index => index === this.vectorSourceClipIndices[0]) &&
@@ -1645,6 +1654,7 @@ class DenseContentCompiler {
       this.vectorSourceClipIndices.length = 0;
       this.vectorSourceBlendModes.length = 0;
       this.vectorSourceEvents.length = 0;
+      this.vectorSourceOptionalContentIndices.length = 0;
       this.vectorPathPaintRanges.length = 0;
       const count = strokeResult.endpoints.length / 4;
       if (count > 0) {
@@ -1653,6 +1663,7 @@ class DenseContentCompiler {
         this.vectorPathPaintRanges.push(0, count);
         this.vectorSourceClipIndices.push(clipIndex, clipIndex);
         this.vectorSourceBlendModes.push(0, 0);
+        this.vectorSourceOptionalContentIndices.push(-1, -1);
       }
     }
     const fillPathMetaA = this.fillPathMetaA.toTypedArray();
@@ -1700,6 +1711,7 @@ class DenseContentCompiler {
         vectorSceneData: {
           ...(this.vectorShadingPaints.length ? { shadingPaints: Object.freeze(this.vectorShadingPaints) } : {}),
           sourceEvents: Uint32Array.from(this.vectorSourceEvents),
+          ...(this.options.retainOptionalContent ? { sourceOptionalContentIndices: Int32Array.from(this.vectorSourceOptionalContentIndices) } : {}),
           sourceBlendModes: Uint8Array.from(this.vectorSourceBlendModes),
           ...(this.policy.orderedPaint ? {
             pathPaintRanges: Uint32Array.from(this.vectorPathPaintRanges),
@@ -1720,6 +1732,7 @@ class DenseContentCompiler {
           imagePaintOrders: Uint32Array.from(this.vectorImagePaintOrders),
           formPaintOrders: Uint32Array.from(this.vectorFormPaintOrders),
           imageFlags: Uint8Array.from(this.vectorImageFlags),
+          imageOpacities: Float32Array.from(this.vectorImageOpacities),
           imagePathSpanCheckpoints: Uint32Array.from(this.vectorImagePathSpanCheckpoints),
           imagePathSourceSpans: Float64Array.from(this.vectorImagePathSourceSpans),
           selectivePaintOrdinalSpans: Uint32Array.from(this.vectorSelectivePaintOrdinalSpans),
@@ -2320,7 +2333,7 @@ class DenseContentCompiler {
         const imageIndex = this.options.imageXObjects?.get(resourceName);
         if (imageIndex !== undefined) {
           const association = this.imageOptionalContent.get(resourceName);
-          if (association?.defaultVisible === false) {
+          if (!this.options.retainOptionalContent && association?.defaultVisible === false) {
             if (imageIndex !== -1 && (!Number.isSafeInteger(imageIndex) || imageIndex < 0)) {
               throw new DensePdfSyntaxError(
                 `Hidden Image XObject /${resourceName} has an invalid page-local index.`
@@ -2335,7 +2348,7 @@ class DenseContentCompiler {
             this.referencedXObjects.add(resourceName);
             this.recordImagePaintRun(
               imageIndex,
-              association?.optionalContentIndex ?? this.activeOptionalContentIndex,
+              this.combineOptionalContent(this.activeOptionalContentIndex, association?.optionalContentIndex ?? -1),
               this.operatorSourceOffset,
               this.operatorSourceLength,
               "Do"
@@ -2352,10 +2365,10 @@ class DenseContentCompiler {
           }
           this.referencedXObjects.add(resourceName);
           const association = this.formOptionalContent.get(resourceName);
-          if (this.contentVisible && association?.defaultVisible !== false) {
+          if (this.contentVisible && (this.options.retainOptionalContent || association?.defaultVisible !== false)) {
             this.recordFormPaint(
               formDefinitionIndex,
-              association?.optionalContentIndex ?? this.activeOptionalContentIndex
+              this.combineOptionalContent(this.activeOptionalContentIndex, association?.optionalContentIndex ?? -1)
             );
           }
           return;
@@ -2389,7 +2402,8 @@ class DenseContentCompiler {
         }
         if (this.policy.displayProgram !== true &&
             !(this.policy.vectorScene === true &&
-              this.policy.selectiveRaster === true)) {
+              (this.policy.selectiveRaster === true ||
+                (this.policy.orderedPaint && this.options.vectorShadings?.has(gradientIndex))))) {
           throw new DensePdfUnsupportedError(
             "The sh operator requires source-ordered display-program compilation.",
             operator
@@ -2909,7 +2923,7 @@ class DenseContentCompiler {
       ? operator.includes("*") ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO
       : null;
     const largeDisconnectedFill =
-      !this.policy.displayProgram && pathVisible &&
+      !this.policy.displayProgram && !this.policy.orderedPaint && pathVisible &&
       fillRule === FILL_RULE_NONZERO &&
       countPathMoveOps(pathData) >= 100;
     if (largeDisconnectedFill && !(
@@ -3111,6 +3125,7 @@ class DenseContentCompiler {
 
     if (visibleFill) {
       const fillStart = this.fillPathCount;
+      const fillSegmentStart = fillSegmentsA.quadCount;
       if (fillRule === null) {
         throw new DensePdfSyntaxError("Missing PDF fill rule for a painted fill path.");
       }
@@ -3132,6 +3147,9 @@ class DenseContentCompiler {
             this.state.clipMask
           );
       if (emittedBounds) {
+        if (!this.policy.displayProgram && fillSegmentsA.quadCount - fillSegmentStart > 65_536) {
+          throw new DensePdfUnsupportedError("VectorScene fill exceeds the 65536-segment analytic coverage budget.", operator);
+        }
         this.fillPathCount += 1;
         this.fillBounds = combineBounds(this.fillBounds, emittedBounds);
       }
@@ -3412,7 +3430,7 @@ class DenseContentCompiler {
     }
   }
 
-  private recordVectorSourceEvent(kind: number, index: number, operator: string): void {
+  private recordVectorSourceEvent(kind: number, index: number, operator: string, optionalContentIndex = this.activeOptionalContentIndex): void {
     if (
       !Number.isSafeInteger(kind) || kind < 0 || kind > 0xffff_ffff ||
       !Number.isSafeInteger(index) || index < 0 || index > 0xffff_ffff ||
@@ -3424,6 +3442,7 @@ class DenseContentCompiler {
       );
     }
     this.vectorSourceEvents.push(kind, index);
+    this.vectorSourceOptionalContentIndices.push(optionalContentIndex);
     this.vectorSourceClipIndices.push(this.state.clipIndex);
     this.vectorSourceBlendModes.push(this.state.blendMode === "Multiply" ? 1 : 0);
   }
@@ -3761,7 +3780,7 @@ class DenseContentCompiler {
       if (!this.policy.orderedPaint && this.policy.selectiveRaster === true &&
           !this.state.clipIsDefault && (!this.state.clipIsExactRectangle ||
           this.state.matrix[1] !== 0 || this.state.matrix[2] !== 0)) {
-        this.assertVectorSceneComposite("nonstroke", operator, true, false);
+        this.assertVectorSceneComposite("nonstroke", operator, false, false);
         const ordinal = this.nextVectorPaintOrdinal(operator);
         this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
         this.recordVectorSelectivePaint(ordinal);
@@ -3782,7 +3801,7 @@ class DenseContentCompiler {
       }
       if (this.policy.selectiveRaster && !this.policy.orderedPaint &&
           this.vectorSawVisibleText && !overlappingPathSpan) {
-        this.assertVectorSceneComposite("nonstroke", operator, true, false);
+        this.assertVectorSceneComposite("nonstroke", operator, false, false);
         const ordinal = this.nextVectorPaintOrdinal(operator);
         this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
         this.recordVectorSelectivePaint(ordinal);
@@ -3796,7 +3815,7 @@ class DenseContentCompiler {
           operator
         );
       }
-      this.assertVectorSceneComposite("nonstroke", operator, true, false);
+      this.assertVectorSceneComposite("nonstroke", operator, false, false);
       const ordinal = this.nextVectorPaintOrdinal(operator);
       const imageInvocationIndex = this.vectorImageIndices.length;
       this.vectorImageIndices.push(imageIndex);
@@ -3808,6 +3827,7 @@ class DenseContentCompiler {
         this.state.clipBounds.maxY
       );
       this.vectorImagePaintOrders.push(ordinal);
+      this.vectorImageOpacities.push(this.state.fillAlpha);
       this.vectorImageFlags.push(
         (this.state.clipIsDefault ? 0 : DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED) |
         (this.vectorSawVisibleText
@@ -3837,7 +3857,8 @@ class DenseContentCompiler {
       this.recordVectorSourceEvent(
         DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
         imageInvocationIndex,
-        operator
+        operator,
+        optionalContentIndex
       );
       this.vectorPathSpanStartFillCount = this.fillPathCount;
       this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
@@ -3959,7 +3980,8 @@ class DenseContentCompiler {
       this.recordVectorSourceEvent(
         DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
         paintIndex,
-        "Do"
+        "Do",
+        optionalContentIndex
       );
       return;
     }
@@ -4151,9 +4173,7 @@ class DenseContentCompiler {
     });
     this.markedContentStack.push({
       nodeIndex,
-      optionalContentIndex: optionalContentIndex >= 0
-        ? optionalContentIndex
-        : parent?.optionalContentIndex ?? -1,
+      optionalContentIndex: this.combineOptionalContent(parent?.optionalContentIndex ?? -1, optionalContentIndex),
       defaultVisible: (parent?.defaultVisible ?? true) && ownDefaultVisible
     });
   }
@@ -4190,7 +4210,11 @@ class DenseContentCompiler {
   }
 
   private get contentVisible(): boolean {
-    return this.markedContentStack.at(-1)?.defaultVisible ?? true;
+    return this.options.retainOptionalContent === true || (this.markedContentStack.at(-1)?.defaultVisible ?? true);
+  }
+
+  private combineOptionalContent(parent: number, own: number): number {
+    return this.options.combineOptionalContent?.(parent, own) ?? (own >= 0 ? own : parent);
   }
 
   private clearPaintPathState(): void {

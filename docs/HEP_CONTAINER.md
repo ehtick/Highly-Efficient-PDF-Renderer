@@ -1,10 +1,11 @@
 # HEP container version 1
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-version **1** wraps the existing **scene schema version 6**, recorded in
+version **1** wraps **scene schema version 7**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
-document model is not this container's scene schema. Legacy ZIP-based files must
-be converted with `node scripts/repack-heps.mjs` or regenerated from their PDF.
+document model is not this container's scene schema. Readers require scene v7;
+older HEP files must be regenerated from their original PDF. Container repacking
+preserves section bytes and does not upgrade a scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
 There are no directory records, timestamps, encryption, ZIP structures, or
@@ -85,6 +86,102 @@ with XOR `0xffffffff` (the same convention as ZIP and zlib).
 
 ## Scene draw order
 
+### Optional content (PDF layers)
+
+The optional `manifest.scene.optionalContent` object contains `groups`,
+`conditions`, `order`, and `radioGroups`. Group entries contain a document-local
+`id`, display `name`, `defaultVisible`, `locked`, and `usedInView` booleans. Store
+the document/artifact identity alongside a layer ID; names are not unique and
+IDs have no stability guarantee across independently converted files.
+
+Conditions form a bounded, acyclic graph. A condition is a group reference
+`{kind:"group",groupId}`, a boolean `{kind:"constant",value}`, a negation
+`{kind:"not",operand}`, or `{kind:"and"|"or",operands}`. Numeric operands index
+the condition table. This retains nested marked-content, OCG and OCMD semantics
+without requiring one layer ID per primitive. Optional-content-aware draw runs
+add `optionalContent`, a condition-table index; an absent field means
+unconditional visibility. Initially hidden geometry remains in the canonical
+stores and retains its primitive indices when layers are toggled.
+
+`order` retains the default configuration's display tree using group nodes
+`{kind:"group",groupId,children?}` and label nodes
+`{kind:"label",label,children}`. `radioGroups` lists arrays of mutually exclusive
+group IDs. Runtime visibility belongs to a view and is never written over these
+original definitions or exported defaults.
+
+When searchable characters need visibility associations, `manifest.textIndex`
+adds `optionalContentFile`, naming `text/optional-content.varint`. Its unsigned
+varint stream has one token per UTF-16 code unit, in page order: zero means
+unconditional and a positive token is the condition-table index plus one. This
+also associates fallback text quads that have no rendered glyph instance.
+The section must have exactly the declared text length and valid condition
+references. Scenes without such associations omit this section.
+
+Layer tables are limited to 100,000 groups, 1,000,000 condition nodes/operands,
+and nesting depth 64. IDs and references must be valid and unique where required;
+cyclic conditions, invalid draw-run references and malformed text associations
+are rejected. The existing 16 MiB manifest limit still applies.
+
+### Compositing and replay resources
+
+`scene.paintGraph.roots` retains the ordered hierarchy of draw leaves, composite
+groups, and retained fallback leaves. Draw leaves reference a draw-run index.
+Groups retain alpha, isolation, knockout, blend mode, bounds, optional visibility
+condition, and an optional alpha/luminosity mask subtree. Mask transfer samples
+are JSON arrays on disk and Float32Array values after loading. Each canonical
+draw run is covered once, including singleton raster runs substituted by a
+retained leaf. Repeated/cyclic nodes and nesting beyond 64 are rejected.
+
+`scene.retainedPages` entries contain a resource `file`, a six-value page-to-scene
+`matrix`, and an `optionalContentConditions` array mapping retained memberships
+to scene conditions (`-1` means unconditional). A resource is shared by all
+fallback islands that replay that page. Its file is `retained/page-N.bin` and
+contains self-contained retained drawing commands and typed stores, never a PDF
+that must be reparsed. Runtime visibility updates copy only membership bytes and
+rebuild affected raster slots before an atomic presentation change. Slots use a
+fixed full-page structural quad, so their canonical identity and picking bounds
+remain valid when previously hidden content becomes visible.
+
+Backdrop-dependent islands replay the retained command prefix, so changing an
+underlying layer can change a later island even when the island's own layer
+remains visible. Replay uses original PDF paints and current layer visibility.
+Temporary viewer color overrides and the global vector tint do not recolor
+fallback pixels or feed into their retained backdrop correction; these islands
+retain raster appearance and inspection limits.
+
+Each retained resource begins with 16 bytes: ASCII `HRP` followed by zero,
+little-endian uint32 encoding version `1`, uint32 UTF-8 JSON metadata length,
+and uint32 payload byte length. Metadata is padded with zeroes to a four-byte
+boundary. Typed arrays appear in metadata as
+`{$heprArray:"u8"|"u32"|"i32"|"f32",offset,length}`; offsets address the aligned
+payload, lengths count elements, and multibyte values are little-endian. Repeated
+references reuse one array. Metadata is limited to 16 MiB and the payload to
+768 MiB; array ranges and the complete retained-page schema are validated.
+Ordinary scenes omit these resources. Old embedded-PDF raster recovery is not
+part of scene v7.
+
+### Gradient meshes and image opacity
+
+`gradientMetaA.x == 2` identifies indexed triangle shading. Optional top-level
+`gradientMesh` metadata names four raw little-endian sections: ranges (uint32
+`[firstIndex,indexCount]` per gradient), positions (float32 XY per vertex), colors
+(float32 sRGB RGBA per vertex), and triangle indices (uint32). It also declares
+`vertexCount` and `indexCount`. Vertex colors and all geometry remain shared by
+paints; references continue to identify the whole gradient fill. Analytic paints
+have empty mesh ranges. Readers validate complete section lengths, finite values,
+unit colors, triangle alignment and vertex references, with limits of ten million
+vertices and thirty million indices.
+
+For analytic gradients, `gradientMetaA.z` uses bit 0 to disable start extension
+and bit 1 to disable end extension. `gradientMetaA.w` is zero for no background,
+otherwise packed RGB8 plus one; a PDF `sh` paint does not use shading background.
+Radial gradients may have intersecting circles and retain the highest eligible
+real root with nonnegative radius. Raster-layer metadata optionally adds
+`opacity` in `[0,1]`; absence means one. Opacity does not duplicate or rewrite the
+shared RGBA image bytes.
+
+### Paint runs
+
 The optional `manifest.scene.drawRuns` array records PDF paint order across
 vector and image stores. Each entry is `{ "kind": "fill", "first": 0, "count": 1 }`.
 Kinds are `fill`, `stroke`, `text`, `raster`, `gradient-fill`, and `gradient-stroke`;
@@ -99,12 +196,13 @@ that honors them; treating it as separate fixed passes can change overlaps.
 The ordered scenes retain vector geometry; bounded raster layers are used for
 content that requires unsupported compositing or paint features.
 
-An optional `blendMode: "Multiply"` on fill, stroke, text or raster runs applies
-PDF Multiply to that paint and the previously painted backdrop. Absent means
-Normal source-over. Readers must retain this field when batching or merging
-pages, and apply source alpha and antialias coverage to the blend. The native
-and Three renderers use two paired passes per primitive so transparent target
-alpha is also preserved correctly. Gradient runs do not accept this field.
+An optional `blendMode: "Multiply"` on ordinary draw runs preserves the compact
+legacy representation of PDF Multiply. Absent means Normal source-over. The
+paint graph represents all PDF blend modes, including nonseparable modes, along
+with isolation, knockout and soft masks. Readers must retain graph boundaries
+when batching or merging pages. Graph renderers track separate color, shape and
+group alpha surfaces; plain runs without a graph may use the established paired
+Multiply passes. Gradient paint blend modes are represented by graph groups.
 
 An optional `clipIndex` on a fill, stroke, text or raster run references
 `manifest.scene.clipPaths`. Each clip is `{ "parent": -1, "fillRule": 0,
@@ -134,12 +232,12 @@ CRC32 detects accidental corruption; it is not authentication.
 | Decoded chunk | 1 GiB |
 | Total decoded chunks, including alignment gaps | 2 GiB |
 | `manifest.json` | 16 MiB |
-| `source/source.pdf` or `source.pdf` | 512 MiB |
+| Each retained page program | 16 MiB metadata + 768 MiB typed stores |
 | Each `raster/` payload | 768 MiB |
 | Total `raster/` payloads | 1 GiB |
 
-The scene loader additionally applies its semantic raster, image-dimension, and
-source-PDF limits. Callers can provide stricter per-entry byte limits to the
+The scene loader additionally applies its semantic raster, image-dimension,
+optional-content DAG and paint-graph limits. Callers can provide stricter per-entry byte limits to the
 internal reader. Metadata limits are checked before decompression, and streamed
 decoded output cannot exceed its declared length. A grouped chunk is decoded once
 per reader, including concurrent entry reads. Standalone decoded chunks are not

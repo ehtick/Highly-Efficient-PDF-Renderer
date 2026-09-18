@@ -1,3 +1,4 @@
+import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
@@ -330,7 +331,8 @@ fn heprTextFragment(
   segmentTexWidth: f32,
   textAAScreenPx: f32,
   textCurveEnabled: f32,
-  vectorOverride: vec4<f32>
+  vectorOverride: vec4<f32>,
+  shapeOnly: f32
 ) -> vec4<f32> {
   if (clipReference > 0.0 &&
       (world.x < clipRect.x || world.y < clipRect.y ||
@@ -418,7 +420,7 @@ fn heprTextFragment(
         mipBiasedUvDy
       ).r
     );
-    let rasterAlpha = clamp(rasterCoverage, 0.0, 1.0) * instanceColor.a;
+    let rasterAlpha = clamp(rasterCoverage, 0.0, 1.0) * mix(instanceColor.a, 1.0, shapeOnly);
     if (rasterAlpha <= 0.001) {
       discard;
     }
@@ -543,7 +545,7 @@ fn heprTextFragment(
   // Nonzero fill stays opaque across overlap-only contour edges. Coincident
   // exterior edges are grouped above and antialiased as one true boundary.
   let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
-  let alpha = alphaBase * instanceColor.a;
+  let alpha = alphaBase * mix(instanceColor.a, 1.0, shapeOnly);
   if (alpha <= 0.001) {
     discard;
   }
@@ -569,6 +571,8 @@ export function createThreeWebGpuTextMaterial(
   material.lights = false;
   configureStraightAlphaBlending(material);
 
+  const shapeOnlyUniform = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnlyUniform);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
@@ -648,7 +652,8 @@ export function createThreeWebGpuTextMaterial(
     segmentTexWidth: segmentTextureWidthUniform,
     textAAScreenPx: textAAScreenPxUniform,
     textCurveEnabled: curveUniform,
-    vectorOverride: TSL.uniform(options.vectorOverride)
+    vectorOverride: TSL.uniform(options.vectorOverride),
+    shapeOnly: shapeOnlyUniform
   });
 
   registerThreeNodeClipPosition(material, (vertexPack as { xy: unknown }).xy);

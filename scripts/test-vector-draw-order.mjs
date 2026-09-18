@@ -203,16 +203,17 @@ try {
     } finally { layers.forEach(layer => layer.dispose()); }
   }
 
-  // A rejected nested subtree must not leave partially accumulated vector paint behind.
+  // A nested transparency subtree is lowered once, without leaking partial retries.
   const compositeSession = await openPdf({ kind: "bytes", bytes: fixture(true) }, {
     missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "synthetic-composite-order" })
   });
   try {
     const composite = await compositeSession.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" });
-    assert.equal(composite.fillPathCount, 2, "only caller fills remain outside the composite");
-    assert.equal(composite.segmentCount, 2, "the rejected child stroke cannot leak into the caller");
+    assert.equal(composite.fillPathCount, 4, "caller and child fills remain canonical");
+    assert.equal(composite.segmentCount, 3, "the child stroke appears exactly once");
     assert.equal(composite.textInstanceCount, 1);
-    assert.equal(composite.rasterLayers.length, 1);
+    assert.equal(composite.rasterLayers.length, 1, "only the original image remains raster");
+    assert.ok(composite.paintGraph, "compositing boundaries are retained");
     validateVectorDrawRuns(composite);
   } finally { await compositeSession.close(); }
   console.log("Vector draw order survives Forms, culling, rendering, grids and HEP persistence");

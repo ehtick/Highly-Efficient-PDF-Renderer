@@ -1,18 +1,12 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { stripTypeScriptTypes } from "node:module";
+import { registerHooks } from "node:module";
+registerHooks({ resolve(specifier, context, next) {
+  return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
 import { installSelectionTestHost } from "./lib/selectionTestHost.mjs";
-
-function sourceUrl(source) {
-  return `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source, { mode: "strip" })).toString("base64")}`;
-}
-const geometryUrl = sourceUrl(await readFile(new URL("../src/sceneTextGeometry.ts", import.meta.url), "utf8"));
-const overlayUrl = sourceUrl(await readFile(new URL("../src/textSelectionOverlay.ts", import.meta.url), "utf8"));
-const source = (await readFile(new URL("../src/textSelection.ts", import.meta.url), "utf8"))
-  .replaceAll('"./sceneTextGeometry"', JSON.stringify(geometryUrl))
-  .replaceAll('"./textSelectionOverlay"', JSON.stringify(overlayUrl));
-const { createTextSelectionController } = await import(sourceUrl(source));
-const { computeCharQuad } = await import(geometryUrl);
+const { createTextSelectionController } = await import("../src/textSelection.ts");
+const { computeCharQuad } = await import("../src/sceneTextGeometry.ts");
 
 // UO.400 DETAILS, physical page 34: the drawing number precedes the project
 // name in the stream. Its lower baseline accepts B/l but rejects the shorter

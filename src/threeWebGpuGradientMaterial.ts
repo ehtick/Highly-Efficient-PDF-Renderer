@@ -1,3 +1,5 @@
+import { registerThreePdfShapeUniform } from "./threePdfShape";
+import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
@@ -39,6 +41,7 @@ interface CommonMaterialOptions extends GradientTextureOptions {
 }
 
 export interface ThreeWebGpuGradientFillMaterialOptions extends CommonMaterialOptions {
+  mesh?: boolean;
   fillPathMetaTextureA: THREE.DataTexture;
   fillPathMetaTextureB: THREE.DataTexture;
   fillPathMetaTextureC: THREE.DataTexture;
@@ -97,6 +100,9 @@ fn heprGradientFloatMod(x: f32, y: f32) -> f32 {
 }
 `);
 
+const gradientParameterFn = TSL.wgslFn(GRADIENT_PARAMETER_WGSL);
+const gradientBackgroundFn = TSL.wgslFn(GRADIENT_BACKGROUND_WGSL);
+
 const gradientSampleFn = TSL.wgslFn(`
 fn heprSamplePdfGradient(
   world: vec2<f32>,
@@ -130,47 +136,10 @@ fn heprSamplePdfGradient(
     return vec4<f32>(0.0);
   }
 
-  let p0 = c.zw;
-  let p1 = d.xy;
-  var t: f32;
-  if (a.x < 0.5) {
-    let axis = p1 - p0;
-    let denom = dot(axis, axis);
-    if (denom <= 0.0000000001) {
-      return vec4<f32>(0.0);
-    }
-    t = dot(q - p0, axis) / denom;
-  } else {
-    let centerDelta = p1 - p0;
-    let radiusDelta = d.w - d.z;
-    let fromStart = q - p0;
-    let qa = dot(centerDelta, centerDelta) - radiusDelta * radiusDelta;
-    let qb = -2.0 * (dot(fromStart, centerDelta) + d.z * radiusDelta);
-    let qc = dot(fromStart, fromStart) - d.z * d.z;
-    if (abs(qa) <= 0.0000000001) {
-      if (abs(qb) <= 0.0000000001) {
-        return vec4<f32>(0.0);
-      }
-      t = -qc / qb;
-      if (d.z + t * radiusDelta < 0.0) {
-        return vec4<f32>(0.0);
-      }
-    } else {
-      let discriminant = qb * qb - 4.0 * qa * qc;
-      if (discriminant < 0.0) {
-        return vec4<f32>(0.0);
-      }
-      let root = sqrt(max(discriminant, 0.0));
-      let t0 = (-qb - root) / (2.0 * qa);
-      let t1 = (-qb + root) / (2.0 * qa);
-      let valid0 = d.z + t0 * radiusDelta >= 0.0;
-      let valid1 = d.z + t1 * radiusDelta >= 0.0;
-      if (!valid0 && !valid1) {
-        return vec4<f32>(0.0);
-      }
-      t = select(t1, t0, valid0 && (!valid1 || t0 >= t1));
-    }
-  }
+  if (a.x > 1.5) { return vec4<f32>(1.0); }
+  let parameter = heprGradientParameter(a, c, d, q);
+  if (parameter.y < 0.5) { return heprGradientBackground(a.w); }
+  let t = parameter.x;
 
   let sampleX = clamp(t, 0.0, 1.0) * 1023.0;
   let x0 = i32(floor(sampleX));
@@ -180,18 +149,19 @@ fn heprSamplePdfGradient(
   let color1 = textureLoad(lut, vec2<i32>(x1, gradientIndex), 0);
   return mix(color0, color1, amount);
 }
-`);
+`, [includeNode(gradientParameterFn), includeNode(gradientBackgroundFn)]);
 
 const fillVertexPackFn = TSL.wgslFn(`
 fn heprGradientFillVertexPack(
   corner: vec2<f32>,
   metaA: vec4<f32>,
   metaB: vec4<f32>,
-  metaC: vec4<f32>
+  metaC: vec4<f32>,
+  shapeOnly: f32
 ) -> vec4<f32> {
   let segmentCount = i32(metaA.y + 0.5);
   let alpha = metaC.w;
-  if (segmentCount <= 0 || alpha <= 0.001) {
+  if (segmentCount <= 0 || (alpha <= 0.001 && shapeOnly < 0.5)) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
@@ -299,6 +269,9 @@ fn heprGradientFillFragment(
   sourceGradientIndex: f32,
   maskGradientIndex: f32,
   fillAAScreenPx: f32,
+  meshColor: vec4<f32>,
+  useMesh: f32,
+  shapeOnly: f32,
   vectorOverride: vec4<f32>,
   primitiveColor: vec4<f32>
 ) -> vec4<f32> {
@@ -308,12 +281,12 @@ fn heprGradientFillFragment(
   let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
-  if (segmentCount <= 0 || metaC.w <= 0.001) { discard; }
+  if (segmentCount <= 0 || (metaC.w <= 0.001 && shapeOnly < 0.5)) { discard; }
   var minDistance = 100000000000000000000.0;
   var winding = 0;
   var crossings = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
-  for (var i = 0; i < 2048; i = i + 1) {
+  for (var i = 0; i < segmentCount; i = i + 1) {
     if (i >= segmentCount) { break; }
     let index = segmentStart + i;
     let coord = vec2<i32>(index % safeWidth, index / safeWidth);
@@ -340,14 +313,15 @@ fn heprGradientFillFragment(
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
   }
 
-  let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
+  let sampledSource = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
+  let source = select(sampledSource, meshColor * sampledSource.a, useMesh > 0.5);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let solidColor = vec3<f32>(metaB.z, metaB.w, metaC.z);
   let sourceColor = select(solidColor, source.rgb, sourceGradientIndex >= -0.5);
   let resolvedColor = mix(sourceColor, primitiveColor.rgb, primitiveColor.a);
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  let alpha = coverage * metaC.w * source.a * mask.a;
+  let alpha = coverage * mix(metaC.w, 1.0, shapeOnly) * source.a * mix(mask.a, 1.0, shapeOnly);
   if (alpha <= 0.001) { discard; }
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
@@ -365,7 +339,7 @@ const strokeWorldPackFn = TSL.wgslFn(`
 fn heprGradientStrokeWorldPack(
   corner: vec2<f32>, primitiveA: vec4<f32>, primitiveB: vec4<f32>, style: vec4<f32>,
   primitiveBounds: vec4<f32>, zoom: f32, useLocalToClip: f32,
-  localUnitsPerPixelInput: f32, aaScreenPx: f32
+  localUnitsPerPixelInput: f32, aaScreenPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
   let isQuadratic = primitiveB.z >= 0.5;
   var halfWidth = style.x;
@@ -374,7 +348,7 @@ fn heprGradientStrokeWorldPack(
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let isRoundCap = heprGradientFloatMod(floor(styleFlags * 0.5), 2.0) >= 0.5;
   let geometryLength = select(length(primitiveB.xy - primitiveA.xy), length(primitiveA.zw - primitiveA.xy) + length(primitiveB.xy - primitiveA.zw), isQuadratic);
-  if ((geometryLength < 0.00001 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength < 0.00001 && !isRoundCap) || (alpha <= 0.001 && shapeOnly < 0.5)) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
   let localUnitsPerPixel = select(1.0 / max(zoom, 0.0001), max(localUnitsPerPixelInput, 0.000001), useLocalToClip >= 0.5);
@@ -395,14 +369,14 @@ fn heprGradientStrokeFragment(
   gradientMetaA: texture_2d<f32>, gradientMetaB: texture_2d<f32>,
   gradientMetaC: texture_2d<f32>, gradientMetaD: texture_2d<f32>,
   gradientMetaE: texture_2d<f32>, gradientLut: texture_2d<f32>, gradientMetaWidth: f32,
-  sourceGradientIndex: f32, maskGradientIndex: f32
+  sourceGradientIndex: f32, maskGradientIndex: f32, shapeOnly: f32
 ) -> vec4<f32> {
   // Evaluate derivatives in uniform control flow before alpha/clip discards.
   let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
   let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
   let styleFlags = floor(primitiveB.w / 2.0 + 0.000001);
   let alphaStyle = primitiveB.w - styleFlags * 2.0;
-  if (alphaStyle <= 0.001) { discard; }
+  if (alphaStyle <= 0.001 && shapeOnly < 0.5) { discard; }
   let hasClipBounds = heprGradientFloatMod(floor(styleFlags * 0.25), 2.0) >= 0.5;
   if (hasClipBounds && (local.x < primitiveBounds.x || local.y < primitiveBounds.y || local.x > primitiveBounds.z || local.y > primitiveBounds.w)) { discard; }
   let distanceToSegment = select(
@@ -421,7 +395,7 @@ fn heprGradientStrokeFragment(
   let resolvedColor = mix(sourceColor, primitiveColor.rgb, primitiveColor.a);
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  let alpha = coverage * alphaStyle * source.a * mask.a;
+  let alpha = coverage * mix(alphaStyle, 1.0, shapeOnly) * source.a * mix(mask.a, 1.0, shapeOnly);
   if (alpha <= 0.001) { discard; }
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
@@ -436,6 +410,8 @@ export function createThreeWebGpuGradientFillMaterial(
   options: ThreeWebGpuGradientFillMaterialOptions
 ): ThreeWebGpuGradientFillMaterialState {
   const material = createBaseMaterial();
+  const shapeOnly = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnly);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const pathWidth = TSL.uniform(Math.max(1, options.fillPathTextureWidth));
@@ -446,8 +422,8 @@ export function createThreeWebGpuGradientFillMaterial(
   const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0));
   const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0));
   const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0));
-  const vertexPack = varyingNode(callNode(fillVertexPackFn, {
-    corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC
+  const vertexPack = varyingNode(options.mesh ? TSL.vec4(TSL.attribute("aMeshPosition", "vec2") as never, 1, 0) : callNode(fillVertexPackFn, {
+    corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC, shapeOnly
   }));
   const vertexValue = vertexPack as { xy: unknown };
   material.vertexNode = callNode(clipPositionFn, {
@@ -465,6 +441,8 @@ export function createThreeWebGpuGradientFillMaterial(
     segmentTexWidth: segmentWidth,
     ...createGradientNodes(options, gradientWidth),
     fillAAScreenPx: TSL.uniform(1),
+    meshColor: options.mesh ? varyingNode(TSL.attribute("aMeshColor", "vec4")) : TSL.vec4(0),
+    useMesh: TSL.uniform(options.mesh ? 1 : 0), shapeOnly,
     vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor)
   });
   registerThreeNodeClipPosition(material, vertexValue.xy);
@@ -479,6 +457,8 @@ export function createThreeWebGpuGradientStrokeMaterial(
   options: ThreeWebGpuGradientStrokeMaterialOptions
 ): ThreeWebGpuGradientStrokeMaterialState {
   const material = createBaseMaterial();
+  const shapeOnly = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnly);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
@@ -494,7 +474,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const worldPack = varyingNode(callNode(strokeWorldPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), primitiveA, primitiveB, style, primitiveBounds,
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
-    localUnitsPerPixelInput: localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1)
+    localUnitsPerPixelInput: localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1), shapeOnly
   }));
   const worldValue = worldPack as { xy: unknown; z: unknown };
   material.vertexNode = callNode(strokeClipPositionFn, {
@@ -504,7 +484,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
     localToClip: TSL.uniform(options.localToClip)
   });
   material.fragmentNode = callNode(strokeFragmentFns[options.colorCompositing], {
-    local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds,
+    local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds, shapeOnly,
     halfWidthFromVertex: worldValue.z, strokeCurveEnabled: curveUniform,
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor),
     ...createGradientNodes(options, gradientWidth)

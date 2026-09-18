@@ -1,5 +1,7 @@
 import * as THREE from "three";
-import { ScenePrimitivePicker, getScenePrimitive, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
+import { ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
+import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
   type PrimitiveKind } from "./scenePrimitives";
 import { PrimitiveAppearanceState, type PrimitiveColorUpdate, type PrimitiveHighlightSet,
   type PrimitiveOverride } from "./primitiveAppearance";
@@ -17,6 +19,10 @@ import type { RendererApi } from "./rendererTypes";
 import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialGradientLayer } from "./threeMaterialGradientLayer";
+import { OptionalContentController, type LayerVisibilityChange, type OptionalContentListener,
+  type OptionalContentSnapshot } from "./optionalContent";
+import { isScenePrimitiveVisible } from "./scenePrimitives";
+import { RetainedPageReplay } from "./retainedPageReplay";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
@@ -242,6 +248,8 @@ interface ThreeHostRenderer {
   getDrawingBufferSize?: (target: THREE.Vector2) => THREE.Vector2;
   getSize?: (target: THREE.Vector2) => THREE.Vector2;
   getPixelRatio?: () => number;
+  getRenderTarget?: () => THREE.RenderTarget | null;
+  getViewport?: (target: THREE.Vector4) => THREE.Vector4;
   /** WebGPURenderer exposes anisotropy here; WebGL exposes it on capabilities. */
   getMaxAnisotropy?: () => number;
 }
@@ -334,6 +342,9 @@ export class HeprThreePdfObject extends THREE.Group {
   private threeTextLodResourceFallback = false;
 
   private readonly primitiveAppearance: PrimitiveAppearanceState;
+  private readonly layerVisibility: OptionalContentController;
+  private readonly paintVisibility: ScenePaintVisibility;
+  private readonly retainedReplay: RetainedPageReplay | null;
   private primitivePicker: ScenePrimitivePicker | null = null;
   private primitivePreparationProgress: number | null = null;
   private readonly primitivePreparationListeners = new Set<(percentage: number | null) => void>();
@@ -360,6 +371,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private lastViewportHeight = 0;
   private textureAnisotropy = 1;
   private materialPipelineActive = false;
+  private paintCompositor: ThreePaintCompositor | null = null;
   private frameListener: ((stats: DrawStats) => void) | null = null;
   private lastNativeDrawStats: DrawStats | null = null;
   private isDisposed = false;
@@ -442,6 +454,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.sourceLabel = loadedScene.sourceLabel;
     this.sourceKind = loadedScene.sourceKind;
     this.sceneData = loadedScene.scene;
+    this.paintVisibility = new ScenePaintVisibility(this.sceneData);
     this.rendererType = rendererType;
     this.renderer = renderer;
     this.renderCanvas = renderCanvas;
@@ -514,7 +527,70 @@ export class HeprThreePdfObject extends THREE.Group {
       onColors: updates => this.applyPrimitiveColorUpdates(updates),
       onHighlights: highlights => this.applyPrimitiveHighlights(highlights)
     });
+    this.retainedReplay = this.sceneData.retainedPages?.length ? new RetainedPageReplay(this.sceneData) : null;
+    this.layerVisibility = new OptionalContentController(this.sceneData, {
+      onChange: snapshot => this.applyLayerVisibility(snapshot),
+      prepare: async (snapshot, context) => {
+        const prepared = await this.retainedReplay?.prepare(snapshot, context);
+        if (!prepared) return;
+        context.signal.throwIfAborted();
+        const materials = this.rasterMaterialLayer.prepareRasterLayerUpdates(prepared.layers);
+        const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
+        let native: ReturnType<NonNullable<RendererApi["prepareRasterLayerUpdates"]>> | undefined;
+        try {
+          if (!deferred.hasUploadedScene || deferred.hasUploadedScene()) native = this.renderer.prepareRasterLayerUpdates?.(prepared.layers);
+        } catch (error) { materials.dispose(); throw error; }
+        const abort = (): void => { materials.dispose(); native?.dispose(); };
+        context.signal.addEventListener("abort", abort, { once: true });
+        return () => {
+          try {
+            context.signal.throwIfAborted();
+            if (!native && (!deferred.hasUploadedScene || deferred.hasUploadedScene())) native = this.renderer.prepareRasterLayerUpdates?.(prepared.layers);
+            native?.commit(); materials.commit(); prepared.commit();
+          } finally { context.signal.removeEventListener("abort", abort); abort(); }
+        };
+      }
+    });
+    this.applyLayerVisibility(this.layerVisibility.getSnapshot());
     this.configureDormantPipeline();
+  }
+
+  getLayers() { return this.layerVisibility.getLayers(); }
+  get layerVisibilityRevision(): number { return this.layerVisibility.revision; }
+  getLayerOrder() { return this.layerVisibility.getOrder(); }
+  getOptionalContentVisibility(): OptionalContentSnapshot { return this.layerVisibility.getSnapshot(); }
+  setLayerVisibility(layerId: string, visible: boolean): Promise<void> {
+    return this.layerVisibility.setLayerVisibility(layerId, visible);
+  }
+  setLayerVisibilities(changes: readonly LayerVisibilityChange[]): Promise<void> {
+    return this.layerVisibility.setLayerVisibilities(changes);
+  }
+  setAllLayerVisibility(visible: boolean, layerIds?: readonly string[]): Promise<void> {
+    return this.layerVisibility.setAllLayerVisibility(visible, layerIds);
+  }
+  getAllLayerVisibility(layerIds?: readonly string[]) { return this.layerVisibility.getAllLayerVisibility(layerIds); }
+  resetLayerVisibility(): Promise<void> { return this.layerVisibility.resetLayerVisibility(); }
+  subscribeLayerVisibility(listener: OptionalContentListener): () => void { return this.layerVisibility.subscribe(listener); }
+  isPrimitiveVisible(ref: PrimitiveRef): boolean {
+    validatePrimitiveRef(this.sceneData, ref);
+    return isScenePrimitiveVisible(this.sceneData, ref, condition => this.layerVisibility.isVisible(condition));
+  }
+
+  private applyLayerVisibility(snapshot: OptionalContentSnapshot): void {
+    this.paintVisibility.setVisibility(snapshot);
+    this.strokeMaterialLayer?.setOptionalContentVisibility(snapshot);
+    this.fillMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.textMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.gradientMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.rasterMaterialLayer.setOptionalContentVisibility(snapshot);
+    // A deferred native renderer remains dormant; replay immediately after upload.
+    const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
+    if (!deferred.hasUploadedScene || deferred.hasUploadedScene()) this.renderer.setOptionalContentVisibility?.(snapshot);
+    const hover = this.primitiveAppearance.getHover();
+    if (hover && !this.isPrimitiveVisible(hover)) this.primitiveAppearance.setHover(null);
+    this.primitiveAppearance.setSelection(this.primitiveAppearance.getSelection().filter(ref => this.isPrimitiveVisible(ref)));
+    this.setSearchHighlights(null);
+    this.setTextSelectionHighlights(null);
   }
 
   /** Geometric picking against the canonical scene, independent of render LOD. */
@@ -550,8 +626,19 @@ export class HeprThreePdfObject extends THREE.Group {
     };
     this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
       percentage => this.reportPrimitivePreparationProgress(percentage));
-    return this.primitivePicker.pick({ point, clientPoint: { x: clientX, y: clientY }, project, unproject,
-      tolerancePx: options.tolerancePx, kinds: options.kinds, signal: options.signal });
+    const revision = this.layerVisibility.revision;
+    const hit = await this.primitivePicker.pick({ point, clientPoint: { x: clientX, y: clientY }, project, unproject,
+      tolerancePx: options.tolerancePx, kinds: options.kinds, signal: options.signal,
+      rasterLayers: this.retainedReplay?.getLayers(),
+      isConditionVisible: condition => this.layerVisibility.isVisible(condition),
+      resolveColor: (ref, original) => {
+        const rgb = this.primitiveAppearance.getOverrideColor(ref) ?? original;
+        const tint = this.rendererConfig.vectorOverride;
+        return rgb.map((value, channel) => value * (1 - tint[3]) + tint[channel] * tint[3]) as [number, number, number];
+      },
+      isVisible: ref => this.isPrimitiveVisible(ref) });
+    if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during picking.", "AbortError");
+    return hit;
   }
 
   /** Observe shared picking preparation, including after an individual query is cancelled.
@@ -579,8 +666,12 @@ export class HeprThreePdfObject extends THREE.Group {
     return getScenePrimitive(this.sceneData, ref);
   }
 
-  setHover(ref: PrimitiveRef | null): void { this.primitiveAppearance.setHover(ref); }
-  setSelection(refs: readonly PrimitiveRef[]): void { this.primitiveAppearance.setSelection(refs); }
+  setHover(ref: PrimitiveRef | null): void { this.primitiveAppearance.setHover(ref && this.isPrimitiveVisible(ref) ? ref : null); }
+  setSelection(refs: readonly PrimitiveRef[]): void {
+    // Validate the complete batch even when some of its primitives are hidden.
+    for (const ref of refs) validatePrimitiveRef(this.sceneData, ref);
+    this.primitiveAppearance.setSelection(refs.filter(ref => this.isPrimitiveVisible(ref)));
+  }
   setPrimitiveOverrides(refs: readonly PrimitiveRef[], override: PrimitiveOverride): void {
     this.primitiveAppearance.setOverrides(refs, override);
   }
@@ -703,7 +794,7 @@ export class HeprThreePdfObject extends THREE.Group {
       return [];
     }
     this.textSearcher ??= createSceneTextSearcher(this.sceneData);
-    return this.textSearcher.search(query, options).map((match) => ({
+    return this.textSearcher.search(query, { ...options, optionalContent: this.layerVisibility.getSnapshot() }).map((match) => ({
       ...match,
       localBounds: {
         minX: match.bounds.minX - this.sceneCenterX,
@@ -1342,6 +1433,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.primitivePicker = null;
     this.reportPrimitivePreparationProgress(null);
     this.primitivePreparationListeners.clear();
+    this.layerVisibility.dispose();
+    this.retainedReplay?.dispose();
     this.isDisposed = true;
     this.primitiveAppearance.dispose();
     this.primitiveHighlightLayer?.dispose();
@@ -1360,6 +1453,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pageMesh.geometry.dispose();
     this.pageMesh.material.dispose();
     this.rasterMaterialLayer.dispose();
+    this.paintCompositor?.dispose();
+    this.paintCompositor = null;
     this.gradientMaterialLayer.dispose();
     this.fillMaterialLayer.dispose();
     this.strokeMaterialLayer?.dispose();
@@ -1461,6 +1556,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private resetRenderPipelinesAfterLayerChange(): void {
+    this.strokeMaterialLayer?.setOptionalContentVisibility(this.layerVisibility.getSnapshot());
     this.strokeMaterialLayer?.setVisible(false);
     this.triangleStrokeLayer?.setVisible(false);
     this.vectorLodStrokeLayer?.deactivate();
@@ -1682,6 +1778,11 @@ export class HeprThreePdfObject extends THREE.Group {
       if (!this.nativePrimitiveColorsReplayed) {
         const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
         deferred.ensureSceneUploaded?.();
+        if (this.retainedReplay) {
+          const updates = this.renderer.prepareRasterLayerUpdates?.(this.retainedReplay.getLayers());
+          try { updates?.commit(); } finally { updates?.dispose(); }
+        }
+        this.renderer.setOptionalContentVisibility?.(this.layerVisibility.getSnapshot());
         this.renderer.setPrimitiveColorUpdates?.(this.primitiveAppearance.getColorUpdates());
         this.nativePrimitiveColorsReplayed = true;
       }
@@ -1753,6 +1854,19 @@ export class HeprThreePdfObject extends THREE.Group {
       this.renderTexture.needsUpdate = true;
       this.lastUploadedFrameSerial = presentedFrameSerial;
     }
+    if (cameraDrivenMaterialPipelineEnabled && this.paintVisibility.requiresCompositing) {
+      if (!this.paintCompositor) {
+        this.paintCompositor = new ThreePaintCompositor(this.rendererType);
+        this.add(this.paintCompositor.mesh);
+      }
+      const roots: THREE.Object3D[] = [this.rasterMaterialLayer.group, this.gradientMaterialLayer.group,
+        this.fillMaterialLayer.mesh, this.textMaterialLayer.mesh];
+      if (this.strokeMaterialLayer) roots.push(this.strokeMaterialLayer.mesh);
+      this.paintCompositor.render(renderer as unknown as ThreePaintHostRenderer, this.sceneData, roots,
+        materialLayerViewport.width, materialLayerViewport.height,
+        condition => this.layerVisibility.isVisible(condition));
+      for (const root of roots) root.visible = false;
+    } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }
 
   private resizeNativeRendererCanvas(viewport: ViewportPixels): void {
@@ -1890,6 +2004,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.add(replacementLayer.mesh);
     }
     this.textMaterialLayer = replacementLayer;
+    replacementLayer.setOptionalContentVisibility(this.layerVisibility.getSnapshot());
     replacementLayer.setPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates(), this.sceneData);
     previousLayer.dispose();
     this.lastSyncedFrameSerial = -1;
@@ -3144,6 +3259,12 @@ function applyRendererConfig(renderer: RendererApi, config: RendererConfig): voi
 }
 
 function readThreeRendererViewportPixels(renderer: ThreeHostRenderer): ViewportPixels {
+  const target = renderer.getRenderTarget?.();
+  const viewport = target?.viewport ?? renderer.getViewport?.(new THREE.Vector4());
+  const ratio = target ? 1 : renderer.getPixelRatio?.() ?? 1;
+  if (viewport && viewport.z > 0 && viewport.w > 0) {
+    return { width: Math.max(1, Math.round(viewport.z * ratio)), height: Math.max(1, Math.round(viewport.w * ratio)) };
+  }
   const drawingBufferSize = typeof renderer.getDrawingBufferSize === "function"
     ? renderer.getDrawingBufferSize(new THREE.Vector2())
     : null;

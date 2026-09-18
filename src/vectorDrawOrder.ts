@@ -1,11 +1,11 @@
 import { validateVectorClips } from "./vectorClips";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 
-export function appendVectorDrawRun(runs: VectorDrawRun[], kind: VectorDrawRun["kind"], first: number, count: number, clipIndex?: number, blendMode?: VectorDrawRun["blendMode"]): void {
+export function appendVectorDrawRun(runs: VectorDrawRun[], kind: VectorDrawRun["kind"], first: number, count: number, clipIndex?: number, blendMode?: VectorDrawRun["blendMode"], optionalContent?: number): void {
   if (count === 0) return;
   const previous = runs[runs.length - 1];
-  if (previous?.kind === kind && previous.clipIndex === clipIndex && previous.blendMode === blendMode && previous.first + previous.count === first) previous.count += count;
-  else runs.push({ kind, first, count, ...(clipIndex === undefined ? {} : { clipIndex }), ...(blendMode ? { blendMode } : {}) });
+  if (previous?.kind === kind && previous.clipIndex === clipIndex && previous.blendMode === blendMode && previous.optionalContent === optionalContent && previous.first + previous.count === first) previous.count += count;
+  else runs.push({ kind, first, count, ...(clipIndex === undefined ? {} : { clipIndex }), ...(blendMode ? { blendMode } : {}), ...(optionalContent === undefined ? {} : { optionalContent }) });
 }
 
 /** Fixed-pass order for older scenes and pages that do not need interleaving. */
@@ -49,6 +49,7 @@ export function validateVectorDrawRuns(scene: VectorScene): void {
         !Number.isSafeInteger(run.count) || run.count <= 0 || run.first + run.count > counts[run.kind]) {
       throw new Error("Vector draw run is outside its instance store.");
     }
+    if (run.optionalContent !== undefined && (!Number.isSafeInteger(run.optionalContent) || run.optionalContent < 0 || run.optionalContent >= (scene.optionalContent?.conditions.length ?? 0))) throw new Error("Invalid optional-content draw condition.");
     if (run.blendMode !== undefined && run.blendMode !== "Multiply") throw new Error("Invalid vector blend mode.");
     if (run.blendMode && run.kind.startsWith("gradient-")) throw new Error("Gradient draw runs do not support Multiply blending.");
     if (run.clipIndex !== undefined && (!Number.isSafeInteger(run.clipIndex) || run.clipIndex < 0 ||

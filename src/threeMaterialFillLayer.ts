@@ -1,3 +1,4 @@
+import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
@@ -195,6 +196,10 @@ export class ThreeMaterialFillLayer {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
     this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex");
+  }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    this.orderedRuns?.setOptionalContentVisibility(snapshot);
   }
 
   setVisible(visible: boolean): void {

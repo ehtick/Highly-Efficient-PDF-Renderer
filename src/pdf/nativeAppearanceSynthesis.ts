@@ -178,11 +178,11 @@ export class NativePdfAppearanceSynthesizer {
 
   async synthesize(
     annotation: NativePdfAnnotationAppearance,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    retainOptionalContent = false
   ): Promise<NativePdfSynthesizedAppearance | null> {
     throwIfAborted(signal);
     const cached = this.resultCache.get(annotation);
-    if (cached) return cached;
     if (!annotation.visibleInDefaultView) return null;
     let optionalContentIndex = -1;
     if (annotation.optionalContent !== undefined && annotation.optionalContent !== null) {
@@ -202,9 +202,10 @@ export class NativePdfAppearanceSynthesizer {
           }
         });
       }
-      if (!membership.defaultVisible) return null;
+      if (!retainOptionalContent && !membership.defaultVisible) return null;
       optionalContentIndex = membership.index;
     }
+    if (cached) return cached;
     if (annotation.subtype === "Link") {
       await this.requireMissingNormalAppearance(annotation, signal);
       return await this.synthesizeLinkBorder(annotation, optionalContentIndex, signal);
@@ -1325,10 +1326,11 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
   registry: NativePdfFormAppearanceRegistry,
   synthesizer: NativePdfAppearanceSynthesizer,
   annotation: NativePdfAnnotationAppearance,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  retainOptionalContent = false
 ): Promise<NativePdfResolvedAnnotationAppearance | null> {
   try {
-    return await registry.resolveAnnotationAppearance(annotation, signal);
+    return await registry.resolveAnnotationAppearance(annotation, signal, retainOptionalContent);
   } catch (error) {
     if (
       !(error instanceof PdfError) ||
@@ -1339,7 +1341,7 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
     ) {
       throw error;
     }
-    return await synthesizer.synthesize(annotation, signal);
+    return await synthesizer.synthesize(annotation, signal, retainOptionalContent);
   }
 }
 

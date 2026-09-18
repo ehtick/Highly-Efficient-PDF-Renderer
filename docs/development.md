@@ -98,6 +98,32 @@ recorded results and limits.
 
 ## Performance and fidelity
 
+### Manual PDF layer and effect checks
+
+After running type checking and the fast synthetic suites, manually check both
+native backends and both Three.js backends with layered drawings. These checks
+require a browser and are not part of the automated non-browser acceptance:
+
+- Toggle default-off layers, nested memberships, locked groups, and radio groups;
+  verify the lower paint becomes visible and pickable when an upper layer is hidden.
+- Inspect overlapping transparency groups, knockout, blend modes, transformed
+  alpha/luminosity masks, and gradients at several zoom levels. Check tiling
+  patterns, Type3 text, mesh shadings, compound-fill holes, and rotated pages.
+- Pan using cached frames, change DPR/viewport size, switch backends, and hide/show
+  a recolored primitive. Layer state and colors should survive a backend switch;
+  new documents should use their own defaults.
+- Confirm hidden text disappears from search and selection, hidden drawing traces
+  clear, and layer changes remain independent of the Drawing Selection checkbox.
+- Exercise rapid layer changes on a fallback-heavy page. Progress should appear,
+  obsolete work should not commit, and a failure should keep the applied state.
+- Export a synthetic layered scene after toggling it, then reopen the v7 file.
+  It should restore PDF defaults and replay remaining composites without a PDF.
+
+Regenerate bundled HEP files manually before using those examples with v7. The
+synthetic suites deliberately do not regenerate them or convert real-PDF corpora.
+
+### Rendering performance
+
 The [parser benchmark guide](parser-benchmark.md) describes production parser
 measurements and their scope. The optional [oracle harness](../oracle/README.md)
 has a separate dependency installation for rendering comparisons. Run corpus

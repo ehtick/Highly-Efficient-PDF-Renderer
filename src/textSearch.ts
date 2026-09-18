@@ -1,6 +1,8 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi, SearchHighlightSet } from "./rendererTypes";
 import { computeCharRangeHighlightBounds } from "./sceneTextGeometry";
+import type { OptionalContentSnapshot } from "./optionalContent";
+import { isSceneTextCharVisible } from "./optionalContentText";
 
 export interface TextSearchMatch {
   /** Zero-based page index in the composed scene. */
@@ -29,6 +31,7 @@ export interface TextSearchState {
 }
 
 export interface TextSearchController {
+  refreshVisibility(): void;
   setScene(scene: VectorScene | null): void;
   setQuery(query: string): void;
   setCaseSensitive(enabled: boolean): void;
@@ -55,6 +58,8 @@ const READABLE_MATCH_CSS_PX = 40;
 const MIN_READABLE_MATCH_CSS_PX = 12;
 
 export interface SceneTextSearchOptions {
+  /** Applied per-view layer state; omitted uses original PDF defaults. */
+  optionalContent?: OptionalContentSnapshot | null;
   /** Case-sensitive matching. Defaults to false. */
   caseSensitive?: boolean;
   /** Match-count cap. Defaults to 5000. */
@@ -209,6 +214,11 @@ export function createSceneTextSearcher(scene: VectorScene): SceneTextSearcher {
           if (found < 0) {
             break;
           }
+          let visible = true;
+          for (let i = found; i < found + needle.length; i++) {
+            if (!isSceneTextCharVisible(scene, pages[pageIndex], i, options.optionalContent)) { visible = false; break; }
+          }
+          if (!visible) { fromIndex = found + Math.max(1, needle.length); continue; }
           const highlightBounds = computeCharRangeHighlightBounds(
             scene,
             pages[pageIndex],
@@ -259,7 +269,8 @@ export function createTextSearchController(options: TextSearchControllerOptions)
   };
 
   const collectMatches = (): void => {
-    matches = searcher ? searcher.search(query, { caseSensitive, maxMatches: MAX_MATCHES }) : [];
+    matches = searcher ? searcher.search(query, { caseSensitive, maxMatches: MAX_MATCHES,
+      optionalContent: options.getRenderer()?.getOptionalContentVisibility?.() }) : [];
     matchCountCapped = matches.length >= MAX_MATCHES;
   };
 
@@ -346,6 +357,8 @@ export function createTextSearchController(options: TextSearchControllerOptions)
       // where it is: scene swaps should not yank the view around.
       runSearch(false);
     },
+
+    refreshVisibility(): void { runSearch(false); },
 
     setQuery(nextQuery: string): void {
       if (nextQuery === query) {

@@ -10,6 +10,11 @@ export interface GradientSceneData {
   gradientMetaD: Float32Array;
   gradientMetaE: Float32Array;
   gradientLut: Uint8Array<ArrayBufferLike>;
+  /** Optional indexed triangle paints; ranges are [firstIndex, indexCount] for each gradient. */
+  gradientMeshRanges?: Uint32Array;
+  gradientMeshPositions?: Float32Array;
+  gradientMeshColors?: Float32Array;
+  gradientMeshIndices?: Uint32Array;
   gradientFillPathCount: number;
   gradientFillSegmentCount: number;
   gradientFillPathMetaA: Float32Array;
@@ -64,6 +69,10 @@ export function readGradientSceneData(scene: VectorScene): GradientSceneData {
     gradientMetaD: floatArray(source.gradientMetaD),
     gradientMetaE: floatArray(source.gradientMetaE),
     gradientLut: byteArray(source.gradientLut),
+    gradientMeshRanges: source.gradientMeshRanges,
+    gradientMeshPositions: source.gradientMeshPositions,
+    gradientMeshColors: source.gradientMeshColors,
+    gradientMeshIndices: source.gradientMeshIndices,
     gradientFillPathCount: nonNegativeInt(source.gradientFillPathCount),
     gradientFillSegmentCount: nonNegativeInt(source.gradientFillSegmentCount),
     gradientFillPathMetaA: floatArray(source.gradientFillPathMetaA),

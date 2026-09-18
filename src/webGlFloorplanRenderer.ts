@@ -1,3 +1,10 @@
+import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
+import { buildGradientMeshRenderData } from "./gradientMesh";
+import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
+import { WebGlPaintCompositor } from "./webGlPaintCompositor";
+import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
+import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
+import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { estimateHighlightLocalUnitsPerPixel } from "./primitiveHighlightProjection";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePrimitiveColors";
@@ -8,7 +15,7 @@ import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 import { packVectorClips } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import {
   buildOrderedGradientPaintCommands,
   GRADIENT_LUT_WIDTH,
@@ -435,7 +442,6 @@ out vec4 outColor;
 
 ${GLSL_OUTPUT_COLOR_HELPERS}
 
-const int MAX_FILL_PATH_PRIMITIVES = 2048;
 const float FILL_PRIMITIVE_QUADRATIC = 1.0;
 const int QUAD_WINDING_SUBDIVISIONS = 6;
 
@@ -549,7 +555,7 @@ void main() {
   int winding = 0;
   int crossings = 0;
 
-  for (int i = 0; i < MAX_FILL_PATH_PRIMITIVES; i += 1) {
+  for (int i = 0; i < vSegmentCount; i += 1) {
     if (i >= vSegmentCount) {
       break;
     }
@@ -1196,6 +1202,7 @@ precision highp float;
 precision highp sampler2D;
 
 uniform sampler2D uRasterTex;
+uniform float uRasterOpacity;
 in vec2 vUv;
 in vec2 vWorld;
 out vec4 outColor;
@@ -1203,7 +1210,7 @@ out vec4 outColor;
 ${VECTOR_CLIP_GLSL}
 
 void main() {
-  vec4 color = texture(uRasterTex, vUv);
+  vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;
   if (color.a <= 0.001) {
     discard;
   }
@@ -1303,17 +1310,17 @@ const CLEAR_COLOR_G = 169 / 255;
 const CLEAR_COLOR_B = 175 / 255;
 
 // Shared shader sources exposed for adapter integrations (Three/Babylon/native wrappers).
-export const CORE_STROKE_VERTEX_SHADER_SOURCE = VERTEX_SHADER_SOURCE;
-export const CORE_STROKE_FRAGMENT_SHADER_SOURCE = FRAGMENT_SHADER_SOURCE;
-export const CORE_FILL_VERTEX_SHADER_SOURCE = FILL_VERTEX_SHADER_SOURCE;
-export const CORE_FILL_FRAGMENT_SHADER_SOURCE = FILL_FRAGMENT_SHADER_SOURCE;
-export const CORE_TEXT_VERTEX_SHADER_SOURCE = TEXT_VERTEX_SHADER_SOURCE;
-export const CORE_TEXT_FRAGMENT_SHADER_SOURCE = TEXT_FRAGMENT_SHADER_SOURCE;
+export const CORE_STROKE_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(VERTEX_SHADER_SOURCE);
+export const CORE_STROKE_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(FRAGMENT_SHADER_SOURCE);
+export const CORE_FILL_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(FILL_VERTEX_SHADER_SOURCE);
+export const CORE_FILL_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(FILL_FRAGMENT_SHADER_SOURCE);
+export const CORE_TEXT_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(TEXT_VERTEX_SHADER_SOURCE);
+export const CORE_TEXT_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(TEXT_FRAGMENT_SHADER_SOURCE);
 export const CORE_BLIT_VERTEX_SHADER_SOURCE = BLIT_VERTEX_SHADER_SOURCE;
 export const CORE_BLIT_FRAGMENT_SHADER_SOURCE = BLIT_FRAGMENT_SHADER_SOURCE;
 export const CORE_VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE;
-export const CORE_RASTER_VERTEX_SHADER_SOURCE = RASTER_VERTEX_SHADER_SOURCE;
-export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = RASTER_FRAGMENT_SHADER_SOURCE;
+export const CORE_RASTER_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(RASTER_VERTEX_SHADER_SOURCE);
+export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(RASTER_FRAGMENT_SHADER_SOURCE);
 
 /** Per-frame draw diagnostics from HEPR's native renderer. */
 export interface DrawStats {
@@ -1322,6 +1329,9 @@ export interface DrawStats {
 
   /** Total stroke segment count in the loaded scene. */
   totalSegments: number;
+
+  /** Redundant visible strokes temporarily omitted; separate from extraction-time removals. */
+  redundantSegments?: number;
 
   /** Whether renderer-side culling reduced the frame workload. */
   usedCulling: boolean;
@@ -1442,6 +1452,7 @@ export interface WebGlFloorplanRendererOptions {
 type FrameListener = (stats: DrawStats) => void;
 
 interface RasterLayerGpu {
+  opacity: number;
   texture: WebGLTexture;
   matrix: Float32Array;
   paintOrder: number;
@@ -1579,6 +1590,11 @@ export class WebGlFloorplanRenderer {
   private readonly gradientStrokeTextures: readonly WebGLTexture[];
 
   private readonly gradientFillUniforms: Readonly<Record<string, WebGLUniformLocation>>;
+  private gradientMeshProgram: WebGLProgram | null = null;
+  private gradientMeshUniforms: Readonly<Record<string, WebGLUniformLocation>> = {};
+  private gradientMeshBuffer: WebGLBuffer | null = null;
+  private gradientMeshVao: WebGLVertexArrayObject | null = null;
+  private gradientMeshRanges: Uint32Array = new Uint32Array(0);
 
   private readonly gradientStrokeUniforms: Readonly<Record<string, WebGLUniformLocation>>;
 
@@ -1698,6 +1714,8 @@ export class WebGlFloorplanRenderer {
 
   private readonly uRasterTex: WebGLUniformLocation;
 
+  private readonly uRasterOpacity: WebGLUniformLocation;
+
   private readonly uRasterMatrixABCD: WebGLUniformLocation;
 
   private readonly uRasterMatrixEF: WebGLUniformLocation;
@@ -1743,6 +1761,12 @@ export class WebGlFloorplanRenderer {
   private readonly orderedTextureBindings: (WebGLTexture | null | undefined)[] = [];
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
+  private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
+  private paintCompositor: WebGlPaintCompositor | null = null;
+  private paintShapeOnly = false;
+  private readonly paintShapeUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
+  private optionalContentVisibility: OptionalContentSnapshot | null = null;
+  private scenePaintVisibility: ScenePaintVisibility | null = null;
   private primitiveColors: NativePrimitiveColors | null = null;
   private primitiveHighlights: WebGlPrimitiveHighlights | null = null;
 
@@ -2170,6 +2194,7 @@ export class WebGlFloorplanRenderer {
     this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
 
     this.uRasterTex = this.mustGetUniformLocation(this.rasterProgram, "uRasterTex");
+    this.uRasterOpacity = this.mustGetUniformLocation(this.rasterProgram, "uRasterOpacity");
     this.uRasterMatrixABCD = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixABCD");
     this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
@@ -2299,6 +2324,7 @@ export class WebGlFloorplanRenderer {
     const stats = {
       renderedSegments,
       totalSegments: this.segmentCount,
+      redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: 1 / localUnitsPerPixel
     };
@@ -2513,6 +2539,8 @@ export class WebGlFloorplanRenderer {
     this.vectorLodRuntime?.setForceExact(this.primitiveColors.has("stroke"));
     this.textLodRuntime?.setMode(this.primitiveColors.has("text") ? "off" : this.textLodMode);
     this.selectedTextInstanceCount = 0;
+    this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors.has("stroke") &&
+      !this.primitiveColors.has("fill") && !this.primitiveColors.has("text"));
     this.orderedBatches?.invalidate();
     this.panCacheValid = false;
     this.destroyVectorMinifyResources();
@@ -2540,6 +2568,10 @@ export class WebGlFloorplanRenderer {
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
+  }
+
+  getVectorColorOverride(): readonly [number, number, number, number] {
+    return [...this.vectorOverrideColor, this.vectorOverrideOpacity];
   }
 
   setInteractionViewportProvider(
@@ -2601,16 +2633,89 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
+  getRasterLayerUpdates(): ReadonlyMap<number, RasterLayer> { return this.rasterLayerUpdates; }
+
+  prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates {
+    updates = new Map(updates);
+    const source = this.scene;
+    if (!source || this.isDisposed) throw new Error("No active scene for raster replacement.");
+    validateRasterLayerUpdates(source, updates, Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE)));
+    const prepared = new Map<number, RasterLayerGpu>();
+    let finished = false;
+    const release = (): void => {
+      for (const value of prepared.values()) { this.gl.deleteTexture(value.texture); }
+      prepared.clear();
+    };
+    let uploaded = false;
+    const stage = (): void => {
+      for (const [index, layer] of updates) {
+        if ((this.rasterLayerUpdates.get(index) ?? source.rasterLayers[index]) !== layer) {
+          const gl = this.gl, texture = this.mustCreateTexture();
+          try {
+            gl.bindTexture(gl.TEXTURE_2D, texture); configureRasterTexture(gl);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, layer.width, layer.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplyRgba(layer.data));
+            gl.generateMipmap(gl.TEXTURE_2D);
+            prepared.set(index, { texture, matrix: layer.matrix.slice(), opacity: layer.opacity ?? 1,
+              paintOrder: layer.paintOrder, pageIndex: layer.pageIndex });
+          } catch (error) { gl.deleteTexture(texture); throw error; }
+        }
+      }
+      uploaded = true;
+    };
+    try { if (this.rasterTextureResidencyEnabled) stage(); }
+    catch (error) { release(); throw error; }
+    return {
+      commit: () => {
+        if (finished || this.isDisposed || this.scene !== source) {
+          release(); finished = true;
+          throw new DOMException("Raster update superseded.", "AbortError");
+        }
+        if (!this.rasterTextureResidencyEnabled) release();
+        else if (!uploaded) {
+          try { stage(); } catch (error) { release(); finished = true; throw error; }
+        }
+        for (const [index, next] of prepared) {
+          const value = this.rasterLayers[index];
+          if (value) { this.gl.deleteTexture(value.texture); }
+          this.rasterLayers[index] = next;
+        }
+        prepared.clear();
+        for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
+        finished = true;
+        this.panCacheValid = false; this.destroyVectorMinifyResources(); this.requestFrame();
+      },
+      dispose: () => { if (!finished) { finished = true; release(); } }
+    };
+  }
+
+  getOptionalContentVisibility(): OptionalContentSnapshot | null { return this.optionalContentVisibility; }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    if (this.isDisposed || this.optionalContentVisibility === snapshot) return;
+    this.optionalContentVisibility = snapshot;
+    this.scenePaintVisibility?.setVisibility(snapshot);
+    this.orderedBatches?.invalidate();
+    this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setScene(scene: VectorScene): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
     if (this.scene !== scene) {
+      this.rasterLayerUpdates.clear();
+      this.paintCompositor?.dispose(); this.paintCompositor = null;
+      this.optionalContentVisibility = createDefaultOptionalContentSnapshot(scene);
       this.primitiveColors = null;
       this.primitiveHighlights?.dispose();
       this.primitiveHighlights = null;
     }
     validateVectorDrawRuns(scene);
+    this.scenePaintVisibility = new ScenePaintVisibility(scene);
+    this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
     this.uploadVectorClips(scene);
     this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
     this.scene = scene;
@@ -2904,6 +3009,8 @@ export class WebGlFloorplanRenderer {
   }
 
   dispose(): void {
+    this.paintCompositor?.dispose(); this.paintCompositor = null;
+    this.paintShapeUniforms.clear();
     if (this.isDisposed) {
       return;
     }
@@ -2912,6 +3019,7 @@ export class WebGlFloorplanRenderer {
     this.primitiveHighlights = null;
     this.primitiveColors = null;
     this.orderedRunCuller = null;
+    this.scenePaintVisibility = null;
 
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
@@ -3030,6 +3138,9 @@ export class WebGlFloorplanRenderer {
     this.selectedTextInstanceIds = new Float32Array(0);
     this.selectedTextInstanceCount = 0;
     this.gradientData = null;
+    gl.deleteBuffer(this.gradientMeshBuffer); gl.deleteVertexArray(this.gradientMeshVao); gl.deleteProgram(this.gradientMeshProgram);
+    this.gradientMeshBuffer = null; this.gradientMeshVao = null; this.gradientMeshProgram = null;
+    this.gradientMeshRanges = new Uint32Array(0);
     this.orderedGradientPaintCommands = [];
   }
 
@@ -3269,9 +3380,15 @@ export class WebGlFloorplanRenderer {
     this.frameListener?.({
       renderedSegments: instanceCount,
       totalSegments: this.segmentCount,
+      redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     });
+  }
+
+  private getRedundantSegmentCount(): number {
+    return this.strokeRenderingEnabled && !this.scenePaintVisibility?.requiresCompositing
+      ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -3529,7 +3646,7 @@ export class WebGlFloorplanRenderer {
           this.panCacheCenterY
         );
       }
-      this.panCacheUsedCulling = !this.usingAllSegments;
+      this.panCacheUsedCulling = this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments;
       this.panCacheValid = true;
 
       sampleScale = 1;
@@ -3542,6 +3659,7 @@ export class WebGlFloorplanRenderer {
     this.frameListener?.({
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
+      redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
@@ -3656,11 +3774,13 @@ export class WebGlFloorplanRenderer {
       return;
     }
     const gl = this.gl;
-    const uniforms = this.gradientFillUniforms;
+    const meshCount = this.gradientMeshRanges?.[pathIndex * 2 + 1] ?? 0;
+    const program = meshCount ? this.gradientMeshProgram! : this.gradientFillProgram;
+    const uniforms = meshCount ? this.gradientMeshUniforms : this.gradientFillUniforms;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(this.gradientFillProgram);
-    this.bindVectorClip(this.gradientFillProgram);
-    gl.bindVertexArray(this.gradientPaintVao);
+    gl.useProgram(program);
+    this.bindVectorClip(program);
+    gl.bindVertexArray(meshCount ? this.gradientMeshVao : this.gradientPaintVao);
 
     for (let index = 0; index < this.gradientFillTextures.length; index += 1) {
       gl.activeTexture(gl.TEXTURE0 + index);
@@ -3693,7 +3813,10 @@ export class WebGlFloorplanRenderer {
     );
     const primitiveColor = this.primitiveColors?.gradient("gradient-fill", pathIndex);
     gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, pathIndex * 4, 4, 1);
+    if (meshCount) {
+      gl.uniform1i(uniforms.uMeshPathIndex, pathIndex);
+      gl.drawArrays(gl.TRIANGLES, this.gradientMeshRanges[pathIndex * 2], meshCount);
+    } else gl.drawArraysInstanced(gl.TRIANGLE_STRIP, pathIndex * 4, 4, 1);
   }
 
   private drawGradientStrokeRun(
@@ -3822,6 +3945,7 @@ export class WebGlFloorplanRenderer {
     this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
     gl.activeTexture(gl.TEXTURE12);
     gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
+    gl.uniform1f(this.uRasterOpacity, 1);
     gl.uniform1i(this.uRasterTex, 12);
     for (let i = 0; i < this.visiblePageRectCount; i += 1) {
       const rectOffset = this.visiblePageRectIndices[i] * 4;
@@ -3862,6 +3986,7 @@ export class WebGlFloorplanRenderer {
     }
     gl.activeTexture(gl.TEXTURE12);
     gl.bindTexture(gl.TEXTURE_2D, layer.texture);
+    gl.uniform1f(this.uRasterOpacity, layer.opacity);
     gl.uniform1i(this.uRasterTex, 12);
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
@@ -3994,6 +4119,8 @@ export class WebGlFloorplanRenderer {
   }
 
   private bindVectorClip(program: WebGLProgram): void {
+    if (!this.paintShapeUniforms.has(program)) this.paintShapeUniforms.set(program, this.gl.getUniformLocation(program, "uPdfShapeOnly"));
+    this.gl.uniform1f(this.paintShapeUniforms.get(program)!, this.paintShapeOnly ? 1 : 0);
     if (this.multiplyUniforms) {
       if (!this.multiplyUniforms.has(program)) this.multiplyUniforms.set(program, this.gl.getUniformLocation(program, "uHeprMultiply"));
       this.gl.uniform1i(this.multiplyUniforms.get(program)!, this.multiplyPass == null ? 0 : 1);
@@ -4050,10 +4177,15 @@ export class WebGlFloorplanRenderer {
     if (this.rasterRenderingEnabled) this.drawPageBackgrounds(width, height, x, y, zoom);
     let strokes = 0;
     const view = this.localToClipRenderingEnabled ? this.orderedCullingBounds : vectorViewBounds(width, height, x, y, zoom);
-    const runs = this.orderedRunCuller?.select(view, 1 / Math.max(zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const candidates = this.orderedRunCuller?.select(view, 1 / Math.max(zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const visibility = this.optionalContentVisibility;
+    const paintVisibility = this.scenePaintVisibility ??= new ScenePaintVisibility(this.scene!);
+    paintVisibility.setVisibility(visibility);
+    const runs = paintVisibility.select(candidates);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
-    const plan = this.orderedBatches;
+    const plan = paintVisibility.requiresCompositing ? null : this.orderedBatches;
     const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6)) ?? false;
+    this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     if (plan && rebuilt) {
       this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.orderedInstanceBuffer);
       this.gl.bufferData(this.gl.ARRAY_BUFFER, plan.floatInstances.subarray(0, plan.instanceCount * 2), this.gl.DYNAMIC_DRAW);
@@ -4085,6 +4217,18 @@ export class WebGlFloorplanRenderer {
         }
       }
     };
+    if (paintVisibility.requiresCompositing) {
+      this.paintCompositor ??= new WebGlPaintCompositor(this.gl);
+      try {
+        this.paintCompositor.render(this.scene!, width, height, (run, shapeOnly) => {
+          this.paintShapeOnly = shapeOnly;
+          const previous = strokes;
+          draw(run);
+          if (shapeOnly) strokes = previous;
+        }, condition => condition === undefined || visibility?.conditions[condition] === 1);
+      } finally { this.paintShapeOnly = false; this.vectorClipIndex = -1; }
+      return strokes;
+    }
     for (const run of plan?.batches ?? runs) {
       if (!run.blendMode) { draw(run); continue; }
       // Pair both passes for each instance so overlapping instances observe
@@ -4950,6 +5094,7 @@ export class WebGlFloorplanRenderer {
         }
 
         this.rasterLayers.push({
+          opacity: source.opacity ?? 1,
           texture,
           matrix,
           paintOrder: source.paintOrder,
@@ -4965,6 +5110,7 @@ export class WebGlFloorplanRenderer {
   private getSceneRasterLayers(
     scene: VectorScene
   ): Array<{
+    opacity?: number;
     width: number;
     height: number;
     data: Uint8Array<ArrayBufferLike>;
@@ -4973,6 +5119,7 @@ export class WebGlFloorplanRenderer {
     pageIndex: number;
   }> {
     const out: Array<{
+      opacity?: number;
       width: number;
       height: number;
       data: Uint8Array<ArrayBufferLike>;
@@ -4981,7 +5128,8 @@ export class WebGlFloorplanRenderer {
       pageIndex: number;
     }> = [];
     if (Array.isArray(scene.rasterLayers)) {
-      for (const layer of scene.rasterLayers) {
+      for (let index = 0; index < scene.rasterLayers.length; index++) {
+        const layer = this.rasterLayerUpdates.get(index) ?? scene.rasterLayers[index];
         const width = Math.max(0, Math.trunc(layer?.width ?? 0));
         const height = Math.max(0, Math.trunc(layer?.height ?? 0));
         if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
@@ -4991,6 +5139,7 @@ export class WebGlFloorplanRenderer {
           width,
           height,
           data: layer.data,
+          opacity: layer.opacity,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
           pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
@@ -5023,6 +5172,24 @@ export class WebGlFloorplanRenderer {
     const data = readGradientSceneData(scene);
     this.gradientData = data;
     const gl = this.gl;
+    gl.deleteBuffer(this.gradientMeshBuffer); this.gradientMeshBuffer = null;
+    gl.deleteVertexArray(this.gradientMeshVao); this.gradientMeshVao = null;
+    this.gradientMeshRanges = new Uint32Array(0);
+    if (data.gradientMeshIndices?.length) {
+      const mesh = buildGradientMeshRenderData(data);
+      this.gradientMeshRanges = mesh.ranges;
+      if (!this.gradientMeshProgram) {
+        this.gradientMeshProgram = this.createProgram(GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL);
+        this.gradientMeshUniforms = Object.fromEntries([...Object.keys(this.gradientFillUniforms), "uMeshPathIndex"].map(name =>
+          [name, gl.getUniformLocation(this.gradientMeshProgram!, name)!]));
+      }
+      this.gradientMeshBuffer = this.mustCreateBuffer(); this.gradientMeshVao = this.createVertexArray();
+      gl.bindVertexArray(this.gradientMeshVao); gl.bindBuffer(gl.ARRAY_BUFFER, this.gradientMeshBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8);
+      gl.bindVertexArray(null);
+    }
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
     const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
@@ -5347,6 +5514,8 @@ export class WebGlFloorplanRenderer {
     this.vectorLodStats = null;
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+    this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
+      !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
     if (this.orderedBatches && !this.orderedInstanceBuffer) this.orderedInstanceBuffer = this.mustCreateBuffer();
 
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
@@ -5987,8 +6156,8 @@ export class WebGlFloorplanRenderer {
   private createProgram(vertexSource: string, fragmentSource: string): WebGLProgram {
     const gl = this.gl;
 
-    const vertexShader = this.compileShader(gl.VERTEX_SHADER, vertexSource);
-    const fragmentShader = this.compileShader(gl.FRAGMENT_SHADER, fragmentSource);
+    const vertexShader = this.compileShader(gl.VERTEX_SHADER, pdfShapeCoverageGlsl(vertexSource));
+    const fragmentShader = this.compileShader(gl.FRAGMENT_SHADER, pdfShapeCoverageGlsl(fragmentSource));
 
     const program = gl.createProgram();
     if (!program) {

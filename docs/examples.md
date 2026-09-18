@@ -209,6 +209,8 @@ canvas.addEventListener("pointerup", async event => {
 
     const ref = hit.primitive; // e.g. { kind: "stroke", index: 12345 }
     const primitive = pdf.getPrimitive(ref);
+    const layers = new Map(pdf.getLayers().map(layer => [layer.id, layer.name]));
+    console.log("Layer dependencies", hit.optionalContent.layerIds.map(id => ({ id, name: layers.get(id) })));
     if (primitive.segmentCount) {
       const segment = primitive.getSegment(0);
       console.log(segment.start, segment.end, segment.control, primitive.getSegmentStyle(0));
@@ -316,7 +318,7 @@ export function disposeDownload(): void {
 
 To convert without creating a viewer, use `await buildHep(pdfSource)` with a PDF URL, `File`, `Blob`, or bytes. Both forms accept `signal` for cancellation. The result is an `application/x-hep` Blob that the regular loader can open.
 
-For a scene that reports PDF images but has no extracted raster layers, also supply `sourcePdf` and, if pages were selected, `sourcePdfPages` with the same page selection. See the [manual](manual.md) for compression support and Node.js conversion.
+HEP exports preserve the PDF's original layer defaults and initially hidden content. Current layer toggles and temporary drawing colors are view settings. V7 archives include self-contained fallback resources; older archives must be regenerated from their PDFs. See the [manual](manual.md) for compression support and Node.js conversion.
 
 ## Detect rooms in a vector floorplan
 

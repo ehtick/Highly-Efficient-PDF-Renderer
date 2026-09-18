@@ -132,11 +132,12 @@ async function assertSelectiveTransparencyComposite(openPdf) {
   });
   try {
     const scene = await session.compileVectorPage(0, { optimization: "none" });
-    assert.equal(scene.fillPathCount, 0, "captured Form paint is suppressed from packed vectors");
-    assert.equal(scene.rasterLayers.length, 1);
-    assert.ok(scene.rasterLayers[0].width > 0 && scene.rasterLayers[0].height > 0);
-    assert.equal(scene.rasterLayers[0].paintOrder, 0, "the captured root Form retains source order");
-    assert.ok(scene.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value !== 0));
+    assert.equal(scene.fillPathCount, 1, "transparency groups retain their canonical vector paint");
+    assert.equal(scene.rasterLayers.length, 0);
+    const groups = [];
+    const visit = nodes => { for (const node of nodes) if (node.kind === "group") { groups.push(node); visit(node.children); } };
+    visit(scene.paintGraph.roots);
+    assert.ok(groups.some(group => group.isolated), "the Form preserves its isolated compositing boundary");
   } finally {
     await session.close();
   }

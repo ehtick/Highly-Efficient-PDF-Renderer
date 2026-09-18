@@ -219,6 +219,83 @@ or handle their own events with `pick()`, `getPrimitive()`, `setHover()`,
 `setSelection()`, and the primitive override methods. See the
 [examples](examples.md#pick-inspect-and-recolor-drawing-primitives).
 
+## PDF layers
+
+The main viewer's collapsible **PDF Layers** panel displays the PDF's optional
+content groups in their original hierarchy. Filter by name, toggle visibility,
+use **All** to show or hide all editable layers (including layers hidden by the
+filter), or choose **Reset to PDF defaults**. **All** shows a mixed state when some
+available layers are visible. Locked layers are disabled; radio groups
+allow only one enabled member. PDFs without layers show an empty state.
+Bulk enabling preserves the current radio-group choice, or picks an available
+default/first member if none is enabled. **All** becomes checked when every
+compatible editable layer is enabled, so it can then be unchecked to hide them.
+Drawing Selection details show associated layer names and IDs. A primitive can
+depend on several layers or a negated visibility expression.
+
+Layer controls work independently of Drawing Selection. Hidden geometry is
+excluded from picking and hidden text from search and text selection. Hiding a
+selected primitive clears its trace while preserving its temporary color for
+later reappearance. Switching backends keeps the layer state; opening another
+document restores that document's defaults.
+
+Most visibility changes only invalidate rendering and text caches. Compatibility
+effects that need regenerated images show preparation progress; the previous
+applied state remains visible until preparation finishes. Failed changes show an
+error and leave that state intact. Runtime layer choices are never exported.
+
+Layer eligibility is cached when visibility changes. When every paint is visible,
+rendering uses the ordinary culling and batching path without scanning layer
+conditions each frame. Layer boundaries remain in the document's canonical data,
+but compatible visible ranges can share a GPU draw. Native renderers can also
+batch overlapping solid paints with identical colors: normal source-over blending
+produces the same result in either order. Different colors and blending effects
+retain their ordering dependencies. Temporary primitive recoloring disables this
+color-based optimization until the overrides are cleared. Ordinary paint groups
+use the direct rendering path; opacity, masks, knockout, and blend effects still
+require compositing surfaces.
+
+Dense native drawings use a cached paint schedule for the complete scene. Visible
+strokes from different OCGs can share a draw, and disjoint stroke/fill/text paints
+can be regrouped while preserving overlap dependencies. Panning and layer changes
+filter that schedule instead of repeating the batching search. Coverage-scale
+changes during zoom, or temporary color overrides, can require a new schedule.
+This trades some subset-specific batching opportunities for cheaper camera updates;
+the scheduling search remains bounded for heavily overlapping drawings.
+
+For scenes with explicit paint order, native and Three.js rendering also omit
+redundant opaque straight strokes from their temporary draw lists. Comparisons
+require matching color, caps, clipping, and exact collinearity, within compatible
+paint-order regions. A covering stroke
+must be selected by the current layer, viewport, and LOD state. Hiding its layer
+restores any previously covered stroke; recoloring a solid stroke, fill, or text
+instance suspends this optimization until its overrides are cleared. Curves,
+translucent strokes, incompatible paints, and compositing effects remain intact.
+Like the former extraction-time containment optimization, this can reduce the
+extra antialias edge darkening from repeated opaque strokes; it does not use the
+old geometric tolerances to remove nearby distinct lines.
+
+The live **Draw** counter reflects these omissions, with **redundant strokes
+omitted** reported separately. The document's **culled** statistic still describes
+permanent extraction-time removals and may remain zero. Canonical geometry and
+primitive references are preserved for picking, inspection, and export. Existing
+HEP files benefit without regeneration. Decisions are reused until the selected
+stroke IDs or relevant appearance state change. When IDs change, only affected
+collinear groups need their coverage recomputed; packed culling metadata adds
+runtime memory proportional to the stroke count.
+
+For manual performance verification, compare panning and zooming the same drawing
+at the same viewport, DPR, zoom, and LOD settings. Check all layers visible, a subset
+hidden, and a recolored overlapping stroke or fill followed by resetting its color.
+Check that a contained stroke reappears after hiding its covering layer, and
+compare coincident stroke edges at high zoom with the previous optimized output.
+Also check native WebGL/WebGPU and switching backends. Draw-call reductions in
+non-browser tests do not by themselves establish an FPS or GPU-time improvement.
+
+The Three.js and room demos share the rendering and API support, but only the
+main viewer currently mounts the panel. Hosts can mount `createPdfLayerControls()`
+or use the [layer APIs](api.md#pdf-layers-optional-content) with their own controls.
+
 ## HEP files
 
 HEP (`.hep`) stores a pre-parsed document for reuse. It includes geometry, page
@@ -237,9 +314,9 @@ const fromScene = await buildHep(pdf.sceneData, {
 ```
 
 The result is an `application/x-hep` `Blob`; save or upload it with a `.hep`
-filename. Exporting a loaded scene reuses its parsed data. If that scene has
-image operations but no raster layers, also provide `sourcePdf`; use
-`sourcePdfPages` to preserve its original page selection for image recovery.
+filename. Exporting a loaded scene reuses its parsed data, including original
+PDF layer defaults, hidden geometry, and retained fallback resources. The original
+PDF is not required to replay those resources after reopening a v7 archive.
 
 By default, `buildHep` uses DEFLATE compression and stores each raster as the
 smaller of WebP or PNG, with raw RGBA as a fallback when encoding is unavailable.
@@ -252,7 +329,9 @@ The builder accepts `signal` and `onProgress`, including raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP container v1 with scene schema v6. The
+The loader supports HEP container v1 with scene schema v7. Earlier scene schemas
+must be regenerated from the original PDF; repacking a container cannot restore
+layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and
 resource limits.
 

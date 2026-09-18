@@ -261,6 +261,18 @@ await withRegistry(primary, {}, async ({ document, registry, emitted }) => {
     diagnostics.map(({ message }) => message),
     "retained and callback diagnostics have deterministic order"
   );
+  const [{ createEmptyVectorScene }, { createDefaultOptionalContentSnapshot, validateSceneOptionalContent }] = await Promise.all([
+    import("../src/emptyVectorScene.ts"), import("../src/optionalContent.ts")
+  ]);
+  const data = await registry.sceneData();
+  validateSceneOptionalContent(data);
+  const snapshot = createDefaultOptionalContentSnapshot({ ...createEmptyVectorScene(), optionalContent: data });
+  for (const property of properties) if (property.membershipIndex !== null) {
+    assert.equal(snapshot.conditions[property.membershipIndex] === 1, property.defaultVisible,
+      `${property.name}: exported visibility graph matches static policy and intent semantics`);
+  }
+  assert.equal(data.groups[1].usedInView, false);
+  assert.equal(data.order.length, data.groups.length, "invalid display order safely uses catalog order");
 });
 
 for (const [intent, expected] of [

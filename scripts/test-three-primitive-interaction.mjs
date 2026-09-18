@@ -63,7 +63,9 @@ try {
     if (backend === "webgl") {
       const shader = gradient.entries[0].material.fragmentShader;
       assert.match(shader, /baseColor = mix\(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a\)/);
-      assert.match(shader, /sourcePaint.a \* maskPaint.a/);
+      assert.match(shader, /sourcePaint.a \* mix\(maskPaint.a, 1.0, uPdfShapeOnly\)/);
+      assert.match(shader, /float alpha = inside \? .* \* paintAlpha : 0.0;/);
+      assert.match(shader, /float alpha = heprThreeLinearCoverageToOutputAlpha\(coverage\).* \* paintAlpha;/);
       assert.deepEqual(gradient.entries[0].material.uniforms.uVectorOverride.value.toArray(), options.vectorOverride);
     }
     const restores = updates.map(update => ({ ...update, color: null }));
@@ -88,6 +90,37 @@ try {
     assert.equal(overlay.mesh.geometry.instanceCount, 1);
     overlay.dispose();
     for (const layer of [stroke, fill, text, gradient]) layer.dispose();
+  }
+
+  // Stroke elimination is renderer-owned and must be reversible when any
+  // original solid paint changes, including intervening fills or glyphs.
+  const duplicateScene = { ...scene, segmentCount: 2,
+    endpoints: floats([1, 5, 0, 0, 1, 5, 0, 0]),
+    primitiveMeta: floats([9, 5, 0, 1, 9, 5, 0, 1]),
+    primitiveBounds: floats([1, 5, 9, 5, 1, 5, 9, 5]),
+    styles: floats([0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4]),
+    drawRuns: [{ kind: "stroke", first: 0, count: 2 }] };
+  for (const backend of ["webgl", "webgpu"]) {
+    const layer = new ThreeMaterialStrokeLayer(duplicateScene, {
+      materialBackend: backend, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0]
+    });
+    assert.equal(layer.getRenderedSegmentCount(), 1);
+    for (const kind of ["stroke", "fill", "text"]) {
+      const update = { ref: { kind, index: 0 }, color: [1, 0, 0] };
+      layer.setPrimitiveColorUpdates([update], duplicateScene);
+      assert.equal(layer.getRenderedSegmentCount(), 2, `${backend}: ${kind} override restores redundant strokes`);
+      layer.setPrimitiveColorUpdates([{ ...update, color: null }], duplicateScene);
+      assert.equal(layer.getRenderedSegmentCount(), 1, `${backend}: clearing ${kind} restores stroke elimination`);
+    }
+    layer.setPrimitiveColorUpdates([
+      { ref: { kind: "stroke", index: 0 }, color: [1, 0, 0] },
+      { ref: { kind: "fill", index: 0 }, color: [0, 0, 1] }
+    ], duplicateScene);
+    layer.setPrimitiveColorUpdates([{ ref: { kind: "stroke", index: 0 }, color: null }], duplicateScene);
+    assert.equal(layer.getRenderedSegmentCount(), 2, "other active solid overrides still invalidate the proof");
+    layer.setPrimitiveColorUpdates([{ ref: { kind: "fill", index: 0 }, color: null }], duplicateScene);
+    assert.equal(layer.getRenderedSegmentCount(), 1);
+    layer.dispose();
   }
 
   // Exercise the public object API without a DOM, renderer, or graphics context.

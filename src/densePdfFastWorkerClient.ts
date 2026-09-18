@@ -23,6 +23,7 @@ export type DensePdfFastWorkerProgress = PDFLoadProgress & {
 export interface DensePdfFastWorkerOptions {
   /** One-based PDF page selection using HEPR's existing page-range syntax. */
   pages?: string;
+  retainOptionalContent?: boolean;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
   signal?: AbortSignal;
@@ -102,6 +103,7 @@ export interface DensePdfFastWorkerRequest {
   pdfBytes: Uint8Array;
   options: {
     pages?: string;
+    retainOptionalContent?: boolean;
     enableSegmentMerge: boolean;
     enableInvisibleCull: boolean;
   };
@@ -153,6 +155,7 @@ export async function compileDensePdfInWorker(
     pdfBytes: ownedBytes,
     options: {
       pages: options.pages,
+      retainOptionalContent: options.retainOptionalContent === true,
       enableSegmentMerge: options.enableSegmentMerge !== false,
       enableInvisibleCull: options.enableInvisibleCull !== false
     }

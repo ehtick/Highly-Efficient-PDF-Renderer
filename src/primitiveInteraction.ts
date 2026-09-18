@@ -1,7 +1,8 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi } from "./rendererTypes";
 import { PrimitiveAppearanceState, normalizePrimitiveColor, primitiveRefKey, type PrimitiveColorInput } from "./primitiveAppearance";
-import { ScenePrimitivePicker, getScenePrimitive, type PrimitiveHit, type PrimitiveInfo, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
+import { ScenePrimitivePicker, getScenePrimitive, isScenePrimitiveVisible,
+  type PrimitiveHit, type PrimitiveInfo, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
 
 export interface PrimitiveInteractionCallbacks {
   onSelectionChange?(primitive: PrimitiveInfo | null, displayColor?: [number, number, number] | null): void;
@@ -17,6 +18,7 @@ export interface PrimitiveInteractionOptions extends PrimitiveInteractionCallbac
 
 /** Backend operations used by the shared pointer and selection controller. */
 export interface PrimitiveInteractionAdapter {
+  isVisible?(ref: PrimitiveRef): boolean;
   getCanvas(): HTMLCanvasElement;
   getScene(): VectorScene | null;
   getTarget(): unknown;
@@ -155,7 +157,7 @@ export function createPrimitiveInteractionControllerForAdapter(
         if (pointer && !stillHovering && !pending) pending = { point: pointer, select: false };
       }
     } catch (error) {
-      if (!controller.signal.aborted) options.onError?.(error);
+      if (!controller.signal.aborted && !(error instanceof DOMException && error.name === "AbortError")) options.onError?.(error);
     } finally {
       if (active === controller) { active = null; activeRequest = null; }
       if (enabled && pending && frame === null) frame = requestAnimationFrame(() => { frame = null; void query(); });
@@ -295,6 +297,11 @@ export function createPrimitiveInteractionControllerForAdapter(
         const selection = pendingSelection();
         cancelQuery();
         setHover(null);
+        if (selected && adapter.isVisible?.(selected) === false) {
+          selected = null;
+          adapter.setSelection([]);
+          notifySelection();
+        }
         // Retry a completed click against the updated view instead of silently
         // downgrading it to hover while the camera settles.
         if (selection && !selectingGesture) schedule(selection.point, true);
@@ -324,13 +331,16 @@ export function createPrimitiveInteractionController(options: PrimitiveInteracti
     suppressCallbacks = false;
   };
   return createPrimitiveInteractionControllerForAdapter({
+    isVisible(ref) {
+      return !!source && isScenePrimitiveVisible(source, ref, condition => condition === undefined || options.getRenderer().getOptionalContentVisibility?.()?.conditions[condition] !== 0);
+    },
     getCanvas: options.getCanvas,
     getScene: options.getScene,
     getTarget: options.getRenderer,
     getViewKey: () => {
       // A presented view can lag behind the current projection by one frame.
       const view = options.getRenderer().getViewState();
-      return `${view.cameraCenterX}:${view.cameraCenterY}:${view.zoom}`;
+      return `${view.cameraCenterX}:${view.cameraCenterY}:${view.zoom}:${options.getRenderer().getOptionalContentVisibility?.()?.revision ?? 0}`;
     },
     async pick(point, signal) {
       if (!source) return null;
@@ -339,10 +349,18 @@ export function createPrimitiveInteractionController(options: PrimitiveInteracti
       const rect = options.getCanvas().getBoundingClientRect();
       if (!scenePoint || point.x < rect.left || point.x > rect.right || point.y < rect.top || point.y > rect.bottom) return null;
       picker ??= new ScenePrimitivePicker(source, percentage => onProgress(percentage));
-      return picker.pick({ point: scenePoint, clientPoint: point,
+      const visibility = target.getOptionalContentVisibility?.();
+      const hit = await picker.pick({ point: scenePoint, clientPoint: point,
         project: input => target.sceneToClientPoint?.(input.x, input.y) ?? null,
         unproject: input => target.clientToScenePoint?.(input.x, input.y) ?? null,
-        tolerancePx: 4, signal });
+        tolerancePx: 4, signal, rasterLayers: target.getRasterLayerUpdates?.(),
+        resolveColor(ref, original) {
+          const rgb = appearance?.getOverrideColor(ref) ?? original, tint = target.getVectorColorOverride?.();
+          return tint ? rgb.map((value, channel) => value * (1 - tint[3]) + tint[channel] * tint[3]) as [number, number, number] : rgb;
+        },
+        ...(visibility ? { isConditionVisible: (condition?: number) => condition === undefined || visibility.conditions[condition] !== 0 } : {}) });
+      if (visibility !== target.getOptionalContentVisibility?.()) throw new DOMException("Layer visibility changed during picking.", "AbortError");
+      return hit;
     },
     setHover: ref => appearance?.setHover(ref),
     setSelection: refs => appearance?.setSelection(refs),

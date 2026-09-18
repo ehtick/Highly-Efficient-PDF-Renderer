@@ -1,5 +1,8 @@
 import { rectangleVectorClip } from "./pdf/nativeVectorClips";
 import { buildNativeRasterPage, buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
+import { lowerRetainedPageToVectorScene } from "./retainedVectorPage";
+import { attachRetainedTextOptionalContent } from "./retainedOptionalContentText";
+import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
 import { loadNodeCanvas } from "./nodeCanvas";
 import {
@@ -202,6 +205,10 @@ export interface NativeVectorCompileOptions extends PdfCompileOptions {
   readonly vectorFallback?: "raster" | "error";
   /** Internal compatibility retry for features still using the grouped bridge. */
   readonly preserveDrawingOrder?: boolean;
+  /** Retain all layers for viewer output; internal static fallback can opt out. */
+  readonly retainOptionalContent?: boolean;
+  /** Internal vector expansion budget, independent of parser safety limits. */
+  readonly retainedVectorMaxPatternCells?: number;
   readonly enableSegmentMerge?: boolean;
   readonly enableInvisibleCull?: boolean;
 }
@@ -698,7 +705,7 @@ class NativePdfSession implements NativeVectorPdfSession {
           this.info.byteLength
         ));
       }
-      const text = accumulatedText.compilation.textIndex.text.length > 0 ||
+      const text = compiled.textShowOpCount > 0 || accumulatedText.compilation.textIndex.text.length > 0 ||
         accumulatedText.compilation.glyphs.glyphIds.length > 0
         ? buildNativePageTextResources(
             accumulatedText.compilation,
@@ -740,6 +747,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         ));
       }
       const densePageData = createHeprPageDataFromDense(pageInfo, compiled, {
+        retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
         text,
         forms: compositingPrograms.forms,
         patterns: compositingPrograms.patterns,
@@ -825,7 +833,31 @@ class NativePdfSession implements NativeVectorPdfSession {
     signal.throwIfAborted();
     // Both passes use one limits snapshot, even if a progress callback mutates
     // the caller's options. Subsequent operations still take their own snapshot.
-    options = { ...options, ...(options.limits ? { limits: { ...options.limits } } : {}) };
+    options = { ...options, retainOptionalContent: options.retainOptionalContent !== false && this.optionalContent.groupCount > 0,
+      ...(options.limits ? { limits: { ...options.limits } } : {}) };
+    let retainedAttempted = false;
+    const lowerRetained = async (page: HeprPageData): Promise<VectorScene | null> => {
+      retainedAttempted = true;
+      try {
+        return await lowerRetainedPageToVectorScene(page, {
+          optionalContent: options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined,
+          signal,
+          onDiagnostic: diagnostic => this.appendDiagnostics([diagnostic]),
+          maxPrimitives: options.limits?.maxPathsPerPage ?? this.document.limits.maxPathsPerPage,
+          maxCoordinates: options.limits?.maxPathCoordinatesPerPage ?? this.document.limits.maxPathCoordinatesPerPage,
+          maxPatternCells: options.retainedVectorMaxPatternCells
+        });
+      } catch (error) {
+        signal.throwIfAborted();
+        const expansionLimit = error instanceof PdfError && error.code === "resource-limit" && error.details?.reason === "vector-expansion-limit";
+        if (!isNativeVectorRepresentationFailure(error) && !expansionLimit) throw error;
+        if (options.vectorFallback === "error") throw error;
+        // Layer visibility must be replayable even when a paint feature still
+        // needs the reference renderer. Keep the all-command retained page.
+        if (options.retainOptionalContent || expansionLimit) return this.buildRetainedRasterScene(page, options, signal, error as Error);
+        return null;
+      }
+    };
     try {
       // Stack-local to this operation: never shared across pages, queued calls,
       // changed limits, cancellation, or session close. Graphics/text compilers
@@ -854,7 +886,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       let textCompilation = textCompiler.build();
       const vectorRoot = appendNativeVectorAnnotationPaints(
         compiled, formGraph, imageResources.colorSpaceResolver, pageBounds, sourcePageIndex,
-        options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage, signal
+        options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage, signal,
+        options.retainOptionalContent !== false ? this.optionalContent : undefined
       );
       let vectorCompiled = vectorRoot;
       let selectiveCompositeFormPaintIndices: readonly number[] = [];
@@ -921,8 +954,10 @@ class NativePdfSession implements NativeVectorPdfSession {
           this.info.byteLength
         ));
       }
+      const optionalContentData = options.retainOptionalContent !== false ? await this.optionalContent.sceneData(signal) : undefined;
       const buildScene = (compositeRasterLayers: VectorScene["rasterLayers"]) => buildNativeVectorPage({
         compositeRasterLayers,
+        optionalContent: optionalContentData,
         onDiagnostic: diagnostic => this.appendDiagnostics([diagnostic]),
         pageInfo,
         pageBounds,
@@ -938,6 +973,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         signal
       });
       const compositeRasterLayers: VectorScene["rasterLayers"] = [];
+      let retainedCompositePage: HeprPageData | undefined;
       let compositeTextIndex: VectorScene["textIndex"] = null;
       measurePreparedResources(timings, fontRegistry, imageResources.registry);
       if (selectiveCompositeFormPaintIndices.length !== 0 ||
@@ -947,9 +983,14 @@ class NativePdfSession implements NativeVectorPdfSession {
         const retryTimings = timings ? createNativeVectorCompileTimings() : undefined;
         const retryStartedAt = timings ? nativeVectorTimingNow() : 0;
         const pageData = await this.compilePageUnlocked(sourcePageIndex, options, signal, true, retryTimings, reuse);
+        retainedCompositePage = pageData;
         if (timings) {
           timings.selectiveCompileMs = nativeVectorTimingNow() - retryStartedAt;
           timings.selectiveCompilation = Object.freeze(retryTimings!);
+        }
+        if (options.preserveDrawingOrder !== false || options.retainOptionalContent) {
+          const retainedScene = await lowerRetained(pageData);
+          if (retainedScene) return retainedScene;
         }
         const rasterStartedAt = timings ? nativeVectorTimingNow() : 0;
         compositeRasterLayers.push(...await renderNativeSelectiveCompositeLayers(
@@ -973,6 +1014,23 @@ class NativePdfSession implements NativeVectorPdfSession {
       const scene = buildScene(compositeRasterLayers);
       if (compositeTextIndex) scene.textIndex = compositeTextIndex;
       if (compositeRasterLayers.length > 0) {
+        if (retainedCompositePage) {
+          const page = retainedCompositePage;
+          scene.retainedPages = [{ page,
+            optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
+            matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+          // Raster replay slots own singleton runs; ordinary raster images retain
+          // their existing paint runs and do not acquire retained resources.
+          const runs = scene.drawRuns ?? defaultVectorDrawRuns(scene);
+          scene.drawRuns = runs.flatMap(run => run.kind === "raster"
+            ? Array.from({ length: run.count }, (_, offset) => ({ ...run, first: run.first + offset, count: 1 })) : [run]);
+          scene.paintGraph = { roots: scene.drawRuns.map((run, runIndex) => {
+            const layer = run.kind === "raster" ? scene.rasterLayers[run.first] as NativeSelectiveRasterLayer : undefined;
+            return layer?.retainedFirstCommand === undefined ? { kind: "draw" as const, runIndex }
+              : { kind: "retained" as const, retainedPage: 0, firstCommand: layer.retainedFirstCommand,
+                count: layer.retainedCommandCount!, rasterIndex: run.first };
+          }) };
+        }
         this.appendDiagnostics([{ code: "selective-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
           message: "Some unsupported paint or compositing features use bounded raster layers; surrounding vector content is retained.",
           details: { layers: compositeRasterLayers.length } }]);
@@ -984,6 +1042,11 @@ class NativePdfSession implements NativeVectorPdfSession {
     } catch (error) {
       signal.throwIfAborted();
       const normalized = normalizeCompileError(error, sourcePageIndex);
+      if (!retainedAttempted && isNativeVectorRepresentationFailure(normalized)) {
+        const retainedPage = await this.compilePageUnlocked(sourcePageIndex, options, signal);
+        const retainedScene = await lowerRetained(retainedPage);
+        if (retainedScene) return retainedScene;
+      }
       if (options.preserveDrawingOrder === undefined && isNativeVectorRepresentationFailure(normalized)) {
         return this.compileVectorPageUnlocked(sourcePageIndex, { ...options, preserveDrawingOrder: false },
           signal, timings, reusePageResources, reuseCompositeSurfaces, boundCompositeWork);
@@ -991,6 +1054,29 @@ class NativePdfSession implements NativeVectorPdfSession {
       if (options.vectorFallback === "error" || !isNativeVectorRepresentationFailure(normalized)) throw normalized;
       return await this.compileRasterPageUnlocked(sourcePageIndex, options, signal, normalized);
     }
+  }
+
+  private async buildRetainedRasterScene(page: HeprPageData, options: NativeVectorCompileOptions,
+    signal: AbortSignal, reason: Error): Promise<VectorScene> {
+    const commandCount = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
+    if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal });
+    const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal);
+    if (!layer) throw new PdfError("invalid-object", "A retained page replay produced no structural raster slot.");
+    const scene = buildNativeRasterPage(page, { rgba: new Uint8ClampedArray(layer.data), width: layer.width,
+      height: layer.height, scale: layer.width / layer.matrix[0] }, signal);
+    scene.rasterLayers[0] = layer;
+    scene.rasterLayerData = layer.data; scene.rasterLayerMatrix = layer.matrix;
+    scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
+    scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
+    if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
+    scene.retainedPages = [{ page,
+      optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
+      matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+    scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count: commandCount, rasterIndex: 0 }] };
+    this.appendDiagnostics([{ code: "retained-raster-fallback", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+      message: "This paint program uses replayable raster rendering; PDF layer toggles remain available, with reduced drawing geometry.",
+      details: { reason: reason.message } }]);
+    return scene;
   }
 
   private async compileRasterPageUnlocked(
@@ -1035,6 +1121,16 @@ class NativePdfSession implements NativeVectorPdfSession {
           details: { reason: renderError instanceof Error ? renderError.message : String(renderError) } });
       }
       const scene = buildNativeRasterPage(page, pixels, signal);
+      const count = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
+      if (count) {
+        scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
+        if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
+        scene.retainedPages = [{ page,
+          optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
+          matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+        scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
+        scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count, rasterIndex: 0 }] };
+      }
       onDiagnostic({ code: "page-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
         message: "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable.",
         details: { reason: reason.message, width: pixels.width, height: pixels.height, scale } });
@@ -1133,7 +1229,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       this.imageCodecResolver,
       { iccTransformResolver: this.iccTransformResolver, iccEngine: this.iccEngine },
       (diagnostic) => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }]),
-      options.limits
+      options.limits,
+      (options as NativeVectorCompileOptions).retainOptionalContent === true
     );
     const xObjectReferences = imageResources.xObjectReferences;
     const pageContentSegments = await bindPreparedInlineImages(
@@ -1163,6 +1260,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             pageXObjectReferences: xObjectReferences,
             pageResourceReferences: references,
             optionalContent: this.optionalContent,
+            retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
             appearanceSynthesizer: this.appearanceSynthesizer,
             signal
           }
@@ -1234,7 +1332,10 @@ class NativePdfSession implements NativeVectorPdfSession {
     ));
     const compileStartedAt = timings ? nativeVectorTimingNow() : 0;
     let finalizeStartedAt: number | null = null;
+    const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
+      retainOptionalContent,
+      ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
       pageMatrix,
       pageBounds,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
@@ -1780,7 +1881,7 @@ interface NativeVectorFormFlattenInput {
   readonly rootCompiled: DensePdfCompiledPage;
   readonly rootText: NativeTextCompilation;
   readonly imageResources: LoadedPageImages;
-  readonly options: PdfCompileOptions;
+  readonly options: NativeVectorCompileOptions;
   readonly pageIndex: number;
   readonly pageBounds: DensePdfBounds;
   readonly signal: AbortSignal;
@@ -1839,6 +1940,7 @@ async function flattenNativeVectorFormOccurrences(
     Promise<readonly DensePdfExtGStateDefinition[]>
   >();
   const imageScopes = new Map<number, Promise<ScopedImageResources>>();
+  const vectorShadingScopes = new Map<number, Promise<ReadonlyMap<string, number>>>();
   const inlineScopes = new Map<number, Promise<readonly DensePdfContentSegment[]>>();
   const fontScopes = new Map<
     number,
@@ -1889,7 +1991,8 @@ async function flattenNativeVectorFormOccurrences(
         definition.imageResourceNames,
         colors.colorSpaces,
         pageIndex,
-        signal
+        signal,
+        options.retainOptionalContent !== false
       ));
       imageScopes.set(definition.definitionIndex, pending);
     }
@@ -1927,6 +2030,21 @@ async function flattenNativeVectorFormOccurrences(
   };
 
   const clipIdentities = new Map<DensePdfTextClip, number>();
+  const scopedVectorShadings = (definition: NativePdfFormDefinition): Promise<ReadonlyMap<string, number>> => {
+    let pending = vectorShadingScopes.get(definition.definitionIndex);
+    if (!pending) {
+      pending = (async () => {
+        const indices = new Map<string, number>();
+        for (const name of definition.resourceReferences.shadings) {
+          signal.throwIfAborted();
+          indices.set(name, await imageResources.shadings.add({ kind: "name", value: name }, definition.resources, signal));
+        }
+        return indices;
+      })();
+      vectorShadingScopes.set(definition.definitionIndex, pending);
+    }
+    return pending;
+  };
   const compileOccurrence = async (
     definitionIndex: number,
     paint: DensePdfCompiledPage["formPaints"][number]
@@ -1939,7 +2057,7 @@ async function flattenNativeVectorFormOccurrences(
         details: { reason: "vector-form-definition", definitionIndex }
       });
     }
-    if (!definition.defaultVisible) {
+    if (options.retainOptionalContent === false && !definition.defaultVisible) {
       throw new PdfError("invalid-object", "A hidden Form reached native vector flattening.", {
         pageIndex,
         details: { reason: "vector-form-hidden", definitionIndex }
@@ -1976,8 +2094,10 @@ async function flattenNativeVectorFormOccurrences(
         definition.resourceName
       );
     }
-    if (definition.resourceReferences.shadings.length !== 0 ||
-        definition.resourceReferences.patterns.length !== 0) {
+    const shadingIndices = await scopedVectorShadings(definition);
+    const vectorShadings = supportedNativeVectorShadings(imageResources.shadings);
+    if (definition.resourceReferences.patterns.length !== 0 ||
+        [...shadingIndices.values()].some(index => !nativeVectorOrderedPaintEnabled(options) || !vectorShadings.has(index))) {
       throw vectorFormUnsupported(
         `Form /${definition.resourceName} uses a shading or pattern that the flat VectorScene cannot order.`,
         pageIndex,
@@ -2058,6 +2178,8 @@ async function flattenNativeVectorFormOccurrences(
         ...paint.initialGraphicsState,
         strokeAlpha: paint.initialGraphicsState.fillAlpha
       } : paint.initialGraphicsState,
+      retainOptionalContent: options.retainOptionalContent !== false && optionalContent.groupCount > 0,
+      combineOptionalContent: (parent, own) => optionalContent.combineMemberships(parent, own),
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       ...(nativeVectorOrderedPaintEnabled(options) ? { initialVectorClip: rectangleVectorClip({
@@ -2068,6 +2190,8 @@ async function flattenNativeVectorFormOccurrences(
       extGStates,
       imageXObjects: images.indexes,
       imageOptionalContent: images.optionalContent,
+      shadings: shadingIndices,
+      vectorShadings,
       formXObjects: definition.formResources,
       formOptionalContent: formOptionalContentForScope(
         definition.formResources,
@@ -2174,8 +2298,9 @@ async function flattenNativeVectorFormOccurrences(
   const sourceEvents: number[] = [];
   const sourceClips: (DensePdfTextClip | null)[] = [];
   const sourceBlendModes: number[] = [];
-  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null, blendMode = 0): void => {
-    sourceEvents.push(kind, index); sourceClips.push(clip); sourceBlendModes.push(blendMode);
+  const sourceOptionalContentIndices: number[] = [];
+  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null, blendMode = 0, condition = -1): void => {
+    sourceEvents.push(kind, index); sourceClips.push(clip); sourceBlendModes.push(blendMode); sourceOptionalContentIndices.push(condition);
   };
   const glyphRunMeta: number[] = [];
   const glyphFillColors: number[] = [];
@@ -2188,6 +2313,7 @@ async function flattenNativeVectorFormOccurrences(
   const imageClipBounds: number[] = [];
   const imagePaintOrders: number[] = [];
   const imageFlags: number[] = [];
+  const imageOpacities: number[] = [];
   const shadingPaints: NonNullable<DensePdfVectorSceneData["shadingPaints"]>[number][] = [];
   const activeDefinitions = new Set<number>();
   const maxCommands = options.limits?.maxCommandsPerPage ?? document.limits.maxCommandsPerPage;
@@ -2221,7 +2347,8 @@ async function flattenNativeVectorFormOccurrences(
 
   const walkOccurrence = async (
     occurrence: NativeVectorCompiledOccurrence,
-    inheritedFormPaintOrder: number | null = null
+    inheritedFormPaintOrder: number | null = null,
+    inheritedOptionalContent = -1
   ): Promise<boolean> => {
     signal.throwIfAborted();
     registerOccurrence(occurrence);
@@ -2249,6 +2376,7 @@ async function flattenNativeVectorFormOccurrences(
       const localIndex = sidecar.sourceEvents[offset + 1];
       const vectorClip = sidecar.sourceClips?.[offset / 2] ?? null;
       const blendMode = sidecar.sourceBlendModes?.[offset / 2] ?? 0;
+      const condition = optionalContent.combineMemberships(inheritedOptionalContent, sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1);
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
@@ -2288,7 +2416,7 @@ async function flattenNativeVectorFormOccurrences(
         glyphRunClips.push(sidecar.glyphRunClips?.[localIndex] ?? null);
         appendSourceEvent(
           DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
-          glyphRunMeta.length / 3 - 1, vectorClip, blendMode
+          glyphRunMeta.length / 3 - 1, vectorClip, blendMode, condition
         );
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         if (localIndex >= seenImages.length || seenImages[localIndex] !== 0) {
@@ -2332,7 +2460,8 @@ async function flattenNativeVectorFormOccurrences(
             : inheritedFormPaintOrder ?? globalIndex
         );
         imageFlags.push(sidecar.imageFlags[localIndex]);
-        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip, blendMode);
+        imageOpacities.push(sidecar.imageOpacities?.[localIndex] ?? 1);
+        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip, blendMode, condition);
         if (occurrence.formDefinitionIndex === -1) rootPackedFormSinceImage = false;
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM) {
         if (localIndex >= seenForms.length || seenForms[localIndex] !== 0) {
@@ -2372,13 +2501,13 @@ async function flattenNativeVectorFormOccurrences(
             if (ordered && occurrence.formDefinitionIndex === -1 && rejectedRootForms.has(localIndex)) {
               selectiveCompositeFormPaintIndices.push(localIndex);
               selectiveCompositeFormPaintOrders.push(formPaintOrder);
-              appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder);
+              appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder, null, 0, condition);
             }
             const child = ordered ? children.get(occurrence)![localIndex]
               : await compileOccurrence(paint.definitionIndex, paint);
             if (child) {
               childClipBounds = child.clipBounds;
-              childHasPackedGeometry = await walkOccurrence(child, formPaintOrder);
+              childHasPackedGeometry = await walkOccurrence(child, formPaintOrder, condition);
             }
           } catch (error) {
             if (occurrence.formDefinitionIndex !== -1 ||
@@ -2437,7 +2566,7 @@ async function flattenNativeVectorFormOccurrences(
           throw invalidVectorFormEvent(pageIndex, "shading", localIndex);
         }
         seenShadings[localIndex] = 1;
-        appendSourceEvent(kind, shadingPaints.length, vectorClip, blendMode);
+        appendSourceEvent(kind, shadingPaints.length, vectorClip, blendMode, condition);
         const paint = sidecar.shadingPaints![localIndex];
         shadingPaints.push({ ...paint, paintOrder: inheritedFormPaintOrder ?? paint.paintOrder });
       } else if (ordered && kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
@@ -2448,7 +2577,7 @@ async function flattenNativeVectorFormOccurrences(
         if (!ranges || localIndex * 2 + 1 >= ranges.length || !ownerRecordedGeometry) {
           throw invalidVectorFormEvent(pageIndex, "path", localIndex);
         }
-        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip, blendMode);
+        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip, blendMode, condition);
         pathPaintRanges.push(ranges[localIndex * 2] +
           (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? fillBase : strokeBase), ranges[localIndex * 2 + 1]);
       } else {
@@ -2486,6 +2615,7 @@ async function flattenNativeVectorFormOccurrences(
   const accumulatedText = textAccumulator.build().compilation;
   const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
+    ...(optionalContent.groupCount > 0 ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
     sourceBlendModes: Uint8Array.from(sourceBlendModes),
     ...(ordered ? { pathPaintRanges: Uint32Array.from(pathPaintRanges), sourceClips } : {}),
     glyphRunMeta: Uint32Array.from(glyphRunMeta),
@@ -2499,6 +2629,7 @@ async function flattenNativeVectorFormOccurrences(
     imageClipBounds: Float32Array.from(imageClipBounds),
     imagePaintOrders: Uint32Array.from(imagePaintOrders),
     imageFlags: Uint8Array.from(imageFlags),
+    imageOpacities: Float32Array.from(imageOpacities),
     ...(shadingPaints.length ? { shadingPaints: Object.freeze(shadingPaints) } : {})
   });
   return Object.freeze({
@@ -2650,6 +2781,7 @@ function suppressVectorSelectiveImageSpans(
   const imageClipBounds: number[] = [];
   const imagePaintOrders: number[] = [];
   const imageFlags: number[] = [];
+  const imageOpacities: number[] = [];
   const imageCheckpoints: number[] = [];
   for (let image = 0; image < sidecar.imageIndices.length; image += 1) {
     if (imageSuppressed[image]) continue;
@@ -2659,6 +2791,7 @@ function suppressVectorSelectiveImageSpans(
     imageClipBounds.push(...sidecar.imageClipBounds.subarray(image * 4, image * 4 + 4));
     imagePaintOrders.push(sidecar.imagePaintOrders[image]);
     imageFlags.push(sidecar.imageFlags[image]);
+    imageOpacities.push(sidecar.imageOpacities?.[image] ?? 1);
     imageCheckpoints.push(...checkpoints.subarray(image * 6, image * 6 + 6));
   }
   const sourceEvents: number[] = [];
@@ -2708,6 +2841,7 @@ function suppressVectorSelectiveImageSpans(
         imageClipBounds: Float32Array.from(imageClipBounds),
         imagePaintOrders: Uint32Array.from(imagePaintOrders),
         imageFlags: Uint8Array.from(imageFlags),
+        imageOpacities: Float32Array.from(imageOpacities),
         imagePathSpanCheckpoints: Uint32Array.from(imageCheckpoints)
       }
     },
@@ -2778,7 +2912,10 @@ function isSelectiveCompositeCandidateError(error: unknown): boolean {
   );
 }
 
-type NativeSelectiveRasterLayer = VectorScene["rasterLayers"][number];
+type NativeSelectiveRasterLayer = VectorScene["rasterLayers"][number] & {
+  retainedFirstCommand?: number;
+  retainedCommandCount?: number;
+};
 
 async function renderNativeSelectiveCompositeLayers(
   page: HeprPageData,
@@ -2955,58 +3092,62 @@ async function renderNativeSelectiveCompositeLayers(
         );
       }
       if (unselectedGlyphOffset >= 0) onCompositeText?.();
-      const compatible = createSelectiveCompositePage(page, commands);
-      const scale = nativeSelectiveCompositeScale(page, root.commands, last);
-      const rendered = await renderNativeCompositePixels(compatible, {
-        scale,
-        background: null,
-        surfaceFactory,
-        signal
-      }, renderHeprPageToCanvas2d, renderInternals);
-      const rgba = rendered.rgba;
-      const crop = cropVisibleRgba(rgba, rendered.width, rendered.height, 2, signal);
-      if (!crop) continue;
-      const backdropGroups = collectHeprBackdropGroups(page, commands);
-      const data = backdropGroups.size !== 0 && [...backdropGroups].every(
-        (groupIndex) => heprBackdropGroupCanRender(page, groupIndex)
-      )
-        ? await renderNativeBackdropCorrection({
-            page,
-            rootCommands: root.commands,
-            first,
-            last,
-            selectionRgba: rgba,
-            crop,
-            scale,
-            backdropGroups,
-            surfaceFactory,
-            renderInternals,
-            boundCompositeWork,
-            signal,
-            renderHeprPageToCanvas2d
-          })
-        : crop.data;
-      layers.push({
-        width: crop.width,
-        height: crop.height,
-        data,
-        matrix: new Float32Array([
-          crop.width / rendered.scale,
-          0,
-          0,
-          -crop.height / rendered.scale,
-          crop.x / rendered.scale,
-          page.pageInfo.height - crop.y / rendered.scale
-        ]),
-        paintOrder,
-        pageIndex: 0
-      });
+      const layer = await renderNativeCompositeCommandSpan(page, first, last, paintOrder,
+        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, true);
+      if (layer) layers.push(layer);
     }
     return layers;
   } finally {
     imageSurfaces?.dispose();
     surfaceFactory.releaseAll();
   }
+}
+
+/** Internal replay entry point; the supplied retained page needs no source PDF or parser session. */
+export async function renderNativeRetainedCommandSpan(
+  page: HeprPageData, firstCommand: number, count: number, signal: AbortSignal
+): Promise<NativeSelectiveRasterLayer | null> {
+  signal.throwIfAborted();
+  const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex]?.commands;
+  if (!commands || !Number.isSafeInteger(firstCommand) || firstCommand < 0 || !Number.isSafeInteger(count) ||
+      count <= 0 || firstCommand + count > commands.length) throw new RangeError("Invalid retained command span.");
+  const surfaceFactory = await createNativeCompositeSurfaceFactory();
+  const { renderHeprPageToCanvas2d, HeprCanvas2dImageSurfaceCache } = await import("./heprCanvas2dRenderer");
+  const imageSurfaces = new HeprCanvas2dImageSurfaceCache(page, surfaceFactory,
+    surface => surfaceFactory.retain(surface.canvas), surface => surfaceFactory.release(surface.canvas));
+  try {
+    return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
+      firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
+      { imageSurfaces, boundSoftMasks: true }, true, true);
+  } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
+}
+
+async function renderNativeCompositeCommandSpan(
+  page: HeprPageData, first: number, last: number, paintOrder: number, signal: AbortSignal,
+  surfaceFactory: Awaited<ReturnType<typeof createNativeCompositeSurfaceFactory>>,
+  renderHeprPageToCanvas2d: NativeCompositeRenderer,
+  renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals,
+  boundCompositeWork: boolean,
+  fullPage = false
+): Promise<NativeSelectiveRasterLayer | null> {
+  const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
+  const commands = rootCommands.slice(first, last + 1);
+  const scale = nativeSelectiveCompositeScale(page, rootCommands, last);
+  const rendered = await renderNativeCompositePixels(createSelectiveCompositePage(page, commands), {
+    scale, background: null, surfaceFactory, signal
+  }, renderHeprPageToCanvas2d, renderInternals);
+  const crop = fullPage ? { x: 0, y: 0, width: rendered.width, height: rendered.height, data: new Uint8Array(rendered.rgba) }
+    : cropVisibleRgba(rendered.rgba, rendered.width, rendered.height, 2, signal);
+  if (!crop) return null;
+  const backdropGroups = collectHeprBackdropGroups(page, commands);
+  const data = backdropGroups.size !== 0 && [...backdropGroups].every(groupIndex => heprBackdropGroupCanRender(page, groupIndex))
+    ? await renderNativeBackdropCorrection({ page, rootCommands, first, last, selectionRgba: rendered.rgba,
+      crop, scale, backdropGroups, surfaceFactory, renderInternals, boundCompositeWork, signal, renderHeprPageToCanvas2d })
+    : crop.data;
+  return { width: crop.width, height: crop.height, data,
+    matrix: new Float32Array([crop.width / rendered.scale, 0, 0, -crop.height / rendered.scale,
+      crop.x / rendered.scale, page.pageInfo.height - crop.y / rendered.scale]), paintOrder, pageIndex: 0,
+    retainedFirstCommand: first, retainedCommandCount: last - first + 1 };
 }
 
 function createSelectiveCompositePage(
@@ -3980,7 +4121,8 @@ async function compileNativeFormPrograms(
         definition.imageResourceNames,
         colorScope.colorSpaces,
         pageIndex,
-        signal
+        signal,
+        (options as NativeVectorCompileOptions).retainOptionalContent === true
       ));
       imageScopes.set(definition.definitionIndex, pending);
     }
@@ -4069,7 +4211,7 @@ async function compileNativeFormPrograms(
         details: { reason: "form-definition-missing", definitionIndex }
       });
     }
-    if (!definition.defaultVisible) {
+    if ((options as NativeVectorCompileOptions).retainOptionalContent !== true && !definition.defaultVisible) {
       throw new PdfError(
         "invalid-object",
         "A hidden default-view Form reached display-program specialization.",
@@ -4153,6 +4295,8 @@ async function compileNativeFormPrograms(
       imageXObjects: scopedImageResources.indexes,
       imageOptionalContent: scopedImageResources.optionalContent,
       markedContentProperties,
+      retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
+      ...((options as NativeVectorCompileOptions).retainOptionalContent === true ? { combineOptionalContent: (parent: number, own: number) => optionalContent.combineMemberships(parent, own) } : {}),
       maxMarkedContentDepth: document.limits.maxRecursionDepth,
       maxMarkedContent: options.limits?.maxCommandsPerPage ??
         document.limits.maxCommandsPerPage,
@@ -4225,14 +4369,14 @@ async function compileNativeFormPrograms(
   const annotations: DensePdfFormPageData["annotations"][number][] = [];
   for (const placement of graph.annotationPlacements) {
     const definition = graph.definitions[placement.definitionIndex];
-    if (!definition || !definition.defaultVisible) continue;
+    if (!definition || ((options as NativeVectorCompileOptions).retainOptionalContent !== true && !definition.defaultVisible)) continue;
     annotations.push(Object.freeze({
       programIndex: await specialize(placement.definitionIndex, defaultState),
       transform: placement.invocationMatrix,
       clipBounds: placement.pageBounds,
-      optionalContentIndex: placement.appearance.optionalContentIndex >= 0
-        ? placement.appearance.optionalContentIndex
-        : definition.optionalContentIndex,
+      optionalContentIndex: (options as NativeVectorCompileOptions).retainOptionalContent === true
+        ? optionalContent.combineMemberships(placement.appearance.optionalContentIndex, definition.optionalContentIndex)
+        : placement.appearance.optionalContentIndex >= 0 ? placement.appearance.optionalContentIndex : definition.optionalContentIndex,
       viewTransformFlags:
         ((placement.annotation.flags & NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoZoom) !== 0
           ? HEPR_VIEW_TRANSFORM_FLAG.NoZoom
@@ -4420,6 +4564,7 @@ async function compileNativeType3Programs(
             pageIndex,
             ownerLabel: `Type3 CharProc /${glyph.charProcName}`,
             optionalContent,
+            retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
             signal
           }
         );
@@ -4472,7 +4617,8 @@ async function compileNativeType3Programs(
         .map((reference) => reference.resourceName),
       colorScope.colorSpaces,
       pageIndex,
-      signal
+      signal,
+      (options as NativeVectorCompileOptions).retainOptionalContent === true
     );
     const shadings = new Map<string, number>();
     for (const resourceName of references.shadings) {
@@ -4520,7 +4666,7 @@ async function compileNativeType3Programs(
     const contentSegments = await boundContent;
     if (!glyph.charProc.metrics.colored) {
       for (const [resourceName, imageIndex] of scopedImages.indexes) {
-        if (scopedImages.optionalContent.get(resourceName)?.defaultVisible === false) continue;
+        if ((options as NativeVectorCompileOptions).retainOptionalContent !== true && scopedImages.optionalContent.get(resourceName)?.defaultVisible === false) continue;
         if (!resources.registry.describe(imageIndex).imageMask) {
           throw new PdfError(
             "unsupported-content",
@@ -4579,6 +4725,8 @@ async function compileNativeType3Programs(
       patterns,
       patternColorSpaces: colorScope.patternColorSpaces,
       markedContentProperties,
+      retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
+      ...((options as NativeVectorCompileOptions).retainOptionalContent === true ? { combineOptionalContent: (parent: number, own: number) => optionalContent.combineMemberships(parent, own) } : {}),
       maxMarkedContentDepth: document.limits.maxRecursionDepth,
       maxMarkedContent: maxCommands,
       ...densePathCompileLimits(document, options),
@@ -4827,7 +4975,7 @@ async function compileNativeCompositingPrograms(
   const maskDependencies = new Map<number, Set<number>>();
   const formProgramCache = new Map<
     string,
-    { readonly programIndex: number; readonly dependencies: Set<number> }
+    { readonly programIndex: number; readonly dependencies: Set<number>; readonly optionalContentIndex: number }
   >();
   const softMasks: DensePdfCompositingPageData["softMasks"][number][] = [];
   const maxPasses = document.limits.maxRecursionDepth;
@@ -4862,6 +5010,7 @@ async function compileNativeCompositingPrograms(
         forms = appendFormPrograms(forms, compiledMask.forms);
         cached = Object.freeze({
           programIndex: baseProgramIndex + compiledMask.rootProgramIndex,
+          optionalContentIndex: compiledMask.optionalContentIndex,
           dependencies: compiledMask.dependencies
         });
         formProgramCache.set(formId, cached);
@@ -4875,6 +5024,7 @@ async function compileNativeCompositingPrograms(
       softMasks.push(Object.freeze({
         extGStateIndex: index,
         programIndex: rootProgramIndex,
+        optionalContentIndex: cached.optionalContentIndex,
         subtype: softMask.subtype,
         isolated: softMask.formHandle.group.isolated,
         knockout: softMask.formHandle.group.knockout,
@@ -4950,6 +5100,7 @@ async function compileNativeCompositingPrograms(
 }
 
 interface CompiledNativeSoftMask {
+  readonly optionalContentIndex: number;
   readonly forms: DensePdfFormPageData;
   readonly rootProgramIndex: number;
   readonly dependencies: Set<number>;
@@ -4974,13 +5125,19 @@ async function compileNativeSoftMaskProgram(
   // isolation, knockout and blending-space semantics are applied exactly once.
   const compilationForm = Object.freeze({ ...sourceForm, group: undefined });
   const resourceName = "SMaskRoot";
-  const graph = await buildNativePdfScopedFormDefinitionGraph(
+  let graph = await buildNativePdfScopedFormDefinitionGraph(
     document,
     formRegistry,
     compilationForm,
     content,
-    { pageIndex, resourceName, optionalContent, signal }
+    { pageIndex, resourceName, optionalContent, signal, retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true }
   );
+  if ((options as NativeVectorCompileOptions).retainOptionalContent !== true) {
+    // The static API still needs a valid empty mask program. Its Form content
+    // was pruned by the graph builder, and the mask invocation keeps its OCG.
+    graph = { ...graph, definitions: graph.definitions.map(definition => definition.resourceName === resourceName && !definition.defaultVisible
+      ? { ...definition, defaultVisible: true } : definition) };
+  }
   const bounds: DensePdfBounds = {
     minX: sourceForm.bbox[0],
     minY: sourceForm.bbox[1],
@@ -4993,6 +5150,7 @@ async function compileNativeSoftMaskProgram(
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       formXObjects: graph.pageForms,
+      retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
       output: "display-program",
       enableSegmentMerge: false,
       enableInvisibleCull: false,
@@ -5032,6 +5190,7 @@ async function compileNativeSoftMaskProgram(
   return Object.freeze({
     forms,
     rootProgramIndex: forms.rootInvocationProgramIndices[0],
+    optionalContentIndex: graph.definitions.find(definition => definition.resourceName === resourceName)?.optionalContentIndex ?? -1,
     dependencies
   });
 }
@@ -5556,6 +5715,7 @@ async function compileNativePatternPrograms(
             pageIndex,
             ownerLabel: `tiling pattern ${pattern.id}`,
             optionalContent,
+            retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
             signal
           }
         );
@@ -5607,7 +5767,8 @@ async function compileNativePatternPrograms(
         .map((reference) => reference.resourceName),
       colorScope.colorSpaces,
       pageIndex,
-      signal
+      signal,
+      (options as NativeVectorCompileOptions).retainOptionalContent === true
     );
     const shadings = new Map<string, number>();
     for (const resourceName of references.shadings) {
@@ -5691,6 +5852,8 @@ async function compileNativePatternPrograms(
       patterns: nestedPatterns,
       patternColorSpaces: colorScope.patternColorSpaces,
       markedContentProperties,
+      retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
+      ...((options as NativeVectorCompileOptions).retainOptionalContent === true ? { combineOptionalContent: (parent: number, own: number) => optionalContent.combineMemberships(parent, own) } : {}),
       maxMarkedContentDepth: document.limits.maxRecursionDepth,
       maxMarkedContent: maxCommands,
       ...densePathCompileLimits(document, options),
@@ -6131,7 +6294,8 @@ async function loadScopedImageResources(
   resourceNames: readonly string[],
   colorSpaces: PdfDictionary | undefined,
   pageIndex: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  retainOptionalContent = false
 ): Promise<ScopedImageResources> {
   signal.throwIfAborted();
   if (resourceNames.length === 0) {
@@ -6184,7 +6348,7 @@ async function loadScopedImageResources(
         optionalContentIndex: membership.index,
         defaultVisible: membership.defaultVisible
       }));
-      if (!membership.defaultVisible) {
+      if (!retainOptionalContent && !membership.defaultVisible) {
         // Keep the exact name recognizable by the compiler without decoding
         // or validating a payload that cannot paint in the default view.
         indexes.set(resourceName, -1);
@@ -6206,7 +6370,8 @@ async function loadPageImages(
   imageCodecResolver?: NativeImageCodecResolver,
   iccOptions: PdfIccOptions = {},
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void,
-  limits?: Partial<PdfResourceLimits>
+  limits?: Partial<PdfResourceLimits>,
+  retainOptionalContent = false
 ): Promise<LoadedPageImages> {
   const colorSpaceValue = resources.get("ColorSpace");
   const colorSpaces = colorSpaceValue === undefined || colorSpaceValue === null
@@ -6314,7 +6479,8 @@ async function loadPageImages(
       .map((reference) => reference.resourceName),
     colorSpaces,
     page.sourcePageIndex,
-    signal
+    signal,
+    retainOptionalContent
   );
   if (references.shadings.length > 0) {
     for (const resourceName of references.shadings) {
@@ -6622,12 +6788,14 @@ function appendNativeVectorAnnotationPaints(
   pageBounds: DensePdfBounds,
   pageIndex: number,
   maxCommands: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  optionalContent?: NativeOptionalContentRegistry
 ): DensePdfCompiledPage {
   if (graph.annotationPlacements.length === 0) return compiled;
   const sidecar = compiled.vectorSceneData!;
   const formPaints = [...compiled.formPaints];
   const sourceEvents = Array.from(sidecar.sourceEvents);
+  const sourceOptionalContentIndices = Array.from(sidecar.sourceOptionalContentIndices ?? new Int32Array(sidecar.sourceEvents.length / 2).fill(-1));
   const sourceBlendModes = Array.from(sidecar.sourceBlendModes ?? new Uint8Array(sidecar.sourceEvents.length / 2));
   const sourceClips = sidecar.sourceClips ? [...sidecar.sourceClips] : undefined;
   const formPaintOrders = Array.from(sidecar.formPaintOrders ?? []);
@@ -6645,7 +6813,7 @@ function appendNativeVectorAnnotationPaints(
   for (const placement of graph.annotationPlacements) {
     signal.throwIfAborted();
     const definition = graph.definitions[placement.definitionIndex];
-    if (!definition || !definition.defaultVisible) continue;
+    if (!definition || (!optionalContent && !definition.defaultVisible)) continue;
     if ((placement.annotation.flags &
         (NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoZoom | NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoRotate)) !== 0) {
       throw vectorFormUnsupported(
@@ -6659,6 +6827,7 @@ function appendNativeVectorAnnotationPaints(
     }
     sourceEvents.push(DENSE_PDF_VECTOR_SCENE_EVENT_FORM, formPaints.length);
     sourceBlendModes.push(0);
+    sourceOptionalContentIndices.push(optionalContent?.combineMemberships(placement.appearance.optionalContentIndex, definition.optionalContentIndex) ?? -1);
     sourceClips?.push(null);
     formPaintOrders.push(nextPaintOrder++);
     formPaints.push(Object.freeze({
@@ -6679,6 +6848,7 @@ function appendNativeVectorAnnotationPaints(
     vectorSceneData: {
       ...sidecar,
       sourceEvents: Uint32Array.from(sourceEvents),
+      ...(optionalContent?.groupCount ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
       sourceBlendModes: Uint8Array.from(sourceBlendModes),
       ...(sourceClips ? { sourceClips } : {}),
       formPaintOrders: Uint32Array.from(formPaintOrders)

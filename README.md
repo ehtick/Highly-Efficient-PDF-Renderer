@@ -19,6 +19,7 @@ Open the [standalone viewer](https://soadzoor.github.io/Highly-Efficient-PDF-Ren
 - **Three.js integration:** add a `THREE.Group` to your scene and use your camera and controls.
 - **Multiple pages:** load a whole PDF or selected pages, arranged in a grid.
 - **Search and selection:** find text, highlight matches, and copy selections on desktop and touch devices.
+- **PDF layers:** toggle optional content in the main viewer, inspect layer dependencies when picking geometry, or use the shared library APIs.
 - **Reusable documents:** export `.hep` files with geometry, images, and a searchable text index to skip PDF parsing on subsequent loads.
 
 ## Quick start
@@ -74,6 +75,10 @@ const hepBlob = await buildHep("/document.pdf");
 ```
 
 HEP skips PDF extraction; loading still prepares LOD and GPU resources. See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md#hep-files) for browser export and Node conversion.
+
+HEP uses scene schema **v7 only**. Regenerate older archives from the original
+PDFs. Exports retain hidden content and original layer defaults; temporary layer
+visibility and primitive colors remain per-view settings.
 
 ## Learn more
 

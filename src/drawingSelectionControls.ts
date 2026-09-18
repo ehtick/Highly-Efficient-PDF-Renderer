@@ -2,6 +2,7 @@ import type { PrimitiveInteractionController } from "./primitiveInteraction";
 import type { PrimitiveInfo } from "./scenePrimitives";
 
 interface DrawingSelectionControlsOptions {
+  getLayerName?(id: string): string | undefined;
   container: HTMLElement;
   createController(callbacks: {
     onSelectionChange(primitive: PrimitiveInfo | null, displayColor?: [number, number, number] | null): void;
@@ -67,6 +68,11 @@ export function createDrawingSelectionControls(options: DrawingSelectionControls
       const bounds = primitive.bounds;
       info.textContent = `${primitive.kind} ${primitive.index}${page} · ${primitive.segmentCount} segments · ` +
         `(${bounds.minX.toFixed(2)}, ${bounds.minY.toFixed(2)})–(${bounds.maxX.toFixed(2)}, ${bounds.maxY.toFixed(2)})`;
+      const layers = primitive.optionalContent?.layerIds;
+      if (layers?.length) info.textContent += ` · Layers: ${layers.map(id => {
+        const name = options.getLayerName?.(id);
+        return name ? `${name} (${id})` : id;
+      }).join(", ")}`;
       const color = displayColor ?? primitive.color ?? [1, 0, 0];
       colorInput.value = "#" + color.map(channel =>
         Math.round(Math.max(0, Math.min(1, channel)) * 255).toString(16).padStart(2, "0")).join("");

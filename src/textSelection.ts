@@ -1,4 +1,6 @@
 import type { Bounds, PageTextIndex, VectorScene } from "./pdfVectorExtractor";
+import type { OptionalContentSnapshot } from "./optionalContent";
+import { isSceneTextCharVisible } from "./optionalContentText";
 import {
   computeCharQuad,
   TEXT_BOUNDS_HORIZONTAL_PADDING_FACTOR,
@@ -18,6 +20,7 @@ export interface TextSelectionPoint {
  * three.js apps via the equivalent `HeprThreePdfObject` methods.
  */
 export interface TextSelectionAdapter {
+  getOptionalContentVisibility?(): OptionalContentSnapshot | null;
   getScene(): VectorScene | null;
 
   /** Client (CSS px) -> PDF scene space, or null when the point misses the page. */
@@ -189,7 +192,7 @@ function charBaselineY(scene: VectorScene, page: PageTextIndex, charIndex: numbe
   return offset < scene.textInstanceB.length ? scene.textInstanceB[offset] : null;
 }
 
-function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextLayout {
+function buildPageTextLayout(scene: VectorScene, page: PageTextIndex, visibility?: OptionalContentSnapshot | null): PageTextLayout {
   const charCount = page.charInstance.length;
   const quads = new Float32Array(charCount * 4);
   const lines: PageLineRun[] = [];
@@ -201,6 +204,13 @@ function buildPageTextLayout(scene: VectorScene, page: PageTextIndex): PageTextL
   let previousMaxX = 0;
 
   for (let i = 0; i < charCount; i += 1) {
+    if (!isSceneTextCharVisible(scene, page, i, visibility)) {
+      quads[i * 4] = Number.POSITIVE_INFINITY;
+      currentLine = null;
+      currentBaselineY = null;
+      currentMaxCharHeight = 0;
+      continue;
+    }
     if (!computeCharQuad(scene, page, i, quads, i * 4)) {
       quads[i * 4] = Number.POSITIVE_INFINITY;
       continue;
@@ -317,6 +327,8 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   let activePointerId: number | null = null;
 
   let lastScene: VectorScene | null = null;
+  let lastVisibilityRevision = -1;
+  let visibility: OptionalContentSnapshot | null | undefined;
   const pageLayouts = new Map<number, PageTextLayout>();
 
   /** Selection model: normalized range plus the raw anchor for drag direction. */
@@ -398,7 +410,10 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
 
   function getSceneChecked(): VectorScene | null {
     const scene = adapter.getScene();
-    if (scene !== lastScene) {
+    visibility = adapter.getOptionalContentVisibility?.();
+    const revision = visibility?.revision ?? 0;
+    if (scene !== lastScene || revision !== lastVisibilityRevision) {
+      lastVisibilityRevision = revision;
       lastScene = scene;
       pageLayouts.clear();
       resetSelection(false);
@@ -413,7 +428,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
     let layout = pageLayouts.get(pageIndex);
     if (!layout) {
-      layout = buildPageTextLayout(scene, page);
+      layout = buildPageTextLayout(scene, page, visibility);
       pageLayouts.set(pageIndex, layout);
     }
     return layout;
@@ -765,7 +780,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         parts = [];
         pageParts.set(pageIndex, parts);
       }
-      parts.push(page.text.slice(from, to));
+      let text = "";
+      for (let i = from; i < to; i++) if (isSceneTextCharVisible(scene, page, i, visibility)) text += page.text[i];
+      if (text) parts.push(text);
     });
     // Lines within a page join with the index's separator convention (" ");
     // pages join with a newline.

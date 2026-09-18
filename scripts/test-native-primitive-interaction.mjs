@@ -60,7 +60,7 @@ try {
   globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
   globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
   for (const [Renderer, backend] of [[WebGlFloorplanRenderer, "gl"], [WebGpuFloorplanRenderer, "gpu"]]) {
-    const forceExact = [], textModes = [];
+    const forceExact = [], textModes = [], colorCommutation = [];
     let frames = 0, invalidations = 0;
     const instance = Object.assign(Object.create(Renderer.prototype), {
       scene, gl, gpuDevice: device, primitiveGradientLayout: {}, primitiveColors: null,
@@ -68,7 +68,7 @@ try {
       segmentTextureWidth: 2, fillPathMetaTextureWidth: 1, textInstanceTextureWidth: 1,
       vectorLodRuntime: { setForceExact(value) { forceExact.push(value); } },
       textLodRuntime: { setMode(value) { textModes.push(value); } }, textLodMode: "auto",
-      orderedBatches: { invalidate() { invalidations++; } },
+      orderedBatches: { invalidate() { invalidations++; }, setColorCommutationEnabled(value) { colorCommutation.push(value); } },
       vectorLodLevels: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
       vectorLodLevelResources: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
       destroyVectorMinifyResources() {}, requestFrame() { frames++; }, panCacheValid: true
@@ -79,6 +79,7 @@ try {
     assert.deepEqual(textModes, ["off"]);
     assert.equal(frames, 1);
     assert.equal(invalidations, 1);
+    assert.deepEqual(colorCommutation, [false], "temporary RGB overrides restore conservative paint ordering");
     assert.equal(instance.panCacheValid, false);
     const texels = writes.filter(write => write.kind === "texel");
     assert.equal(texels.length, 5, `${backend}: base stroke and ordered LOD prefix are both patched`);
@@ -88,6 +89,7 @@ try {
     instance.setPrimitiveColorUpdates(updates.map(update => ({ ref: update.ref, color: null })));
     assert.deepEqual(forceExact, [true, false]);
     assert.deepEqual(textModes, ["off", "auto"]);
+    assert.deepEqual(colorCommutation, [false, true], "clearing colors restores same-color batching");
     assert.equal(instance.primitiveColors.updates().length, 0);
     assert.deepEqual(writes.find(write => write.kind === "texel" && write.texture === "stroke").data, [...scene.styles.slice(0, 4)]);
     assert.deepEqual(writes.find(write => write.kind === "texel" && write.texture === "text").data, [51, 77, 102, 128]);

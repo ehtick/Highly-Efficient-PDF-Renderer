@@ -33,7 +33,6 @@ import { createThreePdfObject } from "./threePdfObject";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
-import { tryReadSourcePdfBytesFromExistingHep } from "./hep";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -230,6 +229,7 @@ const textSelection = createTextSelectionController({
   enabled: textSelectionCheckboxElement.checked,
   adapter: {
     getScene: () => currentPdfObject?.sceneData ?? null,
+    getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
     clientToScenePoint: (clientX, clientY) =>
       currentPdfObject?.clientToScenePoint(camera, clientX, clientY, canvasElement) ?? null,
     sceneToClientPoint: (sceneX, sceneY) =>
@@ -1068,6 +1068,9 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       { ...objectOptions, rendererType: backend },
       controller.signal
     );
+    await waitForLoad(nextObject.setLayerVisibilities(previousObject.getLayers()
+      .filter(layer => layer.visible !== layer.defaultVisible)
+      .map(({ id, visible }) => ({ id, visible }))), controller.signal);
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
     if (activeLoadToken !== loadToken) {
@@ -1323,12 +1326,7 @@ async function downloadHep(): Promise<boolean> {
     return false;
   }
 
-  const sourcePdf =
-    pdfObject.sourceKind === "pdf" && lastLoadedSource
-      ? lastLoadedSource
-      : lastDownloadablePdf?.bytes ??
-        lastDownloadablePdf?.blob ??
-        lastDownloadablePdf?.url;
+
 
   const exportController = new AbortController();
   activeHepExportController = exportController;
@@ -1351,8 +1349,7 @@ async function downloadHep(): Promise<boolean> {
         const stageLabel = formatLoadProgressStage(progress.stage);
         const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
         setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
-      },
-      sourcePdf
+      }
     });
 
     if (activeHepExportController !== exportController) {
@@ -1457,32 +1454,8 @@ async function resolveDownloadablePdfSource(
     return hint;
   }
 
-  const hepBytes = await readHepBytesForSource(source, signal);
   signal?.throwIfAborted();
-  if (!hepBytes) {
-    return null;
-  }
-  const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingHep(hepBytes, signal), signal);
-  return sourcePdfBytes && sourcePdfBytes.length > 0
-    ? { label: pdfObject.sourceLabel, bytes: sourcePdfBytes }
-    : null;
-}
-
-async function readHepBytesForSource(source: File | string, signal?: AbortSignal): Promise<Uint8Array | null> {
-  try {
-    if (source instanceof File) {
-      return new Uint8Array(await waitForLoad(source.arrayBuffer(), signal));
-    }
-
-    const response = await fetch(source, { cache: "no-store", signal });
-    if (!response.ok) {
-      return null;
-    }
-    return new Uint8Array(await waitForLoad(response.arrayBuffer(), signal));
-  } catch {
-    signal?.throwIfAborted();
-    return null;
-  }
+  return null;
 }
 
 function formatLoadTiming(

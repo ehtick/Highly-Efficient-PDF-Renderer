@@ -1,12 +1,20 @@
-import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
-import { GRADIENT_LUT_WIDTH } from "./orderedGradientPaint";
+import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { sampleSceneGradientChannel } from "./gradientSampling";
+import { getGradientMeshTriangle, gradientMeshTriangleCount, type GradientMeshTriangle } from "./gradientMesh";
+import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions, scenePaintRunAlpha, releaseScenePaintQuery, type ScenePaintSample } from "./scenePaintQuery";
 
 export type PrimitiveKind = "stroke" | "fill" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
 /** An index in the canonical loaded scene, never an index in a rendering LOD. */
 export interface PrimitiveRef { kind: PrimitiveKind; index: number }
 export interface PrimitivePoint { x: number; y: number }
 export interface PrimitiveSegment { start: PrimitivePoint; end: PrimitivePoint; control?: PrimitivePoint }
+export interface PrimitiveOptionalContent {
+  conditionId: number | null;
+  /** Visibility dependencies, not exclusive ownership; expressions may negate groups. */
+  layerIds: readonly string[];
+}
 export interface PrimitiveSegmentStyle {
   /** Original sRGB color; null for gradient paint or raster RGBA data. */
   color: [number, number, number] | null;
@@ -19,6 +27,7 @@ export interface PrimitiveSegmentStyle {
   clipBounds?: Bounds;
 }
 export interface PrimitiveInfo {
+  optionalContent: PrimitiveOptionalContent;
   ref: PrimitiveRef;
   kind: PrimitiveKind;
   index: number;
@@ -37,6 +46,10 @@ export interface PrimitiveInfo {
   gradientIndex?: number | null;
   /** Gradient store index on gradient primitives; null means no gradient mask. */
   maskGradientIndex?: number | null;
+  shadingKind?: "axial" | "radial" | "mesh";
+  triangleCount?: number;
+  /** Detached scene-space triangle positions and original per-vertex sRGB colors. */
+  getTriangle?(index: number): GradientMeshTriangle;
   strokeWidth?: number;
   fillRule?: "nonzero" | "evenodd";
   quad?: readonly PrimitivePoint[];
@@ -44,13 +57,22 @@ export interface PrimitiveInfo {
   height?: number;
 }
 export interface PrimitiveHit {
+  optionalContent: PrimitiveOptionalContent;
   primitive: PrimitiveRef;
   point: PrimitivePoint;
   closestPoint: PrimitivePoint;
   distancePx: number;
   segmentIndex?: number;
+  triangleIndex?: number;
 }
 export interface ScenePrimitivePickOptions {
+  isConditionVisible?(condition?: number): boolean;
+  /** Display RGB after per-primitive overrides and the existing global vector tint. */
+  resolveColor?(ref: PrimitiveRef, original: readonly [number, number, number]): readonly [number, number, number];
+  /** Applied view-owned fallback pixels; the canonical structural quad stays fixed. */
+  rasterLayers?: ReadonlyMap<number, RasterLayer>;
+  /** Applied per-view visibility; the index remains valid across visibility revisions. */
+  isVisible?(ref: PrimitiveRef): boolean;
   point: PrimitivePoint;
   clientPoint: PrimitivePoint;
   project(point: PrimitivePoint): PrimitivePoint | null;
@@ -83,7 +105,7 @@ const runLookups = new WeakMap<VectorScene, RunLookup>();
 function getRuns(scene: VectorScene): RunLookup {
   let lookup = runLookups.get(scene);
   if (!lookup) {
-    const runs = scene.drawRuns ?? defaultVectorDrawRuns(scene);
+    const runs = scene.paintGraph ? scenePaintOrderedRuns(scene) : scene.drawRuns ?? defaultVectorDrawRuns(scene);
     const byKind = new Map<PrimitiveKind, VectorDrawRun[]>();
     for (const run of runs) {
       let list = byKind.get(run.kind);
@@ -101,6 +123,34 @@ function primitiveRun(scene: VectorScene, ref: PrimitiveRef): VectorDrawRun | un
   const runs = getRuns(scene).byKind.get(ref.kind) ?? [];
   const run = runs[runIndexAt(runs, ref.index)];
   return run && ref.index < run.first + run.count ? run : undefined;
+}
+
+export function getPrimitiveOptionalContent(scene: VectorScene, ref: PrimitiveRef): PrimitiveOptionalContent {
+  validatePrimitiveRef(scene, ref);
+  const conditionId = primitiveRun(scene, ref)?.optionalContent ?? null;
+  const groups = new Set<string>();
+  const visited = new Set<number>();
+  const pending = scenePaintRunConditions(scene, primitiveRun(scene, ref));
+  while (pending.length) {
+    const index = pending.pop()!;
+    if (visited.has(index)) continue;
+    visited.add(index);
+    const condition = scene.optionalContent?.conditions[index];
+    if (condition?.kind === "group") groups.add(condition.groupId);
+    else if (condition?.kind === "not") pending.push(condition.operand);
+    else if (condition?.kind === "and" || condition?.kind === "or") pending.push(...condition.operands);
+  }
+  return { conditionId, layerIds: [...groups] };
+}
+
+/** Lookup costs depend on paint runs, rather than the number of stored primitives. */
+export function getPrimitiveOptionalContentCondition(scene: VectorScene, ref: PrimitiveRef): number | undefined {
+  return primitiveRun(scene, ref)?.optionalContent;
+}
+
+/** Includes static paint-graph eligibility and ancestor visibility conditions. */
+export function isScenePrimitiveVisible(scene: VectorScene, ref: PrimitiveRef, visible: (condition?: number) => boolean): boolean {
+  return isScenePaintRunVisible(scene, primitiveRun(scene, ref), visible);
 }
 function runIndexAt(runs: readonly VectorDrawRun[], index: number): number {
   let lo = 0, hi = runs.length;
@@ -272,6 +322,7 @@ export function getScenePrimitive(scene: VectorScene, reference: PrimitiveRef): 
     color = [scene.textInstanceC[i], scene.textInstanceC[i + 1], scene.textInstanceC[i + 2]];
     opacity = scene.textInstanceC[i + 3]; fillRule = "nonzero";
   }
+  if (ref.kind === "raster") opacity = scene.rasterLayers[ref.index].opacity ?? 1;
   const bounds = primitiveBounds(scene, ref);
   const quad = ref.kind === "raster" ? rasterQuad(scene, ref.index) : undefined;
   const gradientPaint = ref.kind === "gradient-fill" ? scene.gradientFillPaintMeta :
@@ -279,9 +330,14 @@ export function getScenePrimitive(scene: VectorScene, reference: PrimitiveRef): 
   const gradientOffset = ref.kind === "gradient-stroke" ? 2 : 0;
   const gradientIndex = gradientPaint && gradientPaint[i + gradientOffset] >= 0 ? gradientPaint[i + gradientOffset] : null;
   const maskGradientIndex = gradientPaint && gradientPaint[i + gradientOffset + 1] >= 0 ? gradientPaint[i + gradientOffset + 1] : null;
-  return { ref: { ...ref }, kind: ref.kind, index: ref.index, bounds, pageIndex: primitivePage(scene, ref, bounds), color, opacity,
+  const shadingKind = gradientIndex === null ? undefined : scene.gradientMetaA[gradientIndex * 4] === 2 ? "mesh" :
+    scene.gradientMetaA[gradientIndex * 4] === 1 ? "radial" : "axial";
+  return { ref: { ...ref }, optionalContent: getPrimitiveOptionalContent(scene, ref), kind: ref.kind, index: ref.index, bounds, pageIndex: primitivePage(scene, ref, bounds), color, opacity,
     segmentCount: store.count, ...(fillRule ? { fillRule } : {}),
     ...(gradientPaint ? { gradientIndex, maskGradientIndex } : {}),
+    ...(shadingKind ? { shadingKind } : {}),
+    ...(shadingKind === "mesh" ? { triangleCount: gradientMeshTriangleCount(scene, gradientIndex!),
+      getTriangle: (index: number) => getGradientMeshTriangle(scene, gradientIndex!, index) } : {}),
     ...(ref.kind === "stroke" ? { strokeWidth: 2 * scene.styles[i] } : {}),
     ...(quad ? { quad, width: scene.rasterLayers[ref.index].width, height: scene.rasterLayers[ref.index].height } : {}),
     getSegment(index) {
@@ -307,7 +363,7 @@ export function getScenePrimitive(scene: VectorScene, reference: PrimitiveRef): 
       }
       if (ref.kind === "text") return { color: [scene.textInstanceC[i], scene.textInstanceC[i + 1], scene.textInstanceC[i + 2]],
         opacity: scene.textInstanceC[i + 3], ...clip };
-      return { color: null, opacity: 1, ...clip };
+      return { color: null, opacity: scene.rasterLayers[ref.index].opacity ?? 1, ...clip };
     } };
 }
 
@@ -360,40 +416,18 @@ function withinClips(scene: VectorScene, point: PrimitivePoint, clipIndex: numbe
 
 /** Matches the retained gradient shaders, including radial root and LUT alpha. */
 function gradientAlpha(scene: VectorScene, index: number, point: PrimitivePoint): number {
-  if (index < 0) return 1;
-  if (index >= scene.gradientCount) return 0;
-  const i = index * 4, a = scene.gradientMetaA, b = scene.gradientMetaB, c = scene.gradientMetaC;
-  const d = scene.gradientMetaD, e = scene.gradientMetaE;
-  const p = { x: b[i] * point.x + b[i + 2] * point.y + c[i], y: b[i + 1] * point.x + b[i + 3] * point.y + c[i + 1] };
-  if (a[i + 1] >= 0.5 && !inBounds(p, readBounds(e, i))) return 0;
-  const x = p.x - c[i + 2], y = p.y - c[i + 3], dx = d[i] - c[i + 2], dy = d[i + 1] - c[i + 3];
-  let t: number;
-  if (a[i] < 0.5) {
-    const denominator = dx * dx + dy * dy;
-    if (denominator <= 1e-12) return 0;
-    t = (x * dx + y * dy) / denominator;
-  } else {
-    const radius = d[i + 2], delta = d[i + 3] - radius;
-    const roots = quadraticRoots(dx * dx + dy * dy - delta * delta,
-      -2 * (x * dx + y * dy + radius * delta), x * x + y * y - radius * radius)
-      .filter(root => Number.isFinite(root) && radius + root * delta >= 0);
-    if (!roots.length) return 0;
-    t = Math.max(...roots);
-  }
-  const sample = Math.max(0, Math.min(1, t)) * (GRADIENT_LUT_WIDTH - 1), lo = Math.floor(sample), fraction = sample - lo;
-  const base = index * GRADIENT_LUT_WIDTH * 4;
-  const left = scene.gradientLut[base + lo * 4 + 3], right = scene.gradientLut[base + Math.min(lo + 1, GRADIENT_LUT_WIDTH - 1) * 4 + 3];
-  return (left * (1 - fraction) + right * fraction) / 255;
+  return sampleSceneGradientChannel(scene, index, point.x, point.y, 3);
 }
-function rasterAlpha(scene: VectorScene, index: number, point: PrimitivePoint): number {
-  const layer = scene.rasterLayers[index], uv = inverse(point, layer.matrix);
+
+function rasterAlpha(scene: VectorScene, index: number, point: PrimitivePoint, replacement?: RasterLayer): number {
+  const layer = replacement ?? scene.rasterLayers[index], uv = inverse(point, layer.matrix);
   if (!uv || uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || !layer.width || !layer.height) return 0;
   const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y);
   const alpha = (px: number, py: number): number => layer.data[(Math.max(0, Math.min(layer.height - 1, py)) * layer.width +
     Math.max(0, Math.min(layer.width - 1, px))) * 4 + 3] / 255;
   const fx = x - ix, fy = y - iy;
-  return (alpha(ix, iy) * (1 - fx) + alpha(ix + 1, iy) * fx) * (1 - fy) +
-    (alpha(ix, iy + 1) * (1 - fx) + alpha(ix + 1, iy + 1) * fx) * fy;
+  return (layer.opacity ?? 1) * ((alpha(ix, iy) * (1 - fx) + alpha(ix + 1, iy) * fx) * (1 - fy) +
+    (alpha(ix, iy + 1) * (1 - fx) + alpha(ix + 1, iy + 1) * fx) * fy);
 }
 
 interface Nearest { point: PrimitivePoint; distance: number }
@@ -601,14 +635,16 @@ export class ScenePrimitivePicker {
   private disposed = false;
   private building: Promise<void> | null = null;
   private readonly scene: VectorScene;
+  private readonly defaultConditions: Uint8Array | null;
   private readonly onBuildProgress: ((percentage: number | null) => void) | undefined;
   /** Build progress is shared by all requests; null indicates a failed build. */
   constructor(scene: VectorScene, onBuildProgress?: (percentage: number | null) => void) {
     this.scene = scene;
+    this.defaultConditions = scene.optionalContent ? createDefaultOptionalContentSnapshot(scene).conditions : null;
     this.onBuildProgress = onBuildProgress;
   }
 
-  dispose(): void { this.disposed = true; this.index = null; runLookups.delete(this.scene); }
+  dispose(): void { this.disposed = true; this.index = null; runLookups.delete(this.scene); releaseScenePaintQuery(this.scene); }
 
   async pick(options: ScenePrimitivePickOptions): Promise<PrimitiveHit | null> {
     const check = (): void => {
@@ -633,10 +669,25 @@ export class ScenePrimitivePicker {
     }
     const allowed = options.kinds ? new Set(options.kinds) : null;
     let best: PrimitiveHit | null = null, bestRank = -1;
+    const visible = options.isConditionVisible ?? ((condition?: number) => !!options.isVisible || condition === undefined || !this.defaultConditions || this.defaultConditions[condition] === 1);
     const candidate = async (ref: PrimitiveRef, rank: number): Promise<void> => {
-      if (rank <= bestRank || (allowed && !allowed.has(ref.kind))) return;
+      if (rank <= bestRank || (allowed && !allowed.has(ref.kind)) || options.isVisible?.(ref) === false) return;
+      const run = primitiveRun(this.scene, ref);
+      if (!isScenePaintRunVisible(this.scene, run, visible)) return;
+      if (!options.isVisible && !options.isConditionVisible && this.defaultConditions) {
+        const condition = getPrimitiveOptionalContentCondition(this.scene, ref);
+        if (condition !== undefined && this.defaultConditions[condition] !== 1) return;
+      }
       const hit = await this.hit(ref, options, tolerance, work);
-      if (hit) { best = hit; bestRank = rank; }
+      if (hit) {
+        const alpha = await scenePaintRunAlpha(this.scene, run!, hit.closestPoint, {
+          visible,
+          sample: (maskRef, point) => this.samplePaint(maskRef, point, options, work),
+          yield: async () => { if (work.shouldYield()) await work.yield(); }
+        });
+        const sourceAlpha = alpha === 1 ? 1 : (await this.samplePaint(ref, hit.closestPoint, options, work)).color[3];
+        if (alpha * sourceAlpha > ALPHA_EPSILON) { best = hit; bestRank = rank; }
+      }
     };
     if (this.index) {
       const index = this.index, query = emptyBounds();
@@ -826,14 +877,49 @@ export class ScenePrimitivePicker {
     try { this.onBuildProgress?.(percentage); } catch { /* Progress is advisory. */ }
   }
 
-  private async hit(ref: PrimitiveRef, options: ScenePrimitivePickOptions, tolerance: number, work: Work): Promise<PrimitiveHit | null> {
+  private async samplePaint(ref: PrimitiveRef, point: PrimitivePoint, options: ScenePrimitivePickOptions, work: Work): Promise<ScenePaintSample> {
+    const empty: ScenePaintSample = { color: [0, 0, 0, 0], shape: 0 };
+    if (!inBounds(point, primitiveBounds(this.scene, ref))) return empty;
+    const clientPoint = options.project(point);
+    if (!clientPoint) return empty;
+    const hit = await this.hit(ref, { ...options, point, clientPoint }, 0, work, true);
+    if (!hit) return empty;
+    if (ref.kind === "raster") {
+      const layer = options.rasterLayers?.get(ref.index) ?? this.scene.rasterLayers[ref.index], uv = inverse(point, layer.matrix);
+      if (!uv) return empty;
+      const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+      const sample = (channel: number): number => {
+        const at = (px: number, py: number): number => {
+          const offset = (Math.max(0, Math.min(layer.height - 1, py)) * layer.width + Math.max(0, Math.min(layer.width - 1, px))) * 4;
+          return layer.data[offset + channel] / 255 * (channel === 3 ? 1 : layer.data[offset + 3] / 255);
+        };
+        return (at(ix, iy) * (1 - fx) + at(ix + 1, iy) * fx) * (1 - fy) + (at(ix, iy + 1) * (1 - fx) + at(ix + 1, iy + 1) * fx) * fy;
+      };
+      const coverage = sample(3), alpha = coverage * (layer.opacity ?? 1);
+      const opacity = layer.opacity ?? 1;
+      return { color: [sample(0) * opacity, sample(1) * opacity, sample(2) * opacity, alpha], shape: coverage };
+    }
+    const info = getScenePrimitive(this.scene, ref), style = info.getSegmentStyle(hit.segmentIndex ?? 0);
+    let rgb: readonly [number, number, number] = style.color ?? [0, 0, 0], alpha = style.opacity;
+    if (info.gradientIndex !== undefined && info.gradientIndex !== null) {
+      rgb = [0, 1, 2].map(channel => sampleSceneGradientChannel(this.scene, info.gradientIndex!, point.x, point.y, channel)) as [number, number, number];
+      alpha *= gradientAlpha(this.scene, info.gradientIndex, point);
+    }
+    if (info.maskGradientIndex !== undefined && info.maskGradientIndex !== null) alpha *= gradientAlpha(this.scene, info.maskGradientIndex, point);
+    rgb = options.resolveColor?.(ref, rgb) ?? rgb;
+    return { color: [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha, alpha], shape: 1 };
+  }
+
+  private async hit(ref: PrimitiveRef, options: ScenePrimitivePickOptions, tolerance: number, work: Work, shapeOnly = false): Promise<PrimitiveHit | null> {
     const scene = this.scene, i = ref.index * 4;
     const clip = getPrimitiveClipChain(scene, ref);
     // Tolerance does not permit picking through a hard clip boundary.
     if (!withinClips(scene, options.point, clip.clipIndex, clip.rect)) return null;
     if (ref.kind === "raster") {
-      if (rasterAlpha(scene, ref.index, options.point) > ALPHA_EPSILON)
-        return { primitive: { ...ref }, point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
+      const layer = options.rasterLayers?.get(ref.index) ?? scene.rasterLayers[ref.index];
+      const sampledLayer = shapeOnly ? { ...layer, opacity: 1 } : layer;
+      if (rasterAlpha(scene, ref.index, options.point, sampledLayer) > ALPHA_EPSILON)
+        return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
       const uv = inverse(options.point, scene.rasterLayers[ref.index].matrix);
       // A transparent pixel inside the layer must not become a rectangle hit.
       if (!uv || (uv.x >= 0 && uv.x <= 1 && uv.y >= 0 && uv.y <= 1)) return null;
@@ -843,9 +929,9 @@ export class ScenePrimitivePicker {
         const candidate = await nearestProjected({ start: quad[j], end: quad[(j + 1) % 4] }, options, work);
         if (candidate && (!nearest || candidate.distance < nearest.distance)) nearest = candidate;
       }
-      if (!nearest || nearest.distance > tolerance || rasterAlpha(scene, ref.index, nearest.point) <= ALPHA_EPSILON ||
+      if (!nearest || nearest.distance > tolerance || rasterAlpha(scene, ref.index, nearest.point, sampledLayer) <= ALPHA_EPSILON ||
           !withinClips(scene, nearest.point, clip.clipIndex, clip.rect)) return null;
-      return { primitive: { ...ref }, point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance };
+      return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance };
     }
     const store = segmentStore(scene, ref), stroke = ref.kind === "stroke" || ref.kind === "gradient-stroke";
     let alpha = 1, evenodd = false, source = -1, mask = -1;
@@ -856,6 +942,7 @@ export class ScenePrimitivePicker {
     }
     if (ref.kind === "gradient-fill") { source = scene.gradientFillPaintMeta[i]; mask = scene.gradientFillPaintMeta[i + 1]; }
     if (ref.kind === "gradient-stroke") { source = scene.gradientStrokeRunMetaA[i + 2]; mask = scene.gradientStrokeRunMetaA[i + 3]; }
+    if (shapeOnly) alpha = 1;
     if (alpha <= ALPHA_EPSILON) return null;
     let winding = 0, nearest: Nearest | null = null, nearestIndex = -1;
     for (let j = 0; j < store.count; j++) {
@@ -869,8 +956,8 @@ export class ScenePrimitivePicker {
           const offset = (store.first + j) * 4, encoded = store.b[offset + 3];
           const styles = ref.kind === "stroke" ? scene.styles : scene.gradientStrokeStyles;
           const rect = ref.kind === "gradient-stroke" ? strokeClip(scene.gradientStrokePrimitiveMeta, scene.gradientStrokePrimitiveBounds, store.first + j) : clip.rect;
-          memberRect = rect; memberAlpha = styleAlpha(encoded);
-          if (styleAlpha(encoded) <= ALPHA_EPSILON || (rect && !inBounds(options.point, rect))) { if (work.shouldYield()) await work.yield(); continue; }
+          memberRect = rect; memberAlpha = shapeOnly ? 1 : styleAlpha(encoded);
+          if ((!shapeOnly && styleAlpha(encoded) <= ALPHA_EPSILON) || (rect && !inBounds(options.point, rect))) { if (work.shouldYield()) await work.yield(); continue; }
           const degenerate = Math.hypot(segment.start.x - segment.end.x, segment.start.y - segment.end.y) < 1e-8 &&
             (!segment.control || Math.hypot(segment.start.x - segment.control.x, segment.start.y - segment.control.y) < 1e-8);
           if (degenerate && (styleFlags(encoded) & 2) === 0) { if (work.shouldYield()) await work.yield(); continue; }
@@ -901,8 +988,42 @@ export class ScenePrimitivePicker {
     }
     const inside = !stroke && (evenodd ? Math.abs(winding) % 2 === 1 : winding !== 0);
     if (inside && alpha * gradientAlpha(scene, source, options.point) * gradientAlpha(scene, mask, options.point) > ALPHA_EPSILON)
-      return { primitive: { ...ref }, point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
+      return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
+    let nearestTriangle = -1;
+    // Mesh coverage can end inside the paint's enclosing path. Include its
+    // triangle edges when applying screen-space tolerance around that domain.
+    if (!stroke && source >= 0 && scene.gradientMetaA[source * 4] === 2 && tolerance > 0) {
+      const count = gradientMeshTriangleCount(scene, source), offset = source * 4;
+      for (let triangleIndex = 0; triangleIndex < count; triangleIndex++) {
+        const triangle = getGradientMeshTriangle(scene, source, triangleIndex);
+        for (let edge = 0; edge < 3; edge++) {
+          const start = triangle.points[edge], end = triangle.points[(edge + 1) % 3];
+          const candidate = await nearestProjected({ start, end }, options, work);
+          if (!candidate || candidate.distance > tolerance || (nearest && candidate.distance >= nearest.distance) ||
+              !withinClips(scene, candidate.point, clip.clipIndex, clip.rect)) continue;
+          const b = scene.gradientMetaB, c = scene.gradientMetaC, e = scene.gradientMetaE, point = candidate.point;
+          const qx = b[offset] * point.x + b[offset + 2] * point.y + c[offset];
+          const qy = b[offset + 1] * point.x + b[offset + 3] * point.y + c[offset + 1];
+          if (scene.gradientMetaA[offset + 1] >= .5 && (qx < e[offset] || qy < e[offset + 1] || qx > e[offset + 2] || qy > e[offset + 3])) continue;
+          const dx = end.x - start.x, dy = end.y - start.y, length2 = dx * dx + dy * dy;
+          const t = length2 > 0 ? Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / length2)) : 0;
+          const sourceAlpha = triangle.colors[edge][3] * (1 - t) + triangle.colors[(edge + 1) % 3][3] * t;
+          if (alpha * sourceAlpha * gradientAlpha(scene, mask, point) <= ALPHA_EPSILON) continue;
+          let pointWinding = 0, onBoundary = false;
+          for (let segment = 0; segment < store.count; segment++) {
+            const part = readSegment(store, segment);
+            pointWinding += segmentWinding(part, point);
+            if (!part.control && closestLine(part.start, part.end, point).distance < 1e-7) onBoundary = true;
+            if (work.shouldYield()) await work.yield();
+          }
+          if (!onBoundary && !(evenodd ? Math.abs(pointWinding) % 2 === 1 : pointWinding !== 0)) continue;
+          nearest = candidate; nearestTriangle = triangleIndex;
+        }
+        if (work.shouldYield()) await work.yield();
+      }
+    }
     if (!nearest || nearest.distance > tolerance + 1e-7) return null;
-    return { primitive: { ...ref }, point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance, segmentIndex: nearestIndex };
+    return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance,
+      ...(nearestTriangle >= 0 ? { triangleIndex: nearestTriangle } : { segmentIndex: nearestIndex }) };
   }
 }

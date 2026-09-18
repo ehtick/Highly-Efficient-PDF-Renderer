@@ -1,5 +1,9 @@
 # Parser benchmark
 
+Historical results below refer to the schema and renderer available when measured.
+Current exports use HEP v7; regenerate old archives and rerun relevant manual
+checks before comparing the new paint-graph and layer paths against those results.
+
 Use the production-bundle benchmark for parser cutover decisions. The older
 `benchmark:native-vector-page` script intentionally calls the TypeScript
 session directly, so it omits worker startup and transfer costs. Likewise,

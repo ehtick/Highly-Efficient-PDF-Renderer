@@ -1,19 +1,31 @@
 import { GRADIENT_LUT_WIDTH, type GradientSceneData } from "../orderedGradientPaint";
+import { GRADIENT_DISABLE_START, GRADIENT_DISABLE_END } from "../gradientSampling";
 import type { DensePdfVectorShadingPaint } from "./nativeContentCompiler";
-import type { NativePdfShadingRegistry } from "./nativeShadings";
+import type { NativePdfShadingDescription } from "./nativeShadings";
 import { DEFAULT_PDF_RESOURCE_LIMITS, PdfError, throwIfAborted } from "./nativeTypes";
 
 /** Bound LUT storage to 16 MiB, independently of the ordinary path ceiling. */
 const MAX_VECTOR_SHADING_PAINTS = 4096;
 
-/** The current shader extends both ends; other PDF shading semantics retain fallback. */
-export function supportedNativeVectorShadings(registry: NativePdfShadingRegistry): ReadonlySet<number> {
+export interface NativeVectorGradientSource {
+  readonly size: number;
+  describe(index: number): Readonly<NativePdfShadingDescription>;
+  readonly functions: { evaluate(index: number, inputs: readonly number[], signal?: AbortSignal): ArrayLike<number> };
+  readonly colors: { convertToSrgb(index: number, inputs: readonly number[], signal?: AbortSignal): readonly number[] };
+}
+
+/** Axial and radial shading geometry is evaluated directly by every GPU backend. */
+export function supportedNativeVectorShadings(registry: Pick<NativeVectorGradientSource, "size" | "describe">): ReadonlySet<number> {
   const supported = new Set<number>();
   for (let index = 0; index < registry.size; index++) {
     const shading = registry.describe(index);
-    const [x0, y0, x1, y1] = shading.coordinates;
-    if (shading.shadingType === 2 && shading.extend[0] && shading.extend[1] &&
-        shading.background === null && (x1 - x0) ** 2 + (y1 - y0) ** 2 > 1e-12) {
+    const coords = shading.coordinates;
+    if (!coords.every(Number.isFinite)) continue;
+    if ((shading.shadingType === 2 && coords.length === 4 &&
+          (coords[2] - coords[0]) ** 2 + (coords[3] - coords[1]) ** 2 > 1e-12) ||
+        (shading.shadingType === 3 && coords.length === 6 && coords[2] >= 0 && coords[5] >= 0 &&
+          Math.max(Math.abs(coords[3] - coords[0]), Math.abs(coords[4] - coords[1]),
+            Math.abs(coords[5] - coords[2])) > 1e-9)) {
       supported.add(index);
     }
   }
@@ -23,7 +35,7 @@ export function supportedNativeVectorShadings(registry: NativePdfShadingRegistry
 /** Analytic geometry remains resolution independent; the color function uses the existing 1D LUT. */
 export function buildNativeVectorGradients(
   paints: readonly DensePdfVectorShadingPaint[],
-  registry: NativePdfShadingRegistry | undefined,
+  registry: NativeVectorGradientSource | undefined,
   maxPaths: number,
   signal?: AbortSignal,
   maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage
@@ -72,7 +84,11 @@ export function buildNativeVectorGradients(
     const offset = index * 4;
     // Transform scene points into shading space before projection: transforming
     // the axis alone would distort the gradient under a shear or nonuniform scale.
-    gradientMetaA.set([0, shading.boundingBox ? 1 : 0, 0, 0], offset);
+    // Background is ignored by the PDF `sh` operator (ISO 32000-1, 8.7.4.2).
+    // A.w remains available for a shading-pattern background, RGB8 packed + 1.
+    const radial = shading.shadingType === 3;
+    gradientMetaA.set([radial ? 1 : 0, shading.boundingBox ? 1 : 0,
+      (shading.extend[0] ? 0 : GRADIENT_DISABLE_START) | (shading.extend[1] ? 0 : GRADIENT_DISABLE_END), 0], offset);
     gradientMetaB.set([d / det, -b / det, -c / det, a / det], offset);
     const inverseDet = gradientMetaB[offset] * gradientMetaB[offset + 3] -
       gradientMetaB[offset + 1] * gradientMetaB[offset + 2];
@@ -81,7 +97,9 @@ export function buildNativeVectorGradients(
     }
     gradientMetaC.set([(c * f - d * e) / det, (b * e - a * f) / det,
       shading.coordinates[0], shading.coordinates[1]], offset);
-    gradientMetaD.set([shading.coordinates[2], shading.coordinates[3], 0, 0], offset);
+    gradientMetaD.set(radial
+      ? [shading.coordinates[3], shading.coordinates[4], shading.coordinates[2], shading.coordinates[5]]
+      : [shading.coordinates[2], shading.coordinates[3], 0, 0], offset);
     if (shading.boundingBox) gradientMetaE.set(shading.boundingBox, offset);
 
     let lut = sampled.get(paint.gradientIndex);

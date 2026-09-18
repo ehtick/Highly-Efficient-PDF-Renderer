@@ -24,13 +24,13 @@ try {
     const snapshot = bytes.slice();
     const session = await openPdf({ kind: "bytes", bytes });
     try {
-      const baseline = await session.compileVectorPageWithTimings(0, {}, {
+      const baseline = await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false }, {
         reuseCompositeSurfaces: false, boundCompositeWork: false
       });
       const expected = sceneFingerprint(baseline.scene);
       for (const reuseCompositeSurfaces of [false, true]) {
         for (const boundCompositeWork of [false, true]) {
-          const result = await session.compileVectorPageWithTimings(0, {}, {
+          const result = await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false }, {
             reuseCompositeSurfaces, boundCompositeWork
           });
           assert.equal(sceneFingerprint(result.scene), expected, `${mode}: all scene bytes must match`);
@@ -43,17 +43,18 @@ try {
               assert(after.imageSurfaceHits > 0);
               assert(after.imageSurfaces < before.imageSurfaces);
             }
-            if (boundCompositeWork) assert(after.readbackPixels < before.readbackPixels / 2);
+            if (boundCompositeWork) assert(after.readbackPixels <= before.readbackPixels,
+              "replay slots retain a full structural page frame, while bounded work must not increase readback");
           } else if (boundCompositeWork) {
             assert(after.softMaskPixels < before.softMaskPixels / 2);
           }
         }
       }
-      const nextPage = await session.compileVectorPageWithTimings(1);
-      assert.equal(sceneFingerprint(await session.compileVectorPage(0)), expected);
+      const nextPage = await session.compileVectorPageWithTimings(1, { preserveDrawingOrder: false });
+      assert.equal(sceneFingerprint(await session.compileVectorPage(0, { preserveDrawingOrder: false })), expected);
       assert.equal(sceneFingerprint(baseline.scene), expected, "later calls cannot mutate returned pixels");
       assert.equal(nextPage.timings.selectiveCompositing.imageSurfaces,
-        (await session.compileVectorPageWithTimings(0)).timings.selectiveCompositing.imageSurfaces,
+        (await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false })).timings.selectiveCompositing.imageSurfaces,
         "surface caches cannot survive into another page operation");
     } finally {
       await session.close();

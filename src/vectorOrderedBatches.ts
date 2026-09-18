@@ -2,6 +2,7 @@ import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
+import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -11,6 +12,8 @@ export class VectorOrderedBatches {
   readonly strokeScene: VectorScene;
   readonly cullingPadding: number;
   instanceCount = 0;
+  /** Visible strokes omitted temporarily; canonical scene counts never change. */
+  culledSegmentCount = 0;
   private readonly runtime: VectorStrokeLodRuntime | null;
   private readonly runIndices = new Map<VectorDrawRun, number>();
   private readonly rankToId: Uint32Array;
@@ -27,12 +30,16 @@ export class VectorOrderedBatches {
   private readonly runRanges: Uint32Array;
   private readonly visiblePaints: number[] = [];
   private readonly scheduler: VectorPageDrawScheduler | null;
+  private readonly redundancy: VectorStrokeRedundancy;
+  private readonly redundancyIds: Uint32Array;
+  private redundancyEnabled = true;
   private previousSelectedRanks = new Uint32Array(0);
   private previousRankCount = 0;
   private previousRuns: VectorDrawRun[] = [];
   private previousRunsAreSource = false;
   private initialized = false;
   private dirty = true;
+  private orderDirty = false;
 
   constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null) {
     this.runtime = runtime;
@@ -77,6 +84,8 @@ export class VectorOrderedBatches {
       this.rankRun[rank] = strokeSourceRuns[id] = sourceRun[origins[id]];
     });
     this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns);
+    this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
+    this.redundancyIds = new Uint32Array(total);
     const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
     this.floatInstances = new Float32Array(capacity);
     this.uintInstances = new Uint32Array(capacity);
@@ -84,9 +93,18 @@ export class VectorOrderedBatches {
 
   invalidate(): void { this.dirty = true; }
 
+  setColorCommutationEnabled(enabled: boolean): void {
+    const changed = this.scheduler?.setColorCommutationEnabled(enabled) ?? false;
+    if (!changed && this.redundancyEnabled === enabled) return;
+    this.redundancyEnabled = enabled;
+    this.orderDirty = true;
+    this.dirty = true;
+  }
+
   /** Returns true only when instance data needs uploading again. */
   update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null): boolean {
-    const orderChanged = this.scheduler?.updateScale(unitsPerPixel) ?? false;
+    const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty;
+    this.orderDirty = false;
     let sameRuns = this.initialized && runs.length === this.previousRuns.length;
     if (sameRuns && !(runs === this.sourceRuns && this.previousRunsAreSource)) {
       for (let index = 0; index < runs.length; index++) {
@@ -161,6 +179,7 @@ export class VectorOrderedBatches {
     this.previousRankCount = selectedCount;
     this.batches.length = 0;
     this.instanceCount = 0;
+    this.culledSegmentCount = 0;
     this.visiblePaints.length = 0;
     let cursor = 0;
     for (const run of runs) {
@@ -177,6 +196,19 @@ export class VectorOrderedBatches {
       this.runRanges[runIndex * 2 + 1] = count;
       this.visiblePaints.push(runIndex);
     }
+    if (this.redundancyEnabled) {
+      let count = 0;
+      for (const runIndex of this.visiblePaints) {
+        const run = this.sourceRuns[runIndex];
+        if (run.kind !== "stroke") continue;
+        const start = this.runRanges[runIndex * 2], end = start + this.runRanges[runIndex * 2 + 1];
+        for (let index = start; index < end; index++) {
+          this.redundancyIds[count++] = this.runtime ? this.rankToId[this.selectedRanks[index]] : index;
+        }
+      }
+      this.redundancy.update(this.redundancyIds, count);
+      this.culledSegmentCount = this.redundancy.culledCount;
+    }
     // Schedule paint ranges first, then write selected instances directly in
     // final order. No intermediate instance copy or per-run array views.
     for (const runIndex of this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints) {
@@ -189,14 +221,19 @@ export class VectorOrderedBatches {
       const first = this.instanceCount;
       if (run.kind === "stroke" && this.runtime) {
         for (let index = start; index < start + count; index++) {
-          this.appendInstance(run, this.rankToId[this.selectedRanks[index]]);
+          const id = this.rankToId[this.selectedRanks[index]];
+          if (!this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(run, id);
         }
       } else {
-        for (let id = start; id < start + count; id++) this.appendInstance(run, id);
+        for (let id = start; id < start + count; id++) {
+          if (run.kind !== "stroke" || !this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(run, id);
+        }
       }
+      const retainedCount = this.instanceCount - first;
+      if (!retainedCount) continue;
       const previous = this.batches[this.batches.length - 1];
-      if (previous?.kind === run.kind && previous.clipIndex === -2 && previous.blendMode === run.blendMode) previous.count += count;
-      else this.batches.push({ kind: run.kind, first, count, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) });
+      if (previous?.kind === run.kind && previous.clipIndex === -2 && previous.blendMode === run.blendMode) previous.count += retainedCount;
+      else this.batches.push({ kind: run.kind, first, count: retainedCount, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) });
     }
     this.floatInstances.set(this.uintInstances.subarray(0, this.instanceCount * 2));
     return true;

@@ -19,6 +19,11 @@ import { validateIccEngine, type PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
 import type { NativeVectorPdfSession, PdfSession } from "./pdfSession";
+import type { SceneOptionalContent } from "./optionalContentData";
+import type { SceneRetainedPage } from "./retainedPageData";
+import { composePagePaintGraph } from "./scenePaintGraphComposition";
+import { validateScenePaintGraph, type ScenePaintGraph } from "./scenePaintGraph";
+import { composeOptionalContent } from "./optionalContentComposition";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -30,6 +35,8 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Constant paint alpha, independent of the retained image RGBA; absent means one. */
+  opacity?: number;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
@@ -42,6 +49,8 @@ export interface RasterLayer {
 
 /** Searchable text for one page, in scene space (Y-up, page placement baked in). */
 export interface PageTextIndex {
+  /** One condition per UTF-16 code unit, including OCR; -1 means unconditional. */
+  optionalContent?: Int32Array;
   /** Searchable text; word gaps and line breaks are encoded as a single " ". */
   text: string;
   /**
@@ -89,6 +98,8 @@ export interface VectorClipPath {
 
 /** Consecutive instances painted together, in PDF source order. */
 export interface VectorDrawRun {
+  /** Index of the visibility condition in the document's optional-content model. */
+  optionalContent?: number;
   blendMode?: "Multiply";
   clipIndex?: number;
   kind: "fill" | "stroke" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
@@ -97,6 +108,12 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Self-contained replay sources for layer-aware composite fallback islands. */
+  retainedPages?: SceneRetainedPage[];
+  /** Ordered compositing boundaries. Absent scenes use the ordinary flat fast path. */
+  paintGraph?: ScenePaintGraph;
+  /** Immutable PDF layer definitions and original visibility defaults. */
+  optionalContent?: SceneOptionalContent;
   /** Absent on older scenes that use the fixed image/fill/stroke/text passes. */
   drawRuns?: VectorDrawRun[];
   clipPaths?: VectorClipPath[];
@@ -119,6 +136,10 @@ export interface VectorScene {
   gradientMetaD: Float32Array;
   gradientMetaE: Float32Array;
   gradientLut: Uint8Array;
+  gradientMeshRanges?: Uint32Array;
+  gradientMeshPositions?: Float32Array;
+  gradientMeshColors?: Float32Array;
+  gradientMeshIndices?: Uint32Array;
   gradientFillPathCount: number;
   gradientFillSegmentCount: number;
   gradientFillPathMetaA: Float32Array;
@@ -301,6 +322,7 @@ export async function extractPdfPageScenes(
   let fastResult: Awaited<ReturnType<typeof compileDensePdfInWorker>> | null = null;
   try {
     fastResult = await compileDensePdfInWorker(pdfData, {
+      retainOptionalContent: true,
       pages: options.pages,
       enableSegmentMerge: options.enableSegmentMerge,
       enableInvisibleCull: options.enableInvisibleCull,
@@ -1176,6 +1198,12 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const gradientMetaD = new Float32Array(totalGradientCount * 4);
   const gradientMetaE = new Float32Array(totalGradientCount * 4);
   const gradientLut = new Uint8Array(totalGradientCount * GRADIENT_LUT_WIDTH * 4);
+  const hasGradientMeshes = pageScenes.some(scene => (scene.gradientMeshIndices?.length ?? 0) > 0);
+  const gradientMeshRanges = hasGradientMeshes ? new Uint32Array(totalGradientCount * 2) : undefined;
+  const gradientMeshPositions = hasGradientMeshes ? new Float32Array(pageScenes.reduce((sum, scene) => sum + (scene.gradientMeshPositions?.length ?? 0), 0)) : undefined;
+  const gradientMeshColors = hasGradientMeshes ? new Float32Array(pageScenes.reduce((sum, scene) => sum + (scene.gradientMeshColors?.length ?? 0), 0)) : undefined;
+  const gradientMeshIndices = hasGradientMeshes ? new Uint32Array(pageScenes.reduce((sum, scene) => sum + (scene.gradientMeshIndices?.length ?? 0), 0)) : undefined;
+  let gradientMeshVertexOffset = 0, gradientMeshIndexOffset = 0;
   const gradientFillPathMetaA = new Float32Array(totalGradientFillPathCount * 4);
   const gradientFillPathMetaB = new Float32Array(totalGradientFillPathCount * 4);
   const gradientFillPathMetaC = new Float32Array(totalGradientFillPathCount * 4);
@@ -1219,8 +1247,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let combinedBounds: Bounds | null = null;
   let combinedPageBounds: Bounds | null = null;
 
+  const layers = composeOptionalContent(pageScenes.map(scene => scene.optionalContent));
+  const paintGraph: ScenePaintGraph | undefined = pageScenes.some(scene => scene.paintGraph) ? { roots: [] } : undefined;
+  const retainedPages: SceneRetainedPage[] = [];
   const clipPaths: VectorClipPath[] = [];
-  const drawRuns: VectorDrawRun[] | undefined = pageScenes.some(scene => scene.drawRuns) ? [] : undefined;
+  const drawRuns: VectorDrawRun[] | undefined = paintGraph || pageScenes.some(scene => scene.drawRuns) ? [] : undefined;
   const rasterLayers: RasterLayer[] = [];
   const mergedTextIndexPages: PageTextIndex[] = [];
   const combinedTextContent: SceneTextItem[] = [];
@@ -1229,10 +1260,17 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
     const scene = pageScenes[pageIndex];
     const placement = placements[pageIndex];
+    validateScenePaintGraph(scene);
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
     const clipBase = clipPaths.length;
+    const retainedPageBase = retainedPages.length;
+    for (const resource of scene.retainedPages ?? []) {
+      const matrix = resource.matrix.slice(); matrix[4] += tx; matrix[5] += ty;
+      retainedPages.push({ page: resource.page, matrix, optionalContentConditions: resource.optionalContentConditions.map(
+        condition => condition < 0 ? condition : condition + layers.offsets[pageIndex]) });
+    }
     for (const clip of scene.clipPaths ?? []) {
       const edges = clip.edges.slice();
       for (let i = 0; i < edges.length; i += 2) { edges[i] += tx; edges[i + 1] += ty; }
@@ -1240,14 +1278,24 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     }
     if (drawRuns) {
       validateVectorDrawRuns(scene);
+      const runBase = drawRuns.length;
       const offsets: Record<VectorDrawRun["kind"], number> = {
         fill: fillPathOffset, stroke: segmentOffset, text: textInstanceOffset,
         raster: rasterLayers.length, "gradient-fill": gradientFillPathOffset,
         "gradient-stroke": gradientStrokeRunOffset
       };
       for (const run of scene.drawRuns ?? defaultVectorDrawRuns({ ...scene, rasterLayers: listSceneRasterLayers(scene) })) {
-        appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count,
-          run.clipIndex === undefined ? undefined : run.clipIndex + clipBase, run.blendMode);
+        const clipIndex = run.clipIndex === undefined ? undefined : run.clipIndex + clipBase;
+        const optionalContent = run.optionalContent === undefined ? undefined : run.optionalContent + layers.offsets[pageIndex];
+        if (paintGraph) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
+          ...(clipIndex === undefined ? {} : { clipIndex }), ...(optionalContent === undefined ? {} : { optionalContent }) });
+        else appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count, clipIndex, run.blendMode, optionalContent);
+      }
+      if (paintGraph) {
+        if (scene.paintGraph) paintGraph.roots.push(...composePagePaintGraph(scene.paintGraph, {
+          run: runBase, raster: rasterLayers.length, retainedPage: retainedPageBase, condition: layers.offsets[pageIndex], x: tx, y: ty
+        }).roots);
+        else for (let runIndex = runBase; runIndex < drawRuns.length; runIndex++) paintGraph.roots.push({ kind: "draw", runIndex });
       }
     }
 
@@ -1298,6 +1346,17 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       fillSegmentsB[dst + 3] = scene.fillSegmentsB[src + 3];
     }
 
+    if (gradientMeshRanges && gradientMeshPositions && gradientMeshColors && gradientMeshIndices && scene.gradientMeshIndices) {
+      gradientMeshPositions.set(scene.gradientMeshPositions!, gradientMeshVertexOffset * 2);
+      gradientMeshColors.set(scene.gradientMeshColors!, gradientMeshVertexOffset * 4);
+      for (let i = 0; i < scene.gradientMeshIndices.length; i++) gradientMeshIndices[gradientMeshIndexOffset + i] = scene.gradientMeshIndices[i] + gradientMeshVertexOffset;
+      for (let i = 0; i < scene.gradientCount; i++) {
+        gradientMeshRanges[(gradientOffset + i) * 2] = scene.gradientMeshRanges![i * 2] + gradientMeshIndexOffset;
+        gradientMeshRanges[(gradientOffset + i) * 2 + 1] = scene.gradientMeshRanges![i * 2 + 1];
+      }
+      gradientMeshVertexOffset += scene.gradientMeshPositions!.length / 2;
+      gradientMeshIndexOffset += scene.gradientMeshIndices.length;
+    }
     for (let i = 0; i < scene.gradientCount; i += 1) {
       const src = i * 4;
       const dst = (gradientOffset + i) * 4;
@@ -1467,7 +1526,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         pageTextRanges[rangeDst] = sceneTextRanges[rangeSrc] + textInstanceOffset;
         pageTextRanges[rangeDst + 1] = sceneTextRanges[rangeSrc + 1];
       }
-      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, sceneRectCount, tx, ty, textInstanceOffset);
+      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, sceneRectCount, tx, ty, textInstanceOffset, layers.offsets[pageIndex]);
       pageRectOffset += sceneRectCount;
     } else {
       const dst = pageRectOffset * 4;
@@ -1478,7 +1537,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       const rangeDst = pageRectOffset * 2;
       pageTextRanges[rangeDst] = textInstanceOffset;
       pageTextRanges[rangeDst + 1] = scene.textInstanceCount;
-      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, 1, tx, ty, textInstanceOffset);
+      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, 1, tx, ty, textInstanceOffset, layers.offsets[pageIndex]);
       pageRectOffset += 1;
     }
 
@@ -1502,6 +1561,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         height: layer.height,
         data: layer.data,
         matrix,
+        ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: layer.paintOrder,
         pageIndex: pageRectBase + layer.pageIndex
       });
@@ -1523,6 +1583,9 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
   const composedScene: VectorScene = {
+    ...(paintGraph ? { paintGraph } : {}),
+    ...(retainedPages.length ? { retainedPages } : {}),
+    ...(layers.data ? { optionalContent: layers.data } : {}),
     ...(clipPaths.length ? { clipPaths } : {}),
     ...(drawRuns ? { drawRuns } : {}),
     pageCount: pageScenes.length,
@@ -1544,6 +1607,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     gradientMetaD,
     gradientMetaE,
     gradientLut,
+    ...(hasGradientMeshes ? { gradientMeshRanges, gradientMeshPositions, gradientMeshColors, gradientMeshIndices } : {}),
     gradientFillPathCount: totalGradientFillPathCount,
     gradientFillSegmentCount: totalGradientFillSegmentCount,
     gradientFillPathMetaA,
@@ -1618,20 +1682,21 @@ function appendTranslatedTextIndexPages(
   rectCount: number,
   tx: number,
   ty: number,
-  textInstanceOffset: number
+  textInstanceOffset: number,
+  conditionOffset = 0
 ): void {
   const sourcePages = scene.textIndex?.pages ?? [];
   for (let i = 0; i < rectCount; i += 1) {
     const page = sourcePages[i];
     if (page && page.text.length > 0) {
-      target.push(offsetPageTextIndex(page, tx, ty, textInstanceOffset));
+      target.push(offsetPageTextIndex(page, tx, ty, textInstanceOffset, conditionOffset));
     } else {
       target.push({ text: "", charInstance: new Int32Array(0), fallbackQuads: new Float32Array(0) });
     }
   }
 }
 
-function offsetPageTextIndex(page: PageTextIndex, tx: number, ty: number, instanceOffset: number): PageTextIndex {
+function offsetPageTextIndex(page: PageTextIndex, tx: number, ty: number, instanceOffset: number, conditionOffset = 0): PageTextIndex {
   // Copy instead of mutating: cached page scenes get re-composed at other
   // pagesPerRow layouts, so the source data must stay untranslated.
   const charInstance = new Int32Array(page.charInstance.length);
@@ -1648,7 +1713,8 @@ function offsetPageTextIndex(page: PageTextIndex, tx: number, ty: number, instan
     fallbackQuads[i + 2] = source[i + 2] + tx;
     fallbackQuads[i + 3] = source[i + 3] + ty;
   }
-  return { text: page.text, charInstance, fallbackQuads };
+  return { text: page.text, charInstance, fallbackQuads,
+    ...(page.optionalContent ? { optionalContent: Int32Array.from(page.optionalContent, index => index < 0 ? -1 : index + conditionOffset) } : {}) };
 }
 
 export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
@@ -2047,6 +2113,7 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         height,
         data: layer.data,
         matrix,
+        ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
         pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
       });

@@ -212,8 +212,20 @@ export type {
 export type { HeprTextSearchMatch } from "./threePdfObject";
 export type { PrimitivePickOptions } from "./threePdfObject";
 export type {
-  PrimitiveKind, PrimitiveRef, PrimitivePoint, PrimitiveSegment, PrimitiveSegmentStyle, PrimitiveInfo, PrimitiveHit
+  PrimitiveKind, PrimitiveRef, PrimitivePoint, PrimitiveSegment, PrimitiveSegmentStyle, PrimitiveInfo, PrimitiveHit, PrimitiveOptionalContent
 } from "./scenePrimitives";
+export type { GradientMeshTriangle } from "./gradientMesh";
+export { OptionalContentController } from "./optionalContent";
+export type { OptionalContentLayer, OptionalContentSnapshot, OptionalContentListener, LayerVisibilityChange,
+  LayerVisibilitySummary, OptionalContentControllerOptions, OptionalContentUpdateOptions } from "./optionalContent";
+export type { SceneOptionalContent, OptionalContentGroup, OptionalContentCondition, OptionalContentOrderNode } from "./optionalContentData";
+export type { ScenePaintGraph, ScenePaintNode, ScenePaintDraw, ScenePaintGroup, ScenePaintMask, ScenePaintRetained } from "./scenePaintGraph";
+export type { SceneRetainedPage } from "./retainedPageData";
+export { createLayerVisibilityController } from "./layerVisibility";
+export type { LayerVisibilityController, LayerVisibilityOptions } from "./layerVisibility";
+export { createPdfLayerControls } from "./pdfLayerControls";
+export type { PdfLayerControlsOptions } from "./pdfLayerControls";
+export { isSceneTextCharVisible } from "./optionalContentText";
 export type { PrimitiveColorInput, PrimitiveOverride } from "./primitiveAppearance";
 export { createPrimitiveInteractionController } from "./primitiveInteraction";
 export { createThreePrimitiveInteractionController } from "./threePrimitiveInteraction";

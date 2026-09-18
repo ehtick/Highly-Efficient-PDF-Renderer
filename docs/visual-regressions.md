@@ -1,5 +1,9 @@
 # Accepted native appearance and honest statistics
 
+This records the earlier v6 appearance baseline. Current HEP loading is v7-only;
+the paint-graph and layer work requires fresh manual GPU verification. Keep these
+historical measurements separate from the current [validation checklist](development.md#manual-pdf-layer-and-effect-checks).
+
 This change freezes the accepted current appearance, not main's extra labels.
 It does not change the GPU renderer, page layout, camera, zoom/pan, paint
 resolution, or search/selection implementation. HEP remains v6.
@@ -95,9 +99,10 @@ estimates include expanded Form occurrences and are neither raw PDF operator
 counts nor GPU draw calls. Do not compare that number across engines as
 equivalent work. Compare timings and accepted output instead.
 
-New HEP exports preserve image-transfer counts, cull diagnostics and operator
-counter provenance as additive v6 metadata. Old v6 files still load, but the
-missing cull/image breakdown is shown as unavailable, not fabricated zeros.
+The v6 baseline added image-transfer counts, cull diagnostics and operator
+counter provenance. The current v7 format retains those fields. Missing
+cull/image breakdown is shown as unavailable, not fabricated zeros; v6 files
+must now be regenerated from their original PDFs.
 Mixed old/new page grids also retain that uncertainty. Tests cover all three
 categories, optimization disabled, grid aggregation, HEP round trips, missing
 metadata and inconsistent counts.

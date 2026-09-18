@@ -1,3 +1,4 @@
+import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
@@ -42,6 +43,7 @@ interface CullingBounds {
 export class ThreeMaterialStrokeLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
+  private readonly solidColorOverrides = new Set<string>();
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly segmentTextureA: THREE.DataTexture;
@@ -196,6 +198,10 @@ export class ThreeMaterialStrokeLayer {
     this.orderedRuns = ThreeVectorDrawRuns.create(scene, "stroke", this.mesh, "aSegmentIndex");
   }
 
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    this.orderedRuns?.setOptionalContentVisibility(snapshot);
+  }
+
   setVisible(visible: boolean): void {
     this.mesh.visible = visible;
   }
@@ -220,6 +226,16 @@ export class ThreeMaterialStrokeLayer {
     patchPrimitiveColorTexture(this.segmentStyleTexture, scene.styles, updates, "stroke", [
       { source: 1, target: 1 }, { source: 2, target: 2 }, { source: 3, target: 3 }
     ]);
+    // The shared redundancy planner may cross same-color fill/text paints.
+    // Recoloring any solid primitive therefore restores all stroke candidates,
+    // until clearing the last override makes the original proof valid again.
+    for (const update of updates) {
+      if (update.ref.kind !== "stroke" && update.ref.kind !== "fill" && update.ref.kind !== "text") continue;
+      const key = `${update.ref.kind}:${update.ref.index}`;
+      if (update.color) this.solidColorOverrides.add(key);
+      else this.solidColorOverrides.delete(key);
+    }
+    this.orderedRuns?.setStrokeRedundancyEnabled(this.solidColorOverrides.size === 0);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

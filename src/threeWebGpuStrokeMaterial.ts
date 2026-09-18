@@ -1,3 +1,4 @@
+import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
@@ -82,7 +83,8 @@ fn heprStrokeWorldPack(
   zoom: f32,
   useLocalToClip: f32,
   localUnitsPerPixelInput: f32,
-  aaScreenPx: f32
+  aaScreenPx: f32,
+  shapeOnly: f32
 ) -> vec4<f32> {
   let p0 = primitiveA.xy;
   let p1 = primitiveA.zw;
@@ -92,7 +94,7 @@ fn heprStrokeWorldPack(
   var halfWidth = style.x;
   let packedStyle = primitiveB.w;
   let styleFlags = floor(packedStyle / 2.0 + 0.000001);
-  let alpha = packedStyle - styleFlags * 2.0;
+  let alpha = mix(packedStyle - styleFlags * 2.0, 1.0, shapeOnly);
   let isHairline = heprFloatMod(styleFlags, 2.0) >= 0.5;
   let isRoundCap = heprFloatMod(floor(styleFlags * 0.5), 2.0) >= 0.5;
 
@@ -173,7 +175,8 @@ fn heprStrokeFragment(
   halfWidthFromVertex: f32,
   strokeCurveEnabled: f32,
   aaScreenPx: f32,
-  vectorOverride: vec4<f32>
+  vectorOverride: vec4<f32>,
+  shapeOnly: f32
 ) -> vec4<f32> {
   let p0 = primitiveA.xy;
   let p1 = primitiveA.zw;
@@ -181,7 +184,7 @@ fn heprStrokeFragment(
   let primitiveType = primitiveB.z;
   let packedStyle = primitiveB.w;
   let styleFlags = floor(packedStyle / 2.0 + 0.000001);
-  let alphaStyle = packedStyle - styleFlags * 2.0;
+  let alphaStyle = mix(packedStyle - styleFlags * 2.0, 1.0, shapeOnly);
   if (alphaStyle <= 0.001) {
     discard;
   }
@@ -242,6 +245,8 @@ export function createThreeWebGpuStrokeMaterial(
   material.lights = false;
   configureStraightAlphaBlending(material);
 
+  const shapeOnlyUniform = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnlyUniform);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
@@ -269,7 +274,8 @@ export function createThreeWebGpuStrokeMaterial(
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
     localUnitsPerPixelInput: localUnitsPerPixelUniform,
-    aaScreenPx: aaScreenPxUniform
+    aaScreenPx: aaScreenPxUniform,
+    shapeOnly: shapeOnlyUniform
   }));
   const worldPackValue = worldPack as {
     xy: unknown;
@@ -298,7 +304,8 @@ export function createThreeWebGpuStrokeMaterial(
     halfWidthFromVertex: worldPackValue.z,
     strokeCurveEnabled: curveUniform,
     aaScreenPx: aaScreenPxUniform,
-    vectorOverride: vectorOverrideUniform
+    vectorOverride: vectorOverrideUniform,
+    shapeOnly: shapeOnlyUniform
   });
 
   registerThreeNodeClipPosition(material, worldPackValue.xy);

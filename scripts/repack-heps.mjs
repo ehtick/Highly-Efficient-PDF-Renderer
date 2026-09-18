@@ -27,7 +27,7 @@ async function verifyHep(bytes, { HepArchive, expected, signal }) {
     }
     if (name === "manifest.json") {
       const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decoded));
-      if (manifest?.formatVersion !== 6) throw new Error("Only HEP scene schema 6 can be repacked");
+      if (manifest?.formatVersion !== 6 && manifest?.formatVersion !== 7) throw new Error("Only HEP scene schemas 6 and 7 can be verified");
     }
   }
   if (!archive.files["manifest.json"]) throw new Error("HEP manifest.json is missing");

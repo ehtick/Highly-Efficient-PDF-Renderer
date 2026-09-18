@@ -8,6 +8,8 @@ export type DensePdfFallbackReason =
   | "invalid-structure";
 
 export interface DensePdfPreflightOptions {
+  /** Route layered documents to the native compiler that preserves layer conditions. */
+  retainOptionalContent?: boolean;
   /** One-based Chrome-style page selection, for example `"1-5, 8"`. */
   pages?: string;
 

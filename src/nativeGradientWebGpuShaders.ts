@@ -1,3 +1,4 @@
+import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 
 const CAMERA_STRUCT = /* wgsl */ `
@@ -36,6 +37,9 @@ fn gradientCoord(index : i32) -> vec2i {
   return vec2i(index % i32(dimensions.x), index / i32(dimensions.x));
 }
 
+${GRADIENT_PARAMETER_WGSL}
+${GRADIENT_BACKGROUND_WGSL}
+
 fn samplePdfGradient(index : i32, scenePoint : vec2f) -> vec4f {
   let gradientCount = i32(textureDimensions(uGradientLut).y);
   if (index < 0 || index >= gradientCount) {
@@ -57,49 +61,9 @@ fn samplePdfGradient(index : i32, scenePoint : vec2f) -> vec4f {
     return vec4f(0.0);
   }
 
-  let p0 = metaC.zw;
-  let p1 = metaD.xy;
-  let axis = p1 - p0;
-  var t = 0.0;
-  if (metaA.x < 0.5) {
-    let denominator = dot(axis, axis);
-    if (denominator <= 1e-12) {
-      return vec4f(0.0);
-    }
-    t = dot(point - p0, axis) / denominator;
-  } else {
-    let radius0 = metaD.z;
-    let radiusDelta = metaD.w - radius0;
-    let offset = point - p0;
-    let coefficientA = dot(axis, axis) - radiusDelta * radiusDelta;
-    let coefficientB = -2.0 * (dot(offset, axis) + radius0 * radiusDelta);
-    let coefficientC = dot(offset, offset) - radius0 * radius0;
-    var firstRoot = -1e20;
-    var secondRoot = -1e20;
-    if (abs(coefficientA) <= 1e-10) {
-      if (abs(coefficientB) <= 1e-10) {
-        return vec4f(0.0);
-      }
-      firstRoot = -coefficientC / coefficientB;
-    } else {
-      let discriminant = coefficientB * coefficientB - 4.0 * coefficientA * coefficientC;
-      if (discriminant < 0.0) {
-        return vec4f(0.0);
-      }
-      let rootDelta = sqrt(max(discriminant, 0.0));
-      firstRoot = (-coefficientB - rootDelta) / (2.0 * coefficientA);
-      secondRoot = (-coefficientB + rootDelta) / (2.0 * coefficientA);
-    }
-    let firstValid = firstRoot > -1e19 && radius0 + firstRoot * radiusDelta >= 0.0;
-    let secondValid = secondRoot > -1e19 && radius0 + secondRoot * radiusDelta >= 0.0;
-    if (!firstValid && !secondValid) {
-      return vec4f(0.0);
-    }
-    t = select(firstRoot, secondRoot, secondValid);
-    if (firstValid && secondValid) {
-      t = max(firstRoot, secondRoot);
-    }
-  }
+  let parameter = heprGradientParameter(metaA, metaC, metaD, point);
+  if (parameter.y < 0.5) { return heprGradientBackground(metaA.w); }
+  let t = parameter.x;
 
   let lutX = (clamp(t, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0;
   let lutY = (f32(index) + 0.5) / f32(max(gradientCount, 1));
@@ -275,7 +239,7 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   var minDistance = 1e20;
   var winding = 0;
   var crossings = 0;
-  for (var primitiveIndex = 0; primitiveIndex < 2048; primitiveIndex = primitiveIndex + 1) {
+  for (var primitiveIndex = 0; primitiveIndex < inData.segmentCount; primitiveIndex = primitiveIndex + 1) {
     if (primitiveIndex >= inData.segmentCount) { break; }
     let coord = coordFromIndex(inData.segmentStart + primitiveIndex, i32(dimensions.x));
     let primitiveA = textureLoad(uSegmentsA, coord, 0);

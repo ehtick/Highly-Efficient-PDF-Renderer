@@ -1,3 +1,4 @@
+import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
@@ -63,10 +64,11 @@ fn heprFillVertexPack(
   corner: vec2<f32>,
   metaA: vec4<f32>,
   metaB: vec4<f32>,
-  metaC: vec4<f32>
+  metaC: vec4<f32>,
+  shapeOnly: f32
 ) -> vec4<f32> {
   let segmentCount = i32(metaA.y + 0.5);
-  let alpha = metaC.w;
+  let alpha = mix(metaC.w, 1.0, shapeOnly);
   if (segmentCount <= 0 || alpha <= 0.001) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
@@ -114,11 +116,12 @@ fn heprFillFragment(
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
   fillAAScreenPx: f32,
-  vectorOverride: vec4<f32>
+  vectorOverride: vec4<f32>,
+  shapeOnly: f32
 ) -> vec4<f32> {
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
-  let alphaStyle = metaC.w;
+  let alphaStyle = mix(metaC.w, 1.0, shapeOnly);
   if (segmentCount <= 0 || alphaStyle <= 0.001) {
     discard;
   }
@@ -128,7 +131,7 @@ fn heprFillFragment(
   var crossings = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
 
-  for (var i = 0; i < 2048; i = i + 1) {
+  for (var i = 0; i < segmentCount; i = i + 1) {
     if (i >= segmentCount) {
       break;
     }
@@ -300,6 +303,8 @@ export function createThreeWebGpuFillMaterial(
   material.lights = false;
   configureStraightAlphaBlending(material);
 
+  const shapeOnlyUniform = TSL.uniform(0);
+  registerThreePdfShapeUniform(material, shapeOnlyUniform);
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const fillAAScreenPxUniform = TSL.uniform(1);
@@ -319,7 +324,8 @@ export function createThreeWebGpuFillMaterial(
     corner,
     metaA,
     metaB,
-    metaC
+    metaC,
+    shapeOnly: shapeOnlyUniform
   }));
   const vertexPackValue = vertexPack as { xy: unknown };
 
@@ -340,7 +346,8 @@ export function createThreeWebGpuFillMaterial(
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: fillSegmentTextureWidthUniform,
     fillAAScreenPx: fillAAScreenPxUniform,
-    vectorOverride: TSL.uniform(options.vectorOverride)
+    vectorOverride: TSL.uniform(options.vectorOverride),
+    shapeOnly: shapeOnlyUniform
   });
 
   registerThreeNodeClipPosition(material, vertexPackValue.xy);

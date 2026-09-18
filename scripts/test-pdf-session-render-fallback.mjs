@@ -17,7 +17,7 @@ try {
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
   const fallbackAnnotation = fixture({
-    annotations: true, content: "q /G gs 0 0 1 1 re f Q", state: "/ca .5 /AIS true"
+    annotations: true, image: true, stencil: true, content: "q /G gs 0 0 1 1 re f Q /Im Do", state: "/ca .5 /AIS true"
   });
   const cases = [
     ["annotation after unsupported page paint", fallbackAnnotation, (scene) => {
@@ -80,7 +80,7 @@ try {
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
     await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => /alpha-as-shape/.test(error.message));
+      error => /mask or codec/.test(error.message));
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {
@@ -119,8 +119,12 @@ try {
   }) });
   try {
     const scene = await approximate.compileVectorPage(0);
-    assertPixel(scene, 2, 2, [255, 0, 0, 128]);
-    assert.ok(approximate.getDiagnostics().some(d => d.code === "compositing-approximation"));
+    assert.equal(scene.rasterLayers.length, 0, "alpha-as-shape keeps canonical geometry");
+    assert.equal(scene.fillPathCount, 2);
+    const groups = [];
+    const visit = nodes => { for (const node of nodes) if (node.kind === "group") { groups.push(node); visit(node.children); } };
+    visit(scene.paintGraph.roots);
+    assert.ok(groups.some(group => group.alphaIsShape && group.alpha === 0.5));
   } finally { await approximate.close(); }
 
   const resolverError = new Error("caller font resolver failed");
@@ -171,13 +175,13 @@ function assertPixel(scene, x, y, expected) {
   const offset = (Math.floor((height - y) / height * layer.height) * layer.width + Math.floor(x / width * layer.width)) * 4;
   assert.deepEqual([...layer.data.subarray(offset, offset + 4)], expected);
 }
-function fixture({ content = "", annotations = false, image = false, oneBit = false, font = false, state = "" } = {}) {
+function fixture({ content = "", annotations = false, image = false, oneBit = false, stencil = false, font = false, state = "" } = {}) {
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << ${image ? "/XObject << /Im 5 0 R >>" : ""} ${font ? "/Font << /F 7 0 R >>" : ""} ${state ? "/ExtGState << /G 8 0 R >>" : ""} >> /Contents 4 0 R ${annotations ? "/Annots [6 0 R]" : ""} >>` },
     { number: 4, body: tinyPdfStream("", content) },
-    { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${oneBit ? 2 : 1} /Height 1 /BitsPerComponent ${oneBit ? 1 : 8} /ColorSpace /Device${oneBit ? "Gray" : "RGB"}`, oneBit ? Uint8Array.of(0x40) : Uint8Array.of(255, 0, 0)) },
+    { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${oneBit ? 2 : 1} /Height 1 /BitsPerComponent ${oneBit || stencil ? 1 : 8} ${stencil ? "/ImageMask true" : `/ColorSpace /Device${oneBit ? "Gray" : "RGB"}`}`, oneBit ? Uint8Array.of(0x40) : stencil ? Uint8Array.of(0) : Uint8Array.of(255, 0, 0)) },
     { number: 6, body: "<< /Type /Annot /Subtype /Square /Rect [10 5 20 15] /IC [1 0 0] /Border [0 0 0] >>" },
     { number: 7, body: "<< /Type /Font /Subtype /TrueType /BaseFont /FallbackFixture /Encoding /WinAnsiEncoding >>" },
     { number: 8, body: `<< ${state} >>` },

@@ -479,7 +479,8 @@ export class NativePdfFormAppearanceRegistry {
    */
   async resolveAnnotationAppearance(
     annotation: NativePdfAnnotationAppearance,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    retainOptionalContent = false
   ): Promise<NativePdfResolvedAnnotationAppearance | null> {
     throwIfAborted(signal);
     const privateAnnotation = this.annotationPrivate.get(annotation);
@@ -519,7 +520,7 @@ export class NativePdfFormAppearanceRegistry {
           }
         );
       }
-      if (!membership.defaultVisible) return null;
+      if (!retainOptionalContent && !membership.defaultVisible) return null;
       optionalContentIndex = membership.index;
     }
     const appearanceValue = annotation.dictionary.get("AP");

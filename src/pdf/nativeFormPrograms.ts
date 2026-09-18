@@ -74,6 +74,7 @@ export interface NativePdfFormGraphOptions {
   /** Reuse the caller's exact first-use XObject classification. */
   readonly pageXObjectReferences?: readonly NativePdfXObjectReference[];
   readonly optionalContent?: NativeOptionalContentRegistry;
+  readonly retainOptionalContent?: boolean;
   /** Deterministic fallback for visible Widgets without a usable `/AP /N`. */
   readonly appearanceSynthesizer?: NativePdfAppearanceSynthesizer;
   /** Reuse the caller's exact page scan instead of lexing page content again. */
@@ -85,6 +86,7 @@ export interface NativePdfScopedFormGraphOptions {
   readonly pageIndex: number;
   readonly resourceName: string;
   readonly optionalContent?: NativeOptionalContentRegistry;
+  readonly retainOptionalContent?: boolean;
   readonly signal?: AbortSignal;
 }
 
@@ -92,6 +94,7 @@ export interface NativePdfResourceFormGraphOptions {
   readonly pageIndex: number;
   readonly ownerLabel: string;
   readonly optionalContent?: NativeOptionalContentRegistry;
+  readonly retainOptionalContent?: boolean;
   readonly signal?: AbortSignal;
 }
 
@@ -157,7 +160,7 @@ export async function buildNativePdfFormDefinitionGraph(
     );
     definition.optionalContentIndex = association.optionalContentIndex;
     definition.defaultVisible = association.defaultVisible;
-    if (!association.defaultVisible) {
+    if (!options.retainOptionalContent && !association.defaultVisible) {
       definition.content = new Uint8Array(0);
       definition.preparedContent = prepareFormInlineContent(
         document,
@@ -245,9 +248,10 @@ export async function buildNativePdfFormDefinitionGraph(
           registry,
           options.appearanceSynthesizer,
           annotation,
-          options.signal
+          options.signal,
+          options.retainOptionalContent
         )
-      : await registry.resolveAnnotationAppearance(annotation, options.signal);
+      : await registry.resolveAnnotationAppearance(annotation, options.signal, options.retainOptionalContent);
     if (!appearance) continue;
     const resourceName = `${annotation.subtype}#${annotation.annotationIndex}`;
     const definitionIndex = await prepare(appearance.normalAppearance, resourceName);
@@ -357,7 +361,7 @@ export async function buildNativePdfScopedFormDefinitionGraph(
     );
     definition.optionalContentIndex = association.optionalContentIndex;
     definition.defaultVisible = association.defaultVisible;
-    if (!association.defaultVisible) {
+    if (!options.retainOptionalContent && !association.defaultVisible) {
       definition.content = new Uint8Array(0);
       definition.preparedContent = prepareFormInlineContent(
         document,
@@ -505,7 +509,7 @@ export async function buildNativePdfResourceFormDefinitionGraph(
     );
     definition.optionalContentIndex = association.optionalContentIndex;
     definition.defaultVisible = association.defaultVisible;
-    if (!association.defaultVisible) {
+    if (!options.retainOptionalContent && !association.defaultVisible) {
       definition.content = new Uint8Array(0);
       definition.preparedContent = prepareFormInlineContent(
         document,

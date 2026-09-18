@@ -68,7 +68,7 @@ try {
 
       const archive = await HepArchive.loadAsync(bytes);
       const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
-      assert.equal(manifest.formatVersion, 6, "additive metadata must not change the HEP format");
+      assert.equal(manifest.formatVersion, 7, "statistics roundtrips use the current HEP format");
       delete manifest.scene.imageLayerSegmentCount;
       delete manifest.scene.operatorCountKind;
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",
@@ -88,7 +88,7 @@ try {
   } finally {
     await session.close();
   }
-  console.log("scene statistics, native transfers, grid aggregation and v6 metadata tests passed");
+  console.log("scene statistics, native transfers, grid aggregation and v7 metadata tests passed");
 } finally {
   hooks.deregister();
 }

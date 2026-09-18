@@ -1,9 +1,14 @@
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
+import { validateSceneOptionalContent, validateSceneOptionalContentReferences } from "./optionalContent";
+import { validateSceneRetainedPages } from "./retainedPageData";
+import { encodeHeprPageData, decodeHeprPageData } from "./heprPageEncoding";
+import type { HeprPageData } from "./heprDocumentData";
+import { validateScenePaintGraph } from "./scenePaintGraph";
+import { readHepGradientMesh, writeHepGradientMesh, validateGradientMesh } from "./hepGradientMesh";
 import { HepArchive, type HepArchiveEntry } from "./hepContainer";
 import { waitForLoad } from "./loadCancellation";
 
 import {
-  extractPdfRasterScene,
   GRADIENT_LUT_WIDTH,
   inferPageTextRanges,
   optimizeVectorSceneTextGlyphs,
@@ -14,7 +19,6 @@ import {
   type VectorScene
 } from "./pdfVectorExtractor";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
-import { hasPdfHeader } from "./pdfSignature";
 import {
   decodeRasterImageToRgba,
   encodeRasterRgbaAsBestImage,
@@ -93,7 +97,6 @@ type TextureComponentType =
 export interface BuildHepBlobOptions {
   encodeRasterImages?: boolean;
   compression?: "STORE" | "DEFLATE";
-  sourcePdfPages?: string;
   signal?: AbortSignal;
   onBuildProgress?: (value: number, progress: HepBuildProgress) => void;
 }
@@ -106,7 +109,7 @@ export interface HepBuildProgress {
 }
 
 export interface LoadHepOptions {
-  /** Stop loading between archive entries, image decodes, and recovery work. */
+  /** Stop loading between archive entries, image decodes, and retained resource reads. */
   signal?: AbortSignal;
   onProgress?: LoadProgressCallback;
 }
@@ -126,6 +129,7 @@ interface ParsedDataTextureEntry {
 }
 
 interface ParsedDataRasterLayerEntry {
+  opacity?: unknown;
   width?: unknown;
   height?: unknown;
   matrix?: unknown;
@@ -136,6 +140,9 @@ interface ParsedDataRasterLayerEntry {
 }
 
 interface ParsedDataSceneEntry {
+  retainedPages?: unknown;
+  paintGraph?: unknown;
+  optionalContent?: unknown;
   drawRuns?: unknown;
   clipPaths?: unknown;
   bounds?: unknown;
@@ -177,16 +184,13 @@ interface ParsedDataSceneEntry {
 interface ParsedDataManifest {
   formatVersion?: unknown;
   sourceFile?: unknown;
-  sourcePdfFile?: unknown;
-  sourcePdfPages?: unknown;
-  sourcePdfUrl?: unknown;
-  sourcePdfSizeBytes?: unknown;
   scene?: ParsedDataSceneEntry;
   textures?: ParsedDataTextureEntry[];
   textIndex?: unknown;
   strokeGeometry?: unknown;
   textInstances?: unknown;
   gradientLut?: unknown;
+  gradientMesh?: unknown;
 }
 
 interface ParsedDataGradientLutEntry {
@@ -205,6 +209,7 @@ export interface HepBlobResult {
 }
 
 interface SerializedRasterLayerEntry {
+  opacity?: number;
   width: number;
   height: number;
   matrix: number[];
@@ -220,20 +225,17 @@ export async function buildHepBlobForLayout(
   scene: VectorScene,
   sceneStats: SceneTextureStats,
   label: string,
-  sourcePdfBytes: Uint8Array | null,
   textureLayout: TextureLayout,
   sceneRasterLayers: RasterLayer[],
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
   validateVectorDrawRuns(scene);
+  validateSceneOptionalContentReferences(scene);
+  validateSceneRetainedPages(scene);
+  validateScenePaintGraph(scene);
   throwIfBuildAborted(options.signal);
   const encodeRasterImages = options.encodeRasterImages ?? true;
   const compression = options.compression ?? "DEFLATE";
-  const sourcePdfPages =
-    typeof options.sourcePdfPages === "string" && options.sourcePdfPages.trim().length > 0
-      ? options.sourcePdfPages.trim()
-      : undefined;
-
   const totalRasterTexels = encodeRasterImages
     ? countRasterTexelsToEncode(sceneRasterLayers)
     : 0;
@@ -250,11 +252,19 @@ export async function buildHepBlobForLayout(
       : { stage: "hep-build" }
   );
   const archive = new HepArchive();
+  const gradientMesh = writeHepGradientMesh(archive, scene);
+  const retainedFiles = new Map<HeprPageData, string>();
+  const retainedPages = scene.retainedPages?.map(resource => {
+    let file = retainedFiles.get(resource.page);
+    if (!file) {
+      file = `retained/page-${retainedFiles.size}.bin`;
+      archive.file(file, encodeHeprPageData(resource.page, options.signal));
+      retainedFiles.set(resource.page, file);
+    }
+    return { file, optionalContentConditions: Array.from(resource.optionalContentConditions), matrix: Array.from(resource.matrix) };
+  });
   const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
-  const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
-  const useSourcePdfFallback = includeSourcePdf && sceneRasterLayers.length === 0;
-  const rasterLayers = useSourcePdfFallback ? [] : sceneRasterLayers;
-  const sourcePdfFile = useSourcePdfFallback ? "source/source.pdf" : undefined;
+  const rasterLayers = sceneRasterLayers;
 
   for (const entry of textureEntries) {
     throwIfBuildAborted(options.signal);
@@ -275,14 +285,12 @@ export async function buildHepBlobForLayout(
     );
   }
 
-  if (sourcePdfFile && sourcePdfBytes) {
-    archive.file(sourcePdfFile, sourcePdfBytes);
-  }
 
   const textIndexExport = buildTextIndexExport(scene);
   if (textIndexExport) {
     archive.file(TEXT_INDEX_JSON_PATH, textIndexExport.json);
     archive.file(TEXT_CHAR_MAP_PATH, textIndexExport.charMapBytes);
+    if (textIndexExport.optionalContentBytes) archive.file(TEXT_OPTIONAL_CONTENT_PATH, textIndexExport.optionalContentBytes);
     if (textIndexExport.fallbackBytes) {
       archive.file(TEXT_FALLBACK_PATH, textIndexExport.fallbackBytes);
     }
@@ -322,6 +330,9 @@ export async function buildHepBlobForLayout(
     ) {
       throw new Error(`Raster layer ${i} has invalid dimensions or insufficient RGBA data.`);
     }
+    if (layer.opacity !== undefined && (!Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 1)) {
+      throw new Error(`Raster layer ${i} has invalid opacity.`);
+    }
     const serializedMatrix = Array.from(layer.matrix);
     if (
       serializedMatrix.length !== 6 ||
@@ -360,7 +371,8 @@ export async function buildHepBlobForLayout(
       file: filePath,
       encoding,
       paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
-      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
+      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
+      ...(layer.opacity === undefined ? {} : { opacity: layer.opacity })
     });
     if (encodeRasterImages) {
       encodedRasterTexels += layer.width * layer.height;
@@ -381,9 +393,6 @@ export async function buildHepBlobForLayout(
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
-    sourcePdfFile,
-    sourcePdfPages: useSourcePdfFallback ? sourcePdfPages : undefined,
-    sourcePdfSizeBytes: useSourcePdfFallback ? sourcePdfBytes?.length ?? 0 : 0,
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
     textInstances: textInstancesExport?.manifest,
@@ -395,11 +404,13 @@ export async function buildHepBlobForLayout(
         byteLength: gradientLutByteLength
       }
       : undefined,
+    gradientMesh,
     textIndex: textIndexExport
       ? {
         version: 2,
         file: TEXT_INDEX_JSON_PATH,
         charMapFile: TEXT_CHAR_MAP_PATH,
+        optionalContentFile: textIndexExport.optionalContentBytes ? TEXT_OPTIONAL_CONTENT_PATH : undefined,
         fallbackFile: textIndexExport.fallbackBytes ? TEXT_FALLBACK_PATH : undefined,
         fallbackColumnByteLengths: textIndexExport.fallbackBytes ? textIndexExport.fallbackColumnByteLengths : undefined,
         pageCount: textIndexExport.pageCount,
@@ -418,6 +429,10 @@ export async function buildHepBlobForLayout(
       operatorCount: scene.operatorCount,
       operatorCountKind: scene.operatorCountKind,
       drawRuns: scene.drawRuns,
+      optionalContent: scene.optionalContent,
+      retainedPages,
+      paintGraph: scene.paintGraph ? JSON.parse(JSON.stringify(scene.paintGraph,
+        (_key, value: unknown) => value instanceof Float32Array ? Array.from(value) : value)) : undefined,
       clipPaths: scene.clipPaths?.map(clip => ({ ...clip, edges: Array.from(clip.edges) })),
       imageLayerSegmentCount: scene.imageLayerSegmentCount,
       discardedTransparentCount: scene.discardedTransparentCount,
@@ -513,24 +528,25 @@ function throwIfBuildAborted(signal: AbortSignal | undefined): void {
   signal?.throwIfAborted();
 }
 
-/** v6 adds first-class analytic gradient and soft-mask paint resources. */
-const PARSED_DATA_FORMAT_VERSION = 6;
+/** v7 retains PDF layer definitions, conditions and initially hidden content. */
+const PARSED_DATA_FORMAT_VERSION = 7;
 const MAX_PARSED_RASTER_LAYER_COUNT = 4_096;
 const MAX_PARSED_RASTER_DIMENSION = 16_384;
 const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
 const MAX_PARSED_RASTER_PAYLOAD_BYTES = 768 * 1024 * 1024;
 const MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES = 1024 * 1024 * 1024;
 const MAX_PARSED_RASTER_TOTAL_TEXELS = 2 * MAX_PARSED_RASTER_TEXELS_PER_LAYER;
-const MAX_EMBEDDED_SOURCE_PDF_BYTES = 512 * 1024 * 1024;
 const MAX_PARSED_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";
+const TEXT_OPTIONAL_CONTENT_PATH = "text/optional-content.varint";
 
 interface TextIndexExportResult {
   json: string;
   charMapBytes: Uint8Array;
+  optionalContentBytes: Uint8Array | null;
   fallbackBytes: Uint8Array | null;
   fallbackColumnByteLengths: number[];
   pageCount: number;
@@ -584,6 +600,12 @@ function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null 
   }
 
   let fallbackBytes: Uint8Array | null = null;
+  const optionalContent = pages.some(page => page.optionalContent !== undefined)
+    ? new ByteWriter(totalCharCount + 16) : null;
+  if (optionalContent) for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+    const associations = pages[pageIndex].optionalContent;
+    for (let index = 0; index < pageEntries[pageIndex].charCount; index++) optionalContent.writeVarUint32((associations?.[index] ?? -1) + 1);
+  }
   const fallbackColumnByteLengths: number[] = [];
   if (totalFallbackCount > 0) {
     const quads = new Float32Array(totalFallbackCount * 4);
@@ -615,6 +637,7 @@ function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null 
   return {
     json: JSON.stringify({ version: 2, pages: pageEntries }),
     charMapBytes: charMap.toUint8Array(),
+    optionalContentBytes: optionalContent?.toUint8Array() ?? null,
     fallbackBytes,
     fallbackColumnByteLengths,
     pageCount: pageEntries.length,
@@ -627,6 +650,7 @@ interface TextIndexManifestMeta {
   version?: unknown;
   file?: unknown;
   charMapFile?: unknown;
+  optionalContentFile?: unknown;
   fallbackFile?: unknown;
   fallbackColumnByteLengths?: unknown;
 }
@@ -662,6 +686,8 @@ async function readSceneTextIndexFromParsedData(archive: HepArchive, manifest: P
     }
     return await readTextIndexV2(archive, meta, pageEntries, charMapEntry);
   } catch (error) {
+    if (manifest.textIndex && typeof manifest.textIndex === "object" &&
+        "optionalContentFile" in manifest.textIndex) throw error;
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[Parsed data load] Failed to read text index: ${message}`);
     return null;
@@ -675,6 +701,13 @@ async function readTextIndexV2(
   charMapEntry: HepArchiveEntry
 ): Promise<SceneTextIndex | null> {
   const charMapBytes = new Uint8Array(await charMapEntry.async("arraybuffer"));
+  let optionalCursor: VarintCursor | undefined;
+  if (meta.optionalContentFile !== undefined) {
+    if (typeof meta.optionalContentFile !== "string" || !meta.optionalContentFile) throw new Error("Invalid text optional-content section.");
+    const entry = archive.file(meta.optionalContentFile);
+    if (!entry) throw new Error("Missing text optional-content section.");
+    optionalCursor = new VarintCursor(new Uint8Array(await entry.async("arraybuffer")));
+  }
 
   let totalFallbackCount = 0;
   for (const entry of pageEntries) {
@@ -741,9 +774,16 @@ async function readTextIndexV2(
       ? fallbackAll.slice(fallbackOffset * 4, (fallbackOffset + pageFallbackCount) * 4)
       : new Float32Array(0);
     fallbackOffset += pageFallbackCount;
-    pages.push({ text, charInstance, fallbackQuads });
+    const optionalContent = optionalCursor ? new Int32Array(text.length) : undefined;
+    if (optionalContent) for (let index = 0; index < text.length; index++) {
+      const condition = optionalCursor!.readVarUint32() - 1;
+      if (condition > 0x7fffffff) throw new Error("Invalid text optional-content reference.");
+      optionalContent[index] = condition;
+    }
+    pages.push({ text, charInstance, fallbackQuads, ...(optionalContent ? { optionalContent } : {}) });
   }
   cursor.expectEnd("text/char-map.bin");
+  optionalCursor?.expectEnd(TEXT_OPTIONAL_CONTENT_PATH);
 
   return { version: 2, pages };
 }
@@ -1131,6 +1171,9 @@ const preparedHepScenes = new WeakSet<VectorScene>();
  */
 export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
   validateVectorDrawRuns(scene);
+  validateSceneOptionalContentReferences(scene);
+  validateSceneRetainedPages(scene);
+  validateScenePaintGraph(scene);
   if (preparedHepScenes.has(scene)) {
     return scene;
   }
@@ -1177,7 +1220,7 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
 }
 
 /**
- * Stroke storage (retained in v6): uint16 range-quantized coordinates stored as chained
+ * Stroke storage (retained in v7): uint16 range-quantized coordinates stored as chained
  * per-column zigzag-varint deltas (start chains to the previous end, end is
  * relative to its own start) plus a type bitset, a raw u16 packed style
  * column, and control-point deltas only for curve segments.
@@ -1310,7 +1353,7 @@ interface TextInstancesExport {
 }
 
 /**
- * Text instance storage (retained in v6): e/f as fixed-point 1/512 per-column varint deltas
+ * Text instance storage (retained in v7): e/f as fixed-point 1/512 per-column varint deltas
  * (quantization approved: max error 1/1024 scene unit), glyph indices as a
  * raw u16/u32 column. The always-zero 4th channel is dropped.
  */
@@ -1666,6 +1709,8 @@ async function loadSceneFromHepInternal(
   const gradientStrokePrimitiveBounds = trimTextureForItemCount(gradientStrokePrimitiveBoundsEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-primitive-bounds");
   const gradientStrokeStyles = trimTextureForItemCount(gradientStrokeStylesEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-styles");
   const gradientLut = await readGradientLutFromParsedData(archive, manifest.gradientLut, gradientCount);
+  const gradientMesh = await readHepGradientMesh(archive, manifest.gradientMesh, gradientCount, signal);
+  validateGradientMesh({ gradientCount, gradientMetaA, ...gradientMesh });
   const nativeGradientResources: NativeGradientResources = {
     gradientCount,
     gradientMetaA,
@@ -1757,7 +1802,7 @@ async function loadSceneFromHepInternal(
   validateNativeGradientResources(nativeGradientResources, pageCount);
   progress.report(0.82, { stage: "hep-section", sourceType: "hep", unit: "sections" });
   signal?.throwIfAborted();
-  let rasterLayers = await readRasterLayersFromParsedData(archive, sceneMeta, signal);
+  const rasterLayers = await readRasterLayersFromParsedData(archive, sceneMeta, signal);
   signal?.throwIfAborted();
   for (const layer of rasterLayers) {
     if (layer.pageIndex >= pageCount) {
@@ -1765,34 +1810,6 @@ async function loadSceneFromHepInternal(
     }
   }
   progress.report(0.88, { stage: "compile", sourceType: "hep" });
-  if (rasterLayers.length === 0) {
-    const sourcePdfBytes = await readSourcePdfBytesFromParsedData(archive, manifest);
-    signal?.throwIfAborted();
-    if (sourcePdfBytes) {
-      try {
-        const sourcePdfPages = readNonEmptyString(manifest.sourcePdfPages);
-        const rasterScene = await extractPdfRasterScene(createParseBuffer(sourcePdfBytes), {
-          pages: sourcePdfPages ?? (pageCount === 1 ? "1" : `1-${pageCount}`),
-          maxPagesPerRow: pagesPerRow
-        }, signal);
-        if (rasterScene.pageCount !== pageCount) {
-          throw new Error(
-            `Embedded source PDF restored ${rasterScene.pageCount} page(s); expected ${pageCount}.`
-          );
-        }
-        rasterLayers = listSceneRasterLayers(rasterScene);
-        if (rasterLayers.length > 0) {
-          console.log(
-            `[Parsed data load] Restored ${rasterLayers.length.toLocaleString()} raster layer(s) from embedded source PDF.`
-          );
-        }
-      } catch (error) {
-        signal?.throwIfAborted();
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[Parsed data load] Failed to restore raster layers from source PDF: ${message}`);
-      }
-    }
-  }
   const primaryRasterLayer = rasterLayers[0] ?? null;
   const textIndex = await readSceneTextIndexFromParsedData(archive, manifest);
   signal?.throwIfAborted();
@@ -1824,6 +1841,7 @@ async function loadSceneFromHepInternal(
   progress.report(0.96, { stage: "compile", sourceType: "hep" });
 
   const scene = optimizeVectorSceneTextGlyphs({
+    ...gradientMesh,
     pageRects,
     pageTextRanges,
     textIndex,
@@ -1917,7 +1935,62 @@ async function loadSceneFromHepInternal(
   if (sceneMeta.drawRuns !== undefined) {
     scene.drawRuns = sceneMeta.drawRuns as VectorScene["drawRuns"];
   }
+  if (sceneMeta.optionalContent !== undefined) {
+    validateSceneOptionalContent(sceneMeta.optionalContent);
+    scene.optionalContent = sceneMeta.optionalContent;
+  }
+  if (sceneMeta.retainedPages !== undefined) {
+    if (!Array.isArray(sceneMeta.retainedPages) || sceneMeta.retainedPages.length > 4096) throw new Error("Invalid retained page resources.");
+    const retained = new Map<string, HeprPageData>();
+    scene.retainedPages = [];
+    for (const resource of sceneMeta.retainedPages) {
+      signal?.throwIfAborted();
+      if (!resource || typeof resource.file !== "string" || !resource.file ||
+          !Array.isArray(resource.matrix) || resource.matrix.length !== 6 ||
+          !resource.matrix.every((value: unknown) => typeof value === "number" && Number.isFinite(value)) ||
+          !Array.isArray(resource.optionalContentConditions) || !resource.optionalContentConditions.every((value: unknown) =>
+            typeof value === "number" && Number.isSafeInteger(value) && value >= -1 && value <= 0x7fffffff)) {
+        throw new Error("Invalid retained page resource metadata.");
+      }
+      let page = retained.get(resource.file);
+      if (!page) {
+        const entry = archive.file(resource.file);
+        if (!entry) throw new Error("Missing retained page resource.");
+        page = decodeHeprPageData(await entry.async("uint8array"), signal);
+        retained.set(resource.file, page);
+      }
+      scene.retainedPages.push({ page, matrix: Float32Array.from(resource.matrix),
+        optionalContentConditions: Int32Array.from(resource.optionalContentConditions) });
+    }
+  }
+  if (sceneMeta.paintGraph !== undefined) {
+    const graph = sceneMeta.paintGraph as NonNullable<VectorScene["paintGraph"]>;
+    let count = 0;
+    const readNodes = (nodes: unknown, depth: number): void => {
+      if (!Array.isArray(nodes) || depth > 64) throw new Error("Invalid scene paint graph.");
+      for (const node of nodes) {
+        if (++count > 1_000_000 || !node || typeof node !== "object") throw new Error("Invalid scene paint node.");
+        if (node.kind === "group") {
+          readNodes(node.children, depth + 1);
+          if (node.softMask) {
+            readNodes(node.softMask.children, depth + 1);
+            if (node.softMask.transfer !== undefined) {
+              if (!Array.isArray(node.softMask.transfer) || !node.softMask.transfer.every((value: unknown) => typeof value === "number" && Number.isFinite(value))) {
+                throw new Error("Invalid scene mask transfer function.");
+              }
+              node.softMask.transfer = Float32Array.from(node.softMask.transfer);
+            }
+          }
+        }
+      }
+    };
+    if (!graph || typeof graph !== "object") throw new Error("Invalid scene paint graph.");
+    readNodes(graph.roots, 0); scene.paintGraph = graph;
+  }
   validateVectorDrawRuns(scene);
+  validateSceneOptionalContentReferences(scene);
+  validateSceneRetainedPages(scene);
+  validateScenePaintGraph(scene);
   if (strokeGeometry) {
     preparedStrokeGeometry.set(scene, strokeGeometry.encoded);
   }
@@ -1943,7 +2016,8 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         data: layer.data,
         matrix,
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
-        pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
+        pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
+        ...(layer.opacity === undefined ? {} : { opacity: layer.opacity })
       });
     }
   }
@@ -2078,8 +2152,14 @@ function validateNativeGradientResources(resources: NativeGradientResources, pag
     const offset = i * 4;
     const kind = gradientMetaA[offset];
     const hasBBox = gradientMetaA[offset + 1];
-    if ((kind !== 0 && kind !== 1) || (hasBBox !== 0 && hasBBox !== 1)) {
+    if ((kind !== 0 && kind !== 1 && kind !== 2) || (hasBBox !== 0 && hasBBox !== 1)) {
       throw new Error(`Gradient ${i} has an invalid kind or bounding-box flag.`);
+    }
+    const extensionFlags = gradientMetaA[offset + 2];
+    const background = gradientMetaA[offset + 3];
+    if (!Number.isInteger(extensionFlags) || extensionFlags < 0 || extensionFlags > 3 ||
+        !Number.isInteger(background) || background < 0 || background > 0x1000000) {
+      throw new Error(`Gradient ${i} has invalid extension or background metadata.`);
     }
     const values = [
       ...gradientMetaB.subarray(offset, offset + 4),
@@ -2108,9 +2188,6 @@ function validateNativeGradientResources(resources: NativeGradientResources, pag
       const centerDistance = Math.hypot(dx, dy);
       if (centerDistance <= 1e-9 && Math.abs(radius1 - radius0) <= 1e-9) {
         throw new Error(`Radial gradient ${i} has identical start and end circles.`);
-      }
-      if (centerDistance + radius1 > radius0 && centerDistance + radius0 > radius1) {
-        throw new Error(`Radial gradient ${i} uses an unsupported intersecting-circle topology.`);
       }
     }
     if (hasBBox === 1) {
@@ -2367,98 +2444,6 @@ function parseMat2D(value: unknown): Float32Array | null {
   return out;
 }
 
-async function readSourcePdfBytesFromParsedData(archive: HepArchive, manifest: ParsedDataManifest): Promise<Uint8Array | null> {
-  const manifestPath = readNonEmptyString(manifest.sourcePdfFile);
-  const manifestSize = typeof manifest.sourcePdfSizeBytes === "number" &&
-    Number.isSafeInteger(manifest.sourcePdfSizeBytes) &&
-    manifest.sourcePdfSizeBytes > 0
-    ? manifest.sourcePdfSizeBytes
-    : null;
-  const candidatePaths = [
-    manifestPath,
-    "source/source.pdf",
-    "source.pdf"
-  ];
-
-  for (const candidatePath of candidatePaths) {
-    if (!candidatePath) {
-      continue;
-    }
-    const archiveEntry = archive.file(candidatePath);
-    if (!archiveEntry) {
-      continue;
-    }
-
-    const entrySize = readHepEntryUncompressedSize(archiveEntry);
-    if (
-      entrySize === null ||
-      entrySize > MAX_EMBEDDED_SOURCE_PDF_BYTES ||
-      (candidatePath === manifestPath && manifestSize !== null && entrySize !== manifestSize)
-    ) {
-      throw new Error("Embedded source PDF size is invalid or exceeds the memory budget.");
-    }
-
-    const fileBuffer = await archiveEntry.async("arraybuffer");
-    const bytes = new Uint8Array(fileBuffer);
-    if (hasPdfHeader(bytes)) {
-      return bytes;
-    }
-  }
-
-  return null;
-}
-
-export async function tryReadSourcePdfBytesFromExistingHep(
-  hepBytes: Uint8Array,
-  signal?: AbortSignal
-): Promise<Uint8Array | null> {
-  try {
-    const archive = await HepArchive.loadAsync(hepBytes, { signal });
-    const manifestFile = archive.file("manifest.json");
-    let sourcePdfFile: string | null = null;
-    if (manifestFile) {
-      const manifestByteLength = readHepEntryUncompressedSize(manifestFile);
-      if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
-        return null;
-      }
-      const manifestJson = await manifestFile.async("string");
-      try {
-        const manifest = JSON.parse(manifestJson) as ParsedDataManifest;
-        sourcePdfFile = readNonEmptyString(manifest.sourcePdfFile);
-      } catch {
-        sourcePdfFile = null;
-      }
-    }
-
-    const candidatePaths = [sourcePdfFile, "source/source.pdf", "source.pdf"];
-    for (const candidatePath of candidatePaths) {
-      if (!candidatePath) {
-        continue;
-      }
-      const entry = archive.file(candidatePath);
-      if (!entry) {
-        continue;
-      }
-      const sourcePdfByteLength = readHepEntryUncompressedSize(entry);
-      if (
-        sourcePdfByteLength === null ||
-        sourcePdfByteLength > MAX_EMBEDDED_SOURCE_PDF_BYTES
-      ) {
-        return null;
-      }
-      const fileBuffer = await entry.async("arraybuffer");
-      const bytes = new Uint8Array(fileBuffer);
-      if (hasPdfHeader(bytes)) {
-        return bytes;
-      }
-    }
-  } catch {
-    signal?.throwIfAborted();
-    // Source recovery is best-effort, but cancellation must still propagate.
-  }
-
-  return null;
-}
 
 async function readRasterLayersFromParsedData(
   archive: HepArchive,
@@ -2486,6 +2471,7 @@ async function readRasterLayersFromParsedData(
     const matrix = parseMat2D(layerMeta.matrix);
     const paintOrder = layerMeta.paintOrder;
     const pageIndex = layerMeta.pageIndex;
+    const opacity = layerMeta.opacity;
     if (
       width === null ||
       height === null ||
@@ -2496,9 +2482,9 @@ async function readRasterLayersFromParsedData(
       paintOrder < 0 ||
       typeof pageIndex !== "number" ||
       !Number.isSafeInteger(pageIndex) ||
-      pageIndex < 0
+      pageIndex < 0 || (opacity !== undefined && (typeof opacity !== "number" || !Number.isFinite(opacity) || opacity < 0 || opacity > 1))
     ) {
-      throw new Error(`Raster layer ${i} has incomplete or invalid v6 metadata.`);
+      throw new Error(`Raster layer ${i} has incomplete or invalid v7 metadata.`);
     }
 
     const decoded = await readRasterLayerFromZip(archive, path, width, height);
@@ -2512,7 +2498,7 @@ async function readRasterLayersFromParsedData(
       decoded.height !== height ||
       decoded.data.byteLength !== expectedByteLength
     ) {
-      throw new Error(`Raster layer ${i} dimensions do not match its v6 metadata.`);
+      throw new Error(`Raster layer ${i} dimensions do not match its v7 metadata.`);
     }
 
     layers.push({
@@ -2521,7 +2507,8 @@ async function readRasterLayersFromParsedData(
       matrix,
       data: decoded.data,
       paintOrder,
-      pageIndex
+      pageIndex,
+      ...(opacity === undefined ? {} : { opacity: opacity as number })
     });
   }
 
@@ -2550,7 +2537,7 @@ async function readRasterLayerFromZip(
       metadata.height !== heightHint
     ) {
       throw new Error(
-        `Raster image ${path} header dimensions do not match its v6 metadata.`
+        `Raster image ${path} header dimensions do not match its v7 metadata.`
       );
     }
 
@@ -2613,7 +2600,7 @@ function validateRasterLayerBudgets(
       texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER ||
       !path
     ) {
-      throw new Error(`Raster layer ${i} has inconsistent v6 texture metadata.`);
+      throw new Error(`Raster layer ${i} has inconsistent v7 texture metadata.`);
     }
 
     const archiveEntry = archive.file(path);
@@ -3042,8 +3029,4 @@ function readQuantizationVector(value: unknown, textureName: string, label: stri
     out[i] = number;
   }
   return out;
-}
-
-function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
-  return new Uint8Array(bytes).buffer;
 }

@@ -1,6 +1,5 @@
 import {
   loadPdfSceneFromSource,
-  readPdfObjectSourceBytes,
   type PdfObjectSource
 } from "./pdfObjectGenerator";
 import {
@@ -14,7 +13,6 @@ import {
   type LoadProgressCallback,
   type PDFLoadProgress
 } from "./loadProgress";
-import { hasPdfHeader } from "./pdfSignature";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
@@ -58,20 +56,7 @@ export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOption
 }
 
 /** Options when building parsed data from an existing HEPR scene. */
-export interface BuildHepFromSceneOptions extends HepEncodingOptions {
-  /**
-   * Original PDF source used only when the scene reports images but contains no
-   * extracted raster layers. It accepts the same source forms as `pdfObjectGenerator`.
-   */
-  sourcePdf?: PdfObjectSource;
-
-  /**
-   * Original PDF pages represented by the scene, used when restoring raster
-   * layers from `sourcePdf` after loading the generated HEP file. Supply this when
-   * the scene was parsed from a non-prefix selection such as `"3-5"`.
-   */
-  sourcePdfPages?: string;
-}
+export type BuildHepFromSceneOptions = HepEncodingOptions;
 
 /**
  * Build a HEP parsed-data file from a PDF source.
@@ -121,15 +106,10 @@ async function buildHepFromPdf(
   }, options.signal);
   options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(loaded.scene);
-  const sourcePdfBytes = needsSourcePdfFallback(loaded.scene, rasterLayers.length)
-    ? loaded.sourceBytes
-    : null;
   const result = await buildSceneHep(
     loaded.scene,
     normalizeSourceLabel(options.sourceLabel, loaded.sourceLabel),
-    sourcePdfBytes,
     rasterLayers,
-    options.pages,
     options,
     progress.child(0.82, 1, { sourceType: "pdf" })
   );
@@ -145,37 +125,13 @@ async function buildHepFromScene(
   const progress = createLoadProgressReporter(options.onProgress);
   options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(scene);
-  const needsFallback = needsSourcePdfFallback(scene, rasterLayers.length);
-  let sourcePdfBytes: Uint8Array | null = null;
-  let buildStart = 0;
-
-  if (needsFallback) {
-    if (options.sourcePdf === undefined) {
-      throw new Error(
-        "This scene contains PDF image operations but no extracted raster layers. " +
-        "Pass options.sourcePdf so the generated HEP file can preserve the missing image content."
-      );
-    }
-    buildStart = 0.16;
-    sourcePdfBytes = await readPdfObjectSourceBytes(
-      options.sourcePdf,
-      progress.child(0, buildStart, { sourceType: "pdf" }),
-      options.signal
-    );
-    options.signal?.throwIfAborted();
-    if (!hasPdfHeader(sourcePdfBytes)) {
-      throw new Error("options.sourcePdf does not contain PDF data.");
-    }
-  }
 
   const result = await buildSceneHep(
     scene,
     normalizeSourceLabel(options.sourceLabel, "document.pdf"),
-    sourcePdfBytes,
     rasterLayers,
-    options.sourcePdfPages,
     options,
-    progress.child(buildStart, 1)
+    progress.child(0, 1)
   );
   progress.complete();
   options.signal?.throwIfAborted();
@@ -185,9 +141,7 @@ async function buildHepFromScene(
 async function buildSceneHep(
   scene: VectorScene,
   sourceLabel: string,
-  sourcePdfBytes: Uint8Array | null,
   rasterLayers: ReturnType<typeof listSceneRasterLayers>,
-  sourcePdfPages: string | undefined,
   options: HepEncodingOptions,
   progress: ReturnType<typeof createLoadProgressReporter>
 ): Promise<Blob> {
@@ -196,13 +150,11 @@ async function buildSceneHep(
     scene,
     buildSceneTextureStats(scene),
     sourceLabel,
-    sourcePdfBytes,
     "interleaved",
     rasterLayers,
     {
       encodeRasterImages: options.encodeRasterImages ?? true,
       compression: options.compression === "store" ? "STORE" : "DEFLATE",
-      sourcePdfPages,
       signal: options.signal,
       onBuildProgress: (value, buildProgress) => {
         progress.report(value, {
@@ -250,7 +202,7 @@ function assertCurrentVectorScene(scene: VectorScene): void {
     !(scene.gradientLut instanceof Uint8Array)
   ) {
     throw new Error(
-      "VectorScene is missing the native-gradient resources required by HEP format v6."
+      "VectorScene is missing the native-gradient resources required by HEP format v7."
     );
   }
 }
@@ -320,6 +272,9 @@ function normalizeSourceLabel(value: string | undefined, fallback: string): stri
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {
+  if ("sourcePdf" in options || "sourcePdfPages" in options) {
+    throw new RangeError("sourcePdf and sourcePdfPages are no longer supported; HEP v7 requires a complete scene. Reparse the original PDF before export.");
+  }
   if ("compressionLevel" in options) {
     throw new RangeError("compressionLevel is no longer supported; native HEP compression uses the platform default.");
   }
@@ -332,9 +287,6 @@ function validateEncodingOptions(options: HepEncodingOptions): void {
   }
 }
 
-function needsSourcePdfFallback(scene: VectorScene, rasterLayerCount: number): boolean {
-  return scene.imagePaintOpCount > 0 && rasterLayerCount === 0;
-}
 
 function isVectorScene(value: PdfObjectSource | VectorScene): value is VectorScene {
   if (!value || typeof value !== "object") {

@@ -1,7 +1,10 @@
+import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
 
 const GRADIENT_COMMON = `
 ${VECTOR_CLIP_GLSL}
+${GRADIENT_PARAMETER_GLSL}
+${GRADIENT_BACKGROUND_GLSL}
 uniform sampler2D uGradientMetaTexA;
 uniform sampler2D uGradientMetaTexB;
 uniform sampler2D uGradientMetaTexC;
@@ -35,49 +38,9 @@ vec4 samplePdfGradient(int index, vec2 scenePoint) {
     return vec4(0.0);
   }
 
-  vec2 p0 = metaC.zw;
-  vec2 p1 = metaD.xy;
-  vec2 axis = p1 - p0;
-  float t = 0.0;
-  if (metaA.x < 0.5) {
-    float denominator = dot(axis, axis);
-    if (denominator <= 1e-12) {
-      return vec4(0.0);
-    }
-    t = dot(point - p0, axis) / denominator;
-  } else {
-    float radius0 = metaD.z;
-    float radiusDelta = metaD.w - radius0;
-    vec2 offset = point - p0;
-    float coefficientA = dot(axis, axis) - radiusDelta * radiusDelta;
-    float coefficientB = -2.0 * (dot(offset, axis) + radius0 * radiusDelta);
-    float coefficientC = dot(offset, offset) - radius0 * radius0;
-    float firstRoot = -1e20;
-    float secondRoot = -1e20;
-    if (abs(coefficientA) <= 1e-10) {
-      if (abs(coefficientB) <= 1e-10) {
-        return vec4(0.0);
-      }
-      firstRoot = -coefficientC / coefficientB;
-    } else {
-      float discriminant = coefficientB * coefficientB - 4.0 * coefficientA * coefficientC;
-      if (discriminant < 0.0) {
-        return vec4(0.0);
-      }
-      float rootDelta = sqrt(max(discriminant, 0.0));
-      firstRoot = (-coefficientB - rootDelta) / (2.0 * coefficientA);
-      secondRoot = (-coefficientB + rootDelta) / (2.0 * coefficientA);
-    }
-    bool firstValid = firstRoot > -1e19 && radius0 + firstRoot * radiusDelta >= 0.0;
-    bool secondValid = secondRoot > -1e19 && radius0 + secondRoot * radiusDelta >= 0.0;
-    if (!firstValid && !secondValid) {
-      return vec4(0.0);
-    }
-    t = secondValid ? secondRoot : firstRoot;
-    if (firstValid && secondValid) {
-      t = max(firstRoot, secondRoot);
-    }
-  }
+  vec2 parameter = heprGradientParameter(metaA, metaC, metaD, point);
+  if (parameter.y < 0.5) return heprGradientBackground(metaA.w);
+  float t = parameter.x;
 
   float lutX = (clamp(t, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0;
   float lutY = (float(index) + 0.5) / float(max(uGradientCount, 1));
@@ -191,7 +154,6 @@ in vec2 vLocal;
 
 out vec4 outColor;
 
-const int MAX_PATH_PRIMITIVES = 2048;
 const int QUADRATIC_STEPS = 8;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -267,8 +229,7 @@ void main() {
   int winding = 0;
   int crossings = 0;
 
-  for (int primitiveIndex = 0; primitiveIndex < MAX_PATH_PRIMITIVES; primitiveIndex += 1) {
-    if (primitiveIndex >= vSegmentCount) break;
+  for (int primitiveIndex = 0; primitiveIndex < vSegmentCount; primitiveIndex += 1) {
     ivec2 coord = coordFromIndex(vSegmentStart + primitiveIndex, uSegmentTexSize);
     vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
     vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);

@@ -72,6 +72,8 @@ export interface DensePdfPageDataOptions {
   readonly diagnostics?: readonly PdfDiagnostic[];
   /** Complete page-local membership table used by command optionalContentIndex values. */
   readonly optionalContent?: HeprOptionalContentStore;
+  /** Internal viewer resource export keeps commands from initially hidden layers. */
+  readonly retainOptionalContent?: boolean;
   /** Specialized, self-contained Form programs and trailing annotation appearances. */
   readonly forms?: DensePdfFormPageData;
   /** Lazily resolved PatternType 1/2 resources and compiled tiling cells. */
@@ -94,6 +96,8 @@ export interface DensePdfSoftMaskProgramData {
   readonly extGStateIndex: number;
   /** Page-local reusable Form program containing the soft-mask `/G` stream. */
   readonly programIndex: number;
+  /** Optional-content association on the soft mask's Form XObject. */
+  readonly optionalContentIndex?: number;
   readonly subtype: "Alpha" | "Luminosity";
   readonly isolated: boolean;
   readonly knockout: boolean;
@@ -1115,7 +1119,7 @@ export function createHeprPageDataFromDense(
         kind: "invoke-program",
         transformIndex: 0,
         clipIndex: -1,
-        optionalContentIndex: -1,
+        optionalContentIndex: mask.optionalContentIndex ?? -1,
         markedContentIndex: -1,
         sourceOffset: -1,
         sourceLength: -1,
@@ -1155,7 +1159,7 @@ export function createHeprPageDataFromDense(
       throw new TypeError("Dense PDF paint run references invalid optional content.");
     }
     if (
-      optionalContentIndex >= 0 &&
+      !options.retainOptionalContent && optionalContentIndex >= 0 &&
       stores.optionalContent.defaultVisible[optionalContentIndex] === 0
     ) {
       throw new TypeError("Hidden default-view optional content retained a draw command.");
@@ -2308,7 +2312,7 @@ export function createHeprPageDataFromDense(
       annotation.optionalContentIndex < -1 ||
       annotation.optionalContentIndex >= stores.optionalContent.names.length ||
       (
-        annotation.optionalContentIndex >= 0 &&
+        !options.retainOptionalContent && annotation.optionalContentIndex >= 0 &&
         stores.optionalContent.defaultVisible[annotation.optionalContentIndex] === 0
       )
     ) {

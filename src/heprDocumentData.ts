@@ -493,7 +493,7 @@ export interface HeprPaintStore {
 
 export interface HeprOptionalContentStore {
   names: readonly string[];
-  /** Default-view visibility. Hidden content has no draw commands. */
+  /** Default-view visibility; interactive compilation also retains initially hidden commands. */
   defaultVisible: Uint8Array;
 }
 

@@ -192,7 +192,7 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     const preflightStartedAt = nowMs();
     const preflight: DensePdfPreflightResult = await preflightNativeDensePdfDocument(
       request.pdfBytes,
-      { pages: request.options.pages }
+      { pages: request.options.pages, retainOptionalContent: request.options.retainOptionalContent }
     );
     const preflightMs = nowMs() - preflightStartedAt;
     progress.update({

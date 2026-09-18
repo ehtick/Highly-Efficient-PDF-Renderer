@@ -41,6 +41,7 @@ export function createThreePrimitiveInteractionController(
   }
 
   return createPrimitiveInteractionControllerForAdapter({
+    isVisible: ref => options.getPdfObject()?.isPrimitiveVisible(ref) ?? false,
     getCanvas: options.getCanvas,
     getScene: () => options.getPdfObject()?.sceneData ?? null,
     getTarget: options.getPdfObject,
@@ -52,7 +53,7 @@ export function createThreePrimitiveInteractionController(
       // Include object transforms and the entire camera projection, covering
       // orthographic/perspective changes and nonuniform parent transforms.
       return `${camera.projectionMatrix.elements.join(",")}:${camera.matrixWorld.elements.join(",")}:` +
-        `${pdf?.matrixWorld.elements.join(",") ?? ""}`;
+        `${pdf?.matrixWorld.elements.join(",") ?? ""}:${pdf?.layerVisibilityRevision ?? 0}`;
     },
     async pick(point, signal) {
       return object?.pick({ camera: options.getCamera(), element: options.getCanvas(),

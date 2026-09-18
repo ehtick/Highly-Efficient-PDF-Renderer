@@ -1,31 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { stripTypeScriptTypes } from "node:module";
-
-function strippedDataUrl(source) {
-  return `data:text/javascript;base64,${Buffer.from(
-    stripTypeScriptTypes(source, { mode: "strip" })
-  ).toString("base64")}`;
-}
-
-const geometryPath = new URL("../src/sceneTextGeometry.ts", import.meta.url);
-const geometrySource = await readFile(geometryPath, "utf8");
-const geometryUrl = strippedDataUrl(geometrySource);
-
-const searchPath = new URL("../src/textSearch.ts", import.meta.url);
-const searchSource = (await readFile(searchPath, "utf8")).replaceAll(
-  '"./sceneTextGeometry"',
-  JSON.stringify(geometryUrl)
-);
-const {
-  createSceneTextSearcher,
-  createSearchHighlightSet,
-  flattenSearchMatchHighlightBounds
-} = await import(strippedDataUrl(searchSource));
-
-const nativeHighlightsPath = new URL("../src/searchHighlights.ts", import.meta.url);
-const nativeHighlightsSource = await readFile(nativeHighlightsPath, "utf8");
-const { prepareSearchHighlights } = await import(strippedDataUrl(nativeHighlightsSource));
+import { registerHooks } from "node:module";
+registerHooks({ resolve(specifier, context, next) {
+  return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
+const { createSceneTextSearcher, createSearchHighlightSet, flattenSearchMatchHighlightBounds } = await import("../src/textSearch.ts");
+const { prepareSearchHighlights } = await import("../src/searchHighlights.ts");
 
 function createFallbackScene(text, positionForChar) {
   const charInstance = new Int32Array(text.length);

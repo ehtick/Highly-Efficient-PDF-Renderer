@@ -103,6 +103,13 @@ The object supports normal Three.js transforms. `sceneData` contains its parsed
 | `setPrimitiveOverrides(refs, { color })` | Temporarily replace vector RGB, preserving opacity, masks, and drawing order. |
 | `clearPrimitiveOverrides(refs?)` | Restore specified primitives, or all overrides when omitted. |
 | `clearPrimitiveInteraction()` | Clear hover, selection, and colors and release the picking index. |
+| `getLayers()` / `getLayerOrder()` | Read PDF layer records and their display hierarchy. |
+| `setLayerVisibility(id, visible)` | Apply one layer change; resolves after resources and visibility commit. |
+| `setLayerVisibilities(changes)` | Atomically validate and apply an array of `{ id, visible }` changes. |
+| `setAllLayerVisibility(visible, layerIds?)` | Show/hide all editable layers, optionally restricted to IDs, respecting locks and radio groups. |
+| `getAllLayerVisibility(layerIds?)` | Read `{ checked, indeterminate, disabled }` for a bulk-toggle control from applied visibility. |
+| `resetLayerVisibility()` | Restore the PDF's original visibility defaults. |
+| `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
 | `setPageBackgroundColor(r, g, b, alpha)` | Set normalized page background components. |
 | `setVectorColorOverride(r, g, b, opacity)` | Set normalized vector override components. |
@@ -127,7 +134,7 @@ camera and controls. Full method contracts: [HeprThreePdfObject](../src/threePdf
 accepts browser `clientX`/`clientY` values directly. Tolerance defaults to four CSS
 pixels and does not require device-pixel-ratio adjustment. The result contains
 `primitive`, the cursor `point` in composed scene coordinates, `closestPoint`,
-`distancePx`, and an optional `segmentIndex`. The last eligible painted primitive
+`distancePx`, and an optional `segmentIndex` or mesh `triangleIndex`. The last eligible painted primitive
 within tolerance wins. `kinds` filters eligible types, which is useful for a
 measurement tool interested only in strokes. This queries canonical geometry,
 not antialiased framebuffer pixels or simplified LOD geometry.
@@ -149,6 +156,8 @@ color, opacity, and applicable stroke width, hairline/cap flags, and rectangular
 clip. This preserves differing styles within a gradient-stroke run. Gradient
 primitives also expose `gradientIndex` and `maskGradientIndex` into the retained
 gradient store (`null` means a solid source or no mask). Gradient or mixed colors are `null`.
+Mesh and function shadings use `"gradient-fill"` references with `shadingKind: "mesh"`,
+`triangleCount`, and `getTriangle(index)`, which returns detached positions and vertex colors.
 Geometry uses the same composed, Y-up scene coordinates as `sceneData`.
 
 These are the retained drawing primitives. Extraction can merge lines, split
@@ -165,6 +174,10 @@ Invalid kinds/indices and invalid override batches throw before applying changes
 Hover and selection trace stroke centerlines, fill/glyph contours, and raster
 frames inside geometric clips, using their own opacity independently of source
 colors or gradient masks. They do not compute a new outline along clip edges.
+Mesh highlights trace exterior triangle edges, preserving holes and disconnected
+pieces while removing shared seams. Highlight extraction is bounded to 65,536
+triangles per mesh and 8,192 paint-clip edges; an oversized highlight update rejects
+atomically, leaving inspection and rendering available.
 Color overrides accept `0xRRGGBB`, `#rgb`, `#rrggbb`, bare `rrggbb`, CSS named colors such as
 `"red"`, or normalized sRGB `[r, g, b]` tuples. Gradients receive a flat RGB
 override while retaining their alpha and masks; rasters cannot be recolored.
@@ -213,6 +226,87 @@ modified texture even when only a few colors changed. Use hover traces for
 frequent pointer feedback. Call `clearPrimitiveInteraction()` to release the
 optional interaction resources without disposing the document.
 
+### PDF layers (optional content)
+
+Each PDF object owns its visibility state. Two objects can share a `VectorScene`
+and display different layers. `getLayers()` returns detached records containing
+`id`, `name`, `defaultVisible`, `visible`, `locked`, and `usedInView`. IDs are
+opaque and document-scoped; duplicate names are valid. `getLayerOrder()` exposes
+the PDF's group/label hierarchy. The original condition DAG and radio groups
+remain available in `sceneData.optionalContent`.
+
+```ts
+const layers = pdf.getLayers();
+const editable = layers.find(layer => !layer.locked && layer.usedInView);
+if (editable) await pdf.setLayerVisibility(editable.id, false);
+
+const unsubscribe = pdf.subscribeLayerVisibility(snapshot => {
+  console.log("Applied layer revision", snapshot.revision);
+  requestRender();
+});
+
+// Hide all editable layers in one batch, using IDs from getLayers().
+await pdf.setLayerVisibilities(layers
+  .filter(layer => !layer.locked && layer.usedInView)
+  .map(layer => ({ id: layer.id, visible: false })));
+await pdf.resetLayerVisibility();
+// At teardown: unsubscribe();
+```
+
+Batches validate before changing anything. Locked groups and groups outside the
+View intent cannot be changed. Enabling one member of a radio group disables its
+other editable members; a conflicting batch rejects. Rapid changes supersede
+pending preparation, which can reject an earlier promise with `AbortError`.
+The previous applied state stays on screen until replacement resources are ready.
+`subscribeLayerVisibility` reports applied revisions, not pending requests.
+
+`setAllLayerVisibility()` skips locked/non-View layers. Enabling preserves current
+radio-group choices, then enables compatible default-on or first eligible members.
+`getAllLayerVisibility()` reports checked when all compatible editable layers are
+on, mixed when further compatible layers can be enabled, and disabled when there
+are no editable targets. The shared panel's **All** checkbox affects every layer,
+including those hidden by its name filter.
+
+Both a pick hit and its inspected primitive include
+`optionalContent: { conditionId, layerIds }`. `conditionId` addresses the primitive's
+draw-run condition (or is `null`); `layerIds` also includes dependencies inherited
+through groups and masks. These are visibility dependencies, potentially negated
+or involving several layers, rather than an exclusive ownership label. Ungrouped
+content has an empty list. Resolve names through `getLayers()`.
+
+Hidden paints cannot be picked. Hidden hover/selection traces are cleared while
+temporary colors remain available if the paint reappears. Visibility changes
+invalidate stale picks, search results, text-selection layouts, and rendering
+caches while preserving canonical references and the picking hierarchy. Library
+hosts should refresh their search UI after a visibility notification. OCR/fallback
+text uses retained character conditions even when it has no pickable glyph.
+
+For native views, `createLayerVisibilityController({ getScene, getRenderer,
+onChange?, onProgress? })` provides the same layer operations and shared fallback
+preparation. Call `sceneChanged()` after loading a scene, `rendererChanged()` after
+replacing its renderer, and `dispose()` at teardown. Its `onProgress` receives a
+percentage or `null`. Separate controllers give separate view states.
+`OptionalContentController` is the lower-level model with an optional resource
+preparation callback; use the native wrapper when retained raster replay is needed.
+
+`createPdfLayerControls({ container, controller })` mounts the reusable DOM panel
+for either a PDF object or native controller. Connect native preparation progress
+to its `setProgress()`, call `refresh()` after document replacement, and `dispose()`
+at teardown. The panel exposes CSS classes under `.pdf-layers`; the standalone
+viewer stylesheet is a styling example. Only the main demo mounts it by default.
+
+Layer changes do not modify scene definitions, source geometry, or exports.
+HEP stores initially hidden content and the original PDF visibility defaults.
+Layer definitions and retained effects add file and memory costs compared with
+earlier scenes; ordinary flat pages keep the existing rendering path. Effect
+graphs use temporary GPU surfaces at the viewing resolution, subject to memory
+budgets. Retained compatibility fallbacks may require asynchronous image replay
+on a layer change. These temporary surfaces are never serialized as canonical
+geometry. HEP schema v7 is required: regenerate older HEP files from their PDFs.
+Replayable raster fallbacks use the retained PDF's original paints when computing
+their backdrop correction. Temporary vector recoloring or a global tint does not
+recolor that correction; layer-dependent backdrop changes are replayed.
+
 ## `buildHep(input, options?)`
 
 Returns `Promise<Blob>` with MIME type `application/x-hep`. Save it with a `.hep`
@@ -221,16 +315,17 @@ extension. Import it from `@soadzoor/hepr` in either a browser or Node.
 | Input | Options |
 | --- | --- |
 | PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
-| Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options, optional `sourcePdf` and `sourcePdfPages` for image fallback. |
+| Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
 Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, and `signal`.
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
 
-Pass an already-loaded `pdf.sceneData` to avoid parsing again. `sourcePdf` is
-needed only when the scene reports PDF image operations but has no extracted
-raster layers; provide the matching `sourcePdfPages` if pages were selected.
+Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
+the PDF's original layer defaults, including initially hidden geometry, regardless
+of the viewer's current layer settings. V7 retains fallback commands and assets;
+it does not embed the original PDF for later image recovery.
 
 Node hosts can install the optional `@napi-rs/canvas` backend for PDF operations
 that need Canvas2D, image encoding, and encoded HEP image decoding. See the
@@ -241,16 +336,24 @@ that need Canvas2D, image encoding, and encoded HEP image decoding. See the
 
 PDF loading and PDF-to-HEP conversion prefer opening a usable document over
 rejecting a page because the optimized vector representation cannot express it.
-The existing selective image layers remain the first fallback. When that cannot
-preserve clipping or paint order, HEPR tries the retained-page renderer and
-stores the affected page as one image layer. Other pages keep their vector output.
+Axial/radial gradients, bounded tessellated shadings, large compound fills,
+supported tiling patterns and Type3 programs retain canonical geometry. Groups,
+standard blend modes, and alpha/luminosity masks use a shared ordered paint graph
+and renderer-owned transient surfaces. Group opacity is applied to the group
+result, preserving overlap between its children.
+
+Malformed or unsupported effects and exhausted expansion budgets can still use
+diagnosed selective or whole-page image fallbacks. V7 retains the replayable
+program and assets beside these fallback slots so layer changes can regenerate
+their pixels without the original PDF. Print separations and exact overprint
+simulation remain outside scope.
 
 The page image targets 2 pixels per PDF point (144 dpi for ordinary pages), capped
 at 16 million pixels and 16,384 pixels per dimension. Parser image and decoded-byte
 limits can lower these ceilings. Rasterized pages lose vector sharpness and geometry
 needed for features such as room detection. Their extracted text index is retained
-separately for search and selection; no text is painted twice. HEP stores the image
-and text using its existing format, with no source PDF needed when reopening it.
+separately for search and selection; no text is painted twice. HEP stores the image,
+text, and retained replay resources, with no source PDF needed when reopening it.
 
 `onDiagnostic` receives these warnings (also retained by `PdfSession.getDiagnostics()`):
 

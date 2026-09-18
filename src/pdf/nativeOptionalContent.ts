@@ -11,6 +11,7 @@ import {
   PdfError,
   type PdfDiagnostic
 } from "./nativeTypes";
+import type { OptionalContentCondition, OptionalContentOrderNode, SceneOptionalContent } from "../optionalContentData";
 
 export const NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES = Object.freeze({
   HiddenDefault: "optional-content.hidden",
@@ -162,6 +163,8 @@ export class NativeOptionalContentRegistry {
   private initialization: Promise<this> | null = null;
   private operationTail: Promise<void> = Promise.resolve();
   private initialized = false;
+  private defaultConfiguration: PdfValue | undefined;
+  private readonly combinedMemberships = new Map<string, number>();
 
   constructor(
     resolver: NativeOptionalContentResolver,
@@ -261,6 +264,7 @@ export class NativeOptionalContentRegistry {
     if (defaultConfiguration === undefined || defaultConfiguration === null) {
       throw invalidOptionalContent("The catalog /OCProperties dictionary has no default /D configuration.");
     }
+    this.defaultConfiguration = defaultConfiguration;
     await this.applyDefaultConfiguration(defaultConfiguration, signal);
     for (const group of this.groupDrafts) {
       const publicGroup = this.freezeGroup(group);
@@ -300,6 +304,114 @@ export class NativeOptionalContentRegistry {
   listMemberships(): readonly NativeOptionalContentMembership[] {
     this.assertInitialized();
     return Object.freeze([...this.memberships]);
+  }
+
+  /** Retain the conjunction of caller and resource scopes without copying expressions per paint. */
+  combineMemberships(parent: number, own: number): number {
+    if (parent < 0) return own;
+    if (own < 0 || parent === own) return parent;
+    const key = parent < own ? `${parent}:${own}` : `${own}:${parent}`;
+    const cached = this.combinedMemberships.get(key);
+    if (cached !== undefined) return cached;
+    const left = this.getMembership(parent), right = this.getMembership(own);
+    if (this.memberships.length >= this.limits.maxMemberships) throw optionalContentLimit("Combined layer scopes exceed the membership limit.");
+    const index = this.memberships.length;
+    this.memberships.push(Object.freeze({ index, identity: `scope:${key}`, kind: "ocmd",
+      policy: "VisibilityExpression", groupIndices: Object.freeze([...new Set([...left.groupIndices, ...right.groupIndices])]),
+      expression: Object.freeze({ kind: "and", operands: Object.freeze([
+        Object.freeze({ kind: "membership", membershipIndex: parent, defaultVisible: left.defaultVisible }),
+        Object.freeze({ kind: "membership", membershipIndex: own, defaultVisible: right.defaultVisible })
+      ]), defaultVisible: left.defaultVisible && right.defaultVisible }),
+      defaultVisible: left.defaultVisible && right.defaultVisible }));
+    this.membershipEffects.push(this.membershipEffects[parent] || this.membershipEffects[own]);
+    this.combinedMemberships.set(key, index);
+    return index;
+  }
+
+  /** Snapshot the layer graph after page compilation has resolved its resource memberships. */
+  async sceneData(signal?: AbortSignal): Promise<SceneOptionalContent | undefined> {
+    this.assertInitialized();
+    if (!this.groupDrafts.length) return undefined;
+    const conditions: OptionalContentCondition[] = this.memberships.map(() => ({ kind: "constant", value: true }));
+    const append = (condition: OptionalContentCondition): number => { conditions.push(condition); return conditions.length - 1; };
+    const affects = (expression: NativeOptionalContentExpression): boolean => expression.kind === "group"
+      ? this.groupDrafts[expression.groupIndex].usedInDefaultView
+      : expression.kind === "membership" ? this.membershipEffects[expression.membershipIndex]
+      : expression.kind === "not" ? affects(expression.operand) : expression.operands.some(affects);
+    const expressionIndex = (expression: NativeOptionalContentExpression): number => {
+      if (!affects(expression)) return append({ kind: "constant", value: true });
+      if (expression.kind === "membership") return expression.membershipIndex;
+      if (expression.kind === "group") return expression.groupIndex;
+      if (expression.kind === "not") return append({ kind: "not", operand: expressionIndex(expression.operand) });
+      return append({ kind: expression.kind, operands: expression.operands.filter(affects).map(expressionIndex) });
+    };
+    for (const membership of this.memberships) {
+      signal?.throwIfAborted();
+      if (!this.membershipEffects[membership.index]) continue;
+      if (membership.kind === "ocg") {
+        conditions[membership.index] = { kind: "group", groupId: this.groupDrafts[membership.groupIndices[0]].identity };
+      } else if (membership.expression) {
+        const index = expressionIndex(membership.expression);
+        conditions[membership.index] = index === membership.index ? { kind: "constant", value: true }
+          : { kind: "and", operands: [index] };
+      } else {
+        const groups = membership.groupIndices.filter(index => this.groupDrafts[index].usedInDefaultView);
+        const off = membership.policy === "AnyOff" || membership.policy === "AllOff";
+        conditions[membership.index] = { kind: membership.policy === "AllOn" || membership.policy === "AllOff" ? "and" : "or",
+          operands: groups.map(index => off ? append({ kind: "not", operand: index }) : index) };
+      }
+    }
+    const config = this.defaultConfiguration === undefined ? new Map<string, PdfValue>() :
+      await this.resolveDictionary(this.defaultConfiguration, signal, "Default layer configuration");
+    const locked = await this.readConfigurationGroupSet(config.get("Locked"), "/D /Locked", signal);
+    const rawRadio = await this.resolver.resolveValue(config.get("RBGroups"), signal);
+    const radioGroups: string[][] = [];
+    if (rawRadio != null) {
+      if (!Array.isArray(rawRadio)) throw invalidOptionalContent("Layer radio groups must be arrays.");
+      for (const raw of rawRadio) radioGroups.push([...await this.readConfigurationGroupSet(raw, "/D /RBGroups", signal)]);
+    }
+    let order: OptionalContentOrderNode[] = [];
+    const rawOrder = config.get("Order");
+    if (rawOrder != null) {
+      let entries = 0;
+      const readOrder = async (raw: PdfValue, depth: number): Promise<OptionalContentOrderNode[]> => {
+        signal?.throwIfAborted();
+        if (depth > this.limits.maxExpressionDepth || ++entries > this.limits.maxExpressionNodes) throw optionalContentLimit("Layer order exceeds its nesting or node limit.");
+        const value = await this.resolver.resolveValue(raw, signal);
+        if (!Array.isArray(value)) throw invalidOptionalContent("Layer display order must be an array.");
+        const nodes: OptionalContentOrderNode[] = [];
+        for (const item of value) {
+          if (++entries > this.limits.maxExpressionNodes) throw optionalContentLimit("Layer order exceeds its node limit.");
+          if (isPdfRef(item) && this.groupByIdentity.has(this.identityOf(item, "Layer order"))) {
+            nodes.push({ kind: "group", groupId: this.identityOf(item, "Layer order") });
+            continue;
+          }
+          const resolved = await this.resolver.resolveValue(item, signal);
+          if (Array.isArray(resolved)) {
+            const children = await readOrder(item, depth + 1);
+            const previous = nodes.at(-1);
+            if (previous?.kind === "group") nodes[nodes.length - 1] = { ...previous, children };
+            else nodes.push(...children);
+          } else if (isPdfString(resolved)) {
+            const label = decodePdfTextString(resolved.bytes);
+            const remaining = value.slice(value.indexOf(item) + 1);
+            nodes.push({ kind: "label", label, children: await readOrder(remaining, depth + 1) });
+            break;
+          }
+        }
+        return nodes;
+      };
+      try { order = await readOrder(rawOrder, 0); }
+      catch (error) {
+        signal?.throwIfAborted();
+        if (error instanceof PdfError && error.code === "resource-limit") throw error;
+        this.diagnostics.push({ code: "optional-content.invalid-order", severity: "warning", message: "Invalid PDF layer display order; catalog order is used." });
+      }
+    }
+    if (!order.length) order = this.groupDrafts.map(group => ({ kind: "group", groupId: group.identity }));
+    return { groups: this.groupDrafts.map(group => ({ id: group.identity, name: group.name,
+      defaultVisible: group.defaultVisible, usedInView: group.usedInDefaultView, locked: locked.has(group.identity) })),
+      conditions, order, radioGroups };
   }
 
   getGroup(index: number): NativeOptionalContentGroup {

@@ -1,8 +1,10 @@
 import { Color } from "three";
 import type { Bounds, VectorClipPath, VectorScene } from "./pdfVectorExtractor";
+import { buildGradientMeshBoundary } from "./gradientMeshBoundary";
+import { MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
 import {
   getPrimitiveClipChain, getPrimitiveSegmentClipBounds, getScenePrimitive, validatePrimitiveRef,
-  type PrimitiveKind, type PrimitiveRef
+  type PrimitiveInfo, type PrimitiveKind, type PrimitiveRef
 } from "./scenePrimitives";
 
 export type PrimitiveColorInput = string | number | readonly [number, number, number];
@@ -160,10 +162,19 @@ export function buildPrimitiveHighlights(
 ): PrimitiveHighlightSet | null {
   if (!selected.length && !hover) return null;
   const refs = hover ? [...selected, hover] : selected;
+  const traces = new Map<string, { primitive: PrimitiveInfo; mesh?: ReturnType<typeof buildGradientMeshBoundary> }>();
   let count = 0;
   let selectionCount = 0;
   for (let index = 0; index < refs.length; index++) {
-    count += getScenePrimitive(scene, refs[index]).segmentCount;
+    const key = primitiveRefKey(refs[index]);
+    let trace = traces.get(key);
+    if (!trace) {
+      const primitive = getScenePrimitive(scene, refs[index]);
+      const mesh = primitive.kind === "gradient-fill" && primitive.shadingKind === "mesh"
+        ? buildGradientMeshBoundary(scene, primitive.gradientIndex!) : undefined;
+      traces.set(key, trace = { primitive, ...(mesh ? { mesh } : {}) });
+    }
+    count += trace.mesh ? trace.mesh.edges.length / 4 : trace.primitive.segmentCount;
     if (index === selected.length - 1) selectionCount = count;
   }
   if (!count) return null;
@@ -195,10 +206,31 @@ export function buildPrimitiveHighlights(
     return next;
   };
   let cursor = 0;
+  const meshClips = new Map<string, number>();
   for (const ref of refs) {
-    const primitive = getScenePrimitive(scene, ref);
+    const key = primitiveRefKey(ref);
+    const { primitive, mesh } = traces.get(key)!;
     const clip = getPrimitiveClipChain(scene, ref);
     const baseClip = appendRect(copyClip(clip.clipIndex), clip.rect);
+    if (mesh) {
+      let clipIndex = meshClips.get(key);
+      if (clipIndex === undefined) {
+        clipIndex = clipPaths.length;
+        clipPaths.push({ parent: baseClip, fillRule: primitive.fillRule === "evenodd" ? 1 : 0,
+          edges: primitiveContourClip(primitive) });
+        if (mesh.domainClip) {
+          clipPaths.push({ parent: clipIndex, fillRule: 0, edges: mesh.domainClip });
+          clipIndex = clipPaths.length - 1;
+        }
+        meshClips.set(key, clipIndex);
+      }
+      for (let i = 0; i < mesh.edges.length; i += 4) {
+        const x0 = mesh.edges[i], y0 = mesh.edges[i + 1], x1 = mesh.edges[i + 2], y1 = mesh.edges[i + 3];
+        segments.set([x0, y0, x1, y1, x1, y1, 0, clipIndex], cursor);
+        cursor += 8;
+      }
+      continue;
+    }
     for (let index = 0; index < primitive.segmentCount; index++) {
       const segment = primitive.getSegment(index);
       const control = segment.control ?? segment.end;
@@ -210,4 +242,31 @@ export function buildPrimitiveHighlights(
     }
   }
   return { segments, clipPaths, selectionCount, count };
+}
+
+/** Clip approximation matches the existing vector clip tolerance; traced curves stay quadratic. */
+function primitiveContourClip(primitive: PrimitiveInfo): Float32Array {
+  const edges: number[] = [];
+  const line = (x0: number, y0: number, x1: number, y1: number): void => {
+    if (x0 === x1 && y0 === y1) return;
+    if (edges.length / 4 >= MAX_VECTOR_CLIP_EDGES) throw new RangeError("Mesh highlight paint clipping exceeds its edge budget.");
+    edges.push(x0, y0, x1, y1);
+  };
+  const quadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number, depth = 0): void => {
+    const dx = x1 - x0, dy = y1 - y0;
+    const t = Math.max(0, Math.min(1, ((cx - x0) * dx + (cy - y0) * dy) / (dx * dx + dy * dy || 1)));
+    if (Math.hypot(cx - x0 - t * dx, cy - y0 - t * dy) <= 0.0001) { line(x0, y0, x1, y1); return; }
+    if (depth >= 20) throw new RangeError("Mesh highlight paint clipping exceeds its subdivision budget.");
+    const ax = (x0 + cx) / 2, ay = (y0 + cy) / 2, bx = (cx + x1) / 2, by = (cy + y1) / 2;
+    const mx = (ax + bx) / 2, my = (ay + by) / 2;
+    quadratic(x0, y0, ax, ay, mx, my, depth + 1);
+    quadratic(mx, my, bx, by, x1, y1, depth + 1);
+  };
+  if (primitive.segmentCount > MAX_VECTOR_CLIP_EDGES) throw new RangeError("Mesh highlight paint clipping exceeds its edge budget.");
+  for (let i = 0; i < primitive.segmentCount; i++) {
+    const { start, control, end } = primitive.getSegment(i);
+    if (control) quadratic(start.x, start.y, control.x, control.y, end.x, end.y);
+    else line(start.x, start.y, end.x, end.y);
+  }
+  return Float32Array.from(edges);
 }

@@ -9,7 +9,9 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 } });
 const side = 80, scale = 4;
+let sampleSceneGradientChannel;
 try {
+  ({ sampleSceneGradientChannel } = await import("../src/gradientSampling.ts"));
   const { openPdf } = await import("../src/pdfSession.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { defaultVectorDrawRuns, validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
@@ -33,6 +35,17 @@ try {
     { name: "Form flattening preserves root gradients on either side",
       content: "q 35 0 0 35 10 10 cm /S sh Q /F Do q 45 45 15 15 re W n 15 0 0 15 45 45 cm /S sh Q",
       order: ["gradient-fill", "fill", "gradient-fill"] },
+    { name: "radial expanding circles stay vector", shadingType: 3, coords: "0 0 0 0 0 1",
+      content: "q 28 0 0 28 40 40 cm /S sh Q" },
+    { name: "radial shrinking circles stay vector", shadingType: 3, coords: "0 0 1 0 0 .2",
+      content: "q 28 0 0 28 40 40 cm /S sh Q" },
+    { name: "radial disabled extensions", shadingType: 3, coords: "0 0 .2 0 0 1", extend: "false false",
+      content: "q 28 0 0 28 40 40 cm /S sh Q" },
+    { name: "axial disabled start", extend: "false true", content: "q 30 0 0 30 25 10 cm /S sh Q" },
+    { name: "axial disabled end", extend: "true false", content: "q 30 0 0 30 25 10 cm /S sh Q" },
+    { name: "sh ignores Background while respecting its BBox", extend: "false false", background: "/Background [0 1 0]",
+      bbox: "/BBox [-.5 0 1.5 1]", content: "q 30 0 0 30 25 10 cm /S sh Q" },
+    { name: "scoped shading in transformed Form", shadingForm: true, content: "q 1 .2 -.1 1 2 1 cm /F Do Q" },
     { name: "annotation flattening preserves the root shading", annotation: true,
       content: "q 50 0 0 50 10 10 cm /S sh Q", order: ["gradient-fill", "fill"], count: 1 }
   ];
@@ -61,8 +74,8 @@ try {
     { shadingType: 2, coordinates: [0, 0, 0, 0], extend: [true, true], background: null },
     { shadingType: 3, coordinates: [0, 0, 0, 1, 1, 2], extend: [true, true], background: null }
   ];
-  assert.deepEqual([...supportedNativeVectorShadings({ size: descriptions.length, describe: i => descriptions[i] })], [0],
-    "unsupported extension, background, degenerate and radial semantics keep the established fallback");
+  assert.deepEqual([...supportedNativeVectorShadings({ size: descriptions.length, describe: i => descriptions[i] })], [0, 1, 2, 4],
+    "axial/radial domains stay vector; a degenerate axis remains unsupported");
   assert.throws(() => buildNativeVectorGradients(new Array(4097), undefined, 10000), error => error.code === "resource-limit",
     "shading color tables have a bounded allocation independent of the ordinary path limit");
   assert.throws(() => buildNativeVectorGradients(new Array(2), undefined, 100, undefined, 16), error => error.code === "resource-limit",
@@ -72,10 +85,9 @@ try {
   }) });
   try {
     const scene = await mixed.compileVectorPage(0, { optimization: "none" });
-    assert.equal(scene.gradientFillPathCount, 1, "a supported shading survives capture of a different unsupported shading");
-    assert.equal(scene.rasterLayers.length, 1, "only the unsupported shading receives a bounded layer");
-    assert.deepEqual(scene.drawRuns.map(run => run.kind), ["gradient-fill", "raster", "fill"]);
-    assert(scene.rasterLayers[0].matrix[0] < side, "fallback remains restricted to its own clip");
+    assert.equal(scene.gradientFillPathCount, 2, "non-extended shading joins the analytic path");
+    assert.equal(scene.rasterLayers.length, 0, "endpoint restrictions do not create raster layers");
+    assert.deepEqual(scene.drawRuns.map(run => run.kind), ["gradient-fill", "gradient-fill", "fill"]);
     validateVectorDrawRuns(scene);
   } finally { await mixed.close(); }
   // Tiny synthetic in-memory persistence, never a user-document archive.
@@ -85,21 +97,23 @@ try {
   assert.deepEqual(restored.clipPaths, persisted.scene.clipPaths);
   assertPixelsClose(renderScene(restored, restored.drawRuns ?? defaultVectorDrawRuns(restored)), persisted.pixels,
     "gradient HEP roundtrip");
-  console.log("native vector shadings: 7 independent Canvas comparisons, mixed fallback, limits, ordering and HEP roundtrip passed");
+  console.log(`native vector shadings: ${cases.length} independent Canvas comparisons, limits, ordering and HEP roundtrip passed`);
 } finally { hooks.deregister(); }
 
-function fixture({ content, spot = false, bbox = "", domain = "", exponent = 1, annotation = false }) {
+function fixture({ content, spot = false, bbox = "", domain = "", exponent = 1, annotation = false,
+  shadingType = 2, coords = "0 0 1 0", extend = "true true", background = "", shadingForm = false }) {
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${side} ${side}] /Resources << /Shading << /S 5 0 R /R 9 0 R >> /XObject << /F 10 0 R >> /ExtGState << /A << /ca .4 >> >> >> ${annotation ? "/Annots [11 0 R]" : ""} /Contents 4 0 R >>` },
     { number: 4, body: tinyPdfStream("", content) },
-    { number: 5, body: `<< /ShadingType 2 /Coords [0 0 1 0] /ColorSpace ${spot ? "[/Separation /PANTONE407C /DeviceCMYK 8 0 R]" : "/DeviceRGB"} /Function ${spot ? "7" : "6"} 0 R /Extend [true true] ${bbox} ${domain} >>` },
+    { number: 5, body: `<< /ShadingType ${shadingType} /Coords [${coords}] /ColorSpace ${spot ? "[/Separation /PANTONE407C /DeviceCMYK 8 0 R]" : "/DeviceRGB"} /Function ${spot ? "7" : "6"} 0 R /Extend [${extend}] ${bbox} ${domain} ${background} >>` },
     { number: 6, body: `<< /FunctionType 2 /Domain [0 1] /C0 ${spot ? "[.15]" : "[1 .1 .2]"} /C1 ${spot ? "[.9]" : "[.1 .4 .9]"} /N ${exponent} >>` },
     { number: 7, body: "<< /FunctionType 3 /Domain [0 1] /Functions [6 0 R] /Bounds [] /Encode [0 1] >>" },
     { number: 8, body: "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 .0800018 .0899963 .259995] /N 1 >>" },
     { number: 9, body: "<< /ShadingType 2 /Coords [45 0 80 0] /ColorSpace /DeviceRGB /Function 6 0 R /Extend [false false] >>" },
-    { number: 10, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [20 20 40 40] /Resources << >>", "0 0 1 rg 20 20 20 20 re f") },
+    { number: 10, body: tinyPdfStream(`/Type /XObject /Subtype /Form /BBox [20 20 40 40] /Resources << ${shadingForm ? "/Shading << /Inner 5 0 R >>" : ""} >>`,
+      shadingForm ? "20 0 0 20 20 20 cm /Inner sh" : "0 0 1 rg 20 20 20 20 re f") },
     { number: 11, body: "<< /Type /Annot /Subtype /Square /Rect [20 20 40 40] /AP << /N 10 0 R >> >>" }
   ] });
 }
@@ -141,27 +155,16 @@ function renderScene(scene, runs) {
         assert.equal(run.kind, "gradient-fill");
         const layer = surfaceFactory(side * scale, side * scale);
         const image = layer.context.createImageData(side * scale, side * scale);
-        const gradient = scene.gradientFillPaintMeta[i] * 4;
-        const b = scene.gradientMetaB, c = scene.gradientMetaC, d = scene.gradientMetaD;
+        const gradient = scene.gradientFillPaintMeta[i];
         const bounds = scene.gradientFillPathMetaA, boundsEnd = scene.gradientFillPathMetaB;
         for (let py = 0; py < side * scale; py++) for (let px = 0; px < side * scale; px++) {
           const x = (px + .5) / scale, y = side - (py + .5) / scale;
           if (x < bounds[i + 2] || y < bounds[i + 3] || x > boundsEnd[i] || y > boundsEnd[i + 1]) continue;
-          const sx = b[gradient] * x + b[gradient + 2] * y + c[gradient];
-          const sy = b[gradient + 1] * x + b[gradient + 3] * y + c[gradient + 1];
-          const box = scene.gradientMetaE;
-          if (scene.gradientMetaA[gradient + 1] && (sx < box[gradient] || sy < box[gradient + 1] ||
-              sx > box[gradient + 2] || sy > box[gradient + 3])) continue;
-          const dx = d[gradient] - c[gradient + 2], dy = d[gradient + 1] - c[gradient + 3];
-          const t = Math.max(0, Math.min(1, ((sx - c[gradient + 2]) * dx + (sy - c[gradient + 3]) * dy) / (dx * dx + dy * dy))) * 1023;
-          const low = Math.floor(t), fraction = t - low;
           const offset = (py * side * scale + px) * 4;
-          for (let channel = 0; channel < 3; channel++) {
-            const first = scene.gradientLut[gradient * 1024 + low * 4 + channel];
-            const second = scene.gradientLut[gradient * 1024 + Math.min(1023, low + 1) * 4 + channel];
-            image.data[offset + channel] = first + (second - first) * fraction;
+          for (let channel = 0; channel < 4; channel++) {
+            image.data[offset + channel] = sampleSceneGradientChannel(scene, gradient, x, y, channel) *
+              (channel === 3 ? scene.gradientFillPathMetaC[i + 3] : 1) * 255;
           }
-          image.data[offset + 3] = scene.gradientFillPathMetaC[i + 3] * 255;
         }
         layer.context.putImageData(image, 0, 0);
         context.save(); context.setTransform(1, 0, 0, 1, 0, 0); context.drawImage(layer.canvas, 0, 0); context.restore();

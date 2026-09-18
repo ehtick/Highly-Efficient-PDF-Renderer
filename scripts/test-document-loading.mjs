@@ -38,7 +38,6 @@ const context = vm.createContext({
   updateMetricsPanel: noop,
   extractPdfPageScenes: (buffer, options, signal) => nextParse(buffer, options, signal),
   loadSceneFromHep: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
-  tryReadSourcePdfBytesFromExistingHep: async () => null,
   computeAutoPagesPerRow: () => 1,
   composeVectorScenesInGrid: (pages) => pages[0],
   prepareSceneForHepRendering: (value) => value,
@@ -48,7 +47,7 @@ const context = vm.createContext({
   yieldToBrowserPaint: async () => {}, sanitizeDownloadName: (label) => label,
   triggerBrowserDownload: noop, formatFileSize: String,
   buildHep: async (value, options) => {
-    exports.push({ scene: value, source: options.sourcePdf, label: options.sourceLabel });
+    exports.push({ scene: value, label: options.sourceLabel });
     return { size: 1 };
   },
   renderer: {
@@ -159,7 +158,7 @@ function assertDocument(id, label) {
 async function assertExport(id, label) {
   assert.equal(await context.downloadHep(), true);
   assert.equal(exports.at(-1).scene.id, id);
-  assert.equal(exports.at(-1).source[0], id);
+  assert.equal(exports.at(-1).source, undefined, "v7 exports the complete scene without embedding its source PDF");
   assert.equal(exports.at(-1).label, label);
 }
 
@@ -259,7 +258,17 @@ async function testThreeBackendReplacement() {
     const previous = host.currentPdfObject;
     previous.sceneData = canonicalScene;
     previous.setFrameListener = noop;
+    previous.getLayers = () => [
+      { id: "visible", visible: true, defaultVisible: true },
+      { id: "hidden", visible: true, defaultVisible: false }
+    ];
     const replacement = { ...demoObject("replacement"), sceneData: canonicalScene, setFrameListener: noop };
+    let layerReplays = 0;
+    replacement.setLayerVisibilities = async changes => {
+      assert.equal(JSON.stringify(changes), JSON.stringify([{ id: "hidden", visible: true }]));
+      assert.equal(host.currentPdfObject, previous, "prepare layer state before installing replacement");
+      layerReplays++;
+    };
     let sceneResets = 0;
     let stateReplays = 0;
     Object.assign(host, {
@@ -306,6 +315,7 @@ async function testThreeBackendReplacement() {
       vm.runInContext(sourceFunction(source, name), host);
     }
     await host.reloadSourceWithBackend("webgpu");
+    assert.equal(layerReplays, 1, "same-scene backend changes replay nondefault PDF layer choices");
     assert.equal(sceneResets, 0, "Same-scene renderer replacements must retain selection and colors");
     assert.equal(stateReplays, failRenderer ? 0 : 1);
     assert.equal(host.currentPdfObject, failRenderer ? previous : replacement);

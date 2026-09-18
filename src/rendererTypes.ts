@@ -1,9 +1,11 @@
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
+import type { PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import type { SearchHighlightSet } from "./searchHighlights";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import type { TextLodMode, TextLodStats } from "./textLodCore";
 import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
+import type { OptionalContentSnapshot } from "./optionalContent";
 
 export type { SearchHighlightSet } from "./searchHighlights";
 
@@ -34,6 +36,11 @@ export interface ViewStateUpdateOptions {
  * `HeprThreePdfObject` methods instead of calling this interface directly.
  */
 export interface RendererApi {
+  prepareRasterLayerUpdates?(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates;
+  getRasterLayerUpdates?(): ReadonlyMap<number, RasterLayer>;
+  /** Apply a prepared, immutable visibility revision without uploading geometry again. */
+  setOptionalContentVisibility?(snapshot: OptionalContentSnapshot): void;
+  getOptionalContentVisibility?(): OptionalContentSnapshot | null;
   /** Subscribe to per-frame draw diagnostics. */
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
 
@@ -78,6 +85,7 @@ export interface RendererApi {
 
   /** Set vector color override with normalized RGBA-style channels. */
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void;
+  getVectorColorOverride?(): readonly [number, number, number, number];
 
   /** Runtime-only colors; null entries restore original scene colors. */
   setPrimitiveColorUpdates?(updates: readonly PrimitiveColorUpdate[]): void;

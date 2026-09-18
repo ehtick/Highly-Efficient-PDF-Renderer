@@ -3,6 +3,7 @@ import { NodeMaterial, TSL } from "three/webgpu";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { copyThreePdfShapeUniform } from "./threePdfShape";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
@@ -28,6 +29,7 @@ export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataText
 export function initializeThreeVectorClip(material: THREE.Material, texture: THREE.DataTexture): void {
   materialTextures.set(material, texture);
   if (material instanceof THREE.RawShaderMaterial) {
+    material.uniforms.uPdfShapeOnly ??= { value: 0 };
     material.uniforms.uVectorClipTex = { value: texture };
     material.uniforms.uVectorClipIndex = { value: -1 };
   }
@@ -39,6 +41,7 @@ export function createThreeVectorClipMaterial(source: THREE.Material, clipIndex?
   const texture = materialTextures.get(source);
   if (!texture) throw new Error("Clipped material has no vector clip texture.");
   const material = source.clone();
+  copyThreePdfShapeUniform(source, material);
   if (source instanceof THREE.RawShaderMaterial && material instanceof THREE.RawShaderMaterial) {
     material.uniforms = { ...source.uniforms, uVectorClipIndex: { value: clipIndex } };
   } else if (source instanceof NodeMaterial && material instanceof NodeMaterial) {

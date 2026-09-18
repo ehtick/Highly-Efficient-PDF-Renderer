@@ -40,9 +40,78 @@ try {
   assert.deepEqual(paints(singlePlan), ["stroke:0:0", "stroke:1:0", "fill:0:0", "text:0:0", "raster:0:0"]);
   assert.equal(singlePlan.update(single.drawRuns, 0.11), false);
   assert(singlePlan.update(single.drawRuns, 20), "growing AA refreshes order even though the page group is unchanged");
-  assert.equal(singlePlan.batches.length, 5, "AA overlap prevents the within-page swap");
+  assert.equal(singlePlan.batches.length, 4, "a fill quad does not acquire the old four-pixel stroke margin");
+  assert(singlePlan.update(single.drawRuns, 128));
+  assert.equal(singlePlan.batches.length, 5, "actual stroke AA reaching the distant fill prevents the within-page swap");
   assert(singlePlan.update(single.drawRuns, 0.1));
   assert.equal(singlePlan.batches.length, 4, "zooming back restores safe batching");
+
+  // Native strokes can paint beyond their centerlines; fill and glyph quads
+  // remain bounded by their vertices. Exercise those distinct coverage limits.
+  const aaStrokeScene = (hairline, gap) => {
+    const value = makePages([0]);
+    value.pageRects = Float32Array.of(-50, -50, 50, 50);
+    value.drawRuns = value.drawRuns.slice(0, 3);
+    value.endpoints.set([0,20,10,20, 20,0,30,0]);
+    value.primitiveMeta.set([10,20,0,0.5, 30,0,0,hairline ? 3 : 1]);
+    value.primitiveBounds.set([0,20,10,20, 20,0,30,0]);
+    value.styles.set([0.25,0,0,0, hairline ? 0 : 0.75,0,0,0]);
+    value.fillPathMetaA.set([0,4,20,gap]);
+    value.fillPathMetaB.set([30,gap+1,1,0]);
+    value.fillPathMetaC = Float32Array.of(0,0,0,1);
+    return value;
+  };
+  for (const [hairline, gap] of [[true, 0.8], [false, 1.7]]) {
+    const edge = aaStrokeScene(hairline, gap), edgePlan = new VectorOrderedBatches(edge, null);
+    const edgeOriginal = structuredClone(edge);
+    edgePlan.update(edge.drawRuns, 1);
+    assert.deepEqual(paints(edgePlan), ["stroke:0:0", "fill:0:0", "stroke:1:0"],
+      "different-color paint touching visible stroke AA keeps source order");
+    assert.equal(edgePlan.update(edge.drawRuns, 0.9), false, "a shared conservative scale bucket reuses the upload");
+    edgePlan.update(edge.drawRuns, 0.125);
+    assert.deepEqual(paints(edgePlan), ["stroke:0:0", "stroke:1:0", "fill:0:0"],
+      "zooming in may batch only after stroke AA no longer reaches the fill");
+    edgePlan.update(edge.drawRuns, null);
+    assert.deepEqual(paints(edgePlan), ["stroke:0:0", "fill:0:0", "stroke:1:0"]);
+    edgePlan.update(edge.drawRuns, 1);
+    assert.deepEqual(paints(edgePlan), ["stroke:0:0", "fill:0:0", "stroke:1:0"]);
+    assert.deepEqual(edge, edgeOriginal, "coverage scheduling does not alter AA, source geometry, or styles");
+  }
+  const edgeLod = aaStrokeScene(true, 0.8);
+  edgeLod.endpoints[5] = edgeLod.endpoints[7] = edgeLod.primitiveMeta[5] = 10;
+  edgeLod.primitiveBounds[5] = edgeLod.primitiveBounds[7] = 10;
+  const edgeCoarse = structuredClone(edgeLod);
+  edgeCoarse.endpoints[5] = edgeCoarse.endpoints[7] = edgeCoarse.primitiveMeta[5] = 0;
+  edgeCoarse.primitiveBounds[5] = edgeCoarse.primitiveBounds[7] = 0;
+  setStrokePaintOrigins(edgeCoarse, Uint32Array.of(0, 1));
+  const edgeRuntime = { levels: [edgeLod, edgeCoarse].map((scene, index) => ({ scene, tolerance: index,
+    segmentCount: 2, visibleSegmentIds: Uint32Array.of(0, 1), visibleSegmentCount: index ? 0 : 2 })) };
+  const edgeLodPlan = new VectorOrderedBatches(edgeLod, edgeRuntime);
+  edgeLodPlan.update(edgeLod.drawRuns, 1);
+  assert.deepEqual(paints(edgeLodPlan), ["stroke:0:0", "fill:0:0", "stroke:1:0"],
+    "dormant LOD stroke coverage still fences a future overlapping paint");
+  edgeRuntime.levels[0].visibleSegmentCount = 0; edgeRuntime.levels[1].visibleSegmentCount = 2;
+  edgeLodPlan.invalidate(); edgeLodPlan.update(edgeLod.drawRuns, 1);
+  assert.deepEqual(paints(edgeLodPlan), ["stroke:2:0", "fill:0:0", "stroke:3:0"]);
+
+  const quadEdges = makePages([0, 10]);
+  quadEdges.pageRects = Float32Array.of(-50, -50, 50, 50);
+  quadEdges.segmentCount = 0;
+  for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) quadEdges[key] = new Float32Array(0);
+  quadEdges.drawRuns = [quadEdges.drawRuns[1], quadEdges.drawRuns[3], quadEdges.drawRuns[6]];
+  quadEdges.textInstanceA.set([12,4,-4,12]); quadEdges.textInstanceB.set([12,-2,0,0]);
+  const quadPlan = new VectorOrderedBatches(quadEdges, null);
+  quadPlan.update(quadEdges.drawRuns, 0.001);
+  assert.deepEqual(paints(quadPlan), ["fill:0:0", "text:0:0", "fill:1:0"],
+    "transformed glyph corners overlapping a fill preserve source order at close zoom");
+  const separatedQuads = structuredClone(quadEdges);
+  separatedQuads.fillPathMetaA.set([0,4,-20,0]); separatedQuads.fillPathMetaB.set([-10,1,1,0]);
+  separatedQuads.fillPathMetaA.set([0,4,2.25,0],4); separatedQuads.fillPathMetaB.set([3.25,1,1,0],4);
+  separatedQuads.textInstanceA.set([1,0,0,1]); separatedQuads.textInstanceB.set([0,0,0,0]);
+  const separatedPlan = new VectorOrderedBatches(separatedQuads, null);
+  separatedPlan.update(separatedQuads.drawRuns, 1);
+  assert.deepEqual(paints(separatedPlan), ["fill:0:0", "fill:1:0", "text:0:0"],
+    "disjoint fill and glyph quads need only their conservative raster guard, not stroke AA expansion");
 
   // Page rectangles are only a hint: actual content can extend beyond them.
   // A and B overlap; C is independent and can still be batched with that stream.
@@ -441,7 +510,11 @@ try {
   }
   function assertPageOrder(plan, source, pages) {
     const matches = paint => pages.includes(pageOf(paint));
-    assert.deepEqual(paints(plan).filter(matches), source.filter(matches), "overlapping paints keep source order, including transparency and images");
+    // A proven redundant rectangle clip may be omitted from GPU instances.
+    // Paint identity/order is unchanged; clip equivalence has its own suite.
+    const identity = paint => paint.split(":").slice(0, 2).join(":");
+    assert.deepEqual(paints(plan).filter(matches).map(identity), source.filter(matches).map(identity),
+      "overlapping paints keep source order, including transparency and images");
   }
   function assertOverlappingPaints(scene) {
     const plan = new VectorOrderedBatches(scene, null);

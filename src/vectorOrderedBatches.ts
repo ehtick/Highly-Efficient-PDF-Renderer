@@ -3,6 +3,7 @@ import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
+import { VectorRunClipElision } from "./vectorRunClipElision";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -30,6 +31,7 @@ export class VectorOrderedBatches {
   private readonly runRanges: Uint32Array;
   private readonly visiblePaints: number[] = [];
   private readonly scheduler: VectorPageDrawScheduler | null;
+  private readonly clipElision: VectorRunClipElision | null;
   private readonly redundancy: VectorStrokeRedundancy;
   private readonly redundancyIds: Uint32Array;
   private redundancyEnabled = true;
@@ -84,6 +86,7 @@ export class VectorOrderedBatches {
       this.rankRun[rank] = strokeSourceRuns[id] = sourceRun[origins[id]];
     });
     this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns);
+    this.clipElision = VectorRunClipElision.create(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancyIds = new Uint32Array(total);
     const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
@@ -103,7 +106,8 @@ export class VectorOrderedBatches {
 
   /** Returns true only when instance data needs uploading again. */
   update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null): boolean {
-    const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty;
+    const clipChanged = this.clipElision?.update(unitsPerPixel) ?? false;
+    const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty || clipChanged;
     this.orderDirty = false;
     let sameRuns = this.initialized && runs.length === this.previousRuns.length;
     if (sameRuns && !(runs === this.sourceRuns && this.previousRunsAreSource)) {
@@ -219,14 +223,15 @@ export class VectorOrderedBatches {
         continue;
       }
       const first = this.instanceCount;
+      const clipCode = this.clipElision?.clipCodes[runIndex] ?? (run.clipIndex ?? -1) + 1;
       if (run.kind === "stroke" && this.runtime) {
         for (let index = start; index < start + count; index++) {
           const id = this.rankToId[this.selectedRanks[index]];
-          if (!this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(run, id);
+          if (!this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(id, clipCode);
         }
       } else {
         for (let id = start; id < start + count; id++) {
-          if (run.kind !== "stroke" || !this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(run, id);
+          if (run.kind !== "stroke" || !this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(id, clipCode);
         }
       }
       const retainedCount = this.instanceCount - first;
@@ -239,10 +244,10 @@ export class VectorOrderedBatches {
     return true;
   }
 
-  private appendInstance(run: VectorDrawRun, id: number): void {
+  private appendInstance(id: number, clipCode: number): void {
     const offset = this.instanceCount * 2;
     this.uintInstances[offset] = id;
-    this.uintInstances[offset + 1] = (run.clipIndex ?? -1) + 1;
+    this.uintInstances[offset + 1] = clipCode;
     this.instanceCount++;
   }
 }

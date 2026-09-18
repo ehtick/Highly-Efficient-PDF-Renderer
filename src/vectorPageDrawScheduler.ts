@@ -99,7 +99,8 @@ export class VectorPageDrawScheduler {
       return changed;
     }
     // A power-of-two upper bound avoids rebuilding the dependency partition
-    // on every animated zoom step. Four pixels cover analytic AA and hairlines.
+    // on every animated zoom step. Keep four pixels for the fallback kinds;
+    // ordinary vector paints use their shader-specific coverage bounds below.
     const padding = Math.max(0.001, 4 * 2 ** Math.ceil(Math.log2(Math.max(1e-6, unitsPerPixel))));
     if (this.enabled && padding === this.padding) return false;
     this.enabled = true;
@@ -109,7 +110,14 @@ export class VectorPageDrawScheduler {
     for (let page = 0; page < pages; page++) this.pageBounds.set([Infinity, Infinity, -Infinity, -Infinity], page * 4);
     const box = [0, 0, 0, 0];
     for (let run = 0; run < this.pageForRun.length; run++) {
-      this.bounds.getBounds(run, padding, box);
+      const kind = this.kindForRun[run];
+      // Stroke bounds already include source widths. Native fragment coverage
+      // reaches another 1px, or 1.5px for device hairlines; 2px contains both.
+      // Fill/text vertices stay within their source/transformed-glyph quads:
+      // retain an extra half pixel instead of expanding them by stroke AA.
+      // This changes dependency tests only, never rendered geometry or AA.
+      const coveragePadding = Math.max(0.001, padding * (kind === 0 ? 0.5 : kind < 3 ? 0.125 : 1));
+      this.bounds.getBounds(run, coveragePadding, box);
       if (box.some(Number.isNaN)) box.splice(0, 4, -Infinity, -Infinity, Infinity, Infinity);
       this.paintBounds.set(box, run * 4);
       if (box[0] > box[2] || box[1] > box[3]) continue;

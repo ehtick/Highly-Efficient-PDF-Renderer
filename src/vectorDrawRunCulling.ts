@@ -74,11 +74,16 @@ export class VectorDrawRunCuller {
     }
   }
 
-  /** Expand geometry for screen-space coverage before intersecting its vector clip. */
-  getBounds(index: number, padding: number, output: number[]): void {
+  /** Conservative geometry hull, before the run's geometric clip is applied. */
+  getUnclippedBounds(index: number, padding: number, output: number[]): void {
     const offset = index * 4;
     output[0] = this.bounds[offset] - padding; output[1] = this.bounds[offset + 1] - padding;
     output[2] = this.bounds[offset + 2] + padding; output[3] = this.bounds[offset + 3] + padding;
+  }
+
+  /** Expand geometry for screen-space coverage before intersecting its vector clip. */
+  getBounds(index: number, padding: number, output: number[]): void {
+    this.getUnclippedBounds(index, padding, output);
     const clipIndex = this.scene.drawRuns![index].clipIndex;
     if (clipIndex !== undefined) intersect(output, this.clipBounds[clipIndex]);
   }

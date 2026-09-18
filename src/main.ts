@@ -62,6 +62,7 @@ import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
 import { createPrimitiveInteractionController } from "./primitiveInteraction";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import type { RenderPerformanceOptions, RenderPerformanceProfiler } from "./renderPerformance";
 import {
   describeSceneOperatorCount,
   formatSceneSegmentAccounting,
@@ -330,11 +331,18 @@ const pdfLayerControls = createPdfLayerControls({
   container: document.querySelector<HTMLDivElement>("#pdf-layers")!, controller: layerVisibility
 });
 
+let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
-  updateFpsMetric();
+  const now = performance.now();
+  updateFpsMetric(now);
   textSelection.updateOverlay();
   drawingSelection.onFrame();
 
+  // Camera/interaction work stays per frame; formatting and replacing the HUD
+  // text hundreds of times per second adds unnecessary browser work.
+  if (now - lastRuntimeTextUpdate < 100) return;
+  lastRuntimeTextUpdate = now;
+  metricFpsTextElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
   const rendered = stats.renderedSegments.toLocaleString();
   const total = stats.totalSegments.toLocaleString();
   const mode = stats.usedCulling ? "culled" : "full";
@@ -350,6 +358,7 @@ function onRendererFrame(stats: DrawStats): void {
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
+  lastRuntimeTextUpdate = -Infinity;
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
   rendererApi.setTextLodMode?.(uiControlManager.readTextLodModeInput());
@@ -398,6 +407,44 @@ interface LoadedSource {
 let lastLoadedSource: LoadedSource | null = null;
 let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneLabel: string | null = null;
+let captureProfiler: RenderPerformanceProfiler | null = null;
+let captureContext: Record<string, unknown> | null = null;
+const performanceCapture = {
+  start(options: RenderPerformanceOptions = {}): string {
+    if (!(renderer instanceof WebGlFloorplanRenderer)) {
+      throw new Error("This performance capture currently supports native WebGL. Select WebGL before starting.");
+    }
+    captureProfiler?.stop();
+    captureProfiler = renderer.getPerformanceProfiler();
+    captureContext = {
+      document: lastParsedSceneLabel, backend: "webgl",
+      canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
+      viewAtStart: renderer.getViewState(),
+      vectorLod: uiControlManager.readVectorLodModeInput(), textLod: uiControlManager.readTextLodModeInput(),
+      drawingSelection: drawingSelection.isEnabled(),
+      sourceSegments: lastParsedScene?.segmentCount ?? 0, sourcePaints: lastParsedScene?.drawRuns?.length ?? 0,
+      visibleLayers: layerVisibility.getLayers().filter(layer => layer.visible).map(layer => layer.id)
+    };
+    captureProfiler.start(options);
+    renderer.requestFrame();
+    return `Capturing up to ${options.maxFrames ?? 600} rendered frames. Pan or zoom, then run heprPerf.stop().`;
+  },
+  report() {
+    if (!captureProfiler) throw new Error("Start a capture with heprPerf.start() first.");
+    return { context: captureContext, ...captureProfiler.getReport() };
+  },
+  stop() {
+    captureProfiler?.stop();
+    const report = performanceCapture.report();
+    console.table({ frameCpu: report.frameCpuMs, frameInterval: report.frameIntervalMs,
+      ...report.cpuSections, gpuCommandSpan: report.gpu.frameMs });
+    console.table(report.counters);
+    return report;
+  },
+  json(): string { return JSON.stringify(performanceCapture.report(), null, 2); }
+};
+// Temporary, opt-in console diagnostics. Nothing is captured until start().
+Object.assign(window, { heprPerf: performanceCapture });
 let loadToken = 0;
 let activeSceneLoadToken: number | null = null;
 let pendingSourceLoadCount = 0;
@@ -1084,6 +1131,7 @@ function commitLoadedSource(options: LoadPdfOptions): void {
 }
 
 function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preserveView?: boolean): SceneStats {
+  lastRuntimeTextUpdate = -Infinity;
   const previousScene = lastParsedScene;
   const previousView = target.getViewState();
   try {
@@ -1718,14 +1766,12 @@ function formatPercent(value: number): string {
 }
 
 
-function updateFpsMetric(): void {
-  const now = performance.now();
+function updateFpsMetric(now: number): void {
   if (fpsLastSampleTime > 0) {
     const deltaMs = now - fpsLastSampleTime;
     if (deltaMs > 0) {
       const fpsNow = 1000 / deltaMs;
       fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
-      metricFpsTextElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
     }
   }
   fpsLastSampleTime = now;

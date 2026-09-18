@@ -262,6 +262,12 @@ filter that schedule instead of repeating the batching search. Coverage-scale
 changes during zoom, or temporary color overrides, can require a new schedule.
 This trades some subset-specific batching opportunities for cheaper camera updates;
 the scheduling search remains bounded for heavily overlapping drawings.
+Dependency margins follow the renderer's coverage: strokes include their width
+and screen-space antialiasing, while fill and transformed glyph quads need only a
+small rasterization margin around their existing bounds. Zooming out therefore
+does not artificially expand fill/text dependencies by the larger stroke margin.
+Overlapping paints still retain their required order, including all stroke LOD
+levels; unknown projection scales keep source order.
 
 For scenes with explicit paint order, native and Three.js rendering also omit
 redundant opaque straight strokes from their temporary draw lists. Comparisons
@@ -291,6 +297,59 @@ Check that a contained stroke reappears after hiding its covering layer, and
 compare coincident stroke edges at high zoom with the previous optimized output.
 Also check native WebGL/WebGPU and switching backends. Draw-call reductions in
 non-browser tests do not by themselves establish an FPS or GPU-time improvement.
+
+Native ordered batches also skip geometric rectangle clips when the complete
+paint bounds, including every stroke LOD level and screen-space coverage margin,
+are strictly inside the entire rectangle clip chain. Clipping stays active near
+edges, for polygon clips, and when a conservative projection scale is unavailable.
+Canonical clipping metadata remains intact. WebGL retains compatible texture and
+vertex state between batches; devices without enough combined texture units use
+the original binding layout.
+
+For temporary performance captures in the main viewer, select **WebGL**, load the
+drawing, then run this in the browser console:
+
+```js
+heprPerf.start({ maxFrames: 1200 });
+```
+
+Pan or zoom for several seconds, then run:
+
+```js
+heprPerf.stop();          // CPU timing and batch-counter tables, plus the report
+copy(heprPerf.json());    // Chrome DevTools helper: copy the report for comparison
+```
+
+Capture panning and zooming separately, with the same viewport, DPR, LOD settings,
+and visible layers when comparing versions. Capture is off by default, stops after
+the requested number of rendered frames (600 by default), and also stops when the
+document or renderer is replaced. `heprPerf.report()` reads the current report;
+starting again clears the previous capture. The report includes the starting view,
+drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
+upload counters, and sampled GPU command-span timing when supported.
+
+The report also includes up to 120 `frameRecords` with the camera and viewport,
+CPU phases, batch/instance counts, and GPU timing for the same frame when sampled.
+It selects slow frames and evenly spaced examples when the report is requested;
+selection and sorting do not run in the render loop. Use
+`heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240 })` for more examples, or
+`maxFrameRecords: 0` for aggregate summaries only. These records distinguish a
+costly batch rebuild from a view that repeatedly needs many draws. Missing GPU
+timings mean that frame was not sampled or its result was unavailable, not zero
+GPU work.
+
+GPU timer queries are asynchronous, sampled every fourth frame, and never wait for
+the GPU or force a flush. Unsupported timer queries, disjoint clocks, and dropped
+samples are reported explicitly. CPU timings measure JavaScript/submission work;
+they do not include asynchronous GPU execution or all browser layout/compositing.
+CPU and GPU spans overlap and must not be added. The GPU query brackets the frame's
+command stream, including possible gaps while the CPU prepares more commands; it
+does not measure only time spent executing shaders.
+Frame intervals describe rendered frames, with idle gaps over 250 ms excluded;
+they are not an automatic continuous FPS benchmark. Profiling itself has overhead;
+`heprPerf.start({ gpu: false })` provides a CPU-only capture. Rendering remains
+unchanged by the capture, and the HUD text updates at most ten times per second
+while camera and interaction processing continue every frame.
 
 The Three.js and room demos share the rendering and API support, but only the
 main viewer currently mounts the panel. Hosts can mount `createPdfLayerControls()`

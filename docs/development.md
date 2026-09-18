@@ -36,6 +36,7 @@ Open the URL printed by Vite. The demo entry points are:
 | `npm run test:file -- scripts/test-text-search.mjs` | Run one regression file. |
 | `npm run build` | Build the demo app. |
 | `npm run build:lib` | Build the package and run package checks. |
+| `npm run build:bundler` | Emit the optional browser bundler modules and their assets. |
 | `npm run build:all` | Build the app and package. |
 | `npm run pack:local` | Build the package and create an installable tarball. |
 | `npm run preview` | Serve the built app for manual review. |
@@ -49,6 +50,28 @@ For rendering changes, manually check both demos and backends with representativ
 PDFs. Exercise pan/zoom, text search and selection, document switching, and HEP
 export/reload. The [visual regression guide](visual-regressions.md) lists specific
 appearance checkpoints.
+
+### Published-package consumer check
+
+`npm run build:lib` also builds `dist/bundler`, exposed as
+`@soadzoor/hepr/bundler`, and runs a Vite consumer test against an unpacked npm
+tarball. It checks emitted WASM, fonts, workers, and lazy imports, then exercises
+the emitted parser worker with Node worker threads. This does not verify browser
+fetching or rendering.
+
+To retain that isolated consumer for manual browser verification:
+
+```bash
+npm run test:file -- scripts/test-bundler-package.mjs -- --keep-fixture
+```
+
+In the temporary directory printed by the test, run `npm run dev` manually and
+open `/hepr-smoke/`. Choose a small PDF; the page loads it twice. Also try a PDF
+with JPEG images, standard fonts, and ICC colors. Check the browser Network and
+Console panels for missing assets, dynamic-import failures, or worker session
+errors. Repeat using `npm run build` followed by `npm run preview` to check the
+production output. The fixture uses the same Vite configuration documented in
+the quick start and a non-root deployment path. It never converts PDFs to HEP.
 
 ## Example assets
 

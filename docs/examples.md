@@ -15,12 +15,15 @@ Both viewers support PDF and HEP loading, PDF layer controls, text search, text 
 
 This browser TypeScript module fills the window and adds mouse/touch pan and zoom. Use it in an application with a bundler after installing `@soadzoor/hepr` and `three`. Replace `/drawing.pdf` with a PDF or HEP URL served by your application.
 
+For Vite, apply the [quick-start configuration](../README.md#quick-start).
+All browser examples use the `@soadzoor/hepr/bundler` entry consistently.
+
 For TypeScript, also install the three.js declarations with `npm install --save-dev @types/three`.
 
 ```ts
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import { pdfObjectGenerator } from "@soadzoor/hepr";
+import { pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setClearColor(0xe8e8e8);
@@ -135,7 +138,7 @@ Search uses the document's extracted text index. Highlights follow the PDF throu
 Add this after creating the viewer. The controller handles desktop selection, touch long-press, drag handles, and copying.
 
 ```ts
-import { createTextSelectionController } from "@soadzoor/hepr";
+import { createTextSelectionController } from "@soadzoor/hepr/bundler";
 
 const selection = createTextSelectionController({
   getCanvas: () => renderer.domElement,
@@ -242,7 +245,7 @@ widget. A host can reuse the controller with its own UI instead of implementing
 pointer scheduling and cancellation:
 
 ```ts
-import { createThreePrimitiveInteractionController } from "@soadzoor/hepr";
+import { createThreePrimitiveInteractionController } from "@soadzoor/hepr/bundler";
 
 const drawingSelection = createThreePrimitiveInteractionController({
   getCanvas: () => renderer.domElement,
@@ -293,7 +296,7 @@ canvas:active { cursor: grabbing; }
 Build from an already loaded scene to avoid parsing the PDF again. This example adds a download link; the user chooses when to save it.
 
 ```ts
-import { buildHep } from "@soadzoor/hepr";
+import { buildHep } from "@soadzoor/hepr/bundler";
 
 const hepBlob = await buildHep(pdf.sceneData, {
   sourceLabel: pdf.sourceLabel,
@@ -325,7 +328,7 @@ HEP exports preserve the PDF's original layer defaults and initially hidden cont
 Room detection is optional and loads on first use. It derives room candidates from vector strokes and text labels; results depend on the drawing and should be reviewed.
 
 ```ts
-import { detectRooms, pdfObjectGenerator } from "@soadzoor/hepr";
+import { detectRooms, pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const floorplan = await pdfObjectGenerator("/floorplan.pdf", { extractText: true });
 try {

@@ -39,6 +39,11 @@
       "import": "./dist/lib/index.js",
       "default": "./dist/lib/index.js"
     },
+    "./bundler": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/bundler/index.js",
+      "default": "./dist/bundler/index.js"
+    },
     "./node": {
       "types": "./dist/types/nodePdfSource.d.ts",
       "import": "./dist/lib/node.js",
@@ -55,6 +60,7 @@
   },
   "files": [
     "dist/lib",
+    "dist/bundler",
     "dist/types",
     "README.md",
     "docs/HEP_CONTAINER.md",
@@ -75,7 +81,8 @@
     "test:oracle": "npm --prefix oracle test",
     "dev": "vite",
     "build": "tsc && npm run test:file -- scripts/test-persistent-viewer-contract.mjs && vite build",
-    "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:package",
+    "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run build:bundler && npm run test:package",
+    "build:bundler": "tsc -p tsconfig.bundler.json && node scripts/prepare-bundler-output.mjs",
     "build:all": "npm run build && npm run build:lib",
     "release-new-version": "npm test && npm run build:all && npm version patch && git push --follow-tags",
     "pack:local": "npm run build:lib && npm pack",

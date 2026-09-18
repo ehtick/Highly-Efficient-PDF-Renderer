@@ -30,11 +30,35 @@ Install the browser package alongside three.js:
 npm install @soadzoor/hepr three
 ```
 
-In a browser app with an ES module bundler, serve a PDF at `/document.pdf` and add this to your entry module:
+For browser apps built with Vite, import `@soadzoor/hepr/bundler`. This entry
+provides separate JavaScript modules and asset references that the application
+build can follow. Add these settings to your existing Vite configuration:
+
+```js
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  optimizeDeps: { exclude: ["@soadzoor/hepr/bundler"] },
+  worker: { format: "es" }
+});
+```
+
+The exclusion keeps HEPR's asset and worker references available to Vite's
+development transforms. ES module workers allow lazy imports in production.
+No HEPR plugin or manual asset copying is required. Other bundlers need support
+for module workers and static `new URL("./asset", import.meta.url)` references;
+the package regression checks currently cover Vite.
+
+Use the bundler entry consistently throughout a browser application. The existing
+`@soadzoor/hepr` and `@soadzoor/hepr/three` entries retain the prebuilt `dist/lib`
+layout: serve that directory intact when using it in a browser; do not rebundle
+it or mix its modules with the bundler entry. Node usage is unchanged.
+
+Serve a PDF at `/document.pdf` and add this to your entry module:
 
 ```js
 import * as THREE from "three";
-import { pdfObjectGenerator } from "@soadzoor/hepr";
+import { pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const width = 800;
 const height = 600;
@@ -67,7 +91,7 @@ When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. See
 Build a reusable document from a PDF, or export the scene you already loaded:
 
 ```js
-import { buildHep } from "@soadzoor/hepr";
+import { buildHep } from "@soadzoor/hepr/bundler";
 
 const hepBlob = await buildHep("/document.pdf");
 // Or: const hepBlob = await buildHep(pdf.sceneData);

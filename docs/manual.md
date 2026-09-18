@@ -13,6 +13,9 @@ application, or explore the standalone canvas viewer in the
 npm install @soadzoor/hepr three
 ```
 
+For bundled browser applications, use the `@soadzoor/hepr/bundler` entry and
+the [Vite configuration in the quick start](../README.md#quick-start).
+
 The browser integration requires a canvas and a supported GPU backend:
 
 | Backend | Requirements |
@@ -45,7 +48,7 @@ The loader detects the format from the source. Set `sourceKind: "pdf"` or
 `sourceKind: "hep"` when you need to select it explicitly.
 
 ```ts
-import { pdfObjectGenerator } from "@soadzoor/hepr";
+import { pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const pdf = await pdfObjectGenerator("/documents/plan.pdf", {
   pages: "1-3, 5",
@@ -371,7 +374,7 @@ the same `pdfObjectGenerator()` entry point as a PDF.
 Create a HEP file from a PDF source or an already-loaded scene:
 
 ```ts
-import { buildHep } from "@soadzoor/hepr";
+import { buildHep } from "@soadzoor/hepr/bundler";
 
 const fromPdf = await buildHep(pdfSource, { pages: "3-5" });
 const fromScene = await buildHep(pdf.sceneData, {

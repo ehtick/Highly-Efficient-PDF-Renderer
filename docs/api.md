@@ -11,9 +11,14 @@ This page covers the main integration APIs. The package ships TypeScript declara
 | --- | --- |
 | `@soadzoor/hepr` | Three.js objects, HEP export, search, selection, LOD utilities, and room detection. |
 | `@soadzoor/hepr/three` | Alias for the main entry point, with the same exports. |
+| `@soadzoor/hepr/bundler` | Same public API as the main entry, with modules and assets prepared for browser application bundlers. |
 | `@soadzoor/hepr/node` | Node file sources, PDF worker sessions, and bundled standard-font resolution. |
 | `@soadzoor/hepr/experimental/pdf-worker` | Worker entry used by the PDF session infrastructure. |
 | `@soadzoor/hepr/experimental/dense-pdf-worker` | Worker entry for the specialized dense-vector parser. |
+
+For bundled browser applications, consistently use the `/bundler` entry and the
+[Vite settings in the quick start](../README.md#quick-start). The main and
+`/three` entries retain the prebuilt layout for serving intact and for Node.
 
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 
@@ -22,7 +27,7 @@ your Three.js camera through its render hooks. Add it to your scene and render
 normally; frame the camera using the object's bounds as shown in the [examples](examples.md).
 
 ```ts
-import { pdfObjectGenerator } from "@soadzoor/hepr";
+import { pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const pdf = await pdfObjectGenerator("/drawings/plan.pdf", {
   pages: "1-3, 5",
@@ -346,7 +351,8 @@ recolor that correction; layer-dependent backdrop changes are replayed.
 ## `buildHep(input, options?)`
 
 Returns `Promise<Blob>` with MIME type `application/x-hep`. Save it with a `.hep`
-extension. Import it from `@soadzoor/hepr` in either a browser or Node.
+extension. Import it from `@soadzoor/hepr/bundler` in a bundled browser app,
+or `@soadzoor/hepr` in Node.
 
 | Input | Options |
 | --- | --- |

@@ -4,6 +4,7 @@ import { rm } from "node:fs/promises";
 // prevents a renamed/missing environment variable from widening the delete.
 const generatedTargets = [
   new URL("../dist/lib/", import.meta.url),
+  new URL("../dist/bundler/", import.meta.url),
   new URL("../dist/types/", import.meta.url)
 ];
 

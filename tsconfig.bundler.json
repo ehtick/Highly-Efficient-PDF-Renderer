@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "noEmitOnError": true,
+    "rootDir": "src",
+    "outDir": "dist/bundler"
+  },
+  "include": [
+    "src/index.ts",
+    "src/pdf/pdfWorkerEntry.ts",
+    "src/densePdfFastWorker.ts",
+    "src/densePdfNodeWorkerEntry.ts",
+    "src/roomDetectorWorker.ts",
+    "src/vite-env.d.ts"
+  ]
+}

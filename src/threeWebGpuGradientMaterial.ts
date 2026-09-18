@@ -35,6 +35,7 @@ interface CommonMaterialOptions extends GradientTextureOptions {
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
   vectorOverride: THREE.Vector4;
+  primitiveColor: THREE.Vector4;
 }
 
 export interface ThreeWebGpuGradientFillMaterialOptions extends CommonMaterialOptions {
@@ -298,7 +299,8 @@ fn heprGradientFillFragment(
   sourceGradientIndex: f32,
   maskGradientIndex: f32,
   fillAAScreenPx: f32,
-  vectorOverride: vec4<f32>
+  vectorOverride: vec4<f32>,
+  primitiveColor: vec4<f32>
 ) -> vec4<f32> {
   // WGSL derivatives must execute before any divergent branch, loop exit, or
   // discard. Flat-interpolated paint metadata is not statically uniform.
@@ -341,7 +343,8 @@ fn heprGradientFillFragment(
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let solidColor = vec3<f32>(metaB.z, metaB.w, metaC.z);
-  let resolvedColor = select(solidColor, source.rgb, sourceGradientIndex >= -0.5);
+  let sourceColor = select(solidColor, source.rgb, sourceGradientIndex >= -0.5);
+  let resolvedColor = mix(sourceColor, primitiveColor.rgb, primitiveColor.a);
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
   let alpha = coverage * metaC.w * source.a * mask.a;
@@ -388,7 +391,7 @@ const strokeFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprGradientStrokeFragment(
   local: vec2<f32>, primitiveA: vec4<f32>, primitiveB: vec4<f32>, style: vec4<f32>,
   primitiveBounds: vec4<f32>, halfWidthFromVertex: f32, strokeCurveEnabled: f32,
-  aaScreenPx: f32, vectorOverride: vec4<f32>,
+  aaScreenPx: f32, vectorOverride: vec4<f32>, primitiveColor: vec4<f32>,
   gradientMetaA: texture_2d<f32>, gradientMetaB: texture_2d<f32>,
   gradientMetaC: texture_2d<f32>, gradientMetaD: texture_2d<f32>,
   gradientMetaE: texture_2d<f32>, gradientLut: texture_2d<f32>, gradientMetaWidth: f32,
@@ -414,7 +417,8 @@ fn heprGradientStrokeFragment(
   let coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
-  let resolvedColor = select(style.yzw, source.rgb, sourceGradientIndex >= -0.5);
+  let sourceColor = select(style.yzw, source.rgb, sourceGradientIndex >= -0.5);
+  let resolvedColor = mix(sourceColor, primitiveColor.rgb, primitiveColor.a);
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
   let alpha = coverage * alphaStyle * source.a * mask.a;
@@ -461,7 +465,7 @@ export function createThreeWebGpuGradientFillMaterial(
     segmentTexWidth: segmentWidth,
     ...createGradientNodes(options, gradientWidth),
     fillAAScreenPx: TSL.uniform(1),
-    vectorOverride: TSL.uniform(options.vectorOverride)
+    vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor)
   });
   registerThreeNodeClipPosition(material, vertexValue.xy);
   return {
@@ -502,7 +506,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   material.fragmentNode = callNode(strokeFragmentFns[options.colorCompositing], {
     local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds,
     halfWidthFromVertex: worldValue.z, strokeCurveEnabled: curveUniform,
-    aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride),
+    aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor),
     ...createGradientNodes(options, gradientWidth)
   });
   registerThreeNodeClipPosition(material, worldValue.xy);

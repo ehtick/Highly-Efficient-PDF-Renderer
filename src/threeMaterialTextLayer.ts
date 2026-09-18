@@ -1,3 +1,5 @@
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
+import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
@@ -335,6 +337,12 @@ export class ThreeMaterialTextLayer {
     if (this.webGpuState) {
       this.webGpuState.vectorOnlyUniform.value = this.vectorOnlyUniform.value;
     }
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
+    patchPrimitiveColorTexture(this.textInstanceTextureC, scene.textInstanceC, updates, "text", [
+      { source: 0, target: 0 }, { source: 1, target: 1 }, { source: 2, target: 2 }
+    ]);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

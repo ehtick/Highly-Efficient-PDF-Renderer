@@ -190,6 +190,35 @@ Search and selection work with both PDF and HEP scenes that have extracted
 text. See the [examples](examples.md) and [API reference](api.md) for adapters,
 highlight coordinates, and copy behavior.
 
+## Drawing selection
+
+The standalone viewer, Three.js example, and room detection demo share a
+**Drawing Selection** checkbox that starts unchecked. Enable it to trace
+geometry on hover and select a primitive with a click or tap. The
+panel shows its reference and geometry information and lets you change vector
+colors temporarily. Images can be selected but not recolored. Dragging and
+pinching still move the view; text-selection gestures are suspended until you
+turn drawing selection off in viewers with text selection. Empty clicks and
+Escape clear the selection. The cursor becomes a pointer over selectable
+geometry. In the room demo, selection targets the underlying drawing primitives;
+room detection and TSV overlays remain independent.
+
+On the first hover or click, a progress bar shows **Preparing drawing selection**
+with the percentage of preparation work completed. It disappears when picking
+is ready. You can continue panning and zooming while it prepares, or turn
+Drawing Selection off to cancel preparation.
+
+**Reset selected** restores one selected primitive's original color;
+**Reset all colors** restores all overrides. Turning the checkbox off clears
+interaction state and releases its extra resources. Opening another document
+clears selections and overrides; switching rendering backends preserves them.
+These changes are never written into exported PDF or HEP files.
+
+Library hosts can opt into the shared `createThreePrimitiveInteractionController()`
+or handle their own events with `pick()`, `getPrimitive()`, `setHover()`,
+`setSelection()`, and the primitive override methods. See the
+[examples](examples.md#pick-inspect-and-recolor-drawing-primitives).
+
 ## HEP files
 
 HEP (`.hep`) stores a pre-parsed document for reuse. It includes geometry, page

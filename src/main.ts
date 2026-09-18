@@ -1,4 +1,5 @@
 import "./style.css";
+import "./drawingSelectionControls.css";
 import { waitForLoad } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
@@ -57,6 +58,8 @@ import {
 } from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
+import { createPrimitiveInteractionController } from "./primitiveInteraction";
+import { createDrawingSelectionControls } from "./drawingSelectionControls";
 import {
   describeSceneOperatorCount,
   formatSceneSegmentAccounting,
@@ -110,6 +113,7 @@ const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-se
 const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
 const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
+const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 
 if (
   !canvas ||
@@ -156,7 +160,8 @@ if (
   !textSearchPrevButton ||
   !textSearchNextButton ||
   !textSearchCaseButton ||
-  !textSelectionCheckbox
+  !textSelectionCheckbox ||
+  !drawingSelectionContainer
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -256,6 +261,7 @@ textSearchController = createTextSearchController({
 });
 
 function applyTextSearchScene(scene: VectorScene): void {
+  drawingSelection.sceneChanged();
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
@@ -278,16 +284,36 @@ const textSelection = createTextSelectionController({
 });
 
 textSelectionCheckbox.addEventListener("change", () => {
-  if (textSelectionCheckbox.checked) {
+  if (textSelectionCheckbox.checked && !drawingSelection.isEnabled()) {
     textSelection.enable();
   } else {
     textSelection.disable();
   }
 });
 
+textSelectionCheckbox.disabled = false;
+const drawingSelection = createDrawingSelectionControls({
+  container: drawingSelectionContainer,
+  createController: callbacks => createPrimitiveInteractionController({
+    ...callbacks,
+    getCanvas: () => canvasElement,
+    getRenderer: () => renderer,
+    getScene: () => lastParsedScene,
+    onError: error => { setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`); }
+  }),
+  onEnabledChange: enabled => {
+    textSelectionCheckbox.disabled = enabled;
+    if (enabled) {
+      textSelection.disable();
+      canvasInteractionController.cancelActiveGesture();
+    } else if (textSelectionCheckbox.checked) textSelection.enable();
+  }
+});
+
 function onRendererFrame(stats: DrawStats): void {
   updateFpsMetric();
   textSelection.updateOverlay();
+  drawingSelection.onFrame();
 
   const rendered = stats.renderedSegments.toLocaleString();
   const total = stats.totalSegments.toLocaleString();
@@ -413,6 +439,7 @@ backendSwitcher = createBackendSwitcher({
     // Highlights live in renderer-owned GPU buffers; re-apply after a switch.
     renderer.setSearchHighlights?.(lastSearchHighlights);
     textSelection.refreshHighlights();
+    drawingSelection.rendererChanged();
   },
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {
@@ -480,6 +507,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  drawingSelection.dispose();
   activeHepExportController?.abort();
   sourceLoadController?.abort();
 }, { once: true });
@@ -1043,6 +1071,7 @@ function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preser
     try {
       if (previousScene) target.setScene(previousScene);
       target.setViewState(previousView);
+      if (target === renderer) drawingSelection.rendererChanged();
     } catch (restoreError) {
       console.warn("[HEPR] Failed to restore the previous scene after an upload error.", restoreError);
     }

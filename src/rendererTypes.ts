@@ -1,5 +1,6 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { SearchHighlightSet } from "./searchHighlights";
+import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import type { TextLodMode, TextLodStats } from "./textLodCore";
 import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
@@ -77,6 +78,12 @@ export interface RendererApi {
 
   /** Set vector color override with normalized RGBA-style channels. */
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void;
+
+  /** Runtime-only colors; null entries restore original scene colors. */
+  setPrimitiveColorUpdates?(updates: readonly PrimitiveColorUpdate[]): void;
+
+  /** Independent canonical hover/selection traces, painted above the document. */
+  setPrimitiveHighlights?(highlights: PrimitiveHighlightSet | null): void;
 
   /** Return the view state used for the last presented native frame. */
   getPresentedViewState(): ViewState;

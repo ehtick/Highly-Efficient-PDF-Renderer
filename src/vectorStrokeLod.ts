@@ -1,3 +1,4 @@
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -70,6 +71,14 @@ export class ThreeVectorLodStrokeLayer {
     for (const layer of this.layers) {
       layer.setVectorOverride(red, green, blue, opacity);
     }
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    this.layers[0]?.setPrimitiveColorUpdates(updates, this.scene);
+  }
+
+  setForceExact(enabled: boolean): void {
+    this.runtime.setForceExact(enabled);
   }
 
   setScreenSpaceTransform(): void {

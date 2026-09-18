@@ -96,6 +96,13 @@ The object supports normal Three.js transforms. `sceneData` contains its parsed
 | `setTextSelectionHighlights(rects)` | Draw scene-space `Bounds[]` or packed `Float32Array` selection rectangles; `null` clears them. |
 | `clientToScenePoint(camera, x, y, element)` | Map client CSS pixels to PDF scene coordinates; may return `null`. |
 | `sceneToClientPoint(camera, x, y, element)` | Project PDF scene coordinates to client CSS pixels; may return `null`. |
+| `pick(options)` | Asynchronously find a canonical drawing primitive under client coordinates; returns a hit or `null`. |
+| `subscribePrimitivePreparationProgress(listener)` | Observe shared picking preparation (integer 0–100, or `null` when idle/reset/failed); returns an unsubscribe function. |
+| `getPrimitive(ref)` | Read original style and detached scene-space geometry. |
+| `setHover(ref)` / `setSelection(refs)` | Draw amber hover and blue selection traces; `null` / `[]` clears them. |
+| `setPrimitiveOverrides(refs, { color })` | Temporarily replace vector RGB, preserving opacity, masks, and drawing order. |
+| `clearPrimitiveOverrides(refs?)` | Restore specified primitives, or all overrides when omitted. |
+| `clearPrimitiveInteraction()` | Clear hover, selection, and colors and release the picking index. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
 | `setPageBackgroundColor(r, g, b, alpha)` | Set normalized page background components. |
 | `setVectorColorOverride(r, g, b, opacity)` | Set normalized vector override components. |
@@ -113,6 +120,98 @@ pdf.dispose();
 `attachControls()`, `fitToBounds()`, and `setViewState()` manage the internal
 fallback viewport. In an ordinary Three.js integration, use your application's
 camera and controls. Full method contracts: [HeprThreePdfObject](../src/threePdfObject.ts).
+
+### Drawing primitives
+
+`pick({ camera, element, clientX, clientY, tolerancePx?, kinds?, signal? })`
+accepts browser `clientX`/`clientY` values directly. Tolerance defaults to four CSS
+pixels and does not require device-pixel-ratio adjustment. The result contains
+`primitive`, the cursor `point` in composed scene coordinates, `closestPoint`,
+`distancePx`, and an optional `segmentIndex`. The last eligible painted primitive
+within tolerance wins. `kinds` filters eligible types, which is useful for a
+measurement tool interested only in strokes. This queries canonical geometry,
+not antialiased framebuffer pixels or simplified LOD geometry.
+
+`PrimitiveRef` is `{ kind, index }`, where `kind` is `"stroke"`, `"fill"`,
+`"text"`, `"raster"`, `"gradient-fill"`, or `"gradient-stroke"`. Stroke indices
+identify individual segments; gradient-stroke indices identify complete runs.
+Text indices identify glyph instances: a ligature is not necessarily one
+Unicode character. Raster references identify whole layers, not shapes inside
+their pixels. Invisible OCR text has no pickable render instance.
+
+`getPrimitive(ref)` returns `kind`, `index`, `ref`, `bounds`, `pageIndex` (or
+`null` when ambiguous), original `color`/`opacity`, `segmentCount`, and
+`getSegment(index)` / `getSegmentStyle(index)`. Each segment has detached `start`/`end` points and an
+optional quadratic `control`. Stroke inspection includes `strokeWidth`; fill
+inspection includes `fillRule`; raster inspection includes its transformed
+`quad`, pixel `width`, and pixel `height`. Segment styles expose the original
+color, opacity, and applicable stroke width, hairline/cap flags, and rectangular
+clip. This preserves differing styles within a gradient-stroke run. Gradient
+primitives also expose `gradientIndex` and `maskGradientIndex` into the retained
+gradient store (`null` means a solid source or no mask). Gradient or mixed colors are `null`.
+Geometry uses the same composed, Y-up scene coordinates as `sceneData`.
+
+These are the retained drawing primitives. Extraction can merge lines, split
+dashes, approximate curves, or rasterize content; HEP also quantizes coordinates.
+Original CAD endpoints are not guaranteed to survive. Hosts supply drawing scale
+for real-world measurements and implement snapping using the exposed segments.
+
+References survive reopening the **exact same HEP artifact**. Store an immutable
+document ID or artifact hash alongside `{ kind, index }`. Equal PDF bytes alone
+do not establish compatible indices across different conversion settings,
+pipelines, or versions. References are not portable between unrelated documents.
+Invalid kinds/indices and invalid override batches throw before applying changes.
+
+Hover and selection trace stroke centerlines, fill/glyph contours, and raster
+frames inside geometric clips, using their own opacity independently of source
+colors or gradient masks. They do not compute a new outline along clip edges.
+Color overrides accept `0xRRGGBB`, `#rgb`, `#rrggbb`, bare `rrggbb`, CSS named colors such as
+`"red"`, or normalized sRGB `[r, g, b]` tuples. Gradients receive a flat RGB
+override while retaining their alpha and masks; rasters cannot be recolored.
+The existing global vector tint is applied after primitive overrides.
+
+All interaction state is runtime-only. `sceneData`, PDF/HEP export, and file size
+remain unchanged. The picking hierarchy is built lazily; very large scenes group
+several primitives into each spatial leaf to stay within its 128 MiB estimated
+packed-buffer build budget. They retain spatial rejection and the same canonical
+references and paint order. The index retains the existing geometry arrays; additional memory is
+used for packed bounds, ordering, sparse overrides, and selected/hovered trace
+buffers. First-pick latency includes index construction; coarser leaves may
+require more candidate checks on dense pages. Index building
+and expensive queries yield cooperatively. An `AbortSignal` cancels that request's
+wait or query; a shared index build can continue for other requests. Disposing the
+object cancels the build and outstanding queries. Hosts should cancel or ignore outdated hover
+results when the pointer, camera, or document changes.
+
+`subscribePrimitivePreparationProgress()` immediately reports the current value,
+then follows the shared index build even when one hover query is cancelled.
+Clearing interaction or disposing the object reports `null`; unsubscribe when
+detaching UI from an object. Observer exceptions do not interrupt picking.
+
+For optional built-in mouse/touch handling, use
+`createThreePrimitiveInteractionController({ getCanvas, getCamera, getPdfObject,
+requestRender, onSelectionChange?, onPreparationProgress?, onError? })`.
+The controller starts disabled. `enable()` attaches gestures; `disable()` clears
+its selection, colors, picking resources, and listeners. It handles hover,
+click/tap selection, Escape, drag/pinch suppression, pointer cursor state, and
+outdated query results. It owns the PDF object's primitive interaction state;
+use one controller per viewport and coordinate any text-selection mode in the host.
+
+Call `onFrame()` after updating the camera and object transforms,
+`sceneChanged()` after replacing the document, and `rendererChanged()` after
+replacing a canvas or PDF object for the exact same `sceneData`. The latter
+replays selection and colors. `setSelectedColor(color)`, `resetSelectedColor()`,
+and `resetAllColors()` support host UI controls. Call `dispose()` before tearing
+down the viewport. The controller toggles the canvas's `drawing-selection-hover`
+CSS class; the host provides its cursor styling. See the
+[controller example](examples.md#shared-drawing-selection-controller).
+
+Overriding ordinary stroke/text colors temporarily forces exact rendering for
+that class and restores the requested LOD mode when cleared. Highlighting alone
+keeps LOD active. Batch large color changes; Three.js/WebGPU may upload a whole
+modified texture even when only a few colors changed. Use hover traces for
+frequent pointer feedback. Call `clearPrimitiveInteraction()` to release the
+optional interaction resources without disposing the document.
 
 ## `buildHep(input, options?)`
 

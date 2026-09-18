@@ -1,3 +1,7 @@
+import { estimateHighlightLocalUnitsPerPixel } from "./primitiveHighlightProjection";
+import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
+import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePrimitiveColors";
+import { WebGlPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
@@ -1739,6 +1743,8 @@ export class WebGlFloorplanRenderer {
   private readonly orderedTextureBindings: (WebGLTexture | null | undefined)[] = [];
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
+  private primitiveColors: NativePrimitiveColors | null = null;
+  private primitiveHighlights: WebGlPrimitiveHighlights | null = null;
 
   private grid: SpatialGrid | null = null;
 
@@ -2070,7 +2076,8 @@ export class WebGlFloorplanRenderer {
       "uAAScreenPx",
       "uUseLocalToClip",
       "uLocalToClip",
-      "uVectorOverride"
+      "uVectorOverride",
+      "uPrimitiveOverride"
     ]);
     this.gradientStrokeUniforms = this.mustGetUniformMap(this.gradientStrokeProgram, [
       "uRunMetaTexA",
@@ -2096,7 +2103,8 @@ export class WebGlFloorplanRenderer {
       "uLocalToClip",
       "uLocalUnitsPerPixel",
       "uStrokeCurveEnabled",
-      "uVectorOverride"
+      "uVectorOverride",
+      "uPrimitiveOverride"
     ]);
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
@@ -2313,6 +2321,7 @@ export class WebGlFloorplanRenderer {
       this.needsVisibleSetUpdate = true;
       this.requestFrame();
     }
+    if (this.primitiveColors) this.setPrimitiveColorUpdates(this.primitiveColors.updates());
   }
 
   getVectorStrokeLodStats(): VectorStrokeLodStats | null {
@@ -2329,7 +2338,7 @@ export class WebGlFloorplanRenderer {
       this.setScene(this.scene);
       return;
     }
-    this.textLodRuntime?.setMode(nextMode);
+    this.textLodRuntime?.setMode(this.primitiveColors?.has("text") ? "off" : nextMode);
     this.selectedTextInstanceCount = 0;
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
@@ -2457,6 +2466,60 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
+  setPrimitiveHighlights(highlights: PrimitiveHighlightSet | null): void {
+    if (this.isDisposed) return;
+    if (!highlights?.count) {
+      this.primitiveHighlights?.dispose();
+      this.primitiveHighlights = null;
+      this.requestFrame();
+      return;
+    }
+    if (!this.primitiveHighlights) {
+      this.primitiveHighlights = new WebGlPrimitiveHighlights(this.gl, (vertex, fragment) => this.createProgram(vertex, fragment));
+    }
+    this.primitiveHighlights?.set(highlights);
+    this.requestFrame();
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    if (this.isDisposed || updates.length === 0) return;
+    if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
+    this.primitiveColors ??= new NativePrimitiveColors(this.scene);
+    const patches = this.primitiveColors.update(updates);
+    const widths = { stroke: this.segmentTextureWidth, fillB: this.fillPathMetaTextureWidth,
+      fillC: this.fillPathMetaTextureWidth, text: this.textInstanceTextureWidth };
+    const rows = coalescePrimitiveColorTexels(patches, widths);
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    for (const patch of rows) {
+      const texture = patch.kind === "stroke" ? this.segmentTextureC
+        : patch.kind === "fillB" ? this.fillPathMetaTextureB
+        : patch.kind === "fillC" ? this.fillPathMetaTextureC : this.textInstanceTextureC;
+      const width = widths[patch.kind];
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, patch.index % width, Math.floor(patch.index / width),
+        patch.count, 1, gl.RGBA, patch.pixels instanceof Uint8Array ? gl.UNSIGNED_BYTE : gl.FLOAT, patch.pixels);
+    }
+    const combined = this.orderedBatches ? this.vectorLodLevels[0] : undefined;
+    if (combined?.ownsTextures) {
+      const strokeRows = coalescePrimitiveColorTexels(patches.filter(patch => patch.kind === "stroke"),
+        { ...widths, stroke: combined.textureWidth });
+      gl.bindTexture(gl.TEXTURE_2D, combined.textureC);
+      for (const patch of strokeRows) {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, patch.index % combined.textureWidth, Math.floor(patch.index / combined.textureWidth),
+          patch.count, 1, gl.RGBA, gl.FLOAT, patch.pixels);
+      }
+    }
+    this.vectorLodRuntime?.setForceExact(this.primitiveColors.has("stroke"));
+    this.textLodRuntime?.setMode(this.primitiveColors.has("text") ? "off" : this.textLodMode);
+    this.selectedTextInstanceCount = 0;
+    this.orderedBatches?.invalidate();
+    this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
     const nextRed = clamp(red, 0, 1);
     const nextGreen = clamp(green, 0, 1);
@@ -2541,6 +2604,11 @@ export class WebGlFloorplanRenderer {
   setScene(scene: VectorScene): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
+    }
+    if (this.scene !== scene) {
+      this.primitiveColors = null;
+      this.primitiveHighlights?.dispose();
+      this.primitiveHighlights = null;
     }
     validateVectorDrawRuns(scene);
     this.uploadVectorClips(scene);
@@ -2678,6 +2746,8 @@ export class WebGlFloorplanRenderer {
 
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
+
+    if (this.primitiveColors) this.setPrimitiveColorUpdates(this.primitiveColors.updates());
 
     return this.sceneStats;
   }
@@ -2838,6 +2908,9 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.isDisposed = true;
+    this.primitiveHighlights?.dispose();
+    this.primitiveHighlights = null;
+    this.primitiveColors = null;
     this.orderedRunCuller = null;
 
     if (this.rafHandle !== 0) {
@@ -3618,6 +3691,8 @@ export class WebGlFloorplanRenderer {
       this.vectorOverrideColor[2],
       this.vectorOverrideOpacity
     );
+    const primitiveColor = this.primitiveColors?.gradient("gradient-fill", pathIndex);
+    gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, pathIndex * 4, 4, 1);
   }
 
@@ -3674,6 +3749,8 @@ export class WebGlFloorplanRenderer {
       this.vectorOverrideColor[2],
       this.vectorOverrideOpacity
     );
+    const primitiveColor = this.primitiveColors?.gradient("gradient-stroke", runIndex);
+    gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, runIndex * 4, 4, segmentCount);
   }
 
@@ -3841,6 +3918,14 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoomValue = this.zoom
   ): void {
+    if (this.primitiveHighlights) {
+      const scale = this.resolveClientToPixelScale();
+      this.primitiveHighlights.draw(this.localToClipRenderingEnabled ? this.localToClipMatrix :
+        createOrthographicLocalToClip(cameraCenterX, cameraCenterY, zoomValue, viewportWidth, viewportHeight),
+        this.localToClipRenderingEnabled && this.scene
+          ? estimateHighlightLocalUnitsPerPixel(this.localToClipMatrix, { width: viewportWidth, height: viewportHeight }, this.scene.bounds)
+          : 1 / Math.max(zoomValue, 1e-6), Math.max(scale.x, scale.y));
+    }
     if (this.highlightOthersCount === 0 && this.highlightCurrentCount === 0 && this.highlightSelectionCount === 0) {
       return;
     }
@@ -5255,6 +5340,7 @@ export class WebGlFloorplanRenderer {
   private rebuildVectorLod(scene: VectorScene): boolean {
     if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
+      this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
     } else {
       this.vectorLodRuntime = null;
     }

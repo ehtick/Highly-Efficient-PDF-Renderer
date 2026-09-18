@@ -58,6 +58,7 @@ try {
   calls.length = 0;
   const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
     drawPageBackgroundContentIntoPass() {}, gradientFillPipeline: "fill", gradientStrokePipeline: "stroke",
+    primitiveGradientColors: { bindGroup() { return {}; } },
     gradientFillBindGroup: {}, gradientStrokeBindGroup: {}, vectorClipBindGroups: [-2, -1, 0, 1]
   });
   gpu.drawSourceOrderedContentIntoPass({

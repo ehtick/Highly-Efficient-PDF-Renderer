@@ -1,3 +1,5 @@
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
+import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
@@ -197,6 +199,15 @@ export class ThreeMaterialFillLayer {
 
   setVisible(visible: boolean): void {
     this.mesh.visible = visible;
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
+    patchPrimitiveColorTexture(this.fillPathMetaTextureB, scene.fillPathMetaB, updates, "fill", [
+      { source: 2, target: 2 }, { source: 3, target: 3 }
+    ]);
+    patchPrimitiveColorTexture(this.fillPathMetaTextureC, scene.fillPathMetaC, updates, "fill", [
+      { source: 2, target: 2, component: 2 }
+    ]);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

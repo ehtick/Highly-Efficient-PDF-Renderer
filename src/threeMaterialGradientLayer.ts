@@ -1,3 +1,4 @@
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 
@@ -69,6 +70,9 @@ interface GradientTextureSet {
 }
 
 interface GradientLayerEntry extends ThreePdfOrderedPaintMesh {
+  primitiveKind: "gradient-fill" | "gradient-stroke";
+  primitiveIndex: number;
+  primitiveColor: THREE.Vector4;
   material: THREE.Material;
   geometry: THREE.BufferGeometry;
   fillState?: ThreeWebGpuGradientFillMaterialState;
@@ -145,6 +149,22 @@ export class ThreeMaterialGradientLayer {
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    let fills: Map<number, PrimitiveColorUpdate["color"]> | undefined;
+    let strokes: Map<number, PrimitiveColorUpdate["color"]> | undefined;
+    for (const update of updates) {
+      if (update.ref.kind === "gradient-fill") (fills ??= new Map()).set(update.ref.index, update.color);
+      else if (update.ref.kind === "gradient-stroke") (strokes ??= new Map()).set(update.ref.index, update.color);
+    }
+    if (!fills && !strokes) return;
+    for (const entry of this.entries) {
+      const color = (entry.primitiveKind === "gradient-fill" ? fills : strokes)?.get(entry.primitiveIndex);
+      if (color === undefined) continue;
+      if (color) entry.primitiveColor.set(...color, 1);
+      else entry.primitiveColor.set(0, 0, 0, 0);
+    }
   }
 
   setScreenSpaceTransform(): void {
@@ -244,6 +264,7 @@ export class ThreeMaterialGradientLayer {
       const paintOrder = readFinite(scene.gradientFillPaintMeta?.[paintOffset + 2], pathIndex);
       const pageIndex = readFinite(scene.gradientFillPaintMeta?.[paintOffset + 3], 0);
       const geometry = createFillGeometry(pathIndex);
+      const primitiveColor = new THREE.Vector4();
 
       let material: THREE.Material;
       let fillState: ThreeWebGpuGradientFillMaterialState | undefined;
@@ -256,7 +277,8 @@ export class ThreeMaterialGradientLayer {
           fillSegmentTextureB: segmentB,
           fillPathTextureWidth: pathSize.width,
           fillSegmentTextureWidth: segmentSize.width,
-          ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex)
+          ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex),
+          primitiveColor
         });
         material = fillState.material;
       } else {
@@ -274,6 +296,7 @@ export class ThreeMaterialGradientLayer {
         );
       }
 
+      if (material instanceof THREE.RawShaderMaterial) material.uniforms.uPrimitiveColor = { value: primitiveColor };
       material = this.clipMaterial(material, this.fillClipIndices[pathIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
@@ -282,6 +305,9 @@ export class ThreeMaterialGradientLayer {
         geometry,
         material,
         fillState,
+        primitiveKind: "gradient-fill",
+        primitiveIndex: pathIndex,
+        primitiveColor,
         paintOrder,
         pageIndex
       };
@@ -333,6 +359,7 @@ export class ThreeMaterialGradientLayer {
       const paintOrder = readFinite(scene.gradientStrokeRunMetaB?.[runOffset], runIndex);
       const pageIndex = readFinite(scene.gradientStrokeRunMetaB?.[runOffset + 1], 0);
       const geometry = createStrokeGeometry(start, count);
+      const primitiveColor = new THREE.Vector4();
 
       let material: THREE.Material;
       let strokeState: ThreeWebGpuGradientStrokeMaterialState | undefined;
@@ -344,7 +371,8 @@ export class ThreeMaterialGradientLayer {
           segmentBoundsTexture: segmentBounds,
           segmentTextureWidth: size.width,
           strokeCurveEnabled,
-          ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex)
+          ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex),
+          primitiveColor
         });
         material = strokeState.material;
       } else {
@@ -360,6 +388,7 @@ export class ThreeMaterialGradientLayer {
         );
       }
 
+      if (material instanceof THREE.RawShaderMaterial) material.uniforms.uPrimitiveColor = { value: primitiveColor };
       material = this.clipMaterial(material, this.strokeClipIndices[runIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
@@ -368,6 +397,9 @@ export class ThreeMaterialGradientLayer {
         geometry,
         material,
         strokeState,
+        primitiveKind: "gradient-stroke",
+        primitiveIndex: runIndex,
+        primitiveColor,
         paintOrder,
         pageIndex
       };
@@ -524,6 +556,7 @@ uniform sampler2D uGradientLutTex;
 uniform ivec2 uGradientMetaTexSize;
 uniform float uSourceGradientIndex;
 uniform float uMaskGradientIndex;
+uniform vec4 uPrimitiveColor;
 
 vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
   if (gradientIndexInput < -0.5) {
@@ -593,6 +626,7 @@ function buildGradientFillFragmentShader(): string {
       `  vec4 maskPaint = heprSamplePdfGradient(vLocal, uMaskGradientIndex);\n` +
       `  vec3 baseColor = uSourceGradientIndex >= -0.5 ? sourcePaint.rgb : vColor;\n` +
       `  float paintAlpha = sourcePaint.a * maskPaint.a;\n` +
+      `  baseColor = mix(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a);\n` +
       `  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));`
     )
     .replace("float alpha = inside ? vAlpha : 0.0;", "float alpha = inside ? vAlpha * paintAlpha : 0.0;")
@@ -610,6 +644,7 @@ function buildGradientStrokeFragmentShader(): string {
       `  vec4 sourcePaint = heprSamplePdfGradient(vLocal, uSourceGradientIndex);\n` +
       `  vec4 maskPaint = heprSamplePdfGradient(vLocal, uMaskGradientIndex);\n` +
       `  vec3 baseColor = uSourceGradientIndex >= -0.5 ? sourcePaint.rgb : vColor;\n` +
+      `  baseColor = mix(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a);\n` +
       `  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));\n` +
       `  float paintedAlpha = alpha * sourcePaint.a * maskPaint.a;\n` +
       `  if (paintedAlpha <= 0.001) { discard; }\n` +

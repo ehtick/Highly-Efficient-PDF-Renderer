@@ -5,8 +5,11 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
   buildHep,
+  createThreePrimitiveInteractionController,
   createTextSelectionController,
   pdfObjectGenerator,
+  prebuildTextLod,
+  prebuildVectorStrokeLodRuntime,
   consumeVectorStrokeLodBuildTiming,
   resetVectorStrokeLodBuildTiming,
   type HeprRendererType,
@@ -25,6 +28,8 @@ import {
   type NormalizedExampleEntry
 } from "./exampleManifest";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
+import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import { createThreePdfObject } from "./threePdfObject";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
@@ -54,6 +59,7 @@ const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-s
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-select");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
+const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -97,6 +103,7 @@ if (
   !textLodSelect ||
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
+  !drawingSelectionContainer ||
   !touchRotateRow ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -216,6 +223,8 @@ let controls = createMapControls();
 
 let currentPdfObject: HeprThreePdfObject | null = null;
 
+// Drawing selection always starts off, even if the browser restores form state.
+textSelectionCheckboxElement.disabled = false;
 const textSelection = createTextSelectionController({
   getCanvas: () => canvasElement,
   enabled: textSelectionCheckboxElement.checked,
@@ -264,6 +273,22 @@ const exampleDropdown = createExampleDropdown({
     void loadExampleSelection(selectionKey);
   },
   signal: lifetimeSignal
+});
+const drawingSelection = createDrawingSelectionControls({
+  container: drawingSelectionContainer,
+  createController: callbacks => createThreePrimitiveInteractionController({
+    ...callbacks,
+    getCanvas: () => canvasElement,
+    getCamera: () => camera,
+    getPdfObject: () => currentPdfObject,
+    requestRender,
+    onError: error => setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`)
+  }),
+  onEnabledChange: enabled => {
+    textSelectionCheckboxElement.disabled = enabled;
+    if (enabled || !textSelectionCheckboxElement.checked) textSelection.disable();
+    else textSelection.enable();
+  }
 });
 
 initializeBackendSelect();
@@ -373,6 +398,7 @@ function createMapControls(): MapControls {
 
 function createReplacementViewportCanvas(): HTMLCanvasElement {
   const nextCanvas = canvasElement.cloneNode(false) as HTMLCanvasElement;
+  nextCanvas.classList.remove("drawing-selection-hover");
   nextCanvas.width = Math.max(1, canvasElement.width);
   nextCanvas.height = Math.max(1, canvasElement.height);
   return nextCanvas;
@@ -417,6 +443,7 @@ async function ensureThreeRendererBackend(
   controls.target.copy(previousControlsTarget);
   updatePerspectiveCameraProjection();
   updateCameraClipping();
+  drawingSelection.rendererChanged();
   requestRender();
 }
 
@@ -431,6 +458,7 @@ function renderFrame(now: number = performance.now()): void {
   updateCameraClipping();
   prepareThreeRendererFrame(renderer);
   renderer.render(scene, camera);
+  drawingSelection.onFrame();
   textSelection.updateOverlay();
   // Writing the readouts every frame costs a style recalc, layout and paint per
   // frame, which at high refresh rates dwarfs the numbers being reported. The
@@ -469,6 +497,7 @@ function prepareThreeRendererFrame(nextRenderer: ThreeExampleRenderer): void {
 }
 
 function requestRender(): void {
+  if (lifetimeSignal.aborted) return;
   needsRender = true;
   if (animationFrameId === 0) {
     animationFrameId = requestAnimationFrame(renderFrame);
@@ -594,7 +623,7 @@ touchRotateCheckboxElement.addEventListener("change", () => {
 }, { signal: lifetimeSignal });
 
 textSelectionCheckboxElement.addEventListener("change", () => {
-  if (textSelectionCheckboxElement.checked) {
+  if (textSelectionCheckboxElement.checked && !drawingSelection.isEnabled()) {
     textSelection.enable();
   } else {
     textSelection.disable();
@@ -864,6 +893,8 @@ function disposeExample(): void {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
+  drawingSelection.dispose();
+  textSelection.dispose();
   controls.dispose();
   disposeCurrentObject();
   renderer.dispose();
@@ -1000,8 +1031,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   let nextObject: HeprThreePdfObject | null = null;
   let targetInstalled = false;
 
-  setStatus(`Reloading ${previousObject.sourceLabel} with ${formatBackendLabel(backend)}...`);
-  setLoadingProgress(true, "0.00% Parsing / loading");
+  setStatus(`Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
+  setLoadingProgress(true, "Preparing renderer...");
   setLoadControlsEnabled(false);
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), true);
@@ -1012,16 +1043,30 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   try {
     const loadStart = performance.now();
     resetVectorStrokeLodBuildTiming();
-    nextObject = await pdfObjectGenerator(
-      source,
-      {
-        ...objectOptions,
+    await prebuildVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
+      yieldIntervalMs: 50,
+      shouldCancel: () => controller.signal.aborted,
+      onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: "vector-lod" })
+    });
+    controller.signal.throwIfAborted();
+    if (objectOptions.textLod !== "off") {
+      await prebuildTextLod(previousObject.sceneData, {
+        yieldIntervalMs: 50,
         signal: controller.signal,
-        onProgress: (progress) => {
-          updateLoadingProgress(activeLoadToken, progress);
-        }
+        onProgress: progress => updateLoadingProgress(activeLoadToken, { value: 0.7 + progress.value * 0.26, stage: "text-lod" })
+      });
+    }
+    updateLoadingProgress(activeLoadToken, { value: 0.98, stage: "upload" });
+    // Keep canonical references attached to the exact same scene when
+    // replacing the renderer; do not parse the source again.
+    nextObject = await createThreePdfObject(
+      {
+        scene: previousObject.sceneData,
+        sourceLabel: previousObject.sourceLabel,
+        sourceKind: previousObject.sourceKind
       },
-      backend
+      { ...objectOptions, rendererType: backend },
+      controller.signal
     );
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
@@ -1107,12 +1152,14 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
 }
 
 function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?: boolean } = {}): void {
+  const previousObject = currentPdfObject;
+  const sameScene = previousObject?.sceneData === nextObject.sceneData;
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   lastNativeDrawStats = null;
   nextObject.setFrameListener((stats) => {
     lastNativeDrawStats = stats;
   });
-  disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
+  if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
   scene.add(nextObject);
   resetFpsMeter();
@@ -1121,6 +1168,12 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
     fitCameraToPdfObject(nextObject);
   }
   updateCameraClipping(true);
+  if (sameScene) {
+    // The controller releases the old object's interaction resources and
+    // reapplies selection/colors before that object's renderer is disposed.
+    try { drawingSelection.rendererChanged(); }
+    finally { releasePdfObject(previousObject!); }
+  } else drawingSelection.sceneChanged();
   updateDrawStatsMeter();
   setDownloadDataButtonState(true);
   refreshSearchAvailability();
@@ -1131,16 +1184,22 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   requestRender();
 }
 
+function releasePdfObject(object: HeprThreePdfObject): void {
+  object.setFrameListener(null);
+  object.renderer.setInteractionViewportProvider(null);
+  scene.remove(object);
+  object.dispose();
+}
+
 function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   if (!currentPdfObject) {
     return;
   }
   const clearMetrics = options.clearMetrics !== false;
-  currentPdfObject.setFrameListener(null);
-  currentPdfObject.renderer.setInteractionViewportProvider(null);
-  scene.remove(currentPdfObject);
-  currentPdfObject.dispose();
+  const previousObject = currentPdfObject;
   currentPdfObject = null;
+  drawingSelection.sceneChanged();
+  releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {
     lastDownloadablePdf = null;

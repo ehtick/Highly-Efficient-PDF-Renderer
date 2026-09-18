@@ -1,3 +1,5 @@
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
+import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
@@ -212,6 +214,12 @@ export class ThreeMaterialStrokeLayer {
 
   setStrokeCurveEnabled(enabled: boolean): void {
     this.curveUniform.value = enabled ? 1 : 0;
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
+    patchPrimitiveColorTexture(this.segmentStyleTexture, scene.styles, updates, "stroke", [
+      { source: 1, target: 1 }, { source: 2, target: 2 }, { source: 3, target: 3 }
+    ]);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

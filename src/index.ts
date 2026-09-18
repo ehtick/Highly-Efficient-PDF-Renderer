@@ -210,6 +210,17 @@ export type {
 } from "./textSearch";
 
 export type { HeprTextSearchMatch } from "./threePdfObject";
+export type { PrimitivePickOptions } from "./threePdfObject";
+export type {
+  PrimitiveKind, PrimitiveRef, PrimitivePoint, PrimitiveSegment, PrimitiveSegmentStyle, PrimitiveInfo, PrimitiveHit
+} from "./scenePrimitives";
+export type { PrimitiveColorInput, PrimitiveOverride } from "./primitiveAppearance";
+export { createPrimitiveInteractionController } from "./primitiveInteraction";
+export { createThreePrimitiveInteractionController } from "./threePrimitiveInteraction";
+export type {
+  PrimitiveInteractionCallbacks, PrimitiveInteractionController, PrimitiveInteractionOptions
+} from "./primitiveInteraction";
+export type { ThreePrimitiveInteractionOptions } from "./threePrimitiveInteraction";
 
 export { createTextSelectionController } from "./textSelection";
 

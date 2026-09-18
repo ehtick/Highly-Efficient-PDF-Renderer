@@ -2,7 +2,15 @@ import * as THREE from "three";
 import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
-import { detectRooms, pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
+import {
+  createThreePrimitiveInteractionController,
+  detectRooms,
+  pdfObjectGenerator,
+  type HeprThreePdfObject,
+  type PDFLoadProgress
+} from "./index";
+import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { formatLoadProgressStage } from "./loadProgress";
 import type { DetectedRoom, RoomDetectionResult } from "./roomDetector";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
@@ -20,7 +28,8 @@ const MIN_OBJECT_EXTENT = 1e-3;
 const DEFAULT_CAMERA_FOV_DEGREES = 45;
 const OVERLAY_Z = 0.02;
 const OVERLAY_FILL_OPACITY = 0.34;
-const OVERLAY_RENDER_ORDER = 1_000_000;
+// Draw rooms after the PDF but before search, selection, and hover traces.
+const OVERLAY_RENDER_ORDER = HEPR_THREE_LAYER_ORDER_TEXT + 2;
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -165,6 +174,18 @@ let animationFrameId = 0;
 let needsRender = false;
 let isDisposed = false;
 let isBusy = false;
+
+const drawingSelection = createDrawingSelectionControls({
+  container: requireElement<HTMLDivElement>("#drawing-selection"),
+  createController: (callbacks) => createThreePrimitiveInteractionController({
+    ...callbacks,
+    getCanvas: () => canvas,
+    getCamera: () => camera,
+    getPdfObject: () => currentPdfObject,
+    requestRender,
+    onError: (error) => setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
+});
 
 const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
 const exampleDropdown = createExampleDropdown({
@@ -534,6 +555,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     scene.add(pdfObject);
     pdfValue.textContent = pdfObject.sourceLabel;
     fitCameraToObject(pdfObject);
+    drawingSelection.sceneChanged();
     setStatus(`${file.name} loaded. Add a TSV overlay.`);
     return true;
   } catch (error) {
@@ -933,7 +955,7 @@ function createRoomOverlay(
     lineMaterial = new THREE.LineBasicMaterial({
       vertexColors: true,
       linewidth: 1,
-      transparent: false,
+      transparent: true,
       depthTest: false,
       depthWrite: false
     });
@@ -1223,10 +1245,12 @@ function clearCurrentPdfObject(): void {
     return;
   }
 
-  currentPdfObject.renderer.setInteractionViewportProvider(null);
-  scene.remove(currentPdfObject);
-  currentPdfObject.dispose();
+  const previousPdfObject = currentPdfObject;
   currentPdfObject = null;
+  drawingSelection.sceneChanged();
+  previousPdfObject.renderer.setInteractionViewportProvider(null);
+  scene.remove(previousPdfObject);
+  previousPdfObject.dispose();
   pdfValue.textContent = "-";
   requestRender();
 }
@@ -1349,6 +1373,9 @@ function renderFrame(): void {
   needsRender = false;
   const controlsChanged = controls.update();
   updateCameraClipping();
+  scene.updateMatrixWorld(true);
+  camera.updateMatrixWorld(true);
+  drawingSelection.onFrame();
   renderer.clear(true, true, true);
   renderer.render(scene, camera);
   updateRoomDomLabels();
@@ -1533,6 +1560,7 @@ function disposeDemo(): void {
     animationFrameId = 0;
   }
   controls.dispose();
+  drawingSelection.dispose();
   clearCurrentPdfObject();
   renderer.dispose();
 }

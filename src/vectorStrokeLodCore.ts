@@ -330,6 +330,7 @@ export class VectorStrokeLodRuntime {
   private readonly projectedTileAreas: Float32Array;
   private readonly maxHalfWidth: number;
   private activeLevelIndex = 0;
+  private forceExact = false;
   private useLocalToClip = false;
   private readonly localToClip = new Float64Array(16);
   private localUnitsPerPixel = 1;
@@ -373,6 +374,14 @@ export class VectorStrokeLodRuntime {
 
   setScreenSpaceTransform(): void {
     this.useLocalToClip = false;
+  }
+
+  /** Temporarily retain primitive identity without rebuilding the LOD payload. */
+  setForceExact(enabled: boolean): void {
+    if (this.forceExact === enabled) return;
+    this.forceExact = enabled;
+    this.fullViewBaselineLevelIndex = -1;
+    this.tileSelectedLevelIndices.fill(-1);
   }
 
   setLocalToClipTransform(localToClip: ArrayLike<number>, localUnitsPerPixel: number): void {
@@ -427,6 +436,7 @@ export class VectorStrokeLodRuntime {
   }
 
   private chooseLevelIndex(localUnitsPerPixel: number): number {
+    if (this.forceExact) return 0;
     const maxTolerance = localUnitsPerPixel * LOD_SCREEN_ERROR_BUDGET_PX;
     for (let i = this.levels.length - 1; i >= 1; i -= 1) {
       if (this.levels[i].tolerance <= maxTolerance) {
@@ -521,6 +531,10 @@ export class VectorStrokeLodRuntime {
   }
 
   private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    if (this.forceExact) {
+      this.tileSelectedLevelIndices[tileIndex] = 0;
+      return 0;
+    }
     // Restore exact geometry as soon as it fits. At close zoom the larger
     // per-tile budget must not keep a coarse level alive through hysteresis.
     if (this.levels[0].tileCounts[tileIndex] <= targetSegmentsPerTile) {
@@ -859,6 +873,7 @@ export function takePrebuiltVectorStrokeLodRuntime(scene: VectorScene): VectorSt
 }
 
 export function storePrebuiltVectorStrokeLodRuntime(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
+  runtime.setForceExact(false);
   runtime.resetVisible();
   storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
 }

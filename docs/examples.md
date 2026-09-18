@@ -164,6 +164,128 @@ renderer.setAnimationLoop(() => {
 
 Use `selection.getSelectedText()` to read the current selection, or `selection.enable()` / `selection.disable()` for a feature toggle. In a viewer that swaps documents, return the active scene from `getScene`; the controller clears the selection when that scene changes. Call `refreshHighlights()` after replacing a renderer backend.
 
+## Pick, inspect, and recolor drawing primitives
+
+This example treats a short primary-pointer tap as a selection and leaves drag
+gestures to the host's camera controls. The host owns event listeners; HEPR does
+not install them when a PDF is loaded.
+
+```ts
+const canvas = renderer.domElement;
+let down: { id: number; x: number; y: number; moved: boolean } | null = null;
+let query: AbortController | null = null;
+const listeners = new AbortController();
+
+canvas.addEventListener("pointerdown", event => {
+  query?.abort();
+  // Cancel multi-touch selection; the host can continue panning/pinching.
+  if (!event.isPrimary || down) { down = null; return; }
+  if (event.button === 0) down = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+}, { signal: listeners.signal });
+
+canvas.addEventListener("pointermove", event => {
+  if (down?.id === event.pointerId && Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) {
+    down.moved = true;
+  }
+}, { signal: listeners.signal });
+canvas.addEventListener("pointercancel", () => { down = null; }, { signal: listeners.signal });
+canvas.addEventListener("lostpointercapture", () => { down = null; }, { signal: listeners.signal });
+canvas.addEventListener("pointerup", async event => {
+  const start = down;
+  down = null;
+  if (!start || start.moved || start.id !== event.pointerId ||
+      Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
+  query?.abort();
+  const current = query = new AbortController();
+  try {
+    const hit = await pdf.pick({
+      camera, element: canvas,
+      clientX: event.clientX, clientY: event.clientY,
+      tolerancePx: 4, signal: current.signal,
+    });
+    if (current.signal.aborted) return;
+    pdf.setSelection(hit ? [hit.primitive] : []);
+    if (!hit) return;
+
+    const ref = hit.primitive; // e.g. { kind: "stroke", index: 12345 }
+    const primitive = pdf.getPrimitive(ref);
+    if (primitive.segmentCount) {
+      const segment = primitive.getSegment(0);
+      console.log(segment.start, segment.end, segment.control, primitive.getSegmentStyle(0));
+    }
+    if (ref.kind !== "raster") pdf.setPrimitiveOverrides([ref], { color: "red" });
+    // Later: pdf.clearPrimitiveOverrides([ref]);
+  } catch (error) {
+    if (!current.signal.aborted) console.error(error);
+  }
+}, { signal: listeners.signal });
+
+// Teardown before disposing/replacing pdf:
+// query?.abort();
+// listeners.abort();
+// pdf.clearPrimitiveInteraction();
+```
+
+For hover, debounce or coalesce pointer moves, abort outdated queries, and pass
+the latest hit to `pdf.setHover(hit?.primitive ?? null)`. Keep selection separate.
+Also invalidate pending results when camera controls move. Saved references must
+be paired with the immutable HEP artifact's ID; independently reconverting the
+same PDF does not guarantee matching indices. See the [primitive API](api.md#drawing-primitives)
+for coordinate precision, clipping, and memory behavior.
+
+### Shared drawing selection controller
+
+The demos share the library's optional interaction controller and one controls
+widget. A host can reuse the controller with its own UI instead of implementing
+pointer scheduling and cancellation:
+
+```ts
+import { createThreePrimitiveInteractionController } from "@soadzoor/hepr";
+
+const drawingSelection = createThreePrimitiveInteractionController({
+  getCanvas: () => renderer.domElement,
+  getCamera: () => camera,
+  getPdfObject: () => pdf,
+  requestRender, // Schedule a frame in your host's rendering loop.
+  onPreparationProgress: percentage => {
+    progress.hidden = percentage === null || percentage === 100;
+    progress.value = percentage ?? 0; // <progress max="100">
+  },
+  onSelectionChange: primitive => {
+    console.log(primitive?.ref, primitive?.bounds);
+  },
+  onError: console.error,
+});
+
+// Enable in response to your Drawing Selection toggle. Suspend any competing
+// text-selection gestures first, retaining the user's text-selection preference.
+drawingSelection.enable();
+
+function renderFrame() {
+  controls.update();
+  drawingSelection.onFrame();
+  renderer.render(scene, camera);
+}
+
+// Optional color controls:
+// drawingSelection.setSelectedColor("red");
+// drawingSelection.resetSelectedColor();
+// drawingSelection.resetAllColors();
+
+// After changing pdf to another document: drawingSelection.sceneChanged();
+// After replacing the canvas/object with the same sceneData:
+// drawingSelection.rendererChanged();
+// On toggle off: drawingSelection.disable(); then restore text-selection mode.
+// Before disposing the viewport/PDF object: drawingSelection.dispose();
+```
+
+Use the canvas class for cursor feedback, keeping your existing drag cursor:
+
+```css
+canvas.drawing-selection-hover:not(:active) { cursor: pointer; }
+canvas:active { cursor: grabbing; }
+```
+
 ## Export a HEP file in the browser
 
 Build from an already loaded scene to avoid parsing the PDF again. This example adds a download link; the user chooses when to save it.

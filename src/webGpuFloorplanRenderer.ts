@@ -1,3 +1,6 @@
+import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
+import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGradientColors } from "./nativePrimitiveColors";
+import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
@@ -1621,6 +1624,10 @@ export class WebGpuFloorplanRenderer {
   private orderedBatches: VectorOrderedBatches | null = null;
   private orderedInstanceBuffer: any = null;
   private scene: VectorScene | null = null;
+  private primitiveColors: NativePrimitiveColors | null = null;
+  private primitiveHighlights: WebGpuPrimitiveHighlights | null = null;
+  private readonly primitiveGradientLayout: any;
+  private primitiveGradientColors: WebGpuPrimitiveGradientColors | null = null;
 
   private sceneStats: SceneStats | null = null;
 
@@ -2108,11 +2115,14 @@ export class WebGpuFloorplanRenderer {
     const fillPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.fillBindGroupLayout, this.vectorClipBindGroupLayout]
     });
+    this.primitiveGradientLayout = this.gpuDevice.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } }
+    ] });
     const gradientFillPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout]
+      bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout]
     });
     const gradientStrokePipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.gradientStrokeBindGroupLayout, this.vectorClipBindGroupLayout]
+      bindGroupLayouts: [this.gradientStrokeBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout]
     });
     const textPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.textBindGroupLayout, this.vectorClipBindGroupLayout]
@@ -2289,6 +2299,7 @@ export class WebGpuFloorplanRenderer {
     this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
+    if (this.primitiveColors) this.setPrimitiveColorUpdates(this.primitiveColors.updates());
   }
 
   getVectorStrokeLodStats(): VectorStrokeLodStats | null {
@@ -2310,7 +2321,7 @@ export class WebGpuFloorplanRenderer {
       this.setScene(this.scene);
       return;
     }
-    this.textLodRuntime?.setMode(nextMode);
+    this.textLodRuntime?.setMode(this.primitiveColors?.has("text") ? "off" : nextMode);
     this.selectedTextInstanceCount = 0;
     this.useTextInstanceIndirection = false;
     this.destroyPanCacheResources();
@@ -2442,6 +2453,61 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  setPrimitiveHighlights(highlights: PrimitiveHighlightSet | null): void {
+    if (this.isDisposed) return;
+    if (!highlights?.count) {
+      this.primitiveHighlights?.dispose();
+      this.primitiveHighlights = null;
+      this.requestFrame();
+      return;
+    }
+    if (!this.primitiveHighlights) {
+      this.primitiveHighlights = new WebGpuPrimitiveHighlights(this.gpuDevice, this.presentationFormat);
+    }
+    this.primitiveHighlights?.set(highlights);
+    this.requestFrame();
+  }
+
+  setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    if (this.isDisposed || updates.length === 0) return;
+    if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
+    this.primitiveColors ??= new NativePrimitiveColors(this.scene);
+    const patches = this.primitiveColors.update(updates);
+    const widths = { stroke: this.segmentTextureWidth, fillB: this.fillPathMetaTextureWidth,
+      fillC: this.fillPathMetaTextureWidth, text: this.textInstanceTextureWidth };
+    const rows = coalescePrimitiveColorTexels(patches, widths);
+    for (const patch of rows) {
+      const texture = patch.kind === "stroke" ? this.segmentTextureC
+        : patch.kind === "fillB" ? this.fillPathMetaTextureB
+        : patch.kind === "fillC" ? this.fillPathMetaTextureC : this.textInstanceTextureC;
+      const width = widths[patch.kind];
+      this.gpuDevice.queue.writeTexture({ texture, origin: [patch.index % width, Math.floor(patch.index / width)] },
+        patch.pixels, {}, [patch.count, 1]);
+    }
+    const combined = this.orderedBatches ? this.vectorLodLevelResources[0] : undefined;
+    if (combined?.ownsTextures) {
+      const strokeRows = coalescePrimitiveColorTexels(patches.filter(patch => patch.kind === "stroke"),
+        { ...widths, stroke: combined.textureWidth });
+      for (const patch of strokeRows) {
+        this.gpuDevice.queue.writeTexture({ texture: combined.textureC,
+          origin: [patch.index % combined.textureWidth, Math.floor(patch.index / combined.textureWidth)] },
+          patch.pixels, {}, [patch.count, 1]);
+      }
+    }
+    if (updates.some(update => update.ref.kind === "gradient-fill" || update.ref.kind === "gradient-stroke")) {
+      this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
+      this.primitiveGradientColors.update(updates);
+    }
+    this.vectorLodRuntime?.setForceExact(this.primitiveColors.has("stroke"));
+    this.textLodRuntime?.setMode(this.primitiveColors.has("text") ? "off" : this.textLodMode);
+    this.selectedTextInstanceCount = 0;
+    this.orderedBatches?.invalidate();
+    this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
     const nextRed = clamp(red, 0, 1);
     const nextGreen = clamp(green, 0, 1);
@@ -2529,6 +2595,13 @@ export class WebGpuFloorplanRenderer {
   setScene(scene: VectorScene): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
+    }
+    if (this.scene !== scene) {
+      this.primitiveColors = null;
+      this.primitiveHighlights?.dispose();
+      this.primitiveHighlights = null;
+      this.primitiveGradientColors?.dispose();
+      this.primitiveGradientColors = null;
     }
     validateVectorDrawRuns(scene);
     this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
@@ -2901,6 +2974,8 @@ export class WebGpuFloorplanRenderer {
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
 
+    if (this.primitiveColors) this.setPrimitiveColorUpdates(this.primitiveColors.updates());
+
     return this.sceneStats;
   }
 
@@ -3068,6 +3143,11 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number,
     zoomValue: number
   ): void {
+    if (this.primitiveHighlights) {
+      const scale = this.resolveClientToPixelScale();
+      this.primitiveHighlights.draw(pass, createOrthographicLocalToClip(cameraCenterX, cameraCenterY, zoomValue, viewportWidth, viewportHeight),
+        1 / Math.max(zoomValue, 1e-6), Math.max(scale.x, scale.y));
+    }
     if (this.highlightOthersCount === 0 && this.highlightCurrentCount === 0 && this.highlightSelectionCount === 0) {
       return;
     }
@@ -3196,6 +3276,11 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     this.isDisposed = true;
+    this.primitiveHighlights?.dispose();
+    this.primitiveHighlights = null;
+    this.primitiveColors = null;
+    this.primitiveGradientColors?.dispose();
+    this.primitiveGradientColors = null;
     this.orderedRunCuller = null;
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
@@ -3841,6 +3926,8 @@ export class WebGpuFloorplanRenderer {
     pass.setPipeline(this.gradientFillPipeline);
     this.bindVectorClip(pass);
     pass.setBindGroup(0, this.gradientFillBindGroup);
+    this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
+    pass.setBindGroup(2, this.primitiveGradientColors.bindGroup("gradient-fill", pathIndex));
     pass.draw(4, 1, pathIndex * 4, 0);
   }
 
@@ -3856,6 +3943,8 @@ export class WebGpuFloorplanRenderer {
     pass.setPipeline(this.gradientStrokePipeline);
     this.bindVectorClip(pass);
     pass.setBindGroup(0, this.gradientStrokeBindGroup);
+    this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
+    pass.setBindGroup(2, this.primitiveGradientColors.bindGroup("gradient-stroke", runIndex));
     pass.draw(4, segmentCount, runIndex * 4, 0);
   }
 
@@ -4459,6 +4548,7 @@ export class WebGpuFloorplanRenderer {
   private rebuildVectorLod(scene: VectorScene): boolean {
     if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
+      this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
     } else {
       this.vectorLodRuntime = null;
     }

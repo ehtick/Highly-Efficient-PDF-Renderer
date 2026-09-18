@@ -17,6 +17,7 @@ struct CameraUniforms {
 `;
 
 const GRADIENT_BINDINGS = /* wgsl */ `
+@group(2) @binding(0) var<uniform> uPrimitiveOverride : vec4f;
 @group(1) @binding(0) var uVectorClipTex : texture_2d<f32>;
 @group(1) @binding(1) var<uniform> uVectorClip : vec4f;
 @group(0) @binding(GRADIENT_META_A_BINDING) var uGradientMetaA : texture_2d<f32>;
@@ -306,7 +307,8 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
-  let color = mix(source.rgb, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
+  let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
+  let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
   return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
 }
 `;
@@ -428,7 +430,8 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
-  let color = mix(source.rgb, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
+  let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
+  let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
   return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
 }
 `;

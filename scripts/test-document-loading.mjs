@@ -138,6 +138,7 @@ assert.equal(context.pendingSourceLoadCount, 0);
 assert.equal(context.activeSceneLoadToken, null);
 assert.equal(context.sourceLoadController, null);
 await testThreeDocumentReplacement();
+await testThreeBackendReplacement();
 await testRoomDocumentReplacement();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
 
@@ -216,6 +217,7 @@ async function testRoomDocumentReplacement() {
   const objects = new Map();
   Object.assign(host, {
     currentPdfCoordinateTransform: { id: "A" }, currentGeneratedTsv: null, pdfValue: {},
+    drawingSelection: { sceneChanged: noop },
     isHepFile: () => false, setBusy: noop, syncControlsEnabled: noop,
     updatePdfLoadProgress: noop, fitCameraToObject: noop, scene: { add: noop },
     renderer: { domElement: { getBoundingClientRect: () => ({}) } },
@@ -247,6 +249,69 @@ async function testRoomDocumentReplacement() {
   assert.equal(host.currentPdfCoordinateTransform.id, "C");
   assert.equal(previous.disposals, 1);
   assert.equal(objects.get("C").disposals, 0);
+}
+
+async function testThreeBackendReplacement() {
+  const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
+  for (const failRenderer of [false, true]) {
+    const host = demoHost();
+    const canonicalScene = scene("same artifact");
+    const previous = host.currentPdfObject;
+    previous.sceneData = canonicalScene;
+    previous.setFrameListener = noop;
+    const replacement = { ...demoObject("replacement"), sceneData: canonicalScene, setFrameListener: noop };
+    let sceneResets = 0;
+    let stateReplays = 0;
+    Object.assign(host, {
+      lastLoadedSource: "original.pdf", lastDownloadablePdf: { label: "original.pdf" },
+      lastNativeDrawStats: null, activeThreeRendererBackend: "webgl", lastLoadTimingText: "",
+      readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto" }),
+      captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
+      resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
+      prebuildVectorStrokeLodRuntime: async (sceneData) => assert.equal(sceneData, canonicalScene),
+      prebuildTextLod: async (sceneData) => assert.equal(sceneData, canonicalScene),
+      pdfObjectGenerator: () => assert.fail("Backend switches must reuse the parsed scene"),
+      createThreePdfObject: async (loadedScene, options, signal) => {
+        assert.equal(loadedScene.scene, canonicalScene);
+        assert.equal(loadedScene.sourceLabel, previous.sourceLabel);
+        assert.equal(loadedScene.sourceKind, previous.sourceKind);
+        assert.equal(options.rendererType, "webgpu");
+        signal.throwIfAborted();
+        return replacement;
+      },
+      ensureThreeRendererBackend: async (backend, options) => {
+        assert.equal(options.disposeCurrentPdfObject, false);
+        if (failRenderer) throw new Error("Backend unavailable");
+        host.activeThreeRendererBackend = backend;
+      },
+      drawingSelection: {
+        sceneChanged: () => { sceneResets += 1; },
+        rendererChanged: () => {
+          assert.equal(host.currentPdfObject, replacement);
+          assert.equal(previous.disposals, 0, "Detach/replay interaction state before disposing the old object");
+          stateReplays += 1;
+        }
+      },
+      renderer: { domElement: { getBoundingClientRect: () => ({}) } },
+      scene: { add: noop, remove: noop }, textSearchInputElement: { value: "" },
+      resetFpsMeter: noop, refreshDropIndicator: noop, updateCameraClipping: noop,
+      updateDrawStatsMeter: noop, updateLodStatsMeter: noop, refreshSearchAvailability: noop,
+      updateLoadingProgress: noop, setLoadingProgress: noop, setLoadControlsEnabled: noop,
+      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
+      waitForNextRenderedFrame: async () => {}, formatLoadTiming: () => "timing",
+      updateSceneMetrics: noop, formatBackendLabel: value => value
+    });
+    vm.createContext(host);
+    for (const name of ["reloadSourceWithBackend", "replacePdfObject", "releasePdfObject", "disposeCurrentObject"]) {
+      vm.runInContext(sourceFunction(source, name), host);
+    }
+    await host.reloadSourceWithBackend("webgpu");
+    assert.equal(sceneResets, 0, "Same-scene renderer replacements must retain selection and colors");
+    assert.equal(stateReplays, failRenderer ? 0 : 1);
+    assert.equal(host.currentPdfObject, failRenderer ? previous : replacement);
+    assert.equal(previous.disposals, failRenderer ? 0 : 1);
+    assert.equal(replacement.disposals, failRenderer ? 1 : 0);
+  }
 }
 
 function demoHost() {

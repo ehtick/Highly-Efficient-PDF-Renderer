@@ -1,4 +1,10 @@
 import * as THREE from "three";
+import { ScenePrimitivePicker, getScenePrimitive, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
+  type PrimitiveKind } from "./scenePrimitives";
+import { PrimitiveAppearanceState, type PrimitiveColorUpdate, type PrimitiveHighlightSet,
+  type PrimitiveOverride } from "./primitiveAppearance";
+import { ThreePrimitiveHighlightLayer } from "./threePrimitiveHighlightLayer";
+import { estimateHighlightLocalUnitsPerPixel } from "./primitiveHighlightProjection";
 import { waitForLoad } from "./loadCancellation";
 
 import { createCanvasInteractionController, type CanvasInteractionController } from "./canvasInteractions";
@@ -54,6 +60,17 @@ export interface HeprTextSearchMatch extends TextSearchMatch {
   localBounds: Bounds;
   /** Per-line local highlight rectangles; optional for legacy match objects. */
   localHighlightBounds?: Bounds[];
+}
+
+/** Mouse position in CSS pixels; results refer to canonical loaded-scene primitives. */
+export interface PrimitivePickOptions {
+  camera: THREE.Camera;
+  element: HTMLElement;
+  clientX: number;
+  clientY: number;
+  tolerancePx?: number;
+  kinds?: readonly PrimitiveKind[];
+  signal?: AbortSignal;
 }
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
@@ -316,6 +333,15 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly textLodLayer: ThreeTextLodLayer | null;
   private threeTextLodResourceFallback = false;
 
+  private readonly primitiveAppearance: PrimitiveAppearanceState;
+  private primitivePicker: ScenePrimitivePicker | null = null;
+  private primitivePreparationProgress: number | null = null;
+  private readonly primitivePreparationListeners = new Set<(percentage: number | null) => void>();
+  private primitiveHighlightLayer: ThreePrimitiveHighlightLayer | null = null;
+  private primitiveHighlightBackend: HeprRendererType | null = null;
+  private primitiveHighlightColorCompositing: ThreeColorCompositing | null = null;
+  private nativePrimitiveColorsReplayed = false;
+
   private textSearcher: SceneTextSearcher | null = null;
   private searchHighlightGroup: THREE.Group | null = null;
   private searchHighlightOthersMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
@@ -392,7 +418,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * of calling this constructor directly.
    */
   constructor(
-    loadedScene: LoadedPdfScene,
+    loadedScene: Pick<LoadedPdfScene, "scene" | "sourceLabel" | "sourceKind">,
     rendererType: HeprRendererType,
     renderer: RendererApi,
     renderCanvas: HTMLCanvasElement,
@@ -484,7 +510,127 @@ export class HeprThreePdfObject extends THREE.Group {
       renderer: this.renderer
     };
 
+    this.primitiveAppearance = new PrimitiveAppearanceState(this.sceneData, {
+      onColors: updates => this.applyPrimitiveColorUpdates(updates),
+      onHighlights: highlights => this.applyPrimitiveHighlights(highlights)
+    });
     this.configureDormantPipeline();
+  }
+
+  /** Geometric picking against the canonical scene, independent of render LOD. */
+  async pick(options: PrimitivePickOptions): Promise<PrimitiveHit | null> {
+    if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
+    options.signal?.throwIfAborted();
+    const { camera, element, clientX, clientY } = options;
+    const rect = element.getBoundingClientRect();
+    if (clientX < rect.left || clientY < rect.top || clientX >= rect.left + rect.width ||
+      clientY >= rect.top + rect.height) return null;
+    const point = this.clientToScenePoint(camera, clientX, clientY, element);
+    if (!point) return null;
+    // Snapshot projection so a camera change during a cooperative query cannot
+    // mix coordinate systems. The host decides whether the result is still current.
+    const projection = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+      .multiply(this.pageMesh.matrixWorld).multiply(this.dataToLocalMatrix);
+    const inverse = projection.clone().invert();
+    const project = (input: { x: number; y: number }): { x: number; y: number } | null => {
+      const clip = new THREE.Vector4(input.x, input.y, 0, 1).applyMatrix4(projection);
+      if (clip.w <= 0 || !Number.isFinite(clip.w)) return null;
+      return { x: rect.left + (clip.x / clip.w + 1) * rect.width * 0.5,
+        y: rect.top + (1 - clip.y / clip.w) * rect.height * 0.5 };
+    };
+    const unproject = (input: { x: number; y: number }): { x: number; y: number } | null => {
+      const x = 2 * (input.x - rect.left) / rect.width - 1;
+      const y = 1 - 2 * (input.y - rect.top) / rect.height;
+      const near = new THREE.Vector3(x, y, -1).applyMatrix4(inverse);
+      const far = new THREE.Vector3(x, y, 1).applyMatrix4(inverse);
+      const dz = far.z - near.z;
+      if (Math.abs(dz) < 1e-15) return null;
+      const t = -near.z / dz;
+      return { x: near.x + t * (far.x - near.x), y: near.y + t * (far.y - near.y) };
+    };
+    this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
+      percentage => this.reportPrimitivePreparationProgress(percentage));
+    return this.primitivePicker.pick({ point, clientPoint: { x: clientX, y: clientY }, project, unproject,
+      tolerancePx: options.tolerancePx, kinds: options.kinds, signal: options.signal });
+  }
+
+  /** Observe shared picking preparation, including after an individual query is cancelled.
+   * The current percentage (or null before preparation) is delivered immediately.
+   * Unsubscribe when the host detaches from this object.
+   */
+  subscribePrimitivePreparationProgress(listener: (percentage: number | null) => void): () => void {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    this.primitivePreparationListeners.add(listener);
+    try { listener(this.primitivePreparationProgress); } catch { /* Observers cannot interrupt preparation. */ }
+    return () => { this.primitivePreparationListeners.delete(listener); };
+  }
+
+  private reportPrimitivePreparationProgress(percentage: number | null): void {
+    if (this.primitivePreparationProgress === percentage) return;
+    this.primitivePreparationProgress = percentage;
+    for (const listener of this.primitivePreparationListeners) {
+      try { listener(percentage); } catch { /* Observers cannot interrupt preparation. */ }
+    }
+  }
+
+  /** Detached original geometry and style; changes to the result do not edit the scene. */
+  getPrimitive(ref: PrimitiveRef): PrimitiveInfo {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    return getScenePrimitive(this.sceneData, ref);
+  }
+
+  setHover(ref: PrimitiveRef | null): void { this.primitiveAppearance.setHover(ref); }
+  setSelection(refs: readonly PrimitiveRef[]): void { this.primitiveAppearance.setSelection(refs); }
+  setPrimitiveOverrides(refs: readonly PrimitiveRef[], override: PrimitiveOverride): void {
+    this.primitiveAppearance.setOverrides(refs, override);
+  }
+  clearPrimitiveOverrides(refs?: readonly PrimitiveRef[]): void { this.primitiveAppearance.clearOverrides(refs); }
+
+  /** Clear temporary interaction state and release the lazily constructed picking index. */
+  clearPrimitiveInteraction(): void {
+    if (this.isDisposed) return;
+    this.primitiveAppearance.clear();
+    this.primitivePicker?.dispose();
+    this.primitivePicker = null;
+    this.reportPrimitivePreparationProgress(null);
+  }
+
+  private applyPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    if (this.isDisposed) return;
+    this.strokeMaterialLayer?.setPrimitiveColorUpdates(updates, this.sceneData);
+    this.vectorLodStrokeLayer?.setPrimitiveColorUpdates(updates);
+    this.vectorLodStrokeLayer?.setForceExact(this.primitiveAppearance.hasOverrides("stroke"));
+    this.fillMaterialLayer.setPrimitiveColorUpdates(updates, this.sceneData);
+    this.textMaterialLayer.setPrimitiveColorUpdates(updates, this.sceneData);
+    this.gradientMaterialLayer.setPrimitiveColorUpdates(updates);
+    if (updates.some(update => update.ref.kind === "text")) this.setTextLodMode(this.rendererConfig.textLodMode);
+    if (this.hasUploadedNativeScene()) {
+      this.renderer.setPrimitiveColorUpdates?.(this.nativePrimitiveColorsReplayed
+        ? updates : this.primitiveAppearance.getColorUpdates());
+      this.nativePrimitiveColorsReplayed = true;
+    }
+    this.lastSyncedFrameSerial = -1;
+    this.lastUploadedFrameSerial = -1;
+  }
+
+  private applyPrimitiveHighlights(highlights: PrimitiveHighlightSet | null): void {
+    if (this.isDisposed) return;
+    if (!highlights) {
+      if (this.primitiveHighlightLayer) {
+        this.remove(this.primitiveHighlightLayer.mesh);
+        this.primitiveHighlightLayer.dispose();
+        this.primitiveHighlightLayer = null;
+      }
+      return;
+    }
+    if (!this.primitiveHighlightLayer) {
+      this.primitiveHighlightLayer = new ThreePrimitiveHighlightLayer(this.rendererType,
+        this.rendererConfig.threeColorCompositing);
+      this.primitiveHighlightBackend = this.rendererType;
+      this.primitiveHighlightColorCompositing = this.rendererConfig.threeColorCompositing;
+      this.add(this.primitiveHighlightLayer.mesh);
+    }
+    this.primitiveHighlightLayer.setHighlights(highlights);
   }
 
   /**
@@ -1086,6 +1232,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rebuildThreeStrokeLayer(useVectorLodLayer, useExactMaterialLayer);
     }
 
+    this.applyPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates());
     this.resetRenderPipelinesAfterLayerChange();
   }
 
@@ -1097,7 +1244,7 @@ export class HeprThreePdfObject extends THREE.Group {
     const nextMode: TextLodMode = this.sceneData.drawRuns || mode === "off" ? "off" : "auto";
     this.rendererConfig.textLodMode = nextMode;
     this.renderer.setTextLodMode?.(nextMode);
-    const replacementScene = this.textLodLayer?.setMode(nextMode, this.sceneData) ?? null;
+    const replacementScene = this.textLodLayer?.setMode(this.primitiveAppearance.hasOverrides("text") ? "off" : nextMode, this.sceneData) ?? null;
     if (replacementScene && this.textLodLayer) {
       try {
         const replacementLayer = this.createThreeTextMaterialLayer(replacementScene);
@@ -1191,7 +1338,15 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.isDisposed) {
       return;
     }
+    this.primitivePicker?.dispose();
+    this.primitivePicker = null;
+    this.reportPrimitivePreparationProgress(null);
+    this.primitivePreparationListeners.clear();
     this.isDisposed = true;
+    this.primitiveAppearance.dispose();
+    this.primitiveHighlightLayer?.dispose();
+    if (this.primitiveHighlightLayer) this.remove(this.primitiveHighlightLayer.mesh);
+    this.primitiveHighlightLayer = null;
     this.skipNextBeforeRenderCallback = false;
     this.frameListener = null;
     this.renderer.setFrameListener(null);
@@ -1383,6 +1538,32 @@ export class HeprThreePdfObject extends THREE.Group {
     }
 
     this.syncAuxiliaryOutputColorSpace(renderer);
+    if (this.primitiveHighlightLayer) {
+      const backend = renderer.isWebGPURenderer === true ? "webgpu" : "webgl";
+      const compositing = this.directDisplayOutputActive ? "display" : "linear";
+      // Native-texture fallback may be hosted by a different Three backend.
+      // Its independent overlay must use that host's material type and output.
+      if (this.primitiveHighlightBackend !== backend || this.primitiveHighlightColorCompositing !== compositing) {
+        this.remove(this.primitiveHighlightLayer.mesh);
+        this.primitiveHighlightLayer.dispose();
+        this.primitiveHighlightLayer = new ThreePrimitiveHighlightLayer(backend, compositing);
+        this.primitiveHighlightBackend = backend;
+        this.primitiveHighlightColorCompositing = compositing;
+        this.primitiveHighlightLayer.setHighlights(this.primitiveAppearance.getHighlights()!);
+        this.add(this.primitiveHighlightLayer.mesh);
+      }
+      camera.updateMatrixWorld();
+      this.pageMesh.updateWorldMatrix(true, false);
+      const viewport = readThreeRendererViewportPixels(renderer);
+      const matrix = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+        .multiply(this.pageMesh.matrixWorld).multiply(this.dataToLocalMatrix);
+      const rect = (renderer.domElement as HTMLCanvasElement).getBoundingClientRect?.();
+      const pixelRatio = rect && rect.width > 0 && rect.height > 0
+        ? Math.max(viewport.width / rect.width, viewport.height / rect.height)
+        : renderer.getPixelRatio?.() ?? 1;
+      this.primitiveHighlightLayer.updateFrame(matrix, estimateHighlightLocalUnitsPerPixel(matrix.elements, viewport, this.sceneBounds),
+        pixelRatio);
+    }
     const rendererViewport = readThreeRendererViewportPixels(renderer);
     this.ensureThreeTextLodResourceSupport(renderer);
     this.updateTextureSampling(renderer);
@@ -1498,6 +1679,12 @@ export class HeprThreePdfObject extends THREE.Group {
       shouldRenderThreeCameraFrame ||
       (this.rendererType === "webgpu" && !cameraDrivenMaterialPipelineEnabled);
     if (shouldRenderExternally) {
+      if (!this.nativePrimitiveColorsReplayed) {
+        const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
+        deferred.ensureSceneUploaded?.();
+        this.renderer.setPrimitiveColorUpdates?.(this.primitiveAppearance.getColorUpdates());
+        this.nativePrimitiveColorsReplayed = true;
+      }
       this.renderer.renderExternalFrame?.(performance.now());
     }
 
@@ -1703,6 +1890,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.add(replacementLayer.mesh);
     }
     this.textMaterialLayer = replacementLayer;
+    replacementLayer.setPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates(), this.sceneData);
     previousLayer.dispose();
     this.lastSyncedFrameSerial = -1;
   }
@@ -2644,7 +2832,7 @@ function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
  * parsing, LOD preparation, and object creation.
  */
 export async function createThreePdfObject(
-  loadedScene: LoadedPdfScene,
+  loadedScene: Pick<LoadedPdfScene, "scene" | "sourceLabel" | "sourceKind">,
   options: HeprThreeObjectOptions = {},
   signal?: AbortSignal
 ): Promise<HeprThreePdfObject> {

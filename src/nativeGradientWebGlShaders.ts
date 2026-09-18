@@ -176,6 +176,7 @@ uniform sampler2D uSegmentTexB;
 uniform ivec2 uSegmentTexSize;
 uniform float uAAScreenPx;
 uniform vec4 uVectorOverride;
+uniform vec4 uPrimitiveOverride;
 ${GRADIENT_COMMON}
 
 flat in int vSegmentStart;
@@ -306,7 +307,8 @@ void main() {
   float maskAlpha = vMaskGradientIndex >= 0 ? samplePdfGradient(vMaskGradientIndex, vLocal).a : 1.0;
   float alpha = coverage * vAlpha * source.a * maskAlpha;
   if (alpha <= 0.001) discard;
-  vec3 color = mix(source.rgb, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+  vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
+  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
   outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
 }
 `;
@@ -438,6 +440,7 @@ precision highp sampler2D;
 uniform float uStrokeCurveEnabled;
 uniform float uAAScreenPx;
 uniform vec4 uVectorOverride;
+uniform vec4 uPrimitiveOverride;
 ${GRADIENT_COMMON}
 
 in vec2 vLocal;
@@ -528,7 +531,8 @@ void main() {
   float maskAlpha = vMaskGradientIndex >= 0 ? samplePdfGradient(vMaskGradientIndex, vLocal).a : 1.0;
   float alpha = coverage * vAlpha * source.a * maskAlpha;
   if (alpha <= 0.001) discard;
-  vec3 color = mix(source.rgb, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+  vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
+  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
   outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
 }
 `;

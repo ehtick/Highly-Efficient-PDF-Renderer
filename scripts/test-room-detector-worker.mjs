@@ -158,6 +158,7 @@ async function testDemoLifetime() {
     const context = vm.createContext({
       AbortController, isBusy: false, roomDetectionToken: 0, roomDetectionController: null,
       currentPdfObject: { sceneData: {}, sourceLabel: "tiny", renderer: { setInteractionViewportProvider() {} }, dispose() {} },
+      drawingSelection: { sceneChanged() {} },
       currentPdfCoordinateTransform: {}, detectRoomsSpinner: { hidden: true }, pdfValue: { textContent: "tiny" },
       scene: { remove() {} }, setStatus() {}, requestRender() {}, syncControlsEnabled() {},
       setBusy(value) { context.isBusy = value; }, yieldForLoad: async () => {},

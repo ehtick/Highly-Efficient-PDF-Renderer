@@ -11,6 +11,7 @@ import {
   type PDFLoadProgress
 } from "./index";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { formatLoadProgressStage } from "./loadProgress";
 import type { DetectedRoom, RoomDetectionResult } from "./roomDetector";
@@ -123,6 +124,8 @@ const statusElement = requireElement<HTMLDivElement>("#status");
 const pdfValue = requireElement<HTMLSpanElement>("#pdf-value");
 const tsvValue = requireElement<HTMLSpanElement>("#tsv-value");
 const roomsValue = requireElement<HTMLSpanElement>("#rooms-value");
+const drawCallMeter = createDrawCallMeter(requireElement<HTMLSpanElement>("#draw-calls-value"));
+const drawCallCounter = createThreeDrawCallCounter();
 
 const renderer = new THREE.WebGLRenderer({
   canvas,
@@ -561,6 +564,8 @@ async function loadSceneSource(file: File): Promise<boolean> {
     pendingObject = null;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
+    pdfObject.setFrameListener((stats) => drawCallCounter.recordNativeFrame(stats.drawCalls));
+    drawCallMeter.reset();
     scene.add(pdfObject);
     pdfValue.textContent = pdfObject.sourceLabel;
     fitCameraToObject(pdfObject);
@@ -1260,8 +1265,10 @@ function clearCurrentPdfObject(): void {
   drawingSelection.sceneChanged();
   layerControls.objectChanged();
   previousPdfObject.renderer.setInteractionViewportProvider(null);
+  previousPdfObject.setFrameListener(null);
   scene.remove(previousPdfObject);
   previousPdfObject.dispose();
+  drawCallMeter.reset();
   pdfValue.textContent = "-";
   requestRender();
 }
@@ -1388,7 +1395,7 @@ function renderFrame(): void {
   camera.updateMatrixWorld(true);
   drawingSelection.onFrame();
   renderer.clear(true, true, true);
-  renderer.render(scene, camera);
+  drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   updateRoomDomLabels();
   if (controlsChanged) {
     requestRender();
@@ -1563,6 +1570,7 @@ function disposeDemo(): void {
     return;
   }
   isDisposed = true;
+  drawCallMeter.dispose();
   loadToken += 1;
   sourceLoadController?.abort();
   canvasResizeObserver.disconnect();

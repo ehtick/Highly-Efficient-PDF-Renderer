@@ -34,6 +34,7 @@ import { createThreePdfObject } from "./threePdfObject";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
+import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -76,6 +77,7 @@ const sourceSegmentsValue = document.querySelector<HTMLSpanElement>("#source-seg
 const visibleSegmentsValue = document.querySelector<HTMLSpanElement>("#visible-segments-value");
 const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
+const drawCallsValue = document.querySelector<HTMLSpanElement>("#draw-calls-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
 const textLodStatsValue = document.querySelector<HTMLSpanElement>("#text-lod-stats-value");
@@ -121,6 +123,7 @@ if (
   !visibleSegmentsValue ||
   !timesValue ||
   !fpsValue ||
+  !drawCallsValue ||
   !drawStatsValue ||
   !lodStatsValue ||
   !textLodStatsValue ||
@@ -173,6 +176,8 @@ const textSearchNextButtonElement = textSearchNextButton;
 const textSearchCaseButtonElement = textSearchCaseButton;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
+const drawCallMeter = createDrawCallMeter(drawCallsValue, { signal: lifetimeSignal });
+const drawCallCounter = createThreeDrawCallCounter();
 let loadToken = 0;
 let sourceLoadController: AbortController | null = null;
 const CAMERA_FIT_PADDING_PIXELS = 64;
@@ -454,6 +459,7 @@ async function ensureThreeRendererBackend(
   renderer = nextRenderer;
   activeThreeRendererBackend = backend;
   resetFpsMeter();
+  drawCallMeter.reset();
   controls = createMapControls();
   controls.target.copy(previousControlsTarget);
   updatePerspectiveCameraProjection();
@@ -472,7 +478,7 @@ function renderFrame(now: number = performance.now()): void {
   const controlsChanged = controls.update();
   updateCameraClipping();
   prepareThreeRendererFrame(renderer);
-  renderer.render(scene, camera);
+  drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   drawingSelection.onFrame();
   textSelection.updateOverlay();
   // Writing the readouts every frame costs a style recalc, layout and paint per
@@ -501,9 +507,7 @@ function prepareThreeRendererFrame(nextRenderer: ThreeExampleRenderer): void {
     _nodes?: { nodeFrame?: { frameId: number; update: () => void } };
     info: ThreeExampleRenderer["info"] & { frame: number };
   };
-  if (commonRenderer.info.autoReset) {
-    commonRenderer.info.reset();
-  }
+  // The shared draw-call counter resets frame statistics around the render.
   commonRenderer._nodes?.nodeFrame?.update();
   const frameId = commonRenderer._nodes?.nodeFrame?.frameId;
   if (typeof frameId === "number") {
@@ -1176,12 +1180,14 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   lastNativeDrawStats = null;
   nextObject.setFrameListener((stats) => {
     lastNativeDrawStats = stats;
+    drawCallCounter.recordNativeFrame(stats.drawCalls);
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
   layerControls.objectChanged();
   scene.add(nextObject);
   resetFpsMeter();
+  drawCallMeter.reset();
   refreshDropIndicator();
   if (options.fitCamera !== false) {
     fitCameraToPdfObject(nextObject);
@@ -1222,6 +1228,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {
+    drawCallMeter.reset();
     lastDownloadablePdf = null;
     fileValueElement.textContent = "-";
     sourceSegmentsValueElement.textContent = "-";

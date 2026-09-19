@@ -160,7 +160,9 @@ async function testDemoLifetime() {
     const context = vm.createContext({
       AbortController, isBusy: false, roomDetectionToken: 0, roomDetectionController: null,
       currentPdfObject: { sceneData: {}, sourceLabel: "tiny", renderer: { setInteractionViewportProvider() {} },
+        setFrameListener() {},
         dispose() { assert.equal(layerDetachments, 1); pdfDisposed = true; } },
+      drawCallMeter: { reset() {} },
       drawingSelection: { sceneChanged() {} },
       layerControls: { objectChanged() {
         assert.equal(context.currentPdfObject, null);

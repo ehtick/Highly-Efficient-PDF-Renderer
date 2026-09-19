@@ -188,10 +188,10 @@ try {
   glOverlay.set(highlight);
   glOverlay.set({ ...highlight, selectionCount: 0 });
   assert.equal(writes.filter(write => write.kind === "bufferAllocate").length, 1);
-  glOverlay.draw(identity, 1, 2);
+  assert.equal(glOverlay.draw(identity, 1, 2), 1, "one instanced draw reports one draw call");
   assert.equal(writes.filter(write => write.kind === "draw").length, 1);
   glOverlay.set(null);
-  glOverlay.draw(identity, 1, 2);
+  assert.equal(glOverlay.draw(identity, 1, 2), 0, "empty highlights report no draw calls");
   assert.equal(writes.filter(write => write.kind === "draw").length, 1);
   glOverlay.dispose();
   const gpuOverlay = new WebGpuPrimitiveHighlights(device, "bgra8unorm");
@@ -202,9 +202,9 @@ try {
   assert.equal(writes.filter(write => write.kind === "textureAllocate").length, 1);
   let gpuDraws = 0;
   const pass = { setPipeline() {}, setBindGroup() {}, draw() { gpuDraws++; } };
-  gpuOverlay.draw(pass, identity, 1, 2);
+  assert.equal(gpuOverlay.draw(pass, identity, 1, 2), 1, "one instanced draw reports one draw call");
   gpuOverlay.set(null);
-  gpuOverlay.draw(pass, identity, 1, 2);
+  assert.equal(gpuOverlay.draw(pass, identity, 1, 2), 0, "empty highlights report no draw calls");
   assert.equal(gpuDraws, 1);
   gpuOverlay.dispose();
 

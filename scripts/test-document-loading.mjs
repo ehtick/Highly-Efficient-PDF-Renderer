@@ -369,6 +369,7 @@ function demoHost() {
     performance, AbortController, waitForLoad,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
+    drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {}
   };
 }
@@ -376,6 +377,7 @@ function demoObject(id) {
   return {
     id, sourceLabel: id, sourceKind: "pdf", disposals: 0,
     renderer: { setInteractionViewportProvider: noop },
+    setFrameListener: noop,
     dispose() { this.disposals += 1; }
   };
 }

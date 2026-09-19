@@ -8,6 +8,7 @@ interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 /** Transient GL surfaces for the shared PDF pass executor. */
 export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface> {
   private readonly gl: WebGL2RenderingContext;
+  private readonly onDraw: (() => void) | undefined;
   private readonly program: WebGLProgram;
   private readonly vao: WebGLVertexArrayObject;
   private readonly zero: WebGLTexture;
@@ -19,8 +20,9 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   private approximationReported = false;
   private drawRun: ((run: VectorDrawRun, shapeOnly: boolean) => void) | null = null;
 
-  constructor(gl: WebGL2RenderingContext) {
+  constructor(gl: WebGL2RenderingContext, onDraw?: () => void) {
     this.gl = gl;
+    this.onDraw = onDraw;
     const vertex = this.shader(gl.VERTEX_SHADER, PDF_COMPOSITE_VERTEX_GLSL);
     const fragment = this.shader(gl.FRAGMENT_SHADER, PDF_COMPOSITE_FRAGMENT_GLSL);
     const program = gl.createProgram();
@@ -143,6 +145,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
     gl.uniform3fv(gl.getUniformLocation(this.program, "uMaskBackdrop"), operation.softMask?.backdrop ?? [0, 0, 0]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.onDraw?.();
   }
   dispose(): void {
     this.releaseSurfaces();

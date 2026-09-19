@@ -1327,6 +1327,11 @@ export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(RASTER_FR
 
 /** Per-frame draw diagnostics from HEPR's native renderer. */
 export interface DrawStats {
+  /** GPU draw commands submitted for this frame, including offscreen passes,
+   * cache presentation, page backgrounds, and overlays. Native renderers always
+   * provide this; other integrations may omit it when unavailable. */
+  drawCalls?: number;
+
   /** Number of vector stroke segments rendered in the frame. */
   renderedSegments: number;
 
@@ -1914,6 +1919,7 @@ export class WebGlFloorplanRenderer {
   private rafHandle = 0;
 
   private frameListener: FrameListener | null = null;
+  private frameDrawCalls = 0;
   private performanceProfiler: RenderPerformanceProfiler | null = null;
   private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
   private externalFrameDriver = false;
@@ -2252,6 +2258,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private emitFrameStats(stats: DrawStats): void {
+    stats.drawCalls = this.frameDrawCalls;
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     profile?.beginSection("viewerCallback");
     try { this.frameListener?.(stats); }
@@ -2276,11 +2283,13 @@ export class WebGlFloorplanRenderer {
   }
 
   renderProjectedFrame(options: ProjectedFrameOptions): DrawStats {
+    this.frameDrawCalls = 0;
     const viewportWidth = Math.max(1, Math.round(options.viewportWidth));
     const viewportHeight = Math.max(1, Math.round(options.viewportHeight));
     const localUnitsPerPixel = Math.max(1e-9, Number(options.localUnitsPerPixel));
     if (options.localToClip.length < 16) {
       return {
+        drawCalls: 0,
         renderedSegments: 0,
         totalSegments: this.segmentCount,
         usedCulling: false,
@@ -2292,6 +2301,7 @@ export class WebGlFloorplanRenderer {
       const value = Number(options.localToClip[i]);
       if (!Number.isFinite(value)) {
         return {
+          drawCalls: 0,
           renderedSegments: 0,
           totalSegments: this.segmentCount,
           usedCulling: false,
@@ -2358,6 +2368,7 @@ export class WebGlFloorplanRenderer {
     this.presentedFrameSerial += 1;
 
     const stats = {
+      drawCalls: this.frameDrawCalls,
       renderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
@@ -3256,6 +3267,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private render(timestamp: number = performance.now()): void {
+    this.frameDrawCalls = 0;
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     profile?.beginFrame(timestamp);
     try { this.renderFrame(timestamp, profile); }
@@ -3303,12 +3315,13 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
+    let stats: DrawStats;
     if (this.shouldUsePanCache(isCameraAnimating)) {
       profile?.add("panCacheFrames");
-      this.renderWithPanCache();
+      stats = this.renderWithPanCache();
     } else {
       profile?.add("directFrames");
-      this.renderDirectToScreen();
+      stats = this.renderDirectToScreen();
     }
     // Drawn last with the live camera so highlights can never lag the scene,
     // and never bake into the pan cache.
@@ -3316,6 +3329,7 @@ export class WebGlFloorplanRenderer {
     this.drawSearchHighlights(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     profile?.endSection("overlays");
     this.capturePresentedFrameState();
+    this.emitFrameStats(stats);
 
     if (isCameraAnimating) {
       this.requestFrame();
@@ -3354,7 +3368,7 @@ export class WebGlFloorplanRenderer {
     );
   }
 
-  private renderDirectToScreen(): void {
+  private renderDirectToScreen(): DrawStats {
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     const gl = this.gl;
     let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
@@ -3439,13 +3453,13 @@ export class WebGlFloorplanRenderer {
       }
     }
 
-    this.emitFrameStats({
+    return {
       renderedSegments: instanceCount,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
-    });
+    };
   }
 
   private getRedundantSegmentCount(): number {
@@ -3633,13 +3647,13 @@ export class WebGlFloorplanRenderer {
 
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.frameDrawCalls++;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
-  private renderWithPanCache(): void {
+  private renderWithPanCache(): DrawStats {
     if (!this.ensurePanCacheResources()) {
-      this.renderDirectToScreen();
-      return;
+      return this.renderDirectToScreen();
     }
 
     let sampleScale = this.panCacheZoom / Math.max(this.zoom, 1e-6);
@@ -3718,13 +3732,13 @@ export class WebGlFloorplanRenderer {
 
     this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
 
-    this.emitFrameStats({
+    return {
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
-    });
+    };
   }
 
   private drawOrderedGradientPaint(
@@ -3879,6 +3893,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform1i(uniforms.uMeshPathIndex, pathIndex);
       gl.drawArrays(gl.TRIANGLES, this.gradientMeshRanges[pathIndex * 2], meshCount);
     } else gl.drawArraysInstanced(gl.TRIANGLE_STRIP, pathIndex * 4, 4, 1);
+    this.frameDrawCalls++;
   }
 
   private drawGradientStrokeRun(
@@ -3937,6 +3952,7 @@ export class WebGlFloorplanRenderer {
     const primitiveColor = this.primitiveColors?.gradient("gradient-stroke", runIndex);
     gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, runIndex * 4, 4, segmentCount);
+    this.frameDrawCalls++;
   }
 
   private setGradientUniforms(
@@ -4018,6 +4034,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform4f(this.uRasterMatrixABCD, width, 0, 0, height);
       gl.uniform2f(this.uRasterMatrixEF, minX, minY);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      this.frameDrawCalls++;
     }
   }
 
@@ -4053,6 +4070,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.frameDrawCalls++;
     if (!statePrepared && this.multiplyPass == null) {
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
@@ -4082,6 +4100,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform2f(uniforms.uRasterStripSize, batch.width, batch.height);
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, batch.count);
+    this.frameDrawCalls++;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
@@ -4134,7 +4153,7 @@ export class WebGlFloorplanRenderer {
   ): void {
     if (this.primitiveHighlights) {
       const scale = this.resolveClientToPixelScale();
-      this.primitiveHighlights.draw(this.localToClipRenderingEnabled ? this.localToClipMatrix :
+      this.frameDrawCalls += this.primitiveHighlights.draw(this.localToClipRenderingEnabled ? this.localToClipMatrix :
         createOrthographicLocalToClip(cameraCenterX, cameraCenterY, zoomValue, viewportWidth, viewportHeight),
         this.localToClipRenderingEnabled && this.scene
           ? estimateHighlightLocalUnitsPerPixel(this.localToClipMatrix, { width: viewportWidth, height: viewportHeight }, this.scene.bounds)
@@ -4187,6 +4206,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform4f(this.uHighlightBorderColor, borderColor[0], borderColor[1], borderColor[2], borderColor[3]);
     gl.uniform1f(this.uHighlightBorderPx, borderPx);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+    this.frameDrawCalls++;
   }
 
   private uploadVectorClips(scene: VectorScene): void {
@@ -4354,7 +4374,7 @@ export class WebGlFloorplanRenderer {
     };
     profile?.beginSection("drawSubmission");
     if (paintVisibility.requiresCompositing) {
-      this.paintCompositor ??= new WebGlPaintCompositor(this.gl);
+      this.paintCompositor ??= new WebGlPaintCompositor(this.gl, () => { this.frameDrawCalls++; });
       try {
         this.paintCompositor.render(this.scene!, width, height, (run, shapeOnly) => {
           this.paintShapeOnly = shapeOnly;
@@ -4442,6 +4462,7 @@ export class WebGlFloorplanRenderer {
     if (this.vectorClipIndex !== -2) gl.bindBuffer(gl.ARRAY_BUFFER, this.allFillPathIdBuffer);
     this.bindOrderedInstanceAttribute(3, first);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    this.frameDrawCalls++;
     return count;
   }
 
@@ -4571,6 +4592,7 @@ export class WebGlFloorplanRenderer {
     }
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+    this.frameDrawCalls++;
   }
 
   private drawTextInstances(
@@ -4662,6 +4684,7 @@ export class WebGlFloorplanRenderer {
     if (useTextLodSelection) {
       this.bindOrderedInstanceAttribute(2, 0);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.selectedTextInstanceCount);
+      this.frameDrawCalls++;
       return this.selectedTextInstanceCount;
     }
     return this.drawTextInstanceRanges(range ? [range] : this.visibleTextRanges);
@@ -4722,6 +4745,7 @@ export class WebGlFloorplanRenderer {
       }
       this.bindOrderedInstanceAttribute(2, range.start);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, range.count);
+      this.frameDrawCalls++;
       renderedInstanceCount += range.count;
     }
     return renderedInstanceCount;
@@ -4752,6 +4776,7 @@ export class WebGlFloorplanRenderer {
 
     gl.disable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.frameDrawCalls++;
     gl.enable(gl.BLEND);
   }
 

@@ -40,9 +40,11 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   private approximationReported = false;
   private encoder: any;
   private drawRun: ((run: VectorDrawRun, pass: any, shapeOnly: boolean) => void) | null = null;
+  private readonly onDraw: (() => void) | undefined;
 
-  constructor(device: any, format: string) {
+  constructor(device: any, format: string, onDraw?: () => void) {
     this.device = device; this.format = format;
+    this.onDraw = onDraw;
     const module = device.createShaderModule({ code: PDF_COMPOSITE_WGSL });
     const layout = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: 2, buffer: { type: "uniform", minBindingSize: 48 } },
@@ -146,6 +148,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
       ...textures.map((surface, i) => ({ binding: i + 1, resource: (surface ?? this.zero).view }))
     ] });
     pass.setPipeline(this.pipeline); pass.setBindGroup(0, group); pass.draw(3);
+    this.onDraw?.();
   }
   private transferTexture(values: Float32Array): Surface {
     let surface = this.transfers.get(values); if (surface) return surface;

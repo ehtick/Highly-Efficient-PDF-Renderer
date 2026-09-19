@@ -87,8 +87,9 @@ export class WebGlPrimitiveHighlights {
     }
   }
 
-  draw(matrix: ArrayLike<number>, localUnitsPerPixel: number, pixelRatio: number): void {
-    if (!this.count) return;
+  /** Returns the number of GPU draw commands submitted. */
+  draw(matrix: ArrayLike<number>, localUnitsPerPixel: number, pixelRatio: number): number {
+    if (!this.count) return 0;
     const gl = this.gl;
     this.matrix.set(matrix);
     gl.useProgram(this.program);
@@ -104,6 +105,7 @@ export class WebGlPrimitiveHighlights {
     gl.bindVertexArray(this.vao);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.count);
     gl.bindVertexArray(null);
+    return 1;
   }
 
   dispose(): void {
@@ -180,14 +182,16 @@ export class WebGpuPrimitiveHighlights {
     ] });
   }
 
-  draw(pass: any, matrix: ArrayLike<number>, localUnitsPerPixel: number, pixelRatio: number): void {
-    if (!this.count || !this.bindGroup) return;
+  /** Returns the number of GPU draw commands submitted. */
+  draw(pass: any, matrix: ArrayLike<number>, localUnitsPerPixel: number, pixelRatio: number): number {
+    if (!this.count || !this.bindGroup) return 0;
     this.cameraData.set(matrix, 0);
     this.cameraData.set([localUnitsPerPixel, pixelRatio, this.selectionCount, 0], 16);
     this.device.queue.writeBuffer(this.camera, 0, this.cameraData);
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(4, this.count);
+    return 1;
   }
 
   dispose(): void { this.camera.destroy(); this.segments?.destroy(); this.clips?.destroy(); }

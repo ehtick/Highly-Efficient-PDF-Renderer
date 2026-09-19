@@ -70,6 +70,7 @@ import {
   OPERATOR_COUNT_EXPLANATION
 } from "./sceneStatistics";
 import type { SearchHighlightSet } from "./rendererTypes";
+import { createDrawCallMeter } from "./drawCallMetrics";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
@@ -98,6 +99,7 @@ const metricReductionsElement = document.querySelector<HTMLSpanElement>("#metric
 const metricCullDiscardsElement = document.querySelector<HTMLSpanElement>("#metric-cull-discards");
 const metricTimesElement = document.querySelector<HTMLSpanElement>("#metric-times");
 const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
+const metricDrawCallsElement = document.querySelector<HTMLSpanElement>("#metric-draw-calls");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
@@ -146,6 +148,7 @@ if (
   !metricCullDiscardsElement ||
   !metricTimesElement ||
   !metricFpsElement ||
+  !metricDrawCallsElement ||
   !metricTextureElement ||
   !metricGridMaxCellElement ||
   !dropIndicator ||
@@ -201,6 +204,7 @@ const metricReductionsTextElement = metricReductionsElement;
 const metricCullDiscardsTextElement = metricCullDiscardsElement;
 const metricTimesTextElement = metricTimesElement;
 const metricFpsTextElement = metricFpsElement;
+const drawCallMeter = createDrawCallMeter(metricDrawCallsElement);
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
@@ -335,6 +339,7 @@ let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
   const now = performance.now();
   updateFpsMetric(now);
+  drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
   drawingSelection.onFrame();
 
@@ -359,6 +364,7 @@ function onRendererFrame(stats: DrawStats): void {
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
   lastRuntimeTextUpdate = -Infinity;
+  drawCallMeter.reset();
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
   rendererApi.setTextLodMode?.(uiControlManager.readTextLodModeInput());
@@ -577,6 +583,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  drawCallMeter.dispose();
   drawingSelection.dispose();
   pdfLayerControls.dispose();
   layerVisibility.dispose();

@@ -1667,6 +1667,8 @@ export class WebGpuFloorplanRenderer {
   private vectorLodStats: VectorStrokeLodStats | null = null;
 
   private frameListener: FrameListener | null = null;
+
+  private frameDrawCalls = 0;
   private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
   private presentedCameraCenterX = 0;
   private presentedCameraCenterY = 0;
@@ -3250,7 +3252,7 @@ export class WebGpuFloorplanRenderer {
   ): void {
     if (this.primitiveHighlights) {
       const scale = this.resolveClientToPixelScale();
-      this.primitiveHighlights.draw(pass, createOrthographicLocalToClip(cameraCenterX, cameraCenterY, zoomValue, viewportWidth, viewportHeight),
+      this.frameDrawCalls += this.primitiveHighlights.draw(pass, createOrthographicLocalToClip(cameraCenterX, cameraCenterY, zoomValue, viewportWidth, viewportHeight),
         1 / Math.max(zoomValue, 1e-6), Math.max(scale.x, scale.y));
     }
     if (this.highlightOthersCount === 0 && this.highlightCurrentCount === 0 && this.highlightSelectionCount === 0) {
@@ -3270,14 +3272,17 @@ export class WebGpuFloorplanRenderer {
     if (this.highlightSelectionCount > 0 && this.highlightSelectionBindGroups.length === 1) {
       pass.setBindGroup(0, this.highlightSelectionBindGroups[0]);
       pass.draw(4, this.highlightSelectionCount, 0, 0);
+      this.frameDrawCalls += 1;
     }
     if (this.highlightOthersCount > 0 && this.highlightOthersBindGroups.length === 1) {
       pass.setBindGroup(0, this.highlightOthersBindGroups[0]);
       pass.draw(4, this.highlightOthersCount, 0, 0);
+      this.frameDrawCalls += 1;
     }
     if (this.highlightCurrentCount > 0 && this.highlightCurrentBindGroups.length === 1) {
       pass.setBindGroup(0, this.highlightCurrentBindGroups[0]);
       pass.draw(4, this.highlightCurrentCount, 0, 0);
+      this.frameDrawCalls += 1;
     }
   }
 
@@ -3602,6 +3607,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private render(timestamp: number = performance.now()): void {
+    this.frameDrawCalls = 0;
     const isCameraAnimating = this.updateCameraWithDamping(timestamp);
     this.updatePanReleaseVelocitySample(timestamp);
     if (
@@ -3617,6 +3623,7 @@ export class WebGpuFloorplanRenderer {
       this.clearToScreen();
       this.capturePresentedFrameState();
       this.frameListener?.({
+        drawCalls: this.frameDrawCalls,
         renderedSegments: 0,
         totalSegments: 0,
         usedCulling: false,
@@ -3631,6 +3638,7 @@ export class WebGpuFloorplanRenderer {
     if (!this.hasNativeRenderingEnabled()) {
       this.capturePresentedFrameState();
       this.frameListener?.({
+        drawCalls: this.frameDrawCalls,
         renderedSegments: 0,
         totalSegments: this.segmentCount,
         usedCulling: false,
@@ -3755,6 +3763,7 @@ export class WebGpuFloorplanRenderer {
       this.gpuDevice.queue.submit([encoder.finish()]);
 
       this.frameListener?.({
+        drawCalls: this.frameDrawCalls,
         renderedSegments,
         totalSegments: this.segmentCount,
         redundantSegments: this.getRedundantSegmentCount(),
@@ -3784,6 +3793,7 @@ export class WebGpuFloorplanRenderer {
     this.gpuDevice.queue.submit([encoder.finish()]);
 
     this.frameListener?.({
+      drawCalls: this.frameDrawCalls,
       renderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
@@ -3906,6 +3916,7 @@ export class WebGpuFloorplanRenderer {
     pass.setPipeline(this.vectorCompositePipeline);
     pass.setBindGroup(0, this.vectorCompositeBindGroup);
     pass.draw(4, 1, 0, 0);
+    this.frameDrawCalls += 1;
   }
 
   private renderWithPanCache(): void {
@@ -3978,6 +3989,7 @@ export class WebGpuFloorplanRenderer {
     this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
 
     this.frameListener?.({
+      drawCalls: this.frameDrawCalls,
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
@@ -4011,6 +4023,7 @@ export class WebGpuFloorplanRenderer {
     for (const layer of this.pageBackgroundResources) {
       pass.setBindGroup(0, layer.bindGroup);
       pass.draw(4, 1, 0, 0);
+      this.frameDrawCalls += 1;
     }
   }
 
@@ -4027,6 +4040,7 @@ export class WebGpuFloorplanRenderer {
           this.bindVectorClip(pass);
           pass.setBindGroup(0, resource.bindGroup);
           pass.draw(4, 1, 0, 0);
+          this.frameDrawCalls += 1;
         }
       } else if (command.kind === "gradient-fill") {
         if (this.fillRenderingEnabled) {
@@ -4063,6 +4077,7 @@ export class WebGpuFloorplanRenderer {
       pass.setVertexBuffer(0, this.gradientMeshBuffer);
       pass.draw(meshCount, 1, this.gradientMeshRanges[pathIndex * 2], pathIndex);
     } else pass.draw(4, 1, pathIndex * 4, 0);
+    this.frameDrawCalls += 1;
   }
 
   private drawGradientStrokeIntoPass(pass: any, runIndex: number): void {
@@ -4080,6 +4095,7 @@ export class WebGpuFloorplanRenderer {
     this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
     pass.setBindGroup(2, this.primitiveGradientColors.bindGroup("gradient-stroke", runIndex));
     pass.draw(4, segmentCount, runIndex * 4, 0);
+    this.frameDrawCalls += 1;
   }
 
   private drawRasterContentIntoPass(pass: any): void {
@@ -4100,6 +4116,7 @@ export class WebGpuFloorplanRenderer {
         if (layer) {
           pass.setBindGroup(0, layer.bindGroup);
           pass.draw(4, 1, 0, 0);
+          this.frameDrawCalls += 1;
         }
       }
     }
@@ -4159,6 +4176,7 @@ export class WebGpuFloorplanRenderer {
         this.bindVectorClip(pass);
         pass.setBindGroup(0, bindGroup);
         pass.draw(4, run.count, 0, run.first);
+        this.frameDrawCalls += 1;
         if (run.kind === "stroke") strokes += run.count;
       } else {
         for (let index = run.first; index < run.first + run.count; index++) {
@@ -4170,6 +4188,7 @@ export class WebGpuFloorplanRenderer {
               this.bindVectorClip(pass);
               pass.setBindGroup(0, batch.bindGroup);
               pass.draw(4, batch.count, 0, 0);
+              this.frameDrawCalls += 1;
               index += batch.count - 1;
               continue;
             }
@@ -4179,6 +4198,7 @@ export class WebGpuFloorplanRenderer {
               this.bindVectorClip(pass);
               pass.setBindGroup(0, resource.bindGroup);
               pass.draw(4, 1, 0, 0);
+              this.frameDrawCalls += 1;
             }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
             this.drawGradientFillIntoPass(pass, index);
@@ -4189,7 +4209,8 @@ export class WebGpuFloorplanRenderer {
       }
     };
     if (paintVisibility.requiresCompositing) {
-      this.paintCompositor ??= new WebGpuPaintCompositor(this.gpuDevice, this.presentationFormat);
+      this.paintCompositor ??= new WebGpuPaintCompositor(this.gpuDevice, this.presentationFormat,
+        () => { this.frameDrawCalls += 1; });
       const parentPass = pass;
       try {
         this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
@@ -4222,6 +4243,7 @@ export class WebGpuFloorplanRenderer {
       this.bindVectorClip(pass);
       pass.setBindGroup(0, this.fillBindGroup);
       pass.draw(4, this.fillPathCount, 0, 0);
+      this.frameDrawCalls += 1;
     }
 
     let strokeInstanceCount = 0;
@@ -4237,6 +4259,7 @@ export class WebGpuFloorplanRenderer {
         this.bindVectorClip(pass);
         pass.setBindGroup(0, resource.bindGroup);
         pass.draw(4, instanceCount, 0, 0);
+        this.frameDrawCalls += 1;
         strokeInstanceCount += instanceCount;
       }
     } else {
@@ -4250,6 +4273,7 @@ export class WebGpuFloorplanRenderer {
           this.bindVectorClip(pass);
           pass.setBindGroup(0, strokeBindGroup);
           pass.draw(4, strokeInstanceCount, 0, 0);
+          this.frameDrawCalls += 1;
         }
       }
     }
@@ -4265,6 +4289,7 @@ export class WebGpuFloorplanRenderer {
       this.bindVectorClip(pass);
       pass.setBindGroup(0, this.textBindGroup);
       pass.draw(4, textDrawCount, 0, 0);
+      this.frameDrawCalls += 1;
     }
 
     return strokeInstanceCount;
@@ -4405,6 +4430,7 @@ export class WebGpuFloorplanRenderer {
     pass.setPipeline(this.blitPipeline);
     pass.setBindGroup(0, this.blitBindGroup);
     pass.draw(4, 1, 0, 0);
+    this.frameDrawCalls += 1;
 
     // Live camera on top of the (possibly slightly stale) blitted cache.
     this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);

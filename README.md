@@ -86,6 +86,34 @@ The same loader accepts `.hep` files, `File`/`Blob` objects, bytes, and base64 d
 
 When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) for camera controls, resizing, search, selection, and cleanup.
 
+## Render your own polylines
+
+Compile host geometry into a `VectorScene` and render it using HEPR's Three.js
+stroke batching and camera-driven LOD, without a PDF:
+
+```js
+import { buildStrokeScene, createThreePdfObject } from "@soadzoor/hepr/bundler";
+
+const geometry = buildStrokeScene([
+  { points: [[0, 0], [100, 0], [100, 60], [0, 60]], closed: true,
+    color: "#334155", width: 0.5 },
+  { points: new Float32Array([0, 30, 100, 30]), color: "#dc2626", width: 0.25 }
+]);
+const drawing = await createThreePdfObject(geometry, { vectorLod: "auto" });
+
+// HEPR centers the group. Restore the input XY origin for placement in a BIM scene.
+const b = geometry.pageBounds;
+drawing.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, 0);
+scene.add(drawing);
+// Your existing renderer.render(scene, camera) drives LOD automatically.
+// On removal: drawing.removeFromParent(); drawing.dispose();
+```
+
+Coordinates are Y-up and widths use the same units. The initial builder supports
+opaque solid strokes with round caps/joins; the page background is transparent
+by default. See the [geometry API](docs/api.md#buildstrokescenepolylines-defaults)
+for input validation, defaults, and placement details.
+
 ## Save a HEP file
 
 Build a reusable document from a PDF, or export the scene you already loaded:

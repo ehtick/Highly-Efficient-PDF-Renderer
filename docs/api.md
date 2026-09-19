@@ -87,6 +87,89 @@ successful load, the returned object belongs to the caller and needs disposal.
 Colors accept hex strings, numbers such as `0xffffff`, or normalized RGB tuples
 such as `[1, 1, 1]`. See [rendering option types](../src/threePdfObject.ts).
 
+## `buildStrokeScene(polylines, defaults?)`
+
+Synchronously returns a `VectorScene` compiled from host-provided 2D geometry.
+No PDF, canvas, or GPU context is needed to build it. Pass the result directly
+to `createThreePdfObject` to use the existing Three.js renderer and stroke LOD.
+
+```ts
+import { buildStrokeScene, createThreePdfObject } from "@soadzoor/hepr/bundler";
+
+const geometry = buildStrokeScene([
+  { points: [[0, 0], [100, 0], [100, 60], [0, 60]], closed: true },
+  { points: new Float32Array([0, 30, 100, 30]), color: "#dc2626", width: 0.25 }
+], { color: "#334155", width: 0.5 });
+const drawing = await createThreePdfObject(geometry, {
+  sourceLabel: "Sheet layout",
+  vectorLod: "auto"
+});
+scene.add(drawing);
+```
+
+Each `StrokeScenePolyline` contains:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `points` | Required | Readonly `[x, y]` tuples, or a flat `Float32Array` / `Float64Array` of coordinate pairs. |
+| `closed` | `false` | Add the last-to-first edge unless the final point already equals the first. |
+| `color` | Inherited | sRGB `#RGB`, `#RRGGBB`, CSS color name, `0xRRGGBB`, or normalized RGB tuple. Tuple channels are clamped to 0–1. |
+| `width` | Inherited | Nonnegative full stroke width in scene units; zero means a device-pixel hairline. |
+
+The optional `StrokeSceneStyle` defaults supply `color` (black) and `width` (1)
+for polylines that omit them. Strokes are opaque and solid, with round caps and
+round joins. This version does not accept dash patterns, other cap/join styles,
+curves, fills, text, or images. Keep `curveStrokes` enabled (the rendering default)
+for round cap coverage.
+
+Coordinates are X-right/Y-up, with no implicit unit conversion or Y flip. Widths
+use the same units and scale with the Three.js object. GPU coordinates are float32;
+use coordinates near a local origin and place the group in the larger BIM world
+with Three.js transforms. `Float64Array` input is also converted to float32.
+
+The builder copies inputs and computes stroke bounds and a single page rectangle,
+including stroke width. Treat the returned scene as immutable while rendering;
+changing your original points does not change it. Empty/single-point paths emit
+no strokes. Consecutive points equal after float32 conversion are skipped and
+reported in `discardedDegenerateCount`; entirely empty geometry has zero pages
+and the default bounds `[0, 0, 1, 1]`. Invalid point shapes, nonfinite/out-of-range
+coordinates, invalid colors, and invalid widths throw. Scene buffers support at
+most 16,777,216 candidate segments; practical limits depend on available memory
+and the renderer's GPU texture capacity.
+
+The supported contract is the builder input and rendering workflow. Applications
+should not construct or mutate the packed scene metadata themselves. LOD uses
+the existing visual approximations at overview scales; use `vectorLod: "off"`
+when exact stroke rendering is required.
+
+## `createThreePdfObject(scene, options?)`
+
+Returns `Promise<HeprThreePdfObject>` from a compiled `VectorScene`, including one
+returned by `buildStrokeScene`. It skips source loading/parsing, prepares LOD,
+and creates the same `THREE.Group` used by `pdfObjectGenerator`. No standalone
+viewer UI or custom WebGL lifecycle integration is required.
+
+`CreateThreePdfObjectOptions` accepts the rendering options above, plus
+`sourceLabel` (default `"Vector scene"`), `signal`, and `onProgress`. Unlike the
+file loader, `rendererType` is an **option**, defaulting to `"webgl"`, and
+`pageBackgroundOpacity` defaults to `0`. Set it to `1` for a visible sheet
+background. `sourceKind` on the object and `sourceType` in progress events are
+`"scene"`. Cancellation and disposal follow the file loader's behavior.
+
+The object lies in its local XY plane and is centered on the page bounds, as
+with PDF objects. To retain the input coordinates within a parent BIM/sheet group:
+
+```ts
+const b = geometry.pageBounds;
+drawing.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, 0);
+sheetGroup.add(drawing);
+// Rotate, translate, or scale sheetGroup to place the drawing in the 3D world.
+```
+
+Your normal `renderer.render(scene, camera)` calls drive culling and LOD. Remove
+the group from its parent and call `dispose()` when finished. Geometry edits and
+incremental buffer updates are outside this API; build a new scene if needed.
+
 ## `HeprThreePdfObject`
 
 The object supports normal Three.js transforms. `sceneData` contains its parsed

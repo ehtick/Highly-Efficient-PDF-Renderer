@@ -87,7 +87,10 @@ try {
 
 async function testPublicPipeline(reason) {
   const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
-  for (const stage of ["before", "source", "vector-lod", "text-lod", "upload", "create", "complete", "success"]) {
+  const stages = ["before", "source", "vector-lod", "text-lod", "upload", "create", "complete", "success"];
+  const cases = ["pdf", "scene"].flatMap(sourceKind => stages.map(stage => ({ sourceKind, stage })));
+  for (const { sourceKind, stage } of cases) {
+    if (sourceKind === "scene" && stage === "source") continue;
     const controller = new AbortController();
     let created = 0;
     let disposed = 0;
@@ -95,6 +98,7 @@ async function testPublicPipeline(reason) {
     const context = vm.createContext({
       createLoadProgressReporter, yieldForLoad,
       loadPdfSceneFromSource: async (_source, options) => {
+        assert.equal(sourceKind, "pdf", "compiled scenes must bypass source loading");
         assert.equal(options.signal, controller.signal);
         options.onProgress({ stage: "source", value: 1 });
         return { scene: {}, sourceKind: "pdf" };
@@ -106,8 +110,13 @@ async function testPublicPipeline(reason) {
         assert.equal(options.signal, controller.signal);
         if (options.signal.aborted) throw new Error("text scheduler cancelled");
       },
-      createThreePdfObject: async (_scene, _options, signal) => {
+      createThreePdfObjectFromLoadedScene: async (loaded, options, signal) => {
         assert.equal(signal, controller.signal);
+        assert.equal(loaded.sourceKind, sourceKind);
+        if (sourceKind === "scene") {
+          assert.equal(loaded.sourceLabel, "Host strokes");
+          assert.equal(options.pageBackgroundOpacity, 0);
+        }
         created += 1;
         if (stage === "create") controller.abort(reason);
         return object;
@@ -116,11 +125,18 @@ async function testPublicPipeline(reason) {
       LOAD_PROGRESS_VECTOR_LOD_END: 0.66, LOAD_PROGRESS_TEXT_LOD_START: 0.66,
       LOAD_PROGRESS_TEXT_LOD_END: 0.96, LOAD_PROGRESS_UPLOAD: 0.98
     });
+    vm.runInContext(sourceFunction(source, "prepareThreePdfObject"), context);
+    vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
     vm.runInContext(sourceFunction(source, "pdfObjectGenerator"), context);
     if (stage === "before") controller.abort(reason);
-    const pending = context.pdfObjectGenerator(bytesForTest(), {
+    const factory = sourceKind === "pdf" ? context.pdfObjectGenerator : context.createThreePdfObject;
+    const pending = factory(sourceKind === "pdf" ? bytesForTest() : {}, {
+      sourceLabel: "Host strokes",
       signal: controller.signal,
-      onProgress: (event) => { if (event.stage === stage) controller.abort(reason); }
+      onProgress: (event) => {
+        if (event.stage !== "source") assert.equal(event.sourceType, sourceKind);
+        if (event.stage === stage) controller.abort(reason);
+      }
     });
     if (stage === "success") {
       assert.equal(await pending, object);

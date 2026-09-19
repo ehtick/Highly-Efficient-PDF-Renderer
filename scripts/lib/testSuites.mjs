@@ -44,6 +44,7 @@ export const fastTests = [
   "native-resource-reuse",
   "native-text-clip-index",
   "scene-statistics",
+  "stroke-scene-builder",
   "render-performance",
   "webgl-performance",
   "webgl-ordered-state",

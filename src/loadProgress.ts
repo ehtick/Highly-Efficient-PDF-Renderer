@@ -49,7 +49,7 @@ export interface PDFLoadProgress {
   executionPath?: PDFLoadExecutionPath;
 
   /** Source family currently being processed. */
-  sourceType?: "pdf" | "hep";
+  sourceType?: "pdf" | "hep" | "scene";
 
   /** Unit represented by `processed` and `total`, when available. */
   unit?: "bytes" | "operators" | "segments" | "sections" | "pages" | "texels";

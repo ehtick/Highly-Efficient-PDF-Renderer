@@ -56,6 +56,13 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 export type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
+/** Source metadata for rendering an already compiled scene. */
+export interface ThreePdfSceneSource {
+  scene: LoadedPdfScene["scene"];
+  sourceLabel: string;
+  sourceKind: LoadedPdfScene["sourceKind"] | "scene";
+}
+
 /** A text-search match with bounds in PDF scene space and this object's local space. */
 export interface HeprTextSearchMatch extends TextSearchMatch {
   /**
@@ -300,8 +307,8 @@ export class HeprThreePdfObject extends THREE.Group {
   /** Human-readable source label, usually the file name or URL basename. */
   readonly sourceLabel: string;
 
-  /** Whether this object was loaded from a PDF or HEP parsed-data file. */
-  readonly sourceKind: LoadedPdfScene["sourceKind"];
+  /** PDF, HEP, or a directly supplied compiled scene. */
+  readonly sourceKind: ThreePdfSceneSource["sourceKind"];
 
   /** Native renderer backend used internally by this object. */
   readonly rendererType: HeprRendererType;
@@ -432,7 +439,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * of calling this constructor directly.
    */
   constructor(
-    loadedScene: Pick<LoadedPdfScene, "scene" | "sourceLabel" | "sourceKind">,
+    loadedScene: ThreePdfSceneSource,
     rendererType: HeprRendererType,
     renderer: RendererApi,
     renderCanvas: HTMLCanvasElement,
@@ -2964,11 +2971,11 @@ function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
 
 /**
  * Internal factory that creates a three.js PDF object from a parsed HEPR
- * scene. The public `pdfObjectGenerator` entry point owns source loading,
- * parsing, LOD preparation, and object creation.
+ * scene. The public factories in index.ts own source loading (when needed),
+ * LOD preparation, cancellation, and object creation.
  */
 export async function createThreePdfObject(
-  loadedScene: Pick<LoadedPdfScene, "scene" | "sourceLabel" | "sourceKind">,
+  loadedScene: ThreePdfSceneSource,
   options: HeprThreeObjectOptions = {},
   signal?: AbortSignal
 ): Promise<HeprThreePdfObject> {

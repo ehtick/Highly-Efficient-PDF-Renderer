@@ -5,7 +5,8 @@ import {
   type PdfObjectSourceKind
 } from "./pdfObjectGenerator";
 import {
-  createThreePdfObject,
+  createThreePdfObject as createThreePdfObjectFromLoadedScene,
+  type ThreePdfSceneSource,
   type HeprRendererType,
   type ThreeColorCompositing,
   type HeprThreeObjectOptions,
@@ -16,7 +17,7 @@ import {
   createCanvasInteractionController,
   type CanvasInteractionController
 } from "./canvasInteractions";
-import { createLoadProgressReporter } from "./loadProgress";
+import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
 import { prebuildTextLod } from "./textLodCore";
 import { yieldForLoad } from "./loadCancellation";
@@ -32,6 +33,19 @@ import type { RoomDetectionOptions, RoomDetectionResult } from "./roomDetector";
 export interface PdfObjectGeneratorRuntimeOptions
   extends PdfObjectGeneratorOptions,
     Omit<HeprThreeObjectOptions, "rendererType"> {}
+
+/** Options for rendering a compiled VectorScene, without loading a PDF or HEP. */
+export interface CreateThreePdfObjectOptions extends HeprThreeObjectOptions {
+  /** Label exposed on the returned object. Defaults to "Vector scene". */
+  sourceLabel?: string;
+  /** Cancels LOD preparation and object creation. */
+  signal?: AbortSignal;
+  /** Reports LOD preparation and upload progress with sourceType: "scene". */
+  onProgress?: LoadProgressCallback;
+}
+
+export { buildStrokeScene } from "./strokeSceneBuilder";
+export type { StrokeScenePoint, StrokeSceneStyle, StrokeScenePolyline } from "./strokeSceneBuilder";
 
 const LOAD_PROGRESS_SCENE_END = 0.34;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
@@ -91,7 +105,44 @@ export async function pdfObjectGenerator(
       onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
     });
     signal?.throwIfAborted();
-    const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "hep";
+    return await prepareThreePdfObject(loadedScene, { ...options, rendererType }, progress);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw error;
+  }
+}
+
+/**
+ * Render a compiled scene (for example, buildStrokeScene(polylines)) as a THREE.Group.
+ * Prepares camera-driven LOD without parsing or serializing a document. The group
+ * is centered on scene.pageBounds, just like pdfObjectGenerator's result.
+ * The background is transparent by default. Add the group to your Three.js scene,
+ * render normally, and call removeFromParent() and dispose() when finished.
+ * Do not modify the supplied scene's buffers while it is in use.
+ */
+export async function createThreePdfObject(
+  scene: VectorScene,
+  options: CreateThreePdfObjectOptions = {}
+): Promise<HeprThreePdfObject> {
+  options.signal?.throwIfAborted();
+  const progress = createLoadProgressReporter(options.onProgress);
+  return prepareThreePdfObject({
+    scene,
+    sourceLabel: options.sourceLabel ?? "Vector scene",
+    sourceKind: "scene"
+  }, { ...options, pageBackgroundOpacity: options.pageBackgroundOpacity ?? 0 }, progress);
+}
+
+async function prepareThreePdfObject(
+  loadedScene: ThreePdfSceneSource,
+  options: CreateThreePdfObjectOptions,
+  progress: LoadProgressReporter
+): Promise<HeprThreePdfObject> {
+  const signal = options.signal;
+  const rendererType = options.rendererType ?? "webgl";
+  const sourceType = loadedScene.sourceKind;
+  try {
+    signal?.throwIfAborted();
     progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
     await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
       yieldIntervalMs: 500,
@@ -122,7 +173,7 @@ export async function pdfObjectGenerator(
     signal?.throwIfAborted();
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType });
     await yieldForLoad(signal);
-    const object = await createThreePdfObject(loadedScene, {
+    const object = await createThreePdfObjectFromLoadedScene(loadedScene, {
       ...options,
       rendererType
     }, signal);

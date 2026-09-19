@@ -62,6 +62,8 @@ const entry = chunks.find(file => file.isEntry && file.facadeModuleId === `${lib
 const pdfWorkerEntry = chunks.find(file => file.isEntry && file.facadeModuleId === `${libDir}pdf-worker.js`);
 assert(pdfWorkerEntry, "the parser worker must participate in browser packaging checks");
 assert.ok(entry?.exports.includes("pdfObjectGenerator"));
+assert.ok(entry.exports.includes("buildStrokeScene"));
+assert.ok(entry.exports.includes("createThreePdfObject"));
 assert.ok(entry.exports.includes("detectRooms"), "the root package must retain its room detection API");
 
 const chunksByName = new Map(chunks.map(chunk => [chunk.fileName, chunk]));

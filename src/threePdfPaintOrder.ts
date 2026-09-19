@@ -21,6 +21,11 @@ interface OrderedRasterLayer {
   pageIndex?: number;
 }
 
+interface RasterPaintMesh {
+  mesh: THREE.Object3D;
+  count: number;
+}
+
 /**
  * Interleave sparse native gradient paints with extracted image layers while
  * keeping the complete group below the ordinary-fill band.
@@ -30,19 +35,26 @@ export function applyThreePdfOverlayPaintOrder(
   rasterGroup: THREE.Group,
   nativePaints: readonly ThreePdfOrderedPaintMesh[]
 ): void {
+  const rasterMeshes = collectRasterPaintMeshes(scene, rasterGroup);
   if (scene.drawRuns) {
-    const backgrounds = Math.max(1, Math.floor(scene.pageRects.length / 4));
     scene.drawRuns.forEach((run, index) => {
+      if (run.kind !== "raster" && run.kind !== "gradient-fill" && run.kind !== "gradient-stroke") return;
       for (let item = run.first; item < run.first + run.count; item++) {
-        const mesh = run.kind === "raster" ? rasterGroup.children[backgrounds + item]
-          : run.kind === "gradient-fill" ? nativePaints[item]?.mesh
-          : run.kind === "gradient-stroke" ? nativePaints[scene.gradientFillPathCount + item]?.mesh : null;
-        if (mesh) {
+        const assign = (mesh: THREE.Object3D): void => {
           mesh.renderOrder = vectorDrawRunRenderOrder(index + (item - run.first) / run.count, scene.drawRuns!.length);
           for (const child of mesh.children) {
             if (child.userData.heprMultiplyCompletion) child.renderOrder = vectorDrawRunRenderOrder(
               index + (item - run.first + 0.5) / run.count, scene.drawRuns!.length);
           }
+        };
+        if (run.kind === "raster") {
+          for (const entry of rasterMeshes.get(item) ?? []) {
+            if (item + entry.count <= run.first + run.count) assign(entry.mesh);
+          }
+        } else {
+          const mesh = run.kind === "gradient-fill" ? nativePaints[item]?.mesh
+            : nativePaints[scene.gradientFillPathCount + item]?.mesh;
+          if (mesh) assign(mesh);
         }
       }
     });
@@ -52,12 +64,11 @@ export function applyThreePdfOverlayPaintOrder(
     return;
   }
 
-  const ordered: Array<ThreePdfOrderedPaintMesh & { stableIndex: number }> = [];
-  const pageBackgroundCount = Math.max(1, Math.floor(scene.pageRects.length / 4));
+  const ordered: Array<{ meshes: THREE.Object3D[]; pageIndex: number; paintOrder: number; stableIndex: number }> = [];
   const rasterLayers = Array.isArray(scene.rasterLayers)
     ? (scene.rasterLayers as OrderedRasterLayer[])
     : [];
-  let rasterChildIndex = pageBackgroundCount;
+  let rasterIndex = 0;
 
   for (const layer of rasterLayers) {
     const width = Math.max(0, Math.trunc(Number(layer?.width) || 0));
@@ -72,15 +83,14 @@ export function applyThreePdfOverlayPaintOrder(
       continue;
     }
 
-    const mesh = rasterGroup.children[rasterChildIndex];
-    rasterChildIndex += 1;
+    const meshes = rasterMeshes.get(rasterIndex++)?.map(entry => entry.mesh) ?? [];
     const paintOrder = Number(layer.paintOrder);
     const pageIndex = Number(layer.pageIndex);
-    if (!mesh || !Number.isFinite(paintOrder) || !Number.isFinite(pageIndex)) {
+    if (meshes.length === 0 || !Number.isFinite(paintOrder) || !Number.isFinite(pageIndex)) {
       continue;
     }
     ordered.push({
-      mesh,
+      meshes,
       paintOrder,
       pageIndex,
       stableIndex: ordered.length
@@ -91,7 +101,7 @@ export function applyThreePdfOverlayPaintOrder(
     if (!Number.isFinite(paint.paintOrder) || !Number.isFinite(paint.pageIndex)) {
       continue;
     }
-    ordered.push({ ...paint, stableIndex: ordered.length });
+    ordered.push({ meshes: [paint.mesh], pageIndex: paint.pageIndex, paintOrder: paint.paintOrder, stableIndex: ordered.length });
   }
 
   if (ordered.length === 0) {
@@ -106,7 +116,29 @@ export function applyThreePdfOverlayPaintOrder(
 
   const span = HEPR_THREE_LAYER_ORDER_FILL - HEPR_THREE_LAYER_ORDER_RASTER;
   for (let i = 0; i < ordered.length; i += 1) {
-    ordered[i].mesh.renderOrder =
-      HEPR_THREE_LAYER_ORDER_RASTER + span * ((i + 1) / (ordered.length + 1));
+    const renderOrder = HEPR_THREE_LAYER_ORDER_RASTER + span * ((i + 1) / (ordered.length + 1));
+    for (const mesh of ordered[i].meshes) mesh.renderOrder = renderOrder;
   }
+}
+
+/** Originals and render-only batches can share a canonical first image. */
+function collectRasterPaintMeshes(scene: VectorScene, group: THREE.Group): Map<number, RasterPaintMesh[]> {
+  const entries = new Map<number, RasterPaintMesh[]>();
+  for (const mesh of group.children) {
+    const run = mesh.userData.heprDrawRun;
+    if (mesh.userData.heprPageBackground || run?.kind !== "raster") continue;
+    if (!Number.isInteger(run.first) || run.first < 0 || !Number.isInteger(run.count) || run.count < 1) continue;
+    let aliases = entries.get(run.first);
+    if (!aliases) entries.set(run.first, aliases = []);
+    aliases.push({ mesh, count: run.count });
+  }
+  if (entries.size > 0) return entries;
+
+  // Older adapter-created groups may not carry canonical metadata. Preserve
+  // their positional convention; current merged backgrounds are explicitly tagged.
+  const markedBackgrounds = group.children.some(mesh => mesh.userData.heprPageBackground);
+  const legacyMeshes = markedBackgrounds ? group.children.filter(mesh => !mesh.userData.heprPageBackground)
+    : group.children.slice(Math.max(1, Math.floor(scene.pageRects.length / 4)));
+  legacyMeshes.forEach((mesh, first) => entries.set(first, [{ mesh, count: 1 }]));
+  return entries;
 }

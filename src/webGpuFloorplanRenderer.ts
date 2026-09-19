@@ -1,4 +1,6 @@
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
+import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
+import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
 import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_WGSL, GRADIENT_MESH_VERTEX_LAYOUT } from "./gradientMeshShaders";
@@ -74,6 +76,14 @@ interface WebGpuRasterLayerResource {
   bindGroup: any;
   paintOrder: number;
   pageIndex: number;
+}
+
+interface WebGpuRasterStripResource {
+  first: number;
+  count: number;
+  texture: any;
+  instanceBuffer: any;
+  bindGroup: any;
 }
 
 interface WebGpuVectorLodLevelResource {
@@ -1454,6 +1464,7 @@ export class WebGpuFloorplanRenderer {
   private readonly textPipeline: any;
 
   private readonly rasterPipeline: any;
+  private rasterStripPipeline: any = null;
 
   private readonly blitPipeline: any;
 
@@ -1564,6 +1575,7 @@ export class WebGpuFloorplanRenderer {
 
   private textInstanceTextureC: any = null;
   private rasterLayerResources: WebGpuRasterLayerResource[] = [];
+  private readonly rasterStripResources = new Map<number, WebGpuRasterStripResource>();
   private rasterTextureResidency = true;
   private pageBackgroundResources: WebGpuRasterLayerResource[] = [];
 
@@ -2658,6 +2670,7 @@ export class WebGpuFloorplanRenderer {
           this.rasterLayerResources[index] = next;
         }
         prepared.clear();
+        this.destroyRasterStripResources();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
         finished = true;
         this.panCacheValid = false; this.destroyVectorMinifyResources(); this.requestFrame();
@@ -4150,6 +4163,16 @@ export class WebGpuFloorplanRenderer {
       } else {
         for (let index = run.first; index < run.first + run.count; index++) {
           if (run.kind === "raster" && this.rasterRenderingEnabled) {
+            const batch = multiplyPass === undefined && !paintVisibility.requiresCompositing
+              ? this.rasterStripResources?.get(index) : undefined;
+            if (batch && batch.first + batch.count <= run.first + run.count) {
+              pass.setPipeline(this.rasterStripPipeline);
+              this.bindVectorClip(pass);
+              pass.setBindGroup(0, batch.bindGroup);
+              pass.draw(4, batch.count, 0, 0);
+              index += batch.count - 1;
+              continue;
+            }
             const resource = this.rasterLayerResources[index];
             if (resource) {
               pass.setPipeline(multiplyPass === undefined ? this.rasterPipeline : this.multiplyPipeline(this.rasterPipeline, multiplyPass));
@@ -4893,6 +4916,20 @@ export class WebGpuFloorplanRenderer {
           throw error;
         }
       }
+      // Replayed replacements own their individual resources. They can no
+      // longer use an atlas built from the immutable source scene.
+      if (this.rasterLayerUpdates.size === 0) {
+        try {
+          const batches = buildRasterStripBatches(scene, maxRasterTextureSize);
+          if (batches.length > 0) this.ensureRasterStripPipeline();
+          for (const batch of batches) {
+            this.rasterStripResources.set(batch.first, this.createRasterStripResource(batch));
+          }
+        } catch (error) {
+          this.destroyRasterStripResources();
+          console.warn("Raster strip batching unavailable; drawing original image layers.", error);
+        }
+      }
     } catch (error) {
       this.destroyRasterLayerResources();
       throw error;
@@ -5083,6 +5120,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private destroyRasterLayerResources(): void {
+    this.destroyRasterStripResources();
     for (const layer of this.rasterLayerResources) {
       if (layer.texture) {
         layer.texture.destroy();
@@ -5092,6 +5130,63 @@ export class WebGpuFloorplanRenderer {
       }
     }
     this.rasterLayerResources = [];
+  }
+
+  private destroyRasterStripResources(): void {
+    for (const batch of this.rasterStripResources?.values() ?? []) {
+      batch.texture.destroy();
+      batch.instanceBuffer.destroy();
+    }
+    this.rasterStripResources?.clear();
+  }
+
+  private ensureRasterStripPipeline(): void {
+    if (this.rasterStripPipeline) return;
+    const stage = (globalThis as any).GPUShaderStage;
+    const bindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: stage.VERTEX,
+        buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES } },
+      { binding: 1, visibility: stage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: stage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 3, visibility: stage.FRAGMENT, texture: { sampleType: "float" } }
+    ] });
+    const layout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [bindGroupLayout, this.vectorClipBindGroupLayout]
+    });
+    this.rasterStripPipeline = this.createPipeline(RASTER_STRIP_WGSL, "vsMain", "fsMain", layout, true);
+  }
+
+  private createRasterStripResource(batch: RasterStripBatch): WebGpuRasterStripResource {
+    const textureUsage = (globalThis as any).GPUTextureUsage;
+    const bufferUsage = (globalThis as any).GPUBufferUsage;
+    const texture = this.gpuDevice.createTexture({
+      size: { width: batch.width, height: batch.height, depthOrArrayLayers: 1 },
+      format: "rgba8unorm",
+      usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST
+    });
+    let instanceBuffer: any = null;
+    try {
+      this.writeRgba8Texture(texture, batch.width, batch.height, batch.data);
+      instanceBuffer = this.gpuDevice.createBuffer({
+        size: batch.instances.byteLength,
+        usage: bufferUsage.STORAGE | bufferUsage.COPY_DST
+      });
+      this.gpuDevice.queue.writeBuffer(instanceBuffer, 0, batch.instances);
+      const bindGroup = this.gpuDevice.createBindGroup({
+        layout: this.rasterStripPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES } },
+          { binding: 1, resource: { buffer: instanceBuffer } },
+          { binding: 2, resource: this.rasterLayerSampler },
+          { binding: 3, resource: texture.createView() }
+        ]
+      });
+      return { first: batch.first, count: batch.count, texture, instanceBuffer, bindGroup };
+    } catch (error) {
+      instanceBuffer?.destroy();
+      texture.destroy();
+      throw error;
+    }
   }
 
   private destroyPageBackgroundResources(): void {

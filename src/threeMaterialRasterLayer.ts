@@ -3,6 +3,9 @@ import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVec
 import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
+import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
+import { createThreeWebGpuRasterStripMaterial } from "./threeWebGpuRasterStripMaterial";
 
 import {
   CORE_RASTER_FRAGMENT_SHADER_SOURCE,
@@ -31,7 +34,9 @@ interface ViewportPixels {
 interface RasterLayerEntry {
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   material: THREE.Material;
-  webGpuState?: ThreeWebGpuRasterMaterialState;
+  webGpuState?: Pick<ThreeWebGpuRasterMaterialState, "zoomUniform" | "useLocalToClipUniform"> &
+    Partial<Pick<ThreeWebGpuRasterMaterialState, "updateSource">>;
+  batched?: boolean;
 }
 
 interface ResidentRasterLayerEntry extends RasterLayerEntry {
@@ -62,6 +67,8 @@ export class ThreeMaterialRasterLayer {
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
+  private readonly stripEntries: ResidentRasterLayerEntry[] = [];
+  private activeEntries: RasterLayerEntry[] = [];
   private readonly multiplyMaterials: THREE.Material[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
   private maxRasterTextureDimension: number;
@@ -80,8 +87,11 @@ export class ThreeMaterialRasterLayer {
     this.visibility.setVisibility(this.snapshot);
     this.vectorClipTexture = createThreeVectorClipTexture(scene);
     this.vectorClipIndices = Array(scene.rasterLayers.length).fill(-1);
+    const rasterRuns: Array<VectorDrawRun | undefined> = Array(scene.rasterLayers.length);
     for (const run of scene.drawRuns ?? []) {
-      if (run.kind === "raster" && run.clipIndex !== undefined) this.vectorClipIndices.fill(run.clipIndex, run.first, run.first + run.count);
+      if (run.kind !== "raster") continue;
+      rasterRuns.fill(run, run.first, run.first + run.count);
+      if (run.clipIndex !== undefined) this.vectorClipIndices.fill(run.clipIndex, run.first, run.first + run.count);
     }
     this.materialBackend = options.materialBackend ?? "webgl";
     this.colorCompositing = options.colorCompositing ?? "linear";
@@ -132,8 +142,8 @@ export class ThreeMaterialRasterLayer {
         source.opacity ?? 1
       );
       entry.mesh.userData.heprDrawRun = { kind: "raster", first: rasterIndex, count: 1 };
-      const multiply = !scene.paintGraph && scene.drawRuns?.some(run => run.kind === "raster" && run.blendMode === "Multiply" &&
-        rasterIndex >= run.first && rasterIndex < run.first + run.count);
+      const run = rasterRuns[rasterIndex];
+      const multiply = !scene.paintGraph && run?.blendMode === "Multiply";
       if (multiply) {
         const original = entry.material;
         entry.mesh.material = entry.material = createThreeMultiplyMaterial(original, 0, true);
@@ -146,16 +156,28 @@ export class ThreeMaterialRasterLayer {
         entry.mesh.add(completion);
       }
       entry.mesh.visible = false;
-      this.entries.push(entry);
-      this.rasterEntries.push({
+      const residentEntry = {
         ...entry,
-        run: scene.drawRuns?.find(run => run.kind === "raster" && rasterIndex >= run.first &&
-          rasterIndex < run.first + run.count),
+        run,
         texture,
         resident: false
-      });
+      };
+      this.entries.push(residentEntry);
+      this.rasterEntries.push(residentEntry);
       this.group.add(entry.mesh);
     }
+    try {
+      // 2048 is within WebGL2's minimum texture limit. The shared planner
+      // applies the same per-batch and total allocation bounds as native paths.
+      // Both Three backends generate ordinary image mips by linear sampling.
+      const batches = rasterSources.length === scene.rasterLayers.length
+        ? buildRasterStripBatches(scene, 2048, "linear") : [];
+      for (const batch of batches) this.addStripBatch(batch);
+    } catch (error) {
+      this.destroyStripBatches();
+      console.warn("Raster strip batching unavailable; drawing original image layers.", error);
+    }
+    this.activeEntries = this.entries.filter(entry => !entry.batched);
   }
 
   setVisible(visible: boolean): void {
@@ -165,8 +187,8 @@ export class ThreeMaterialRasterLayer {
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
     this.snapshot = snapshot;
     this.visibility.setVisibility(snapshot);
-    for (const entry of this.rasterEntries) entry.mesh.visible = entry.resident &&
-      this.isEntryVisible(entry);
+    for (const entry of this.rasterEntries) entry.mesh.visible = !entry.batched && entry.resident && this.isEntryVisible(entry);
+    for (const entry of this.stripEntries) entry.mesh.visible = entry.resident && this.isEntryVisible(entry);
   }
 
   private isEntryVisible(entry: ResidentRasterLayerEntry): boolean {
@@ -177,7 +199,10 @@ export class ThreeMaterialRasterLayer {
   }
 
   getMaxRasterTextureDimension(): number {
-    return this.maxRasterTextureDimension;
+    return this.stripEntries.reduce((maximum, entry) => {
+      const image = entry.texture.image as { width: number; height: number };
+      return Math.max(maximum, image.width, image.height);
+    }, this.maxRasterTextureDimension);
   }
 
   /** Stage replacement pixels without uploading resources on a dormant material path. */
@@ -210,6 +235,7 @@ export class ThreeMaterialRasterLayer {
           throw new Error("Raster material layer has been disposed.");
         }
         finished = true;
+        if (staged.length > 0) this.destroyStripBatches();
         for (const { index, layer, texture } of staged) {
           const entry = this.rasterEntries[index];
           const previous = entry.texture;
@@ -217,7 +243,7 @@ export class ThreeMaterialRasterLayer {
           this.ownedTextures.add(texture);
           this.ownedTextures.delete(previous);
           previous.dispose();
-          if (entry.webGpuState) entry.webGpuState.updateSource(texture, layer.matrix, layer.opacity ?? 1);
+          if (entry.webGpuState?.updateSource) entry.webGpuState.updateSource(texture, layer.matrix, layer.opacity ?? 1);
           else {
             const uniforms = (entry.material as THREE.RawShaderMaterial).uniforms;
             uniforms.uRasterTex.value = texture;
@@ -247,6 +273,17 @@ export class ThreeMaterialRasterLayer {
     this.rasterTextureResidencyEnabled = resident;
     if (resident) {
       for (const entry of this.rasterEntries) {
+        if (entry.batched) {
+          // Keep canonical meshes for replacement fallback, without traversing
+          // thousands of hidden children on every Three.js frame.
+          entry.mesh.removeFromParent();
+          continue;
+        }
+        entry.texture.needsUpdate = true;
+        entry.resident = true;
+        entry.mesh.visible = this.isEntryVisible(entry);
+      }
+      for (const entry of this.stripEntries) {
         entry.texture.needsUpdate = true;
         entry.resident = true;
         entry.mesh.visible = this.isEntryVisible(entry);
@@ -256,6 +293,7 @@ export class ThreeMaterialRasterLayer {
     for (const entry of this.rasterEntries) {
       this.evictRasterEntry(entry);
     }
+    for (const entry of this.stripEntries) this.evictRasterEntry(entry);
   }
 
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
@@ -283,7 +321,7 @@ export class ThreeMaterialRasterLayer {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
-    for (const entry of this.entries) {
+    for (const entry of this.activeEntries) {
       if (entry.webGpuState) {
         entry.webGpuState.zoomUniform.value = this.zoomUniform.value;
       }
@@ -292,7 +330,7 @@ export class ThreeMaterialRasterLayer {
 
   setScreenSpaceTransform(): void {
     this.useLocalToClipUniform.value = 0;
-    for (const entry of this.entries) {
+    for (const entry of this.activeEntries) {
       if (entry.webGpuState) {
         entry.webGpuState.useLocalToClipUniform.value = 0;
       }
@@ -302,7 +340,7 @@ export class ThreeMaterialRasterLayer {
   setLocalToClipTransform(localToClip: THREE.Matrix4): void {
     this.useLocalToClipUniform.value = 1;
     this.localToClipUniform.copy(localToClip);
-    for (const entry of this.entries) {
+    for (const entry of this.activeEntries) {
       if (entry.webGpuState) {
         entry.webGpuState.useLocalToClipUniform.value = 1;
       }
@@ -317,11 +355,14 @@ export class ThreeMaterialRasterLayer {
       entry.material.dispose();
     }
     this.entries.length = 0;
+    this.activeEntries.length = 0;
     for (const material of this.multiplyMaterials) material.dispose();
     this.multiplyMaterials.length = 0;
 
     this.geometry.dispose();
     this.pageBackgroundGeometry?.dispose();
+    for (const entry of this.stripEntries) entry.mesh.geometry.dispose();
+    this.stripEntries.length = 0;
 
     for (const texture of this.ownedTextures) {
       texture.dispose();
@@ -337,6 +378,87 @@ export class ThreeMaterialRasterLayer {
     }
     entry.texture.dispose();
     entry.resident = false;
+  }
+
+  private addStripBatch(batch: RasterStripBatch): void {
+    const texture = new THREE.DataTexture(batch.data, batch.width, batch.height, THREE.RGBAFormat, THREE.UnsignedByteType);
+    texture.minFilter = texture.magFilter = THREE.LinearFilter;
+    texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+    texture.flipY = false;
+    texture.generateMipmaps = false;
+    texture.needsUpdate = true;
+    let geometry: THREE.InstancedBufferGeometry | undefined;
+    let material: THREE.Material | undefined;
+    try {
+      geometry = createRasterStripGeometry(batch);
+      let webGpuState: RasterLayerEntry["webGpuState"];
+      if (this.materialBackend === "webgpu") {
+        const state = createThreeWebGpuRasterStripMaterial({ texture, colorCompositing: this.colorCompositing,
+          viewport: this.viewportUniform, cameraCenter: this.cameraCenterUniform, localToClip: this.localToClipUniform });
+        material = state.material;
+        webGpuState = state;
+        state.zoomUniform.value = this.zoomUniform.value;
+        state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
+      } else {
+        // Reuse the native shader, including its independent mip sampling.
+        material = new THREE.RawShaderMaterial({
+          glslVersion: THREE.GLSL3,
+          vertexShader: normalizeCoreShaderSource(RASTER_STRIP_VERTEX_GLSL),
+          fragmentShader: normalizeCoreShaderSource(RASTER_STRIP_FRAGMENT_GLSL),
+          transparent: false, depthTest: false, depthWrite: false, side: THREE.DoubleSide, toneMapped: false,
+          blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+          blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+          uniforms: {
+            uRasterStripTex: { value: texture }, uRasterStripSize: { value: new THREE.Vector2(batch.width, batch.height) },
+            uViewport: { value: this.viewportUniform }, uCameraCenter: { value: this.cameraCenterUniform },
+            uZoom: this.zoomUniform, uUseLocalToClip: this.useLocalToClipUniform, uLocalToClip: { value: this.localToClipUniform }
+          }
+        });
+      }
+      initializeThreeVectorClip(material, this.vectorClipTexture);
+      const clipped = createThreeVectorClipMaterial(material, this.vectorClipIndices[batch.first]);
+      if (clipped !== material) material.dispose();
+      material = clipped;
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      mesh.renderOrder = this.rasterEntries[batch.first].mesh.renderOrder;
+      mesh.userData.heprDrawRun = { kind: "raster", first: batch.first, count: batch.count };
+      const entry = { mesh, material, webGpuState, texture, resident: false, run: this.rasterEntries[batch.first].run };
+      this.stripEntries.push(entry);
+      this.entries.push(entry);
+      this.ownedTextures.add(texture);
+      this.group.add(mesh);
+      for (let index = batch.first; index < batch.first + batch.count; index++) this.rasterEntries[index].batched = true;
+    } catch (error) {
+      texture.dispose(); geometry?.dispose(); material?.dispose();
+      throw error;
+    }
+  }
+
+  private destroyStripBatches(): void {
+    for (const entry of this.stripEntries) {
+      entry.mesh.removeFromParent();
+      entry.mesh.geometry.dispose();
+      entry.material.dispose();
+      entry.texture.dispose();
+      this.ownedTextures.delete(entry.texture);
+      this.entries.splice(this.entries.indexOf(entry), 1);
+    }
+    this.stripEntries.length = 0;
+    for (const entry of this.rasterEntries) {
+      if (!entry.batched) continue;
+      entry.batched = false;
+      if (entry.mesh.parent !== this.group) this.group.add(entry.mesh);
+      entry.resident = this.rasterTextureResidencyEnabled;
+      if (entry.resident) entry.texture.needsUpdate = true;
+      entry.mesh.visible = entry.resident && this.isEntryVisible(entry);
+      if (entry.webGpuState) {
+        entry.webGpuState.zoomUniform.value = this.zoomUniform.value;
+        entry.webGpuState.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
+      }
+    }
+    this.activeEntries = this.entries.filter(entry => !entry.batched);
   }
 
   private createEntry(
@@ -489,6 +611,19 @@ function createRasterGeometry(): THREE.BufferGeometry {
   ]);
   geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
+  return geometry;
+}
+
+function createRasterStripGeometry(batch: RasterStripBatch): THREE.InstancedBufferGeometry {
+  const geometry = new THREE.InstancedBufferGeometry();
+  // Match the native triangle strip's vertex IDs in an indexed Three mesh.
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0], 3));
+  geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, -1, 1, -1, -1, 1, 1, 1], 2));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 2, 1, 3]), 1));
+  const instances = new THREE.InstancedInterleavedBuffer(batch.instances, 8);
+  geometry.setAttribute("aRasterMatrixABCD", new THREE.InterleavedBufferAttribute(instances, 4, 0));
+  geometry.setAttribute("aRasterMatrixEFWidthOpacity", new THREE.InterleavedBufferAttribute(instances, 4, 4));
+  geometry.instanceCount = batch.count;
   return geometry;
 }
 

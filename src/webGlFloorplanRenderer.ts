@@ -1,4 +1,6 @@
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
+import { buildRasterStripBatches } from "./rasterStripBatches";
+import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
 import { WebGlPaintCompositor } from "./webGlPaintCompositor";
@@ -1460,6 +1462,15 @@ interface RasterLayerGpu {
   pageIndex: number;
 }
 
+interface RasterStripBatchGpu {
+  count: number;
+  width: number;
+  height: number;
+  texture: WebGLTexture;
+  buffer: WebGLBuffer;
+  vao: WebGLVertexArrayObject;
+}
+
 interface StrokeTextureSet {
   textureA: WebGLTexture;
   textureB: WebGLTexture;
@@ -1823,6 +1834,10 @@ export class WebGlFloorplanRenderer {
   private textInstanceCount = 0;
 
   private rasterLayers: RasterLayerGpu[] = [];
+
+  private readonly rasterStripBatches = new Map<number, RasterStripBatchGpu>();
+
+  private rasterStripProgram: { program: WebGLProgram; uniforms: Readonly<Record<string, WebGLUniformLocation>> } | null = null;
 
   private rasterTextureResidencyEnabled = true;
 
@@ -2701,6 +2716,7 @@ export class WebGlFloorplanRenderer {
           this.rasterLayers[index] = next;
         }
         prepared.clear();
+        this.destroyRasterStripBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
         finished = true;
         this.panCacheValid = false; this.destroyVectorMinifyResources(); this.requestFrame();
@@ -3136,6 +3152,8 @@ export class WebGlFloorplanRenderer {
     for (const program of programs) {
       gl.deleteProgram(program);
     }
+    if (this.rasterStripProgram) gl.deleteProgram(this.rasterStripProgram.program);
+    this.rasterStripProgram = null;
 
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -4040,6 +4058,33 @@ export class WebGlFloorplanRenderer {
     }
   }
 
+  private drawRasterStripBatch(
+    batch: RasterStripBatchGpu,
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): void {
+    const gl = this.gl;
+    const { program, uniforms } = this.rasterStripProgram!;
+    gl.useProgram(program);
+    this.bindVectorClip(program);
+    gl.bindVertexArray(batch.vao);
+    gl.uniform2f(uniforms.uViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(uniforms.uCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(uniforms.uZoom, zoomValue);
+    gl.uniform1f(uniforms.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    if (this.localToClipRenderingEnabled) gl.uniformMatrix4fv(uniforms.uLocalToClip, false, this.localToClipMatrix);
+    gl.activeTexture(gl.TEXTURE12);
+    gl.bindTexture(gl.TEXTURE_2D, batch.texture);
+    gl.uniform1i(uniforms.uRasterStripTex, 12);
+    gl.uniform2f(uniforms.uRasterStripSize, batch.width, batch.height);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, batch.count);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
   private drawRasterLayer(
     viewportWidth: number,
     viewportHeight: number,
@@ -4289,7 +4334,14 @@ export class WebGlFloorplanRenderer {
         for (let index = run.first; index < run.first + run.count; index++) {
           if (run.kind === "raster" && this.rasterRenderingEnabled) {
             profile?.add("drawBatches");
-            this.drawRasterLayerAtIndex(index, width, height, x, y, zoom);
+            const batch = !paintVisibility.requiresCompositing && this.multiplyPass == null && !run.blendMode
+              ? this.rasterStripBatches?.get(index) : undefined;
+            if (batch && index + batch.count <= run.first + run.count) {
+              this.drawRasterStripBatch(batch, width, height, x, y, zoom);
+              index += batch.count - 1;
+            } else {
+              this.drawRasterLayerAtIndex(index, width, height, x, y, zoom);
+            }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
             profile?.add("drawBatches");
             this.drawGradientFillPath(index, width, height, x, y, zoom);
@@ -5126,11 +5178,76 @@ export class WebGlFloorplanRenderer {
   }
 
   private destroyRasterLayerTextures(): void {
+    this.destroyRasterStripBatches();
     const gl = this.gl;
     for (const layer of this.rasterLayers) {
       gl.deleteTexture(layer.texture);
     }
     this.rasterLayers = [];
+  }
+
+  private destroyRasterStripBatches(): void {
+    for (const batch of this.rasterStripBatches?.values() ?? []) {
+      this.gl.deleteTexture(batch.texture);
+      this.gl.deleteBuffer(batch.buffer);
+      this.gl.deleteVertexArray(batch.vao);
+    }
+    this.rasterStripBatches?.clear();
+  }
+
+  private uploadRasterStripBatches(scene: VectorScene, maxTextureSize: number): void {
+    const gl = this.gl;
+    try {
+      const batches = buildRasterStripBatches(scene, maxTextureSize, "linear");
+      if (batches.length === 0) return;
+      if (!this.rasterStripProgram) {
+        const program = this.createProgram(RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL);
+        try {
+          this.rasterStripProgram = { program, uniforms: this.mustGetUniformMap(program, [
+            "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip", "uRasterStripTex", "uRasterStripSize"
+          ]) };
+        } catch (error) { gl.deleteProgram(program); throw error; }
+      }
+      for (const batch of batches) {
+        const texture = this.mustCreateTexture();
+        let buffer: WebGLBuffer | null = null;
+        let vao: WebGLVertexArrayObject | null = null;
+        try {
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          // Mips are independent ranges within each row, sampled explicitly.
+          // Automatic mip generation would mix unrelated images together.
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, batch.width, batch.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, batch.data);
+          buffer = this.mustCreateBuffer();
+          vao = this.createVertexArray();
+          gl.bindVertexArray(vao);
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.bufferData(gl.ARRAY_BUFFER, batch.instances, gl.STATIC_DRAW);
+          for (let attribute = 0; attribute < 2; attribute++) {
+            gl.enableVertexAttribArray(attribute);
+            gl.vertexAttribPointer(attribute, 4, gl.FLOAT, false, 32, attribute * 16);
+            gl.vertexAttribDivisor(attribute, 1);
+          }
+          this.rasterStripBatches.set(batch.first, {
+            count: batch.count, width: batch.width, height: batch.height, texture, buffer, vao
+          });
+        } catch (error) {
+          gl.deleteTexture(texture);
+          gl.deleteBuffer(buffer);
+          gl.deleteVertexArray(vao);
+          throw error;
+        }
+      }
+    } catch (error) {
+      this.destroyRasterStripBatches();
+      console.warn("Raster strip batching unavailable; drawing original image layers.", error);
+    } finally {
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
   }
 
   private uploadRasterLayers(scene: VectorScene): void {
@@ -5189,6 +5306,9 @@ export class WebGlFloorplanRenderer {
           pageIndex: source.pageIndex
         });
       }
+      // Retained replacements keep the ordinary resources authoritative until
+      // the next document load; batches must never resurrect stale source pixels.
+      if (this.rasterLayerUpdates.size === 0) this.uploadRasterStripBatches(scene, maxRasterTextureSize);
     } catch (error) {
       this.destroyRasterLayerTextures();
       throw error;

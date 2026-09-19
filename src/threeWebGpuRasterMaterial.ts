@@ -41,7 +41,7 @@ function varyingNode(node: unknown): never {
   return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
-const rasterPackFn = TSL.wgslFn(`
+export const rasterPackFn: unknown = TSL.wgslFn(`
 fn heprRasterPack(
   corner: vec2<f32>,
   matrixABCD: vec4<f32>,
@@ -57,7 +57,7 @@ fn heprRasterPack(
 }
 `);
 
-const rasterClipFn = TSL.wgslFn(`
+export const rasterClipFn: unknown = TSL.wgslFn(`
 fn heprRasterClipPosition(
   rasterPack: vec4<f32>,
   viewport: vec2<f32>,
@@ -78,7 +78,7 @@ fn heprRasterClipPosition(
 }
 `);
 
-const rasterFragmentFns = createThreeWebGpuOutputFragmentFns(`
+export const rasterFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprRasterFragment(inputColor: vec4<f32>, opacity: f32, shapeOnly: f32) -> vec4<f32> {
   let color = inputColor * mix(opacity, 1.0, shapeOnly);
   if (color.a <= 0.001) {

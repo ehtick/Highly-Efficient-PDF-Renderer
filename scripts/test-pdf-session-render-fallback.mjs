@@ -11,8 +11,10 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 } });
 try {
-  const { openPdf } = await import("../src/pdfSession.ts");
+  const { openPdf, renderNativeRetainedCommandSpan } = await import("../src/pdfSession.ts");
+  const { DEFAULT_PDF_RESOURCE_LIMITS } = await import("../src/pdf/nativeTypes.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
+  const { computeCharQuad } = await import("../src/sceneTextGeometry.ts");
   const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
@@ -64,6 +66,65 @@ try {
       assert.deepEqual(second.rasterLayerData, scene.rasterLayerData, "repeat operations own usable resources");
     } finally { await session.close(); }
   }
+
+  for (const [name, style, reason] of [
+    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"],
+    ["hairline glyph stroke", "0 w", "native-glyph-stroke"]
+  ]) {
+    const warnings = [];
+    const session = await openPdf({ kind: "bytes", bytes: fixture({
+      font: true, content: `0 0 1 RG ${style} BT /F 100 Tf 1 Tr 5 5 Td (A) Tj ET`
+    }) }, { ...fontOptions, onDiagnostic: d => warnings.push(d) });
+    try {
+      await assert.rejects(session.compileVectorPage(0, { vectorFallback: "error" }),
+        error => error.code === "unsupported-content" && error.details?.reason === reason, name);
+      assert(!warnings.some(d => d.code.endsWith("raster-fallback")), "strict vector mode must not rasterize");
+      const limits = { maxImagePixels: 800, maxImageDimension: 40 };
+      const assertRaster = layer => {
+        assert(layer.width * layer.height <= 800 && layer.width <= 40 && layer.height <= 40,
+          `${name}: fallback obeys the pixel and dimension limits`);
+        assert(layer.data.some((value, index) => index % 4 === 3 && value > 0 && layer.data[index - 1] > 0),
+          `${name}: stroke-only text still paints visible blue pixels`);
+      };
+      for (const preserveDrawingOrder of [undefined, true]) {
+        const scene = await session.compileVectorPage(0, { preserveDrawingOrder, limits });
+        assert.equal(scene.rasterLayers.length, 1, name);
+        assertRaster(scene.rasterLayers[0]);
+        const index = scene.textIndex.pages[0];
+        assert.equal(index.text, "A", `${name}: raster text remains searchable`);
+        const bounds = new Float32Array(4);
+        assert(computeCharQuad(scene, index, 0, bounds, 0));
+        assert(bounds.every(Number.isFinite) && bounds[2] > bounds[0] && bounds[3] > bounds[1]);
+        assert(warnings.some(d => d.code.endsWith("raster-fallback") && d.pageIndex === 0), name);
+      }
+      const decodedBound = await session.compileVectorPage(0, { limits: { maxDecodedStreamBytes: 3200 } });
+      assertRaster(decodedBound.rasterLayers[0]);
+      const page = await session.compilePage(0);
+      const count = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
+      assertRaster(await renderNativeRetainedCommandSpan(page, 0, count, new AbortController().signal,
+        { ...DEFAULT_PDF_RESOURCE_LIMITS, ...limits }));
+      const warningCount = warnings.length;
+      await assert.rejects(session.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
+        error => error.code === "resource-limit", `${name}: hard resource limits must propagate`);
+      await assert.rejects(session.compileVectorPage(0, { signal: AbortSignal.abort() }),
+        error => error.code === "aborted", `${name}: cancellation must propagate`);
+      assert.equal(warnings.length, warningCount, "failed safety checks must not start another fallback");
+    } finally { await session.close(); }
+  }
+
+  const rounded = await openPdf({ kind: "bytes", bytes: fixture({
+    width: 19, height: 19, content: "1 0 0 rg 0 0 19 19 re f"
+  }) });
+  try {
+    const page = await rounded.compilePage(0);
+    const count = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
+    const layer = await renderNativeRetainedCommandSpan(page, 0, count, new AbortController().signal,
+      { ...DEFAULT_PDF_RESOURCE_LIMITS, maxImageDimension: 21 });
+    assert(layer.width <= 21 && layer.height <= 21, "ceil rounding must not exceed the dimension limit");
+    await assert.rejects(renderNativeRetainedCommandSpan(page, 0, count, new AbortController().signal,
+      { ...DEFAULT_PDF_RESOURCE_LIMITS, maxDecodedStreamBytes: 3 }), error => error.code === "resource-limit",
+      "a decoded-byte budget smaller than one pixel must reject without rasterization");
+  } finally { await rounded.close(); }
 
   const simple = await openPdf({ kind: "bytes", bytes: fixture({ content: "1 0 0 rg 0 0 20 10 re f" }) });
   try {
@@ -175,11 +236,11 @@ function assertPixel(scene, x, y, expected) {
   const offset = (Math.floor((height - y) / height * layer.height) * layer.width + Math.floor(x / width * layer.width)) * 4;
   assert.deepEqual([...layer.data.subarray(offset, offset + 4)], expected);
 }
-function fixture({ content = "", annotations = false, image = false, oneBit = false, stencil = false, font = false, state = "" } = {}) {
+function fixture({ content = "", annotations = false, image = false, oneBit = false, stencil = false, font = false, state = "", width = 40, height = 20 } = {}) {
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
-    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << ${image ? "/XObject << /Im 5 0 R >>" : ""} ${font ? "/Font << /F 7 0 R >>" : ""} ${state ? "/ExtGState << /G 8 0 R >>" : ""} >> /Contents 4 0 R ${annotations ? "/Annots [6 0 R]" : ""} >>` },
+    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << ${image ? "/XObject << /Im 5 0 R >>" : ""} ${font ? "/Font << /F 7 0 R >>" : ""} ${state ? "/ExtGState << /G 8 0 R >>" : ""} >> /Contents 4 0 R ${annotations ? "/Annots [6 0 R]" : ""} >>` },
     { number: 4, body: tinyPdfStream("", content) },
     { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${oneBit ? 2 : 1} /Height 1 /BitsPerComponent ${oneBit || stencil ? 1 : 8} ${stencil ? "/ImageMask true" : `/ColorSpace /Device${oneBit ? "Gray" : "RGB"}`}`, oneBit ? Uint8Array.of(0x40) : stencil ? Uint8Array.of(0) : Uint8Array.of(255, 0, 0)) },
     { number: 6, body: "<< /Type /Annot /Subtype /Square /Rect [10 5 20 15] /IC [1 0 0] /Border [0 0 0] >>" },

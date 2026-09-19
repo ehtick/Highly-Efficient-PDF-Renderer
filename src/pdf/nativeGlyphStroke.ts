@@ -250,9 +250,11 @@ export function buildNativeGlyphStroke(
         // sharp reversals and very short edges cannot invert a stroke band.
         if (distance > Math.min(lengths[previous], lengths[index]) / 2) continue;
         const miterRatio = Math.sqrt(2 / (1 + dot));
-        if (stroke.lineJoin === 0 ? miterRatio > stroke.miterLimit :
-          2 * radius * (miterRatio - 1) > tolerance) continue;
-        if (stroke.lineJoin !== 0 && miterRatio > 1 + EPSILON) approximated = true;
+        const exactMiter = stroke.lineJoin === 0 && miterRatio <= stroke.miterLimit;
+        // A miter beyond its limit becomes a bevel. Smooth subdivisions can
+        // merge under the same error bound as explicit bevel/round joins.
+        if (!exactMiter && 2 * radius * (miterRatio - 1) > tolerance) continue;
+        if (!exactMiter && miterRatio > 1 + EPSILON) approximated = true;
         miters[index] = [-(before[1] + after[1]) * radius / (1 + dot),
           (before[0] + after[0]) * radius / (1 + dot)];
       }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
-import { deflateSync } from "node:zlib";
+import { deflateRawSync, deflateSync } from "node:zlib";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -32,6 +32,7 @@ try {
   const { HEPR_IMAGE_FORMAT } = dataApi;
 
   await assertNoInlinePreparationBypass(openPdf);
+  await assertConsecutiveInlineImages(openPdf, validateHeprPageData);
 
   const session = await openPdf({
     kind: "bytes",
@@ -210,6 +211,54 @@ async function assertNoInlinePreparationBypass(openPdf) {
   }
 }
 
+async function assertConsecutiveInlineImages(openPdf, validate) {
+  const predictor = "/W 1 /H 1 /BPC 8 /CS /G /F /Fl " +
+    "/DP << /Predictor 15 /Columns 1 /Colors 1 >>";
+  const checksumCr = deflateSync(Uint8Array.of(0, 12));
+  assert.equal(checksumCr.at(-1), 0x0d);
+  const content = concat(
+    "q 4 0 0 4 0 0 cm ", rawInline(predictor, checksumCr, "\nEI"), " Q\n",
+    "q 4 0 0 4 5 0 cm ", rawInline(predictor, deflateSync(Uint8Array.of(0, 64)), "\r\nEI"), " Q\n",
+    "q 4 0 0 4 10 0 cm ", rawInline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(96)), " Q\n",
+    "q 4 0 0 4 15 0 cm ", rawInline("/W 1 /H 1 /BPC 8 /CS /G /F /Fl", deflateRawSync(Uint8Array.of(127)), "\r\nEI"), " Q\n",
+    "20 0 2 2 re f"
+  );
+  const session = await openPdf({
+    kind: "bytes",
+    bytes: onePagePdf(content),
+    label: "consecutive-inline-images.pdf"
+  });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validate(page);
+    assert.equal(page.stores.images.widths.length, 4);
+    for (const [index, sample] of [12, 64, 96, 127].entries()) {
+      assert.deepEqual(
+        [...page.stores.images.data.subarray(
+          page.stores.images.dataOffsets[index], page.stores.images.dataOffsets[index + 1]
+        )],
+        [sample, sample, sample, 255]
+      );
+    }
+    const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+    const draws = collectCommands(page, root.commands).filter((command) => command.kind === "draw");
+    assert.deepEqual(draws.map((command) => command.source), [
+      "images", "images", "images", "images", "fill-paths"
+    ]);
+    const images = draws.filter((command) => command.source === "images");
+    assert.ok(images.every((command) => command.sourceOffset >= 0 && command.sourceLength > 0));
+    assert.deepEqual(
+      images.map((command) => command.sourceOffset),
+      images.map((command) => command.sourceOffset).sort((left, right) => left - right)
+    );
+    const scene = await session.compileVectorPage(0, { optimization: "none" });
+    assert.equal(scene.rasterLayers.length, 4);
+    assert.equal(scene.fillPathCount, 1);
+  } finally {
+    await session.close();
+  }
+}
+
 async function assertNestedInlineImage(openPdf, validate, bytes, expectedKind) {
   const session = await openPdf({ kind: "bytes", bytes });
   try {
@@ -381,9 +430,9 @@ function crossStreamFixture() {
 }
 
 function ambiguousFixture() {
-  const first = rawInline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128));
-  const second = rawInline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128));
-  return onePagePdf(concat(first, " ", second, " Q"));
+  return onePagePdf(rawInline(
+    "/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128), " EI % EI\n Q"
+  ));
 }
 
 function twoInlineFixture() {
@@ -404,8 +453,8 @@ function onePagePdf(content, { resources = "", catalog = "", extra = [] } = {}) 
   ] });
 }
 
-function rawInline(dictionary, payload) {
-  return concat(`BI ${dictionary} ID `, payload, " EI");
+function rawInline(dictionary, payload, suffix = " EI") {
+  return concat(`BI ${dictionary} ID `, payload, suffix);
 }
 
 function asciiInline(dictionary, payload) {

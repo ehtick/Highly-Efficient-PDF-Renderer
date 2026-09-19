@@ -82,6 +82,9 @@ try {
     for (const lineCap of [0, 1, 2]) compare(`join ${lineJoin}, cap ${lineCap}`, corners, { lineJoin, lineCap });
   }
   compare("miter limit bevel", [move(20, 60), line(50, 15), line(45, 60)], { miterLimit: 1.5 });
+  assert.equal(compare("miter limit one preserves sharp bevels", square, { miterLimit: 1 }).approximated, false);
+  assert.equal(compare("miter limit one merges shallow bevels",
+    [move(15, 50), line(50, 50), line(85, 50.3)], { miterLimit: 1 }).approximated, true);
   compare("clockwise and counterclockwise holes", [...square,
     move(30, 30), line(30, 55), line(55, 55), line(55, 30), close]);
   const curve = [move(20, 45), { kind: "quadratic", controlX: 20, controlY: 10, x: 50, y: 20 },
@@ -89,15 +92,23 @@ try {
   assert.equal(compare("quadratic and cubic curves", curve).approximated, true);
   const thinCurve = buildNativeGlyphStroke(curve, identity, { ...defaults, width: 0.148, lineJoin: 1 });
   assert.ok(thinCurve.segmentsA.length / 4 < 1500);
+  const lowMiterCurve = buildNativeGlyphStroke(curve, identity, { ...defaults, width: 0.16, miterLimit: 1 });
+  assert.ok(lowMiterCurve.segmentsA.length / 4 < 1500, "low miter limits must not exhaust the edge budget on smooth curves");
+  assert.equal(lowMiterCurve.approximated, true);
   compare("thin curved glyph at high zoom", curve, { width: 0.148, lineJoin: 1 }, [0.1, 0, 0, 0.1, 0, 0], 48);
+  compare("miter limit one at high zoom", curve, { width: 0.16, miterLimit: 1 }, [0.1, 0, 0, 0.1, 0, 0], 48);
   compare("reflected sheared stroke space", curve,
     { transform: [-0.85, 0.2, 0.3, 0.8, 88, 5], lineJoin: 1 }, [1, 0.1, 0, 0.9, 0, 0]);
+  compare("miter limit one in reflected sheared stroke space", curve,
+    { transform: [-0.85, 0.2, 0.3, 0.8, 8.8, 0.5], width: 0.16, miterLimit: 1 }, [0.1, 0.01, 0, 0.09, 0, 0], 48);
   compare("text transform differs from graphics-state transform", square,
     { transform: [1.1, 0.15, 0.35, 0.75, 8, 8] }, [0.5, -0.1, 0.1, 1.2, 0, 0]);
   compare("closed dash seam joins", square, { dashArray: [17, 6], dashPhase: 4, lineCap: 2 });
   compare("odd dash pattern", corners, { dashArray: [7, 3, 2], dashPhase: 3, lineCap: 1, lineJoin: 2 });
   compare("negative dash phase", square, { dashArray: [12, 4], dashPhase: -7 });
   compare("dashed curved outline", curve, { dashArray: [9, 5], lineCap: 1, dashPhase: 3 });
+  compare("dashed curved outline with miter limit one", curve,
+    { width: 0.16, miterLimit: 1, dashArray: [0.9, 0.5], dashPhase: 0.3 }, [0.1, 0, 0, 0.1, 0, 0], 64);
   compare("zero off dash joins continuous ink", corners, { dashArray: [6, 0], lineCap: 2 });
   compare("zero on dash paints round dots", corners, { dashArray: [0, 8], lineCap: 1 });
   compare("zero on dash paints square dots", corners, { dashArray: [0, 8], lineCap: 2 });

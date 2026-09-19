@@ -1007,7 +1007,8 @@ class NativePdfSession implements NativeVectorPdfSession {
           (diagnostic) => this.appendDiagnostics([diagnostic]),
           options.preserveDrawingOrder !== false ? () => {
             compositeTextIndex ??= buildNativeFallbackTextIndex(pageData, signal);
-          } : undefined
+          } : undefined,
+          { ...this.document.limits, ...options.limits }
         ));
         if (timings) timings.selectiveRasterMs = nativeVectorTimingNow() - rasterStartedAt;
       }
@@ -1042,6 +1043,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     } catch (error) {
       signal.throwIfAborted();
       const normalized = normalizeCompileError(error, sourcePageIndex);
+      if (options.vectorFallback === "error" && normalized instanceof PdfError &&
+          isNativeGlyphStrokeRepresentationReason(normalized.details?.reason)) throw normalized;
       if (!retainedAttempted && isNativeVectorRepresentationFailure(normalized)) {
         const retainedPage = await this.compilePageUnlocked(sourcePageIndex, options, signal);
         const retainedScene = await lowerRetained(retainedPage);
@@ -1060,7 +1063,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     signal: AbortSignal, reason: Error): Promise<VectorScene> {
     const commandCount = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
     if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal });
-    const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal);
+    const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal,
+      { ...this.document.limits, ...options.limits });
     if (!layer) throw new PdfError("invalid-object", "A retained page replay produced no structural raster slot.");
     const scene = buildNativeRasterPage(page, { rgba: new Uint8ClampedArray(layer.data), width: layer.width,
       height: layer.height, scale: layer.width / layer.matrix[0] }, signal);
@@ -2929,7 +2933,8 @@ async function renderNativeSelectiveCompositeLayers(
   reuseCompositeSurfaces = true,
   boundCompositeWork = true,
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void,
-  onCompositeText?: () => void
+  onCompositeText?: () => void,
+  limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer[]> {
   signal.throwIfAborted();
   const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
@@ -3093,7 +3098,7 @@ async function renderNativeSelectiveCompositeLayers(
       }
       if (unselectedGlyphOffset >= 0) onCompositeText?.();
       const layer = await renderNativeCompositeCommandSpan(page, first, last, paintOrder,
-        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, true);
+        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, true, limits);
       if (layer) layers.push(layer);
     }
     return layers;
@@ -3105,7 +3110,8 @@ async function renderNativeSelectiveCompositeLayers(
 
 /** Internal replay entry point; the supplied retained page needs no source PDF or parser session. */
 export async function renderNativeRetainedCommandSpan(
-  page: HeprPageData, firstCommand: number, count: number, signal: AbortSignal
+  page: HeprPageData, firstCommand: number, count: number, signal: AbortSignal,
+  limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer | null> {
   signal.throwIfAborted();
   const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex]?.commands;
@@ -3118,7 +3124,7 @@ export async function renderNativeRetainedCommandSpan(
   try {
     return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
       firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
-      { imageSurfaces, boundSoftMasks: true }, true, true);
+      { imageSurfaces, boundSoftMasks: true }, true, true, limits);
   } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
 }
 
@@ -3128,11 +3134,12 @@ async function renderNativeCompositeCommandSpan(
   renderHeprPageToCanvas2d: NativeCompositeRenderer,
   renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals,
   boundCompositeWork: boolean,
-  fullPage = false
+  fullPage = false,
+  limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer | null> {
   const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
   const commands = rootCommands.slice(first, last + 1);
-  const scale = nativeSelectiveCompositeScale(page, rootCommands, last);
+  const scale = nativeSelectiveCompositeScale(page, rootCommands, last, limits);
   const rendered = await renderNativeCompositePixels(createSelectiveCompositePage(page, commands), {
     scale, background: null, surfaceFactory, signal
   }, renderHeprPageToCanvas2d, renderInternals);
@@ -3200,8 +3207,14 @@ const NATIVE_SELECTIVE_MAX_CANVAS_PIXELS = 16_000_000;
 function nativeSelectiveCompositeScale(
   page: HeprPageData,
   rootCommands: readonly HeprDisplayCommand[],
-  lastCommandIndex: number
+  lastCommandIndex: number,
+  limits?: Readonly<PdfResourceLimits>
 ): number {
+  // Bound generated layers independently of Canvas source-image and working-surface budgets.
+  const maxPixels = Math.min(NATIVE_SELECTIVE_MAX_CANVAS_PIXELS,
+    limits?.maxImagePixels ?? Infinity, limits ? Math.floor(limits.maxDecodedStreamBytes / 4) : Infinity);
+  if (maxPixels < 1) throw new PdfError("resource-limit", "No pixel budget for composite fallback.");
+  const maxDimension = limits?.maxImageDimension ?? Infinity;
   let scale = NATIVE_SELECTIVE_BASE_SCALE;
   const transforms = page.stores.transforms.values;
   const images = page.stores.images;
@@ -3225,13 +3238,15 @@ function nativeSelectiveCompositeScale(
   }
   const pagePixels = page.pageInfo.width * page.pageInfo.height;
   const cappedScale = pagePixels > 0
-    ? Math.sqrt(NATIVE_SELECTIVE_MAX_CANVAS_PIXELS / pagePixels)
+    ? Math.sqrt(maxPixels / pagePixels)
     : NATIVE_SELECTIVE_BASE_SCALE;
-  scale = Math.min(scale, cappedScale);
+  scale = Math.min(scale, cappedScale,
+    maxDimension / page.pageInfo.width, maxDimension / page.pageInfo.height);
   // Large sheets can require a scale below the preferred minimum. Account for
   // integer canvas dimensions too, so backdrop correction respects its budget.
-  while (Math.ceil(page.pageInfo.width * scale) * Math.ceil(page.pageInfo.height * scale) >
-      NATIVE_SELECTIVE_MAX_CANVAS_PIXELS) scale *= 0.99;
+  while (Math.ceil(page.pageInfo.width * scale) * Math.ceil(page.pageInfo.height * scale) > maxPixels ||
+      Math.ceil(page.pageInfo.width * scale) > maxDimension ||
+      Math.ceil(page.pageInfo.height * scale) > maxDimension) scale *= 0.99;
   return scale;
 }
 
@@ -6925,8 +6940,13 @@ function isNativeVectorRepresentationFailure(error: unknown): error is PdfError 
   if (!(error instanceof PdfError) ||
       (error.code !== "unsupported-content" && error.code !== "unsupported-image")) return false;
   const reason = String(error.details?.reason ?? "");
-  return /^(legacy-vector-|vector-|selective-)/.test(reason) ||
+  return isNativeGlyphStrokeRepresentationReason(reason) ||
+    /^(legacy-vector-|vector-|selective-)/.test(reason) ||
     /^(VectorScene|The VectorScene)/i.test(error.message);
+}
+
+function isNativeGlyphStrokeRepresentationReason(reason: unknown): boolean {
+  return reason === "native-glyph-stroke" || reason === "native-glyph-stroke-complexity";
 }
 
 function normalizeCompileError(error: unknown, sourcePageIndex: number): unknown {

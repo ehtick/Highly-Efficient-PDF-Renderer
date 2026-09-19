@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { deflateSync } from "node:zlib";
+import { deflateRawSync, deflateSync } from "node:zlib";
 import { registerHooks } from "node:module";
 import { writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -179,8 +179,8 @@ const jpeg = prepareNativeInlineImages(
 assert.deepEqual(jpeg.images[0].filterNames, ["DCTDecode"]);
 assert.deepEqual([...jpeg.images[0].stream.bytes], [...jpegPayload]);
 
-// RunLength has no intrinsic content terminator. The embedded " EI " candidate
-// is rejected because its following binary byte is not valid content syntax.
+// RunLength uses the generic structural boundary path. The embedded " EI "
+// candidate is rejected because its following binary byte is not valid content syntax.
 const runLengthPayload = Uint8Array.of(5, 1, 0x20, 0x45, 0x49, 0x20, 0xff, 128);
 const generic = prepareNativeInlineImages(
   concat("q ", inline("/W 6 /H 1 /BPC 8 /CS /G /F /RL", runLengthPayload), " Q")
@@ -219,6 +219,49 @@ assert.deepEqual(
 );
 assert.deepEqual(multiple.images.map((record) => record.imageIndex), [0, 1]);
 
+// Consecutive generic images have independent EI boundaries. Predictor 15
+// mirrors the one-row images in the reported document; the first checksum
+// ends in CR, which must survive the following LF separator.
+const flateDictionary = "/W 1 /H 1 /BPC 8 /CS /G /F /Fl " +
+  "/DP << /Predictor 15 /Colors 1 /Columns 1 >>";
+const checksumCrPayload = deflateSync(Uint8Array.of(0, 12));
+const crlfPayload = deflateSync(Uint8Array.of(0, 64));
+assert.equal(checksumCrPayload.at(-1), 0x0d);
+const consecutiveContent = concat(
+  "q ", inline(flateDictionary, checksumCrPayload, "\nEI"),
+  " Q (BI) Tj /BI MP [/BI << /Label (BI) >>] TJ % BI\nq ",
+  inline(flateDictionary, crlfPayload, "\r\nEI"),
+  " Q q ", inline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(96)),
+  " Q q ", inline("/W 1 /H 1 /BPC 8 /CS /G /F /AHx", "7f>"), " Q"
+);
+const consecutive = prepareNativeInlineImages(consecutiveContent, { sourceOffset: 2_000 });
+assert.equal(consecutive.images.length, 4);
+assert.deepEqual(consecutive.images.map((image) => image.imageIndex), [0, 1, 2, 3]);
+assert.deepEqual([...consecutive.images[0].stream.bytes], [...checksumCrPayload]);
+assert.deepEqual([...consecutive.images[1].stream.bytes], [...crlfPayload, 0x0d]);
+assert.equal(consecutive.images[0].sourceOffset, 2_002);
+assert.equal(consecutive.images[0].dataLength, checksumCrPayload.length);
+assert.equal(
+  consecutive.images[0].eiOffset,
+  consecutive.images[0].dataOffset + checksumCrPayload.length + 1
+);
+let consecutiveOffset = 2_000;
+for (const segment of consecutive.segments) {
+  assert.equal(segment.sourceOffset, consecutiveOffset, "image and content spans remain contiguous");
+  consecutiveOffset += segment.sourceLength;
+  const view = segment.kind === "image" ? segment.stream.bytes : segment.bytes;
+  assert.equal(view.buffer, consecutiveContent.buffer, "all segments retain zero-copy views");
+}
+assert.equal(consecutiveOffset, 2_000 + consecutiveContent.length);
+
+// Raw DEFLATE needs both separator bytes removed; its strict decoder does not
+// have the checksum-validated EOL recovery used for zlib-wrapped input.
+const rawDeflatePayload = deflateRawSync(Uint8Array.of(127));
+const rawDeflate = prepareNativeInlineImages(
+  inline("/W 1 /H 1 /BPC 8 /CS /G /F /Fl", rawDeflatePayload, "\r\nEI")
+);
+assert.deepEqual([...rawDeflate.images[0].stream.bytes], [...rawDeflatePayload]);
+
 const hiddenKeywords = encoder.encode(
   "q (BI ID EI) <4249> [/BI << /Label (EI) >>] Do % BI /W 9 ID x EI\nQ"
 );
@@ -227,13 +270,19 @@ assert.equal(hidden.images.length, 0, "strings, names, arrays, dictionaries, and
 assert.equal(hidden.contentSpans.length, 1);
 assert.equal(hidden.contentSpans[0].bytes.buffer, hiddenKeywords.buffer);
 
-// Two generic candidates both admit exact continuation syntax. Failing closed
-// is deterministic and avoids payload corruption.
-const ambiguous = concat(
+const consecutiveRunLength = concat(
   inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)),
   " ",
   inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)),
   " Q"
+);
+assert.equal(prepareNativeInlineImages(consecutiveRunLength).images.length, 2);
+
+// Candidates within one region remain ambiguous, including when apparent BI
+// tokens occur in comments, strings, names, arrays, or dictionaries.
+const ambiguous = concat(
+  inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)),
+  " (BI) Tj /BI MP [/BI << /Label (BI) >>] TJ % BI EI\n Q"
 );
 expectPdfError(
   () => prepareNativeInlineImages(ambiguous),
@@ -303,6 +352,21 @@ expectPdfError(
   "inline-image-count"
 );
 expectPdfError(
+  () => prepareNativeInlineImages(consecutiveContent, { limits: { maxImages: 1 } }),
+  "resource-limit",
+  "inline-image-count"
+);
+expectPdfError(
+  () => prepareNativeInlineImages(consecutiveContent, { limits: { maxPayloadBytes: checksumCrPayload.length - 1 } }),
+  "resource-limit",
+  "inline-image-payload"
+);
+expectPdfError(
+  () => prepareNativeInlineImages(consecutiveContent, { limits: { maxScanBytes: consecutive.images[0].eiOffset - 2_000 + 3 } }),
+  "resource-limit",
+  "inline-image-scan"
+);
+expectPdfError(
   () => prepareNativeInlineImages(rawContent, { limits: { maxDictionaryEntries: 1 } }),
   "resource-limit",
   "inline-image-dictionary-entries"
@@ -325,6 +389,7 @@ expectPdfError(
 const cancelled = new AbortController();
 cancelled.abort("fixture cancellation");
 expectPdfError(() => prepareNativeInlineImages(rawContent, { signal: cancelled.signal }), "aborted");
+expectPdfError(() => prepareNativeInlineImages(consecutiveContent, { signal: cancelled.signal }), "aborted");
 
 // Prepared streams feed the existing native image/color stores without a
 // serializer round-trip or an external resource lookup.
@@ -340,6 +405,12 @@ try {
   const ascii85Index = await registry.add(ascii85.images[0].stream);
   const genericIndex = await registry.add(generic.images[0].stream);
   const jpegIndex = await registry.add(jpeg.images[0].stream);
+  for (const [imageIndex, sample] of [12, 64, 96, 127].entries()) {
+    const index = await registry.add(consecutive.images[imageIndex].stream);
+    assert.deepEqual([...registry.describe(index).data], [sample, sample, sample, 255]);
+  }
+  const rawDeflateIndex = await registry.add(rawDeflate.images[0].stream);
+  assert.deepEqual([...registry.describe(rawDeflateIndex).data], [127, 127, 127, 255]);
 
   assert.deepEqual([...registry.describe(rawIndex).data], [32, 69, 73, 255, 32, 0, 255, 255]);
   assert.equal(registry.describe(indexedIndex).width, 1);

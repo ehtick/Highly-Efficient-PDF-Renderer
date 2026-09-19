@@ -50,7 +50,7 @@ export interface NativeInlineImageRecord {
   /** Absolute raw dictionary syntax span between BI and ID. */
   readonly dictionaryOffset: number;
   readonly dictionaryLength: number;
-  /** Absolute encoded image-data span, excluding EI delimiter whitespace. */
+  /** Absolute decoder-input span; zlib input may retain a CR for checksum validation. */
   readonly dataOffset: number;
   readonly dataLength: number;
   readonly idOffset: number;
@@ -508,7 +508,14 @@ class NativeInlineImageParser {
     if (firstFilter === "DCTDecode") {
       return this.requireEiAfterKnownPayload(this.findJpegEnd(dataStart));
     }
-    return this.findGenericBoundary(dataStart);
+    // Match the zlib CMF classification in nativeFilters. A CR before the EI
+    // separator's LF may be the last checksum byte. Preserve it for the zlib
+    // decoder, which validates and removes a real trailing EOL if necessary.
+    // Raw DEFLATE has no such recovery and keeps the existing CRLF handling.
+    const cmf = this.bytes[dataStart];
+    const preserveCarriageReturn = firstFilter === "FlateDecode" &&
+      (cmf & 0x0f) === 8 && (cmf >>> 4) <= 7;
+    return this.findGenericBoundary(dataStart, preserveCarriageReturn);
   }
 
   private findAsciiHexEnd(dataStart: number): number {
@@ -596,8 +603,8 @@ class NativeInlineImageParser {
     return { dataEnd, eiStart, eiEnd: eiStart + 2 };
   }
 
-  private findGenericBoundary(dataStart: number): InlineBoundary {
-    const maximumE = Math.min(
+  private findGenericBoundary(dataStart: number, preserveCarriageReturn: boolean): InlineBoundary {
+    let maximumE = Math.min(
       this.bytes.length - 1,
       dataStart + this.limits.maxPayloadBytes + 1
     );
@@ -611,11 +618,18 @@ class NativeInlineImageParser {
         !isTokenBoundary(this.bytes[eiStart + 2])
       ) continue;
       let dataEnd = eiStart - 1;
-      if (this.bytes[dataEnd] === 0x0a && dataEnd > dataStart && this.bytes[dataEnd - 1] === 0x0d) {
+      if (
+        !preserveCarriageReturn && this.bytes[dataEnd] === 0x0a &&
+        dataEnd > dataStart && this.bytes[dataEnd - 1] === 0x0d
+      ) {
         dataEnd -= 1;
       }
       if (dataEnd - dataStart > this.limits.maxPayloadBytes) continue;
-      if (!this.isPlausibleContinuation(eiStart + 2)) continue;
+      const continuationEnd = this.findPlausibleContinuationEnd(eiStart + 2);
+      if (continuationEnd === null) continue;
+      // Later EI operators belong to the next structurally parsed image, not
+      // this payload. Continue checking ambiguity only before that next BI.
+      maximumE = Math.min(maximumE, continuationEnd - 1);
       const candidate = { dataEnd, eiStart, eiEnd: eiStart + 2 };
       if (match) {
         throw imageError(
@@ -640,13 +654,13 @@ class NativeInlineImageParser {
     );
   }
 
-  private isPlausibleContinuation(start: number): boolean {
+  private findPlausibleContinuationEnd(start: number): number | null {
     try {
       let offset = start;
       let operandCount = 0;
       while (true) {
         offset = skipWhitespaceAndComments(this.bytes, offset, this.budget);
-        if (offset >= this.bytes.length) return operandCount === 0;
+        if (offset >= this.bytes.length) return operandCount === 0 ? offset : null;
         const item = readContentItem(
           this.bytes,
           offset,
@@ -660,12 +674,12 @@ class NativeInlineImageParser {
           operandCount += 1;
           continue;
         }
-        if (item.word === "BI") return operandCount === 0;
-        if (item.word === "ID" || item.word === "EI") return false;
+        if (item.word === "BI") return operandCount === 0 ? item.start : null;
+        if (item.word === "ID" || item.word === "EI") return null;
         operandCount = 0;
       }
     } catch (error) {
-      if (error instanceof PdfError && error.code === "unsupported-content") return false;
+      if (error instanceof PdfError && error.code === "unsupported-content") return null;
       throw error;
     }
   }

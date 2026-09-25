@@ -488,11 +488,15 @@ bands; their shaders read the same uniforms, and a host that never sets the
 cell uniforms (`uFillCellHeaders`, `uCellHeaders`) leaves them at zero, which
 means no cells.
 
-Antialiased clips probe the pixel for edges within 0.75 pixels. Only then are
-its 4×4 samples tested, all in one pass: each clip node near the pixel clears
-the bits of the samples outside it, reading the probe's cells or bands once,
-and the pixel's coverage is the share of samples left. Native WebGL and Three
-WebGL do this; WebGPU still tests each sample through the whole clip chain.
+Antialiased clips test a 4×4 grid of samples over the pixel. Each node of the
+clip chain clears the bits of the samples outside it, reading only the cells
+(or bands) that hold the samples, and the pixel's coverage is the share of
+samples left. Native WebGL and Three WebGL do this; WebGPU still probes for
+nearby edges and then tests each sample through the whole clip chain.
+
+These shaders issue several texture reads before using any: most of a
+pixel's time is the latency of its reads, and a draw takes as long as its
+slowest pixels.
 
 For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad

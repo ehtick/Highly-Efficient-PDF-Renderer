@@ -217,12 +217,12 @@ try {
     return { winding, near };
   }
   // A mirror of heprClipPolygonSamples: the 4x4 antialiasing samples' inside
-  // bits (4 * row + column) from the probe level's cells, or from bands.
+  // bits (4 * row + column) from the cells spanning the samples, or from bands.
   const SAMPLE_OFFSETS = [-0.375, -0.125, 0.125, 0.375];
   function sampleMask(data, node, point, aaWidth) {
     const texel = index => [data[index * 4], data[index * 4 + 1], data[index * 4 + 2], data[index * 4 + 3]];
     const clampCell = (v, last) => Math.min(Math.max(Math.floor(v), 0), last);
-    const radius = 0.75 * aaWidth;
+    const span = 0.75 * aaWidth;
     const xs = SAMPLE_OFFSETS.map(offset => point[0] + offset * aaWidth);
     const ys = SAMPLE_OFFSETS.map(offset => point[1] + offset * aaWidth);
     const winding = [0, 1, 2, 3].map(() => [0, 0, 0, 0]);
@@ -235,8 +235,8 @@ try {
     };
     if (node[3] & 4) {
       const cells = texel(node[1]), origin = texel(node[1] + 1);
-      let level = Math.min(Math.max(Math.ceil(Math.log2(Math.max(2 * radius / cells[2], 1)) / cells[3]), 0), cells[1] - 1);
-      if (cells[2] * 2 ** (level * cells[3]) < 2 * radius && level < cells[1] - 1) level++;
+      let level = Math.min(Math.max(Math.ceil(Math.log2(Math.max(span / cells[2], 1)) / cells[3]), 0), cells[1] - 1);
+      if (cells[2] * 2 ** (level * cells[3]) < span && level < cells[1] - 1) level++;
       const size = cells[2] * 2 ** (level * cells[3]), grid = texel(cells[0] + level);
       const columnOf = xs.map(x => clampCell((x - origin[0]) / size, grid[1] - 1));
       const rowOf = ys.map(y => clampCell((y - origin[1]) / size, grid[2] - 1));

@@ -1,5 +1,48 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL: draws last as long as their slowest pixels (September 25)
+
+After the previous round, a `gpuOperations` capture panning at fit-all
+measured fills at 3.0 ms and gradient fills at 2.7 ms per frame (medians),
+against a model that predicted about 2.0 and 1.5 ms. The capture's per-position
+medians (`typical`) show why. The most expensive draws are tiny: a fill draw
+covering 426 pixels takes 0.26 ms, and gradient fills of 182 pixels take 0.23
+ms, while a fill covering 67,000 pixels takes 0.12 ms.
+
+The model ranks draws by their slowest pixel, the one with the most
+dependent texture reads. That ranking reproduces the capture's list almost in
+order. For gradient fills, the draws whose worst pixel does 1,100–1,450 units
+of work take 0.22–0.27 ms, and those near 550 take about 0.15 ms: roughly 0.2
+µs per unit, about one texture read's latency plus its arithmetic. Summed over
+the frame, the slowest pixel of each fill and gradient-fill draw comes to 27k
+units, about 6 ms of a 7 ms frame. Pixel counts and total work barely matter.
+Draws effectively run one after another, and each takes as long as its
+slowest group of 32 pixels. Untimed spans match the timed sums, so this is
+not an artefact of the per-operation queries.
+
+Those worst pixels come from small, very dense geometry. One fill path packs
+688 segments into 7×5 pixels. Gradient clips are flattened into 1,027–4,824
+edges; at a clip's edge the worst pixel spent 566 units on the distance probe
+and another 875 on its samples.
+
+- **Clip antialiasing from the samples alone.** The distance probe only
+  decided whether to sample, but the 16 samples already give inside or
+  outside. Each node now clears the bits of the samples outside it, reading
+  cells about the size of the sample spread (0.75 pixels) rather than the
+  probe's 1.5. Antialiased clips no longer run the point test either. In the model, the
+  sum of gradient draws' worst pixels drops from 13.2k to 5.7k units at
+  fit-all, and from 3.5k to 2.1k at zoom 0.56.
+- **Reads before use.** Sample loops read four edges before testing any, and
+  fill cells read the next piece and the next cell's record before computing
+  the current piece. The dependent latencies then overlap instead of adding
+  up. The model counts reads, not latency, so it cannot estimate this.
+
+Coverage is unchanged. The shipped clip GLSL compiled as C++ still matches
+brute-force 16-sample coverage on every checked query, for cells and bands,
+and catches broken closures, rows, band rows, rectangle bounds and unroll
+masks. `test-vector-cell-index` evaluates the read-ahead fill loop and fails
+if the read-ahead or the pair mask is off by one.
+
 ## Native WebGL: after the cell index (September 25)
 
 Two captures at fit-all (zoom 0.224, panning), one with `gpuOperations`,

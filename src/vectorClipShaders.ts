@@ -1,58 +1,29 @@
 import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
 
-// The width is supplied by the caller so derivatives can be taken before any
-// divergent control flow or discard. A distance probe limits supersampling to
-// boundary pixels; winding samples preserve holes and overlapping subpaths,
-// whose internal edges must not become translucent distance-field seams.
-function vectorClipGlsl(antialias: boolean): string {
-  return `${antialias ? VECTOR_CLIP_SAMPLE_GLSL : ""}
-float ${antialias ? "heprVectorClipAA(vec2 point, float aaWidth)" : "heprVectorClip(vec2 point)"} {
-  ${antialias ? "" : "const float aaWidth = 0.0;"}
-  bool needsSampling = false;
-  float radius = aaWidth * 0.75;${antialias ? `
-  // A 4x4 grid of samples, one bit each (4 * row + column); nodes near the
-  // pixel clear the bits of samples outside them.
-  vec4 sampleX = point.x + VECTOR_CLIP_SAMPLE_OFFSETS * aaWidth;
-  vec4 sampleY = point.y + VECTOR_CLIP_SAMPLE_OFFSETS * aaWidth;
-  uint samples = 0xFFFFu;` : ""}
+// Point test: whether a point lies inside the whole clip chain. Cell storage
+// (vectorCellIndex.ts) gives the winding from the cell holding the point, at
+// the finest level: its pieces, plus closures standing in for all geometry
+// right of the cell's column.
+const VECTOR_CLIP_POINT_GLSL = `
+float heprVectorClip(vec2 point) {
   highp int index = int(uVectorClipIndex);
   for (highp int depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
     if (index < 0) break;
     vec4 node = heprClipTexel(index);
     if (node.z < 0.0) {
       vec4 bounds = heprClipTexel(int(node.y));
-      if (aaWidth > 0.0) {
-        if (any(greaterThanEqual(bounds.xy, bounds.zw))) return 0.0;
-        vec2 inset = min(point - bounds.xy, bounds.zw - point);
-        if (min(inset.x, inset.y) <= -radius) return 0.0;${antialias ? `
-        if (min(inset.x, inset.y) < radius) {
-          needsSampling = true;
-          samples &= heprClipRectSamples(bounds, sampleX, sampleY);
-        }` : `
-        needsSampling = needsSampling || min(inset.x, inset.y) < radius;`}
-      } else {
-        // Match polygon winding at boundaries: include min, exclude max.
-        if (any(lessThan(point, bounds.xy)) || any(greaterThanEqual(point, bounds.zw))) return 0.0;
-      }
+      // Match polygon winding at boundaries: include min, exclude max.
+      if (any(lessThan(point, bounds.xy)) || any(greaterThanEqual(point, bounds.zw))) return 0.0;
       index = int(node.x);
       continue;
     }
     highp int flags = int(node.w);
     highp int winding = 0;
-    float minDistance = radius;
     if ((flags & 4) != 0) {
-      // Cell storage (vectorCellIndex.ts). The winding comes from the cell
-      // holding the point: its pieces, plus closures standing in for all
-      // geometry right of the cell's column. The distance probe reads the
-      // finest level whose cells span its diameter, so at most four hold every
-      // edge within reach; point tests read the finest level.
       vec4 cells = heprClipTexel(int(node.y));
       vec4 origin = heprClipTexel(int(node.y) + 1);
-      float level = radius > 0.0 ? heprClipCellLevel(cells, 2.0 * radius) : 0.0;
-      float size = cells.z * exp2(level * cells.w);
-      vec4 grid = heprClipTexel(int(cells.x + level));
-      vec2 lastCell = grid.yz - 1.0;
-      vec2 home = clamp(floor((point - origin.xy) / size), vec2(0.0), lastCell);
+      vec4 grid = heprClipTexel(int(cells.x));
+      vec2 home = clamp(floor((point - origin.xy) / cells.z), vec2(0.0), grid.yz - 1.0);
       vec4 cell = heprClipTexel(int(grid.x + home.y * grid.y + home.x));
       for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
         if (piece >= int(cell.y)) break;
@@ -68,89 +39,49 @@ float ${antialias ? "heprVectorClipAA(vec2 point, float aaWidth)" : "heprVectorC
         if (pair.x <= point.y) winding -= int(pair.y);
         if (pair.z <= point.y) winding -= int(pair.w);
       }
-      if (aaWidth > 0.0) {
-        vec2 near = clamp(floor((point - vec2(radius) - origin.xy) / size), vec2(0.0), lastCell);
-        vec2 far = clamp(floor((point + vec2(radius) - origin.xy) / size), vec2(0.0), lastCell);
-        for (highp int row = int(near.y); row <= int(far.y); row++) {
-          for (highp int column = int(near.x); column <= int(far.x); column++) {
-            vec4 probe = heprClipTexel(int(grid.x) + row * int(grid.y) + column);
-            for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
-              if (piece >= int(probe.y)) break;
-              vec4 line = heprClipTexel(int(probe.x) + piece);
-              if (all(greaterThanEqual(point, min(line.xy, line.zw) - vec2(radius))) &&
-                  all(lessThanEqual(point, max(line.xy, line.zw) + vec2(radius)))) {
-                vec2 delta = line.zw - line.xy;
-                float squaredLength = dot(delta, delta);
-                float t = squaredLength > 0.0 ? clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0) : 0.0;
-                minDistance = min(minDistance, length(point - (line.xy + t * delta)));
-              }
-            }
-          }
-        }
-      }
     } else {
-      highp int firstBand = 0;
-      highp int lastBand = 0;
-      highp int rowBand = 0;
-      vec4 bands = vec4(0.0);
+      highp int firstEdge = int(node.y);
+      highp int edgeCount = int(node.z);
       if ((flags & 2) != 0) {
-        bands = heprClipTexel(int(node.y));
+        vec4 bands = heprClipTexel(int(node.y));
         // Clamp in float before converting: far-offscreen points can exceed i32.
-        rowBand = int(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
-        firstBand = int(clamp(floor((point.y - radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
-        lastBand = int(clamp(floor((point.y + radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
+        highp int band = int(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
+        vec4 range = heprClipTexel(int(bands.x) + band);
+        firstEdge = int(range.x);
+        edgeCount = int(range.y);
       }
-      for (highp int band = firstBand; band <= lastBand; band++) {
-        highp int firstEdge = int(node.y);
-        highp int edgeCount = int(node.z);
-        if ((flags & 2) != 0) {
-          vec4 range = heprClipTexel(int(bands.x) + band);
-          firstEdge = int(range.x);
-          edgeCount = int(range.y);
-        }
-        for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
-          if (edge >= edgeCount) break;
-          vec4 line = heprClipTexel(firstEdge + edge);
-          // An edge can appear in several bands; only the center row counts it.
-          if (band == rowBand && (line.y > point.y) != (line.w > point.y)) {
-            float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
-            if (x > point.x) winding += line.w > line.y ? 1 : -1;
-          }
-          // Distant edges affect winding only. Keep distance work at the boundary.
-          if (aaWidth > 0.0 && all(greaterThanEqual(point, min(line.xy, line.zw) - vec2(radius))) &&
-              all(lessThanEqual(point, max(line.xy, line.zw) + vec2(radius)))) {
-            vec2 delta = line.zw - line.xy;
-            float squaredLength = dot(delta, delta);
-            float t = squaredLength > 0.0 ? clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0) : 0.0;
-            minDistance = min(minDistance, length(point - (line.xy + t * delta)));
-          }
+      for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
+        if (edge >= edgeCount) break;
+        vec4 line = heprClipTexel(firstEdge + edge);
+        if ((line.y > point.y) != (line.w > point.y)) {
+          float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
+          if (x > point.x) winding += line.w > line.y ? 1 : -1;
         }
       }
     }
     bool inside = (flags & 1) != 0 ? (abs(winding) % 2 != 0) : winding != 0;
-    if (aaWidth > 0.0) {
-      if (minDistance < radius) {
-        needsSampling = true;${antialias ? `
-        samples &= heprClipPolygonSamples(node, flags, sampleX, sampleY, radius);
-        if (samples == 0u) return 0.0;` : ""}
-      } else if (!inside) return 0.0;
-    } else if (!inside) return 0.0;
+    if (!inside) return 0.0;
     index = int(node.x);
   }
   if (index >= 0) return 0.0;
-  ${antialias ? `
-  // The samples lie within the probe radius, so a node without an edge in
-  // reach holds all of them or none. The mask covers the whole intersection,
-  // so coincident ancestors do not fade twice.
-  if (needsSampling) return heprSampleCoverage(samples);` : ""}
   return 1.0;
 }
 `;
-}
 
-// Sample offsets in pixels: the centres of a 4x4 grid over the pixel. The
-// farthest lies 0.53 pixels from the centre, inside the 0.75-pixel probe.
-const VECTOR_CLIP_SAMPLE_GLSL = `
+// Antialiased clip: a 4x4 grid of samples over the pixel, one bit each
+// (4 * row + column). Every node of the chain clears the bits of the samples
+// outside it, and the pixel's coverage is the share of samples left. Sampling
+// the whole intersection keeps coincident ancestors from fading twice, and
+// winding samples preserve holes and overlapping subpaths, whose internal
+// edges must not become translucent seams. The width is supplied by the
+// caller so derivatives can be taken before any divergent control flow.
+//
+// A node's samples come from the level whose cells span the samples, so at
+// most two cells each way hold them. Loops read four texels before using
+// any: a pixel's time is mostly the latency of its reads, and a draw lasts as
+// long as its slowest pixels.
+const VECTOR_CLIP_AA_GLSL = `
+// Sample offsets in pixels: the centres of a 4x4 grid over the pixel.
 const vec4 VECTOR_CLIP_SAMPLE_OFFSETS = vec4(-0.375, -0.125, 0.125, 0.375);
 
 uint heprSampleBits(vec4 inside) {
@@ -192,13 +123,40 @@ void heprClipSampleCrossings(vec4 line, vec4 sampleX, vec4 sampleY, vec4 rows, v
   }
 }
 
+// Edges first..first+count-1, four per iteration: all four are read before
+// any is used. Reads past the end repeat the last edge and count for nothing.
+void heprClipSampleEdges(highp int first, highp int count, vec4 sampleX, vec4 sampleY, vec4 rows, vec4 columns,
+    inout vec4 winding0, inout vec4 winding1, inout vec4 winding2, inout vec4 winding3) {
+  for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge += 4) {
+    if (edge >= count) break;
+    highp int last = first + count - 1;
+    vec4 line0 = heprClipTexel(first + edge);
+    vec4 line1 = heprClipTexel(min(first + edge + 1, last));
+    vec4 line2 = heprClipTexel(min(first + edge + 2, last));
+    vec4 line3 = heprClipTexel(min(first + edge + 3, last));
+    heprClipSampleCrossings(line0, sampleX, sampleY, rows, columns, winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line1, sampleX, sampleY, edge + 1 < count ? rows : vec4(0.0), columns,
+      winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line2, sampleX, sampleY, edge + 2 < count ? rows : vec4(0.0), columns,
+      winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line3, sampleX, sampleY, edge + 3 < count ? rows : vec4(0.0), columns,
+      winding0, winding1, winding2, winding3);
+  }
+}
+
+// Closure pairs (y, weight, y, weight): the winding of geometry right of the
+// cell's column, for samples at or above each y.
+vec4 heprClipClosuresBelow(vec4 pair, vec4 sampleY) {
+  return pair.y * step(vec4(pair.x), sampleY) + pair.w * step(vec4(pair.z), sampleY);
+}
+
 uint heprSampleInside(vec4 winding, bool evenOdd) {
   return heprSampleBits(evenOdd ? mod(abs(winding), 2.0) : abs(winding));
 }
 
-// Samples inside one polygon node. Only called near its boundary, so every
-// sample lies within the distance probe's cells or bands.
-uint heprClipPolygonSamples(vec4 node, highp int flags, vec4 sampleX, vec4 sampleY, float radius) {
+// Samples inside one polygon node; span is the samples' extent in each axis.
+uint heprClipPolygonSamples(vec4 node, vec4 sampleX, vec4 sampleY, float span) {
+  highp int flags = int(node.w);
   vec4 winding0 = vec4(0.0);
   vec4 winding1 = vec4(0.0);
   vec4 winding2 = vec4(0.0);
@@ -206,11 +164,10 @@ uint heprClipPolygonSamples(vec4 node, highp int flags, vec4 sampleX, vec4 sampl
   if ((flags & 4) != 0) {
     vec4 cells = heprClipTexel(int(node.y));
     vec4 origin = heprClipTexel(int(node.y) + 1);
-    float level = heprClipCellLevel(cells, 2.0 * radius);
+    float level = heprClipCellLevel(cells, span);
     float size = cells.z * exp2(level * cells.w);
     vec4 grid = heprClipTexel(int(cells.x + level));
-    // As in the point test, each sample takes its own cell's pieces and
-    // closures; the samples span at most two cells each way.
+    // As in the point test, each sample takes its own cell's pieces and closures.
     vec4 columnOf = clamp(floor((sampleX - origin.x) / size), 0.0, grid.y - 1.0);
     vec4 rowOf = clamp(floor((sampleY - origin.y) / size), 0.0, grid.z - 1.0);
     for (highp int row = int(rowOf.x); row <= int(rowOf.w); row++) {
@@ -218,15 +175,16 @@ uint heprClipPolygonSamples(vec4 node, highp int flags, vec4 sampleX, vec4 sampl
       for (highp int column = int(columnOf.x); column <= int(columnOf.w); column++) {
         vec4 columns = vec4(equal(columnOf, vec4(float(column))));
         vec4 cell = heprClipTexel(int(grid.x) + row * int(grid.y) + column);
-        for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
-          if (piece >= int(cell.y)) break;
-          heprClipSampleCrossings(heprClipTexel(int(cell.x) + piece), sampleX, sampleY, rows, columns,
-            winding0, winding1, winding2, winding3);
-        }
-        for (highp int closure = 0; closure < ${MAX_VECTOR_CLIP_EDGES}; closure++) {
-          if (closure >= int(cell.w)) break;
-          vec4 pair = heprClipTexel(int(cell.z) + closure);
-          vec4 below = (pair.y * step(vec4(pair.x), sampleY) + pair.w * step(vec4(pair.z), sampleY)) * rows;
+        heprClipSampleEdges(int(cell.x), int(cell.y), sampleX, sampleY, rows, columns,
+          winding0, winding1, winding2, winding3);
+        highp int closures = int(cell.z);
+        highp int closureCount = int(cell.w);
+        for (highp int closure = 0; closure < ${MAX_VECTOR_CLIP_EDGES}; closure += 2) {
+          if (closure >= closureCount) break;
+          vec4 pair0 = heprClipTexel(closures + closure);
+          vec4 pair1 = heprClipTexel(closures + min(closure + 1, closureCount - 1));
+          vec4 below = (heprClipClosuresBelow(pair0, sampleY) +
+            (closure + 1 < closureCount ? heprClipClosuresBelow(pair1, sampleY) : vec4(0.0))) * rows;
           winding0 -= below.x * columns;
           winding1 -= below.y * columns;
           winding2 -= below.z * columns;
@@ -250,17 +208,31 @@ uint heprClipPolygonSamples(vec4 node, highp int flags, vec4 sampleX, vec4 sampl
         edgeCount = int(range.y);
       }
       // An edge can appear in several bands; each sample row counts its own.
-      vec4 rows = vec4(equal(bandOf, vec4(float(band))));
-      for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
-        if (edge >= edgeCount) break;
-        heprClipSampleCrossings(heprClipTexel(firstEdge + edge), sampleX, sampleY, rows, vec4(1.0),
-          winding0, winding1, winding2, winding3);
-      }
+      heprClipSampleEdges(firstEdge, edgeCount, sampleX, sampleY, vec4(equal(bandOf, vec4(float(band)))),
+        vec4(1.0), winding0, winding1, winding2, winding3);
     }
   }
   bool evenOdd = (flags & 1) != 0;
   return heprSampleGrid(heprSampleInside(winding0, evenOdd), heprSampleInside(winding1, evenOdd),
     heprSampleInside(winding2, evenOdd), heprSampleInside(winding3, evenOdd));
+}
+
+float heprVectorClipAA(vec2 point, float aaWidth) {
+  vec4 sampleX = point.x + VECTOR_CLIP_SAMPLE_OFFSETS * aaWidth;
+  vec4 sampleY = point.y + VECTOR_CLIP_SAMPLE_OFFSETS * aaWidth;
+  float span = 0.75 * aaWidth;
+  uint samples = 0xFFFFu;
+  highp int index = int(uVectorClipIndex);
+  for (highp int depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
+    if (index < 0) break;
+    vec4 node = heprClipTexel(index);
+    samples &= node.z < 0.0 ? heprClipRectSamples(heprClipTexel(int(node.y)), sampleX, sampleY)
+      : heprClipPolygonSamples(node, sampleX, sampleY, span);
+    if (samples == 0u) return 0.0;
+    index = int(node.x);
+  }
+  if (index >= 0) return 0.0;
+  return heprSampleCoverage(samples);
 }
 `;
 
@@ -272,13 +244,13 @@ vec4 heprClipTexel(highp int index) {
   return texelFetch(uVectorClipTex, ivec2(index % width, index / width), 0);
 }
 
-// The finest level whose cells span a probe of the given diameter.
+// The finest level whose cells are at least the given width.
 float heprClipCellLevel(vec4 cells, float reach) {
   float level = clamp(ceil(log2(max(reach / cells.z, 1.0)) / cells.w), 0.0, cells.y - 1.0);
   if (cells.z * exp2(level * cells.w) < reach && level < cells.y - 1.0) level += 1.0;
   return level;
 }
-` + vectorClipGlsl(false) + vectorClipGlsl(true);
+` + VECTOR_CLIP_POINT_GLSL + VECTOR_CLIP_AA_GLSL;
 
 function vectorClipWgsl(antialias: boolean): string {
   return `

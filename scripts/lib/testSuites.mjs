@@ -27,6 +27,7 @@ export const fastTests = [
   "selective-raster-reasons",
   "retained-image-soft-mask",
   "vector-fill-bands",
+  "vector-cell-index",
   "webgl-shader-precision",
   "subpixel-stroke-coverage",
   "fill-area-coverage",

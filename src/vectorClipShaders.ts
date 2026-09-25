@@ -28,46 +28,101 @@ float ${antialias ? "heprVectorClipAA(vec2 point, float aaWidth)" : "heprVectorC
       index = int(node.x);
       continue;
     }
-    highp int firstBand = 0;
-    highp int lastBand = 0;
-    highp int rowBand = 0;
-    vec4 bands = vec4(0.0);
-    if (node.w >= 2.0) {
-      bands = heprClipTexel(int(node.y));
-      // Clamp in float before converting: far-offscreen points can exceed i32.
-      rowBand = int(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
-      firstBand = int(clamp(floor((point.y - radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
-      lastBand = int(clamp(floor((point.y + radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
-    }
+    highp int flags = int(node.w);
     highp int winding = 0;
     float minDistance = radius;
-    for (highp int band = firstBand; band <= lastBand; band++) {
-      highp int firstEdge = int(node.y);
-      highp int edgeCount = int(node.z);
-      if (node.w >= 2.0) {
-        vec4 range = heprClipTexel(int(bands.x) + band);
-        firstEdge = int(range.x);
-        edgeCount = int(range.y);
+    if ((flags & 4) != 0) {
+      // Cell storage (vectorCellIndex.ts). The winding comes from the cell
+      // holding the point: its pieces, plus closures standing in for all
+      // geometry right of the cell's column. The distance probe reads the
+      // finest level whose cells span its diameter, so at most four hold every
+      // edge within reach; point tests read the finest level.
+      vec4 cells = heprClipTexel(int(node.y));
+      vec4 origin = heprClipTexel(int(node.y) + 1);
+      float level = 0.0;
+      if (radius > 0.0) {
+        level = clamp(ceil(log2(max(2.0 * radius / cells.z, 1.0)) / cells.w), 0.0, cells.y - 1.0);
+        if (cells.z * exp2(level * cells.w) < 2.0 * radius && level < cells.y - 1.0) level += 1.0;
       }
-      for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
-        if (edge >= edgeCount) break;
-        vec4 line = heprClipTexel(firstEdge + edge);
-        // An edge can appear in several bands; only the center row counts it.
-        if (band == rowBand && (line.y > point.y) != (line.w > point.y)) {
+      float size = cells.z * exp2(level * cells.w);
+      vec4 grid = heprClipTexel(int(cells.x + level));
+      vec2 lastCell = grid.yz - 1.0;
+      vec2 home = clamp(floor((point - origin.xy) / size), vec2(0.0), lastCell);
+      vec4 cell = heprClipTexel(int(grid.x + home.y * grid.y + home.x));
+      for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
+        if (piece >= int(cell.y)) break;
+        vec4 line = heprClipTexel(int(cell.x) + piece);
+        if ((line.y > point.y) != (line.w > point.y)) {
           float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
           if (x > point.x) winding += line.w > line.y ? 1 : -1;
         }
-        // Distant edges affect winding only. Keep distance work at the boundary.
-        if (aaWidth > 0.0 && all(greaterThanEqual(point, min(line.xy, line.zw) - vec2(radius))) &&
-            all(lessThanEqual(point, max(line.xy, line.zw) + vec2(radius)))) {
-          vec2 delta = line.zw - line.xy;
-          float squaredLength = dot(delta, delta);
-          float t = squaredLength > 0.0 ? clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0) : 0.0;
-          minDistance = min(minDistance, length(point - (line.xy + t * delta)));
+      }
+      for (highp int closure = 0; closure < ${MAX_VECTOR_CLIP_EDGES}; closure++) {
+        if (closure >= int(cell.w)) break;
+        vec4 pair = heprClipTexel(int(cell.z) + closure);
+        if (pair.x <= point.y) winding -= int(pair.y);
+        if (pair.z <= point.y) winding -= int(pair.w);
+      }
+      if (aaWidth > 0.0) {
+        vec2 near = clamp(floor((point - vec2(radius) - origin.xy) / size), vec2(0.0), lastCell);
+        vec2 far = clamp(floor((point + vec2(radius) - origin.xy) / size), vec2(0.0), lastCell);
+        for (highp int row = int(near.y); row <= int(far.y); row++) {
+          for (highp int column = int(near.x); column <= int(far.x); column++) {
+            vec4 probe = heprClipTexel(int(grid.x) + row * int(grid.y) + column);
+            for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
+              if (piece >= int(probe.y)) break;
+              vec4 line = heprClipTexel(int(probe.x) + piece);
+              if (all(greaterThanEqual(point, min(line.xy, line.zw) - vec2(radius))) &&
+                  all(lessThanEqual(point, max(line.xy, line.zw) + vec2(radius)))) {
+                vec2 delta = line.zw - line.xy;
+                float squaredLength = dot(delta, delta);
+                float t = squaredLength > 0.0 ? clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0) : 0.0;
+                minDistance = min(minDistance, length(point - (line.xy + t * delta)));
+              }
+            }
+          }
+        }
+      }
+    } else {
+      highp int firstBand = 0;
+      highp int lastBand = 0;
+      highp int rowBand = 0;
+      vec4 bands = vec4(0.0);
+      if ((flags & 2) != 0) {
+        bands = heprClipTexel(int(node.y));
+        // Clamp in float before converting: far-offscreen points can exceed i32.
+        rowBand = int(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
+        firstBand = int(clamp(floor((point.y - radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
+        lastBand = int(clamp(floor((point.y + radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
+      }
+      for (highp int band = firstBand; band <= lastBand; band++) {
+        highp int firstEdge = int(node.y);
+        highp int edgeCount = int(node.z);
+        if ((flags & 2) != 0) {
+          vec4 range = heprClipTexel(int(bands.x) + band);
+          firstEdge = int(range.x);
+          edgeCount = int(range.y);
+        }
+        for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
+          if (edge >= edgeCount) break;
+          vec4 line = heprClipTexel(firstEdge + edge);
+          // An edge can appear in several bands; only the center row counts it.
+          if (band == rowBand && (line.y > point.y) != (line.w > point.y)) {
+            float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
+            if (x > point.x) winding += line.w > line.y ? 1 : -1;
+          }
+          // Distant edges affect winding only. Keep distance work at the boundary.
+          if (aaWidth > 0.0 && all(greaterThanEqual(point, min(line.xy, line.zw) - vec2(radius))) &&
+              all(lessThanEqual(point, max(line.xy, line.zw) + vec2(radius)))) {
+            vec2 delta = line.zw - line.xy;
+            float squaredLength = dot(delta, delta);
+            float t = squaredLength > 0.0 ? clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0) : 0.0;
+            minDistance = min(minDistance, length(point - (line.xy + t * delta)));
+          }
         }
       }
     }
-    bool inside = (int(node.w) & 1) != 0 ? (abs(winding) % 2 != 0) : winding != 0;
+    bool inside = (flags & 1) != 0 ? (abs(winding) % 2 != 0) : winding != 0;
     if (aaWidth > 0.0) {
       if (minDistance < radius) needsSampling = true;
       else if (!inside) return 0.0;

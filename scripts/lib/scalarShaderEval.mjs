@@ -4,25 +4,30 @@
 const helpers = {
   clamp: (value, low, high) => Math.min(Math.max(value, low), high),
   min: Math.min, max: Math.max, abs: Math.abs, sqrt: Math.sqrt, ceil: Math.ceil, floor: Math.floor,
+  log2: Math.log2, exp2: value => 2 ** value,
   vec2: (x, y) => ({ x, y }),
+  vec4: (x, y, z, w) => ({ x, y, z, w }),
   toFloat: value => value,
   toInt: value => Math.trunc(value),
   select: (whenFalse, whenTrue, condition) => condition ? whenTrue : whenFalse
 };
 
-function compile(source) {
+// `extra` supplies functions the source calls but defines elsewhere, such as
+// texture fetches, as plain JS.
+function compile(source, extra = {}) {
   const names = [...source.matchAll(/\bfunction\s+(hepr\w+)\s*\(/g)].map(match => match[1]);
   const body = `${source}\nreturn { ${names.join(", ")} };`;
-  return new Function(...Object.keys(helpers), body)(...Object.values(helpers));
+  const all = { ...helpers, ...extra };
+  return new Function(...Object.keys(all), body)(...Object.values(all));
 }
 
-export function evaluateGlsl(source) {
+export function evaluateGlsl(source, extra) {
   return compile(source
     .replace(/\b(?:float|vec2|int|bool)\s+(hepr\w+)\s*\(([^)]*)\)\s*\{/g, (_, name, params) =>
       `function ${name}(${params.split(",").map(param => param.trim().split(/\s+/).pop()).join(", ")}) {`)
     .replace(/\b(?:float|vec2|vec4|int|bool)\s+(\w+)\s*=/g, "let $1 =")
     .replace(/\bfloat\(/g, "toFloat(")
-    .replace(/\bint\(/g, "toInt("));
+    .replace(/\bint\(/g, "toInt("), extra);
 }
 
 export function evaluateWgsl(source) {

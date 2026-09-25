@@ -467,6 +467,18 @@ the existing full scan retained when indexing is unsuitable or exceeds its
 memory budget. Both native and Three WebGL/WebGPU rendering benefit; these
 gradient-specific console counters remain native WebGL only.
 
+Bands stop helping once they are thinner than a pixel: every pixel then visits
+all the segments in its rows. Native WebGL therefore indexes fill paths,
+gradient fill paths and clip polygons with a multi-level grid of cells as
+well (`src/vectorCellIndex.ts`). A pixel reads the finest level whose cells
+are at least its footprint, so it visits at most two cells each way at any
+zoom, and gets the same coverage as the unindexed sum up to rounding. The
+index is built when a scene is uploaded (about 0.3 s for the Broschuere HEP).
+A fill store's index may add up to four texels per segment; paths are indexed
+from the largest down, and a path left out keeps its bands. A clip polygon's
+index may use twelve texels per edge within the clip texture's limit, else it
+keeps bands too. Native WebGPU and Three still use bands.
+
 For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad
 areas in framebuffer pixels, rounded outward. It includes overlap and ignores

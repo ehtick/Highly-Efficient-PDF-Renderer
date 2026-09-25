@@ -1,4 +1,5 @@
 import type { VectorClipPath, VectorScene } from "./pdfVectorExtractor";
+import { buildVectorPathCells, type VectorPathCells } from "./vectorCellIndex";
 
 export const MAX_VECTOR_CLIP_EDGES = 8192;
 export const MAX_VECTOR_CLIP_DEPTH = 64;
@@ -124,9 +125,45 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
   return { minY, height, counts, entries };
 }
 
+/** Clip polygons are indexed more finely than fills: one texel per line piece. */
+const CLIP_CELL_OPTIONS = { targetPieces: 8, levelStep: 1, texelsPerSegment: 12, keepHorizontal: true };
+
+/** A cell index over a clip polygon's edges (see vectorCellIndex.ts), or null. */
+function buildClipCells(edges: Float32Array): VectorPathCells | null {
+  const count = edges.length / 4;
+  const segmentsA = new Float32Array(count * 4), segmentsB = new Float32Array(count * 4);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let edge = 0; edge < count; edge++) {
+    const x0 = edges[edge * 4], y0 = edges[edge * 4 + 1], x1 = edges[edge * 4 + 2], y1 = edges[edge * 4 + 3];
+    segmentsA.set([x0, y0, x0, y0], edge * 4);
+    segmentsB.set([x1, y1, 0, 0], edge * 4);
+    minX = Math.min(minX, x0, x1); minY = Math.min(minY, y0, y1);
+    maxX = Math.max(maxX, x0, x1); maxY = Math.max(maxY, y0, y1);
+  }
+  return buildVectorPathCells(segmentsA, segmentsB, 0, count, [minX, minY, maxX, maxY], 0.5, CLIP_CELL_OPTIONS);
+}
+
+/** Texels a clip's cell index occupies: header pair, levels, cells, pieces, closures. */
+function clipCellTexels(cells: VectorPathCells): number {
+  return 2 + cells.levels.length + cells.cellCount + cells.pieceCount + cells.closurePairCount;
+}
+
+export interface PackVectorClipOptions {
+  /**
+   * Index polygons with cells instead of bands. Only shaders that read flag
+   * bit 2 may be given this layout: native WebGL's GLSL does.
+   */
+  readonly cells?: boolean;
+}
+
 /**
  * One RGBA header [parent, offset, originalEdgeCount, flags] per original clip.
  * flags bit 0 is the fill rule; bit 1 selects horizontal-band polygon storage.
+ * Bit 2 selects cell storage instead: the offset points to [first level texel,
+ * level count, finest cell size, level step] and [origin x, origin y, 0, 0],
+ * then per level [first cell texel, columns, rows, 0], per cell [first piece
+ * texel, piece count, first closure texel, closure texel count], the line
+ * pieces as edge vec4s and the closure pairs, all addressed absolutely.
  * A negative edge count retains the rectangle [minX, minY, maxX, maxY] fast path.
  * An indexed offset points to [tableOffset, minY, bandHeight, bandCount], followed
  * by one [firstEdgeTexel, count, 0, 0] per band and contiguous unchanged edge vec4s.
@@ -135,7 +172,8 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
  * The optional capacity bounds derived GPU storage; indexing falls back to the
  * original scan when it cannot fit. Canonical scene/HEP geometry is untouched.
  */
-export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels = MAX_VECTOR_CLIP_TEXELS): Float32Array {
+export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels = MAX_VECTOR_CLIP_TEXELS,
+  options: PackVectorClipOptions = {}): Float32Array {
   if (!Number.isSafeInteger(maxTexels) || maxTexels < 1 || maxTexels > MAX_VECTOR_CLIP_TEXELS) {
     throw new RangeError("Invalid vector clip texture capacity.");
   }
@@ -163,18 +201,30 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
   // Reserve every clip's unindexed payload first. An earlier index must never
   // consume the room needed by a later clip that the original layout could fit.
   const indexes: (ClipBands | null)[] = [];
+  const cellIndexes: (VectorPathCells | null)[] = [];
   for (let index = 0; index < clips.length; index++) {
+    const original = clips[index].edges.length / 4;
+    const cells = options.cells && !rectangles[index] ? buildClipCells(clips[index].edges) : null;
+    if (cells && count + clipCellTexels(cells) - original <= maxTexels) {
+      cellIndexes.push(cells); indexes.push(null); count += clipCellTexels(cells) - original;
+      continue;
+    }
+    cellIndexes.push(null);
     const bands = rectangles[index] ? null : buildClipBands(clips[index].edges);
-    const extra = bands ? 1 + bands.counts.length + bands.entries - clips[index].edges.length / 4 : 0;
+    const extra = bands ? 1 + bands.counts.length + bands.entries - original : 0;
     if (bands && count + extra <= maxTexels) { indexes.push(bands); count += extra; }
     else indexes.push(null);
   }
   const data = new Float32Array(Math.max(1, count) * 4);
   let edgeOffset = clips.length;
   for (let index = 0; index < clips.length; index++) {
-    const clip = clips[index], rectangle = rectangles[index], bands = indexes[index];
+    const clip = clips[index], rectangle = rectangles[index], bands = indexes[index], cells = cellIndexes[index];
     data.set([parents[index], edgeOffset, rectangle ? -1 : clip.edges.length / 4,
-      clip.fillRule + (bands ? 2 : 0)], index * 4);
+      clip.fillRule + (bands ? 2 : 0) + (cells ? 4 : 0)], index * 4);
+    if (cells) {
+      edgeOffset = packClipCells(data, edgeOffset, cells);
+      continue;
+    }
     if (!bands) {
       data.set(rectangle ?? clip.edges, edgeOffset * 4);
       edgeOffset += rectangle ? 1 : clip.edges.length / 4;
@@ -200,4 +250,30 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
     }
   }
   return data;
+}
+
+/** Writes a clip's cell index at `offset`, returning the next free texel. */
+function packClipCells(data: Float32Array, offset: number, cells: VectorPathCells): number {
+  const levelBase = offset + 2;
+  let cell = levelBase + cells.levels.length;
+  let piece = cell + cells.cellCount;
+  let pair = piece + cells.pieceCount;
+  data.set([levelBase, cells.levels.length, cells.cellSize, cells.levelStep], offset * 4);
+  data.set([cells.originX, cells.originY, 0, 0], (offset + 1) * 4);
+  cells.levels.forEach((grid, level) => {
+    data.set([cell, grid.columns, grid.rows, 0], (levelBase + level) * 4);
+    const firstPiece = piece, firstPair = pair;
+    for (let local = 0; local < grid.columns * grid.rows; local++) {
+      data.set([firstPiece + grid.cells[local * 4], grid.cells[local * 4 + 1],
+        firstPair + grid.cells[local * 4 + 2], grid.cells[local * 4 + 3]], cell * 4);
+      cell++;
+    }
+    for (let source = 0; source < grid.pieces.length; source += 8) {
+      data.set([grid.pieces[source], grid.pieces[source + 1], grid.pieces[source + 4], grid.pieces[source + 5]], piece * 4);
+      piece++;
+    }
+    data.set(grid.closures, pair * 4);
+    pair += grid.closures.length / 4;
+  });
+  return pair;
 }

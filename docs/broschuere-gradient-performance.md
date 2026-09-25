@@ -1,5 +1,53 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL: per-operation GPU times and the cell index (September 25)
+
+A `gpuOperations` capture (zoom 0.158, panning) settled where the frame's GPU
+time goes. The timed operations sum to 16.2 ms p50 against a 15.8 ms command
+span, so the GPU is busy, not waiting for commands:
+
+| Operations | Per frame | GPU ms per frame |
+| --- | ---: | ---: |
+| Gradient fills | 64 | 7.96 |
+| Fills | 80 | 7.15 |
+| Clears, raster, text, blits, composites, strokes | 220 | about 1.6 |
+
+One fill draw of 13 paths took about 2.1 ms in every timed frame. Three of
+its paths have 1,540–1,708 segments in only 12–13 horizontal bands, each 0.01
+px tall at that zoom, so every pixel's footprint covered all the bands and
+visited every segment about twice: 3,000 on average, 6,100 at worst. Gradient
+fills are mostly four-segment rectangles, but their clips are polygons of
+1,027–4,096 flattened edges in bands 0.03–0.25 px tall; the antialiased clip
+probe visited 350–570 edges per pixel. Bands only divide paths vertically, so
+once they are thinner than a pixel they stop limiting the work. That is why
+zooming out never made frames cheaper.
+
+Native WebGL now indexes fills, gradient fills and clip polygons with a
+multi-level grid of cells (`src/vectorCellIndex.ts`). A pixel reads the finest
+level whose cells span its footprint, splits its box at the cells' column
+edges, evaluates only the segment pieces in those cells exactly, and accounts
+for everything right of a column through a few closures per cell: the
+vertical extents of right-hand geometry telescope to the points where the
+path crosses the column's edge. Coverage matches the unindexed sum up to
+rounding; `test-vector-cell-index` checks exact agreement on dyadic geometry,
+Float32 and curve tolerances elsewhere, and 7,078 clip winding and distance
+probes against brute force.
+
+Modelled per-tile work at the captured view (the slowest pixel of each 8×4
+block, summed; it matched the measured 15 ms before this change):
+
+| Work | Bands | Cells |
+| --- | ---: | ---: |
+| Fill segment visits | 1.08 M | 0.45 M |
+| Gradient clip edge visits | 0.97 M | 0.30 M |
+
+Fill iterations also drop from three dependent fetches to two independent
+ones. Of the remaining clip work, 0.18 M is antialiasing samples, each still a
+full point test; evaluating all 16 samples in the probe's pass over the same
+cells would remove most of it. The index adds about 0.3 s to scene upload for
+this document and uses 1.2 M texels for fills (from 0.24 M segments) and 0.4 M
+for clips. Only a new capture can show the resulting frame time.
+
 ## Native WebGL fit-all: follow-up capture (September 25)
 
 A capture after the changes below (same document, viewport, DPR, zoom 0.224,

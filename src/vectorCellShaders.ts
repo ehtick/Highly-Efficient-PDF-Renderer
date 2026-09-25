@@ -5,15 +5,17 @@
  * includes FILL_COVERAGE_GLSL first. `cells` is the path's header: first
  * level texel, level count, finest cell size and the log2 size ratio between
  * levels; `origin` is its grid origin.
- * The finest level whose cells span the footprint keeps the box within two
- * columns and two rows. Each column's part of the box takes its pieces
+ * The finest level whose cells span half the footprint keeps the box within
+ * three columns and three rows: smaller cells than the footprint hold fewer
+ * pieces the box does not reach, which outweighs reading more of them.
+ * Each column's part of the box takes its pieces
  * exactly and everything right of it through the cell's closures; each row
  * integrates only its own rows, as bands do. The parts are weighted by their
  * share of the box, so the result is the whole box's averaged winding.
  */
 export const VECTOR_CELL_COVERAGE_GLSL = `
 float heprCellWinding(vec4 cells, vec2 origin, vec4 box, vec2 footprint) {
-  float reach = max(footprint.x, footprint.y);
+  float reach = 0.5 * max(footprint.x, footprint.y);
   float level = clamp(ceil(log2(max(reach / cells.z, 1.0)) / cells.w), 0.0, cells.y - 1.0);
   float size = cells.z * exp2(level * cells.w);
   if (size < reach && level < cells.y - 1.0) {

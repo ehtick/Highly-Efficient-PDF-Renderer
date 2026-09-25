@@ -382,8 +382,9 @@ uniform ivec2 uFillPathMetaTexSize;
 uniform sampler2D uFillSegmentTexA;
 uniform ivec2 uFillSegmentTexSize;
 uniform int uFillBandBase;
-// Per-path cell headers follow in the same store; negative when there are none.
-uniform int uFillCellBase;
+// Per-path cell headers follow in the same store, from one less than this
+// texel: zero, the value of a uniform the host never sets, means none.
+uniform int uFillCellHeaders;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -456,8 +457,8 @@ void main() {
   vSegmentCount = segmentCount;
   vFillBands = uFillBandBase < 0 ? vec4(0.0)
     : texelFetch(uFillSegmentTexA, coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
-  vFillCells = uFillCellBase < 0 ? vec4(0.0)
-    : texelFetch(uFillSegmentTexA, coordFromIndex(uFillCellBase + pathIndex, uFillSegmentTexSize), 0);
+  vFillCells = uFillCellHeaders <= 0 ? vec4(0.0)
+    : texelFetch(uFillSegmentTexA, coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
   vFillOrigin = minBounds;
   vColor = vec3(metaB.z, metaB.w, metaC.z);
   vAlpha = alpha;
@@ -1417,11 +1418,12 @@ export class WebGlFloorplanRenderer {
 
   private readonly uFillAAScreenPx: WebGLUniformLocation;
   private readonly uFillBandBase: WebGLUniformLocation;
-  private readonly uFillCellBase: WebGLUniformLocation;
+  private readonly uFillCellHeaders: WebGLUniformLocation;
   private readonly uFillBandEntries: WebGLUniformLocation;
   /** Texel offsets of the band index inside the fill segment store; -1 when absent. */
   private fillBandBase = -1;
   private fillBandEntries = 0;
+  /** Texel of path 0's cell header, or -1; the shaders take it plus one. */
   private fillCellBase = -1;
 
   private readonly uFillUseLocalToClip: WebGLUniformLocation;
@@ -1645,6 +1647,7 @@ export class WebGlFloorplanRenderer {
   /** Texel offsets of the band index inside the gradient segment store; -1 when absent. */
   private gradientFillBandBase = -1;
   private gradientFillBandEntries = 0;
+  /** Texel of path 0's cell header, or -1; the shader takes it plus one. */
   private gradientFillCellBase = -1;
   private gradientFillSegmentTextureWidth = 1;
 
@@ -1927,7 +1930,7 @@ export class WebGlFloorplanRenderer {
       "uPrimitiveOverride",
       "uBandBase",
       "uBandEntries",
-      "uCellBase",
+      "uCellHeaders",
       "uClipBounds"
     ]);
     this.gradientStrokeUniforms = this.mustGetUniformMap(this.gradientStrokeProgram, [
@@ -1985,7 +1988,7 @@ export class WebGlFloorplanRenderer {
     this.uFillZoom = this.mustGetUniformLocation(this.fillProgram, "uZoom");
     this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
     this.uFillBandBase = this.mustGetUniformLocation(this.fillProgram, "uFillBandBase");
-    this.uFillCellBase = this.mustGetUniformLocation(this.fillProgram, "uFillCellBase");
+    this.uFillCellHeaders = this.mustGetUniformLocation(this.fillProgram, "uFillCellHeaders");
     this.uFillBandEntries = this.mustGetUniformLocation(this.fillProgram, "uFillBandEntries");
     this.uFillUseLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uUseLocalToClip");
     this.uFillLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uLocalToClip");
@@ -3716,7 +3719,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform2i(uniforms.uSegmentTexSize, this.gradientFillSegmentTextureWidth, this.gradientFillSegmentTextureHeight);
       gl.uniform1i(uniforms.uBandBase, this.gradientFillBandBase);
       gl.uniform1i(uniforms.uBandEntries, this.gradientFillBandEntries);
-      gl.uniform1i(uniforms.uCellBase, this.gradientFillCellBase);
+      gl.uniform1i(uniforms.uCellHeaders, this.gradientFillCellBase + 1);
       this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
       gl.uniform1f(uniforms.uAAScreenPx, 1);
       gl.uniform4f(
@@ -4504,7 +4507,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform1f(this.uFillZoom, zoomValue);
       gl.uniform1f(this.uFillAAScreenPx, 1);
       gl.uniform1i(this.uFillBandBase, this.fillBandBase);
-      gl.uniform1i(this.uFillCellBase, this.fillCellBase);
+      gl.uniform1i(this.uFillCellHeaders, this.fillCellBase + 1);
       gl.uniform1i(this.uFillBandEntries, this.fillBandEntries);
       gl.uniform1f(this.uFillUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
       if (this.localToClipRenderingEnabled) {

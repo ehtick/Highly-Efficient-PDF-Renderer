@@ -88,8 +88,10 @@ export interface RenderPerformanceReport {
       /** Summed operation time and operation count of each timed frame. */
       frameMs: RenderPerformanceSummary;
       operationsPerFrame: RenderPerformanceSummary;
-      byLabel: { label: string; operationsPerFrame: number; msPerFrame: number; maxMs: number }[];
+      byLabel: GpuOperationLabel[];
       slowest: GpuOperationDetail[];
+      /** The slowest operation positions by median time over the timed frames. */
+      typical: GpuOperationTypical[];
     } | null;
   };
   notes: readonly string[];
@@ -525,6 +527,10 @@ function summarize(samples: readonly number[]): RenderPerformanceSummary {
     p50: percentile(0.5), p95: percentile(0.95), min: sorted[0], max: sorted[sorted.length - 1] };
 }
 
+function median(samples: readonly number[]): number {
+  return summarize(samples).p50 ?? 0;
+}
+
 /** One timed operation, as reported among the slowest of a capture. */
 export interface GpuOperationDetail {
   label: string;
@@ -541,6 +547,23 @@ export interface GpuOperationDetail {
   scissor: [number, number, number, number] | null;
 }
 
+/**
+ * Time per frame of one label: mean, and median over the timed frames, which
+ * a one-off stall such as a cold first frame cannot inflate.
+ */
+export interface GpuOperationLabel {
+  label: string;
+  operationsPerFrame: number;
+  msPerFrame: number;
+  medianMsPerFrame: number;
+  maxMs: number;
+}
+
+/** One operation position, as its median over the timed frames that reached it. */
+export interface GpuOperationTypical extends GpuOperationDetail {
+  frames: number;
+}
+
 interface GpuOperationTotals {
   status: "available" | "unavailable" | "disjoint";
   reason: string | null;
@@ -549,8 +572,9 @@ interface GpuOperationTotals {
   /** Per completed frame: summed operation time, and operations timed. */
   frameMs: number[];
   frameOperations: number[];
-  byLabel: { label: string; operationsPerFrame: number; msPerFrame: number; maxMs: number }[];
+  byLabel: GpuOperationLabel[];
   slowest: GpuOperationDetail[];
+  typical: GpuOperationTypical[];
 }
 
 interface PendingOperation extends Omit<GpuOperationDetail, "ms"> { query: WebGLQuery }
@@ -593,7 +617,9 @@ class GpuOperationTimer {
   private readonly pending: PendingOperation[][] = [];
   private readonly frameMs: number[] = [];
   private readonly frameOperations: number[] = [];
-  private readonly labels = new Map<string, { calls: number; ms: number; maxMs: number }>();
+  private readonly labels = new Map<string, { calls: number; ms: number; maxMs: number; frameMs: number[] }>();
+  /** Keyed by position and label, so a frame whose sequence differs does not mix operations. */
+  private readonly positions = new Map<string, { detail: GpuOperationDetail; ms: number[] }>();
   private slowest: GpuOperationDetail[] = [];
   private droppedFrames = 0;
   private status: GpuOperationTotals["status"] = "available";
@@ -650,14 +676,21 @@ class GpuOperationTimer {
           return nanoseconds / 1_000_000;
         });
         if (!valid) { this.droppedFrames++; continue; }
+        const frame = this.frameMs.length;
         operations.forEach((operation, index) => {
           const ms = times[index];
           total += ms;
-          const entry = this.labels.get(operation.label) ?? { calls: 0, ms: 0, maxMs: 0 };
+          let entry = this.labels.get(operation.label);
+          if (!entry) this.labels.set(operation.label, entry = { calls: 0, ms: 0, maxMs: 0, frameMs: [] });
           entry.calls++; entry.ms += ms; entry.maxMs = Math.max(entry.maxMs, ms);
-          this.labels.set(operation.label, entry);
+          while (entry.frameMs.length <= frame) entry.frameMs.push(0);
+          entry.frameMs[frame] += ms;
+          const { query: _query, ...detail } = operation;
+          const key = `${operation.order}:${operation.label}`;
+          const position = this.positions.get(key);
+          if (position) position.ms.push(ms);
+          else if (this.positions.size < MAX_OPERATIONS_PER_FRAME) this.positions.set(key, { detail: { ...detail, ms }, ms: [ms] });
           if (this.slowest.length < SLOWEST || ms > this.slowest[this.slowest.length - 1].ms) {
-            const { query: _query, ...detail } = operation;
             this.slowest.push({ ...detail, ms });
             this.slowest.sort((a, b) => b.ms - a.ms);
             this.slowest.length = Math.min(this.slowest.length, SLOWEST);
@@ -679,13 +712,26 @@ class GpuOperationTimer {
 
   totals(): GpuOperationTotals {
     const frames = Math.max(1, this.frameMs.length);
+    const copy = <T extends GpuOperationDetail>(detail: T): T => ({ ...detail,
+      viewport: [...detail.viewport] as [number, number],
+      scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null });
+    // Frames without a label count as zero; positions reached by under half the
+    // frames are not typical of them.
+    const byLabel = [...this.labels].map(([label, entry]) => {
+      const perFrame = [...entry.frameMs];
+      while (perFrame.length < this.frameMs.length) perFrame.push(0);
+      return { label, operationsPerFrame: entry.calls / frames, msPerFrame: entry.ms / frames,
+        medianMsPerFrame: median(perFrame), maxMs: entry.maxMs };
+    }).sort((a, b) => b.medianMsPerFrame - a.medianMsPerFrame || b.msPerFrame - a.msPerFrame);
+    const typical = [...this.positions.values()]
+      .filter(position => position.ms.length * 2 >= this.frameMs.length)
+      .map(position => ({ ...copy(position.detail), ms: median(position.ms), frames: position.ms.length }))
+      .sort((a, b) => b.ms - a.ms || a.order - b.order)
+      .slice(0, SLOWEST);
     return {
       status: this.status, reason: this.reason, sampleEvery: GPU_OPERATION_SAMPLE_EVERY,
       droppedFrames: this.droppedFrames, frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
-      byLabel: [...this.labels].map(([label, entry]) => ({ label, operationsPerFrame: entry.calls / frames,
-        msPerFrame: entry.ms / frames, maxMs: entry.maxMs })).sort((a, b) => b.msPerFrame - a.msPerFrame),
-      slowest: this.slowest.map(detail => ({ ...detail, viewport: [...detail.viewport] as [number, number],
-        scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null }))
+      byLabel, slowest: this.slowest.map(copy), typical
     };
   }
 

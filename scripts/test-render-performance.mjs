@@ -187,14 +187,20 @@ assert(occupied.current, "the host query remains active");
   const report = described.getReport().gpu.operations;
   assert.equal(report.status, "available");
   assert.equal(report.frameMs.samples, 3);
-  assert.equal(report.frameMs.average, 3 + 1 + 0.5 + 0.25);
+  assert.equal(report.frameMs.average, 3 + 1 + 0.5 + 0.25 + 27 / 3);
+  assert.equal(report.frameMs.p50, 3 + 1 + 0.5 + 0.25);
   assert.equal(report.operationsPerFrame.average, 4);
-  assert.deepEqual(report.byLabel.map(entry => [entry.label, entry.operationsPerFrame, entry.msPerFrame]),
-    [["fill → offscreen", 1, 3], ["clear → offscreen", 1, 1], ["program#1 → screen", 1, 0.5], ["blit → screen", 1, 0.25]],
-    "undescribed programs get a stable ordinal and targets follow framebuffer bindings");
+  assert.deepEqual(report.byLabel.map(entry => [entry.label, entry.operationsPerFrame, entry.msPerFrame, entry.medianMsPerFrame]),
+    [["fill → offscreen", 1, 12, 3], ["clear → offscreen", 1, 1, 1], ["program#1 → screen", 1, 0.5, 0.5],
+      ["blit → screen", 1, 0.25, 0.25]],
+    "undescribed programs get a stable ordinal and targets follow framebuffer bindings; medians ignore the stall");
   const [slowest] = report.slowest;
-  assert.deepEqual({ ...slowest }, { label: "fill → offscreen", ms: 3, order: 0, call: "drawArraysInstanced",
+  assert.deepEqual({ ...slowest }, { label: "fill → offscreen", ms: 30, order: 0, call: "drawArraysInstanced",
     vertices: 4, instances: 10, pixels: null, target: "offscreen", viewport: [100, 50], scissor: null });
+  assert.deepEqual(report.typical.map(detail => [detail.label, detail.order, detail.ms, detail.frames]),
+    [["fill → offscreen", 0, 3, 3], ["clear → offscreen", 1, 1, 3], ["program#1 → screen", 2, 0.5, 3],
+      ["blit → screen", 3, 0.25, 3]], "each position's median over the frames");
+  assert.deepEqual(report.typical.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
   assert.deepEqual(report.slowest.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
   assert.equal(report.slowest.find(detail => detail.call === "blitFramebuffer").pixels, 600);
   assert.equal(report.slowest.length, 12);
@@ -334,7 +340,9 @@ function operationGl() {
     }
     getQueryParameter(query, parameter) {
       assert.equal(query.deleted, false);
-      return parameter === 11 ? query.available : durations[query.call] * 1_000_000;
+      // The first timed frame's fill stalls, as a cold frame can.
+      const stall = query.call === "drawArraysInstanced" && query.frame === 2 ? 10 : 1;
+      return parameter === 11 ? query.available : durations[query.call] * stall * 1_000_000;
     }
     deleteQuery(query) { assert.equal(query.deleted, false); query.deleted = true; }
     useProgram() {} bindFramebuffer() {} viewport() {} scissor() {} enable() {} disable() {}

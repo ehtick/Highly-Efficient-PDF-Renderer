@@ -1,5 +1,46 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL: after the cell index (September 25)
+
+Two captures at fit-all (zoom 0.224, panning), one with `gpuOperations`,
+measure the cell index. The GPU command span fell from 15.3 ms p50 to 6.6–6.7
+ms. Frames now arrive 8.3 ms apart at the median on a 240 Hz display, which is
+120 FPS: the GPU still misses every other refresh. CPU time per frame is 3.1 ms
+p50 and 6.7 ms p95.
+
+The timed operations sum to 6.7 ms p50, matching the span. Means per frame
+were gradient fills 3.4 ms, fills 2.8 ms, clears 0.8 ms (55 per frame), text
+0.6 ms, blits 0.5 ms and compositor passes 0.4 ms. The first timed frame after
+the view settled took 89 ms and inflates each of these means; the profiler now
+also reports medians (see the manual).
+
+The frame model, updated for cells, explains most of the remaining gradient
+time. At a clip's boundary, each of the 16 antialiasing samples walked the
+whole clip chain again, which made up two thirds of the clip work. Fills spend
+theirs on dense small paths, such as 1,294 segments in 49×49 pixels: with a
+level step of four, a pixel read cells up to four times its size.
+
+- **Clip samples in one pass.** A clip node with an edge near the pixel now
+  clears the bits of the samples outside it, reading the cells or bands the
+  probe already chose. Nodes with no edge in reach hold every sample or none.
+  The frame model's sample work drops from 0.49 M to 0.09 M units, and the
+  gradient fills' total from 0.74 M to 0.35 M.
+- **Finer fill cells.** A pixel reads the finest level whose cells are at least
+  half its footprint, up to 3×3 cells. Fill work drops from 1.14 M to 0.88 M
+  units at fit-all and from 0.79 M to 0.63 M at zoom 0.158, with no change in
+  memory. Level step 2, compared with step 1, fits 579 paths instead of 109 in
+  the same budget.
+
+Both keep coverage unchanged. The shipped clip GLSL, compiled as C++ with
+float32 arithmetic, matches brute-force 16-sample coverage on 9,833 queries
+for cell and band layouts, and fails when its closures, row selection, band
+rows or rectangle test are broken. The same check against a JS mirror runs in
+`test-vector-cell-index`.
+
+The cell uniforms now count from one: Three's WebGL materials reuse the core
+fill shader without setting them, and a zero base would have read segment data
+as cell headers. Zero now means that no path has cells.
+
 ## Native WebGL: per-operation GPU times and the cell index (September 25)
 
 A `gpuOperations` capture (zoom 0.158, panning) settled where the frame's GPU

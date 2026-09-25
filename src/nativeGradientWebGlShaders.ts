@@ -69,8 +69,9 @@ uniform ivec2 uPathMetaTexSize;
 uniform sampler2D uSegmentTexA;
 uniform ivec2 uSegmentTexSize;
 uniform int uBandBase;
-// Per-path cell headers follow in the same store; negative when there are none.
-uniform int uCellBase;
+// Per-path cell headers follow in the same store, from one less than this
+// texel; zero means none.
+uniform int uCellHeaders;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -159,8 +160,8 @@ void main() {
   vSegmentCount = segmentCount;
   vBands = uBandBase < 0 ? vec4(0.0)
     : texelFetch(uSegmentTexA, coordFromIndex(uBandBase + pathIndex, uSegmentTexSize), 0);
-  vCells = uCellBase < 0 ? vec4(0.0)
-    : texelFetch(uSegmentTexA, coordFromIndex(uCellBase + pathIndex, uSegmentTexSize), 0);
+  vCells = uCellHeaders <= 0 ? vec4(0.0)
+    : texelFetch(uSegmentTexA, coordFromIndex(uCellHeaders - 1 + pathIndex, uSegmentTexSize), 0);
   vCellOrigin = metaA.zw;
   vSourceGradientIndex = int(round(paintMeta.x));
   vMaskGradientIndex = int(round(paintMeta.y));

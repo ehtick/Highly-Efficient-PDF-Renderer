@@ -13,6 +13,18 @@ try {
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
+  const { CORE_FILL_VERTEX_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
+  const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
+
+  // Hosts reuse the core fill shader without knowing about cells (Three's
+  // materials, adapters): an integer uniform they never set reads zero, which
+  // must mean that no path has cells.
+  for (const [name, source, uniform] of [["core fill", CORE_FILL_VERTEX_SHADER_SOURCE, "uFillCellHeaders"],
+    ["native gradient fill", GRADIENT_FILL_VERTEX_SHADER_SOURCE, "uCellHeaders"]]) {
+    assert.match(source, new RegExp(`uniform int ${uniform};`), `${name}: declares ${uniform}`);
+    assert.match(source, new RegExp(`${uniform} <= 0 \\? vec4\\(0\\.0\\)`), `${name}: zero disables cells`);
+    assert.match(source, new RegExp(`${uniform} - 1 \\+ pathIndex`), `${name}: headers start one texel lower`);
+  }
 
   let seed = 0x2545f491;
   const random = () => ((seed = Math.imul(seed ^ (seed >>> 15), 0x2c1b3c6d) + 0x6d2b79f5 | 0) >>> 0) / 4294967296;
@@ -131,9 +143,10 @@ try {
     const fetchA = fetchFrom(ruleIndex.dataA);
     let worstVisits = 0;
     for (const footprint of [0.25, 1, 4, 16, 64]) {
-      const step = header.w;
-      let level = Math.min(Math.max(Math.ceil(Math.log2(Math.max(footprint / header.z, 1)) / step), 0), header.y - 1);
-      if (header.z * 2 ** (level * step) < footprint && level < header.y - 1) level++;
+      // As heprCellWinding: the finest level whose cells span half the footprint.
+      const step = header.w, reach = footprint / 2;
+      let level = Math.min(Math.max(Math.ceil(Math.log2(Math.max(reach / header.z, 1)) / step), 0), header.y - 1);
+      if (header.z * 2 ** (level * step) < reach && level < header.y - 1) level++;
       const size = header.z * 2 ** (level * step), grid = fetchA(header.x + level);
       for (let x = -footprint; x < 1200; x += footprint * 0.37) {
         let visits = 0;
@@ -203,6 +216,58 @@ try {
     }
     return { winding, near };
   }
+  // A mirror of heprClipPolygonSamples: the 4x4 antialiasing samples' inside
+  // bits (4 * row + column) from the probe level's cells, or from bands.
+  const SAMPLE_OFFSETS = [-0.375, -0.125, 0.125, 0.375];
+  function sampleMask(data, node, point, aaWidth) {
+    const texel = index => [data[index * 4], data[index * 4 + 1], data[index * 4 + 2], data[index * 4 + 3]];
+    const clampCell = (v, last) => Math.min(Math.max(Math.floor(v), 0), last);
+    const radius = 0.75 * aaWidth;
+    const xs = SAMPLE_OFFSETS.map(offset => point[0] + offset * aaWidth);
+    const ys = SAMPLE_OFFSETS.map(offset => point[1] + offset * aaWidth);
+    const winding = [0, 1, 2, 3].map(() => [0, 0, 0, 0]);
+    const crossings = (line, rows, columns) => {
+      for (let row = 0; row < 4; row++) {
+        if (!rows[row] || (line[1] > ys[row]) === (line[3] > ys[row])) continue;
+        const x = line[0] + (ys[row] - line[1]) / (line[3] - line[1]) * (line[2] - line[0]);
+        for (let column = 0; column < 4; column++) if (columns[column] && x > xs[column]) winding[row][column] += line[3] > line[1] ? 1 : -1;
+      }
+    };
+    if (node[3] & 4) {
+      const cells = texel(node[1]), origin = texel(node[1] + 1);
+      let level = Math.min(Math.max(Math.ceil(Math.log2(Math.max(2 * radius / cells[2], 1)) / cells[3]), 0), cells[1] - 1);
+      if (cells[2] * 2 ** (level * cells[3]) < 2 * radius && level < cells[1] - 1) level++;
+      const size = cells[2] * 2 ** (level * cells[3]), grid = texel(cells[0] + level);
+      const columnOf = xs.map(x => clampCell((x - origin[0]) / size, grid[1] - 1));
+      const rowOf = ys.map(y => clampCell((y - origin[1]) / size, grid[2] - 1));
+      for (let row = rowOf[0]; row <= rowOf[3]; row++) for (let column = columnOf[0]; column <= columnOf[3]; column++) {
+        const rows = rowOf.map(r => r === row), columns = columnOf.map(c => c === column);
+        const cell = texel(grid[0] + row * grid[1] + column);
+        for (let piece = 0; piece < cell[1]; piece++) crossings(texel(cell[0] + piece), rows, columns);
+        for (let closure = 0; closure < cell[3]; closure++) {
+          const pair = texel(cell[2] + closure);
+          for (let k = 0; k < 4; k++) {
+            if (!rows[k]) continue;
+            const below = (pair[0] <= ys[k] ? pair[1] : 0) + (pair[2] <= ys[k] ? pair[3] : 0);
+            for (let j = 0; j < 4; j++) if (columns[j]) winding[k][j] -= below;
+          }
+        }
+      }
+    } else {
+      const bands = node[3] & 2 ? texel(node[1]) : null;
+      const bandOf = ys.map(y => bands ? clampCell((y - bands[1]) / bands[2], bands[3] - 1) : 0);
+      for (let band = bandOf[0]; band <= bandOf[3]; band++) {
+        const [first, count] = bands ? texel(bands[0] + band) : [node[1], node[2]];
+        for (let edge = 0; edge < count; edge++) crossings(texel(first + edge), bandOf.map(b => b === band), [true, true, true, true]);
+      }
+    }
+    let mask = 0;
+    for (let row = 0; row < 4; row++) for (let column = 0; column < 4; column++) {
+      const w = winding[row][column];
+      if (node[3] & 1 ? Math.abs(w) % 2 === 1 : w !== 0) mask |= 1 << (4 * row + column);
+    }
+    return mask;
+  }
   function segmentDistance([px, py], [x0, y0, x1, y1]) {
     const dx = x1 - x0, dy = y1 - y0, squared = dx * dx + dy * dy;
     const t = squared > 0 ? Math.min(Math.max(((px - x0) * dx + (py - y0) * dy) / squared, 0), 1) : 0;
@@ -225,7 +290,7 @@ try {
       ...Array.from({ length: 64 }, (_, i) => [f32(100 - i * 200 / 64), 50]),
       ...Array.from({ length: 64 }, (_, i) => [-100, f32(50 - i * 100 / 64)])]])]
   ];
-  let clipPoints = 0, probes = 0;
+  let clipPoints = 0, probes = 0, sampledPixels = 0, partialMasks = 0;
   for (const [name, edges] of clipFixtures) {
     const clips = [{ parent: -1, fillRule: 0, edges }, { parent: -1, fillRule: 1, edges }];
     const packed = packVectorClips(clips, undefined, { cells: true });
@@ -261,7 +326,39 @@ try {
       if (nearest < radius) assert(Math.abs(probe.near - nearest) < 1e-3 * Math.max(1, radius), `${name}: nearest edge distance`);
       clipPoints++; probes++;
     }
+    // Boundary pixels: every sample's inside bit, for both layouts and rules.
+    for (let trial = 0; trial < 300; trial++) {
+      const edge = Math.floor(random() * (edges.length / 4)) * 4, t = random();
+      const aaWidth = 2 ** (random() * 10 - 6) * Math.max(spanX, spanY) / 48;
+      const point = [edges[edge] + t * (edges[edge + 2] - edges[edge]) + (random() * 2 - 1) * aaWidth,
+        edges[edge + 1] + t * (edges[edge + 3] - edges[edge + 1]) + (random() * 2 - 1) * aaWidth];
+      const tolerance = Math.max(spanX, spanY, Math.abs(minX), Math.abs(minY)) * 2 ** -16;
+      let known = 0, evenOdd = 0, nonzero = 0;
+      SAMPLE_OFFSETS.forEach((dy, row) => SAMPLE_OFFSETS.forEach((dx, column) => {
+        const x = point[0] + dx * aaWidth, y = point[1] + dy * aaWidth;
+        let w = 0, nearest = Infinity;
+        for (let i = 0; i < edges.length; i += 4) {
+          const line = [edges[i], edges[i + 1], edges[i + 2], edges[i + 3]];
+          nearest = Math.min(nearest, segmentDistance([x, y], line));
+          if ((line[1] > y) !== (line[3] > y) && line[0] + (y - line[1]) / (line[3] - line[1]) * (line[2] - line[0]) > x) w += line[3] > line[1] ? 1 : -1;
+        }
+        const bit = 1 << (4 * row + column);
+        if (nearest < tolerance) return;
+        known |= bit;
+        if (w !== 0) nonzero |= bit;
+        if (Math.abs(w) % 2 === 1) evenOdd |= bit;
+      }));
+      for (const [layout, data] of [["cells", packed], ["bands", plain]]) {
+        for (const [rule, truth] of [[0, nonzero], [1, evenOdd]]) {
+          const mask = sampleMask(data, [...data.subarray(rule * 4, rule * 4 + 4)], point, aaWidth);
+          assert.equal(mask & known, truth, `${name}: ${layout} rule ${rule} samples at ${point}, width ${aaWidth}`);
+          if (truth !== 0 && truth !== (known & 0xffff)) partialMasks++;
+        }
+      }
+      sampledPixels++;
+    }
   }
+  assert(partialMasks > 1000, `boundary pixels mix inside and outside samples (${partialMasks})`);
   assert(clipPoints > 5000 && probes > 5000, "clip fixtures exercise thousands of points");
-  console.log(`Vector cell index: exact dyadic coverage, bounded work, float32 and curve tolerances, store budgets and ${clipPoints} clip winding/probe points passed`);
+  console.log(`Vector cell index: exact dyadic coverage, bounded work, float32 and curve tolerances, store budgets, ${clipPoints} clip winding/probe points and ${sampledPixels} sampled boundary pixels passed`);
 } finally { hooks.deregister(); }

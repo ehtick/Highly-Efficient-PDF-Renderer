@@ -365,8 +365,14 @@ and blit gets its own GPU timer query. `gpu.operations` then reports:
 - `byLabel`, time and operations per frame for each program and target, such as
   `fill → offscreen` or `composite:softMask → offscreen`. Native WebGL names its
   programs, and compositor passes by kind; other hosts show `program#N`.
+  `msPerFrame` is the mean; `medianMsPerFrame`, which orders the list, is not
+  inflated by a one-off stall such as the first frame after a document loads.
 - `slowest`, the 16 slowest single operations, with vertex and instance counts,
-  viewport, scissor and blit area.
+  viewport, scissor and blit area. One stall can fill this list.
+- `typical`, the 16 slowest operation positions in the frame (`order`), each by
+  its median over the timed frames that reached it (`frames`). When frames issue
+  the same operations, as while panning at one zoom with the whole document in
+  view, this names the draws that cost time in every frame.
 
 Each timed operation runs between its own queries, so the GPU cannot overlap it
 with its neighbours, and those frames run slower. Operation times can therefore
@@ -470,14 +476,23 @@ gradient-specific console counters remain native WebGL only.
 Bands stop helping once they are thinner than a pixel: every pixel then visits
 all the segments in its rows. Native WebGL therefore indexes fill paths,
 gradient fill paths and clip polygons with a multi-level grid of cells as
-well (`src/vectorCellIndex.ts`). A pixel reads the finest level whose cells
-are at least its footprint, so it visits at most two cells each way at any
-zoom, and gets the same coverage as the unindexed sum up to rounding. The
-index is built when a scene is uploaded (about 0.3 s for the Broschuere HEP).
-A fill store's index may add up to four texels per segment; paths are indexed
-from the largest down, and a path left out keeps its bands. A clip polygon's
-index may use twelve texels per edge within the clip texture's limit, else it
-keeps bands too. Native WebGPU and Three still use bands.
+well (`src/vectorCellIndex.ts`). A fill pixel reads the finest level whose
+cells are at least half its footprint, so it visits at most three cells each
+way at any zoom, and gets the same coverage as the unindexed sum up to
+rounding. The index is built when a scene is uploaded (about 0.3 s for the
+Broschuere HEP). A fill store's index may add up to four texels per segment;
+paths are indexed from the largest down, and a path left out keeps its bands.
+A clip polygon's index may use twelve texels per edge within the clip
+texture's limit, else it keeps bands too. Native WebGPU and Three still use
+bands; their shaders read the same uniforms, and a host that never sets the
+cell uniforms (`uFillCellHeaders`, `uCellHeaders`) leaves them at zero, which
+means no cells.
+
+Antialiased clips probe the pixel for edges within 0.75 pixels. Only then are
+its 4×4 samples tested, all in one pass: each clip node near the pixel clears
+the bits of the samples outside it, reading the probe's cells or bands once,
+and the pixel's coverage is the share of samples left. Native WebGL and Three
+WebGL do this; WebGPU still tests each sample through the whole clip chain.
 
 For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad

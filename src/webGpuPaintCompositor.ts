@@ -3,6 +3,7 @@ import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOpe
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_WGSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution, PDF_COMPOSITE_MAX_BYTES } from "./pdfCompositeBudget";
+import type { ScenePaintMask } from "./scenePaintGraph";
 
 interface Surface { texture: any; view: any; width?: number; height?: number }
 /** Diagnostic names of the shared executor's pass operations, by number, as in WebGL. */
@@ -15,8 +16,11 @@ interface ManagedPass { encoder: any; descriptor: any; pause(): void; resume(): 
  */
 export interface WebGpuPaintFolding {
   canFold(run: VectorDrawRun): boolean;
-  /** `mask` is the mask surface's view, or null. */
-  draw(run: VectorDrawRun, pass: any, opacity: number, mask: any): void;
+  /**
+   * `mask` is the mask surface's view, or null. `content` is the soft mask
+   * whose rendered content that surface holds, when it was not converted first.
+   */
+  draw(run: VectorDrawRun, pass: any, opacity: number, mask: any, content?: ScenePaintMask): void;
 }
 const managedPasses = new WeakMap<object, ManagedPass>();
 
@@ -191,10 +195,11 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     try { this.drawSpan!(runs, pass, shapeOnly); } finally { pass.end(); }
   }
   canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
-  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void {
+  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined,
+    content?: ScenePaintMask): void {
     if (mask) this.flushClears([mask]);
     const pass = this.encoder.beginRenderPass({ label: "fold", colorAttachments: [this.attachment(destination)] });
-    try { this.folding!.draw(run, pass, opacity, mask?.view ?? null); } finally { pass.end(); }
+    try { this.folding!.draw(run, pass, opacity, mask?.view ?? null, content); } finally { pass.end(); }
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const rect = this.scissor(operation.bounds);

@@ -3,6 +3,7 @@ import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOpe
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_VERTEX_GLSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
+import type { ScenePaintMask } from "./scenePaintGraph";
 
 interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 
@@ -27,7 +28,8 @@ export interface WebGlPaintCompositorState {
  */
 export interface WebGlPaintFolding {
   canFold(run: VectorDrawRun): boolean;
-  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null): void;
+  /** `content` is the soft mask whose rendered content `mask` holds, when it was not converted first. */
+  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null, content?: ScenePaintMask): void;
 }
 
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
@@ -228,10 +230,11 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     this.drawSpan!(runs, shapeOnly);
   }
   canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
-  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void {
+  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined,
+    content?: ScenePaintMask): void {
     const gl = this.gl; this.target(destination); gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    this.folding!.draw(run, opacity, mask?.texture ?? null);
+    this.folding!.draw(run, opacity, mask?.texture ?? null, content);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;

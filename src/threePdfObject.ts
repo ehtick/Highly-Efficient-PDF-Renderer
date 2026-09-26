@@ -1969,7 +1969,8 @@ export class HeprThreePdfObject extends THREE.Group {
       this.paintCompositor.render(renderer as unknown as ThreePaintHostRenderer, this.sceneData, roots,
         materialLayerViewport.width, materialLayerViewport.height,
         condition => this.layerVisibility.isVisible(condition),
-        bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType));
+        bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType),
+        this.clipFromDataMatrix);
       for (const root of roots) root.visible = false;
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }

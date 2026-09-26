@@ -100,6 +100,7 @@ export const fastTests = [
   "three-primitive-interaction-controller",
   "three-primitive-interaction",
   "three-paint-compositor",
+  "three-gradient-mask-fold",
   "native-primitive-interaction",
   "native-paint-compositor",
   "native-ordered-pan-cache",

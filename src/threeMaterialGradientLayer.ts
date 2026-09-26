@@ -10,7 +10,8 @@ import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
-import { enableThreeNodePaintFold, enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
+import { enableThreeNodePaintFold, enableThreeRawPaintFold, registerThreeGradientMaskSource,
+  threePaintFoldFragmentGlsl } from "./threePaintFold";
 
 import {
   CORE_FILL_FRAGMENT_SHADER_SOURCE,
@@ -368,6 +369,12 @@ export class ThreeMaterialGradientLayer {
           .replace(/sourcePaint.a \* maskPaint.a/g, "sourcePaint.a * mix(maskPaint.a, 1.0, uPdfShapeOnly)");
       }
       material = this.clipMaterial(material, this.fillClipIndices[pathIndex]);
+      // A folded paint can compute a soft mask made of this paint alone.
+      if (!meshCount) {
+        registerThreeGradientMaskSource(material, { lut: gradients.lut, primitiveColor,
+          linear: materialBackend === "webgpu" && this.colorCompositing === "linear",
+          vectorOverride: this.vectorOverrideUniform });
+      }
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;
       mesh.userData.heprDrawRun = { kind: "gradient-fill", first: pathIndex, count: 1, clipIndex: this.fillClipIndices[pathIndex] };

@@ -405,8 +405,9 @@ compositing) and the remaining outer host render. Inside `three.sync`,
 `three.vectorUpdate` and `three.textUpdate` identify camera-dependent work.
 `three.batchRebuild` and `three.batchUpdate` are nested within layer updates.
 `three.compositor` includes setup, batch lookup/geometry preparation, target
-binding, `three.hostDraw` (primitive submissions) and `three.hostPass`
-(composite submissions). Inside `three.compositorSetup`,
+binding, `three.hostDraw` (host renders that draw paints) and `three.hostPass`
+(host renders of composite passes alone). Consecutive compositor operations
+into one surface share a host render; `three.hostRenders` counts them. Inside `three.compositorSetup`,
 `three.compositorCollect` measures proxy/range-index maintenance and
 `three.compositorSelection` measures visible-paint selection. Compare collection
 with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
@@ -542,10 +543,25 @@ clamped rectangle, which all four corners agree on.
 `foldedPaints` counts compositor group chains drawn as a single paint. A chain
 of Normal-blend groups holding one fill path, analytic gradient fill or image
 (no knockout, at most one soft mask) scales that paint by the groups' opacity
-and mask instead of rendering group surfaces and composite passes. Native
-WebGL folds these chains; its soft mask is still prepared on its own surface.
-Native WebGPU and both Three backends fold fills and analytic gradient fills
-(`three.foldedPaints` in Three), but not images.
+and mask instead of rendering group surfaces and composite passes. A soft mask
+without a transfer function is rendered but not converted: the folded paint
+reads the mask's content and computes its alpha or luminosity over the mask
+backdrop itself, so the mask needs no conversion pass. A mask with a transfer
+function is still converted by its own pass first. Native WebGL folds these
+chains; native WebGPU and both Three backends fold fills and analytic gradient
+fills (`three.foldedPaints` in Three), but not images.
+
+In Three, a folded paint whose soft mask holds one analytic gradient fill, and
+nothing else, computes that mask itself (`three.computedMasks`), so the mask
+needs no surface or render at all. The gradient must be axial or radial and
+not masked by another gradient. Its outline, and its one clip beyond the
+folded paint's own chain, must be convex and made of line segments, with up to
+eight edges between them. The paint must be in front of the camera, with no
+colour override. Any other mask is rendered as above.
+
+While the Three compositor renders, it turns off WebGPURenderer's lighting,
+which none of its materials use, and restores it afterwards. With lighting on,
+every `renderer.render()` call rehashes the scene's lights node.
 
 On WebGPU a clear is a render pass of its own, and in Three also a queue
 submission. The native and Three compositors therefore clear a surface as the

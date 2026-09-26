@@ -1,5 +1,120 @@
 # Broschuere rendering performance investigation
 
+## Half the Three render calls, and WebGPU frame pacing (September 26)
+
+Captures at fit-all, with mask-content folding and lighting off in Three:
+
+| Backend | Frame interval p50 | CPU p50 | GPU p50 |
+| --- | --- | --- | --- |
+| Native WebGL | 4.2 ms (238 FPS) | 1.9–2.5 ms | 3.7–3.8 ms |
+| Native WebGPU | 12.5 ms (80 FPS) | 1.7 ms | 3.0 ms |
+| Three WebGL | 8.4 ms (119 FPS) | 6.2–6.7 ms | 5.8–6.3 ms |
+| Three WebGPU | 25 ms (40 FPS) | 19.9–21.2 ms | 3.2 ms |
+
+### Native WebGPU frame pacing
+
+Native WebGPU needed about 4.7 ms of CPU and GPU time but presented every
+third 240 Hz vsync. Its loop waited for each frame's `onSubmittedWorkDone`
+before it requested the next animation frame. Encoding therefore never
+overlapped GPU work, and a frame plus the completion's trip back to the page
+missed two vsyncs.
+
+A frame may now start while the frame before it is still on the GPU, but never
+while two frames are. This is not a queue of finished frames waiting to be
+shown. Here the next frame spends 1.7 ms encoding, which is longer than the
+0.5 ms or so the previous frame still needs on the GPU. So the previous frame
+has finished before the next one is submitted, and input waits for nothing.
+Only a GPU slower than the display makes a frame wait, and then only for the
+rest of the one frame ahead of it. Chrome gives WebGL the same overlap: its
+next animation frame does not wait for the GPU either. Afterwards native WebGPU
+ran close to native WebGL.
+
+### Three: one render call per surface, not per operation
+
+Three WebGPU gives every `renderer.render()` call its own command encoder,
+render pass and `queue.submit`. Chrome's `GPUQueue::submit` flushes to the GPU
+process at once (`FlushNow()`), so each call costs about 110 µs of page time
+here. Three's own JavaScript is about 34 µs of that in the mock-device run.
+The compositor made 149 calls a frame, and cutting the call count is the fix
+that stays within Three's normal rendering.
+
+- **Batching.** Consecutive compositor operations into the same surface now
+  share one host render.
+  - Each queued mesh applies its own state in `onBeforeRender` and restores it
+    in `onAfterRender`. That state is a folded paint's opacity and mask, shape
+    coverage, or a composite pass's inputs. Three WebGPU reads per-object
+    uniforms and textures as it draws each mesh. WebGL uploads them again
+    because `uniformsNeedUpdate` is set.
+  - A paint drawn twice in one batch uses a separate stand-in mesh and subset
+    buffer each time.
+  - Composite passes cover their rectangle with a unit quad placed by a
+    clip-space uniform instead of a scissor. Three sets the scissor per render
+    call, so a scissored pass could not join a batch.
+  - A batch renders before anything writes a surface it reads or draws into.
+- **Computed gradient masks.** 28 of the 29 folded masks were one axial
+  gradient over the page, under one four-edge clip inside the folded paint's
+  own clip. Rendering each one cost a clear and a render. It also split the
+  running surface's batch in two.
+  - The folded paint now computes such a mask at each fragment. It uses the
+    gradient's colour table, bound in place of the mask surface, and a
+    pixel-to-gradient homography. Coverage comes from up to eight half-planes
+    for the paint's outline and its one extra clip.
+  - Anything else keeps the rendered mask: a mesh gradient, a gradient masked
+    by another, a curved or concave outline or clip, a deeper clip chain, a
+    colour override, or geometry behind the camera.
+- **Smaller fixes.**
+  - The blend pass material was `transparent` and double-sided, and Three r185
+    draws such a material twice, back faces first. That cost 12 wasted draws a
+    frame.
+  - The page background texture was re-uploaded every frame because its colour
+    was set unconditionally.
+  - Pass inputs switched between nearest and linear placeholders, which made
+    Three free and recreate a sampler every frame.
+  - The compositor's scene and camera no longer update their world matrices on
+    every call.
+
+In the mock-device run, a frame now makes 71 compositor render calls (was
+149), 3 clears and 75 queue submissions (was 153), and 193 indexed draws (was
+220). A capture is needed to see what that buys in Chrome. At about 110 µs
+per call, it should roughly halve Three WebGPU's CPU time. Three WebGL makes
+the same calls, so it should gain too.
+
+The remaining calls are mostly masked isolated groups, whose mask content
+renders and then converts in a pass of its own. The rest are blend-mode groups,
+which copy their backdrop, and three non-isolated groups.
+
+## Three WebGPU: where the CPU time goes (September 26)
+
+Captures after the changes below, at fit-all on the same machine:
+
+| Backend | Frame interval p50 | CPU p50 | GPU p50 |
+| --- | --- | --- | --- |
+| Native WebGL | 4.2 ms (238 FPS) | 2.4 ms | 4.6 ms |
+| Three WebGL | 8.4 ms (119 FPS) | 6.7 ms | 7.9 ms |
+| Three WebGPU | 29.2 ms (34 FPS) | 24.9 ms | 8.5 ms |
+
+Three WebGPU is bound by CPU. Of its 24.9 ms, 12.4 ms go to about 104
+`renderer.render()` calls that draw paints and 7.0 ms to 73 that run passes,
+about 110 µs per call. Each call begins a command encoder and a render pass
+and submits them: 182 of each per frame.
+
+Driving the real WebGPURenderer and Three object against a mock device in
+Node measures Three's own JavaScript at 6.9 ms per frame, so the rest of the
+browser's cost is most likely in its WebGPU calls. Two findings from that
+profile are fixed:
+
+- With lighting enabled, WebGPURenderer rehashes the scene's lights node once
+  per render call, which was 16–20% of the JavaScript. The compositor now turns
+  lighting off while it renders; none of its materials are lit.
+- 35 soft masks are one gradient each with a luminosity conversion and no
+  transfer function, and 29 of them feed folded paints. Both conversions are
+  linear in the premultiplied pixel, so the folded paint now reads the mask's
+  rendered content and converts it itself, as `dot(pixel, weights) + bias`.
+  That saves 29 passes on every backend.
+
+In the mock-device run, Three WebGPU now makes 149 render calls (was 178) and
+44 composite passes (was 73), and its JavaScript takes 4.8 ms per frame.
+
 ## Three and WebGPU: native WebGL's savings, and captures (September 26)
 
 The first three differences below are now fixed; no captures yet.

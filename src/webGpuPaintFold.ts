@@ -1,7 +1,13 @@
+import { paintFoldMaskWeights } from "./nativePaintFold";
+import type { ScenePaintMask } from "./scenePaintGraph";
+
+/** Bytes of one fold: (opacity, masked, mask bias, 0) and the mask weights. */
+const FOLD_BYTES = 32;
+
 /**
  * Native WebGPU fold inputs (see `paintFoldFragmentWgsl`): a bind group of a
- * dynamic-offset uniform (opacity, masked) and the mask surface, for each
- * foldable paint pipeline. Slot 0 of the uniform buffer holds the neutral
+ * dynamic-offset uniform (opacity, masked, mask weights) and the mask surface,
+ * for each foldable paint pipeline. Slot 0 of the uniform buffer holds the neutral
  * fold. Queue writes all land before a frame's commands run, so every fold
  * of a frame takes a slot of its own.
  */
@@ -23,7 +29,7 @@ export class WebGpuPaintFolds {
     this.device = device;
     const fragment = (globalThis as any).GPUShaderStage?.FRAGMENT ?? 2;
     this.layout = device.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: fragment, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 } },
+      { binding: 0, visibility: fragment, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: FOLD_BYTES } },
       { binding: 1, visibility: fragment, texture: { sampleType: "float" } }
     ] });
     this.stride = Math.max(256, Number(device.limits?.minUniformBufferOffsetAlignment) || 256);
@@ -36,12 +42,18 @@ export class WebGpuPaintFolds {
     this.retired.length = 0;
   }
 
-  /** Applies a group chain's opacity and mask surface view (or null) to the draws until `end`. */
-  begin(opacity: number, mask: any): void {
+  /**
+   * Applies a group chain's opacity and mask surface view (or null) to the
+   * draws until `end`. `content` is the soft mask whose rendered content the
+   * mask surface holds, when it was not converted first.
+   */
+  begin(opacity: number, mask: any, content?: ScenePaintMask): void {
     const slot = this.nextSlot++;
     this.ensure(slot + 1);
     const offset = slot * this.stride;
-    this.device.queue.writeBuffer(this.buffer, offset, Float32Array.of(opacity, mask ? 1 : 0, 0, 0));
+    const [red, green, blue, alpha, bias] = paintFoldMaskWeights(content);
+    this.device.queue.writeBuffer(this.buffer, offset,
+      Float32Array.of(opacity, mask ? 1 : 0, bias, 0, red, green, blue, alpha));
     this.current = { offset, mask };
   }
 
@@ -55,7 +67,7 @@ export class WebGpuPaintFolds {
     let entry = this.groups.get(view);
     if (!entry || entry.buffer !== this.buffer) {
       entry = { buffer: this.buffer, group: this.device.createBindGroup({ layout: this.layout, entries: [
-        { binding: 0, resource: { buffer: this.buffer, size: 16 } },
+        { binding: 0, resource: { buffer: this.buffer, size: FOLD_BYTES } },
         { binding: 1, resource: view }
       ] }) };
       this.groups.set(view, entry);
@@ -84,6 +96,6 @@ export class WebGpuPaintFolds {
     const usage = (globalThis as any).GPUBufferUsage;
     this.buffer = this.device.createBuffer({ size: this.slots * this.stride,
       usage: (usage?.UNIFORM ?? 0x40) | (usage?.COPY_DST ?? 0x08) });
-    this.device.queue.writeBuffer(this.buffer, 0, Float32Array.of(1, 0, 0, 0));
+    this.device.queue.writeBuffer(this.buffer, 0, new Float32Array(FOLD_BYTES / 4).fill(1, 0, 1));
   }
 }

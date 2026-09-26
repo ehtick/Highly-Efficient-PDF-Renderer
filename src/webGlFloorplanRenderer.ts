@@ -8,7 +8,7 @@ import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterSt
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
 import { WebGlPaintCompositor, type WebGlPaintFolding } from "./webGlPaintCompositor";
-import { PAINT_FOLD_MASK_UNIT, paintFoldFragmentGlsl } from "./nativePaintFold";
+import { PAINT_FOLD_MASK_UNIT, paintFoldFragmentGlsl, paintFoldMaskWeights } from "./nativePaintFold";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
@@ -1557,11 +1557,14 @@ export class WebGlFloorplanRenderer {
   private readonly paintFoldUnit: number;
   /** Bound on the fold unit whenever no folded paint is drawing, so no surface stays there. */
   private paintFoldNeutralTexture: WebGLTexture | null = null;
-  /** The opacity and soft mask of the folded paint being drawn, if any. */
-  private paintFold: { opacity: number; mask: WebGLTexture | null } | null = null;
-  /** Per program, the fold uniform it holds: opacity, plus 2 when masked. */
-  private paintFoldStates?: Map<WebGLProgram, number>;
-  private readonly paintFoldUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
+  /**
+   * The opacity, soft mask and mask weights (see `paintFoldMaskWeights`) of
+   * the folded paint being drawn, if any.
+   */
+  private paintFold: { opacity: number; mask: WebGLTexture | null; weights: readonly number[] } | null = null;
+  /** Per program, the fold its uniforms hold; null is the neutral fold. */
+  private paintFoldStates?: Map<WebGLProgram, WebGlFloorplanRenderer["paintFold"]>;
+  private readonly paintFoldUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private readonly orderedInstanceVaos = new Set<number>();
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
@@ -4203,33 +4206,38 @@ export class WebGlFloorplanRenderer {
     this.paintFoldNeutralTexture = texture;
     for (const program of [this.fillProgram, this.gradientFillProgram, this.rasterProgram]) {
       gl.useProgram(program);
-      gl.uniform2f(this.paintFoldLocation(program), 1, 0);
+      gl.uniform4f(this.paintFoldLocations(program)[0], 1, 0, 0, 0);
       gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
-      (this.paintFoldStates ??= new Map()).set(program, 1);
+      (this.paintFoldStates ??= new Map()).set(program, null);
     }
     gl.useProgram(null);
   }
 
-  private paintFoldLocation(program: WebGLProgram): WebGLUniformLocation | null {
-    let location = this.paintFoldUniforms.get(program);
-    if (location === undefined) {
-      location = this.gl.getUniformLocation(program, "uPaintFold");
-      this.paintFoldUniforms.set(program, location);
+  private paintFoldLocations(program: WebGLProgram): [WebGLUniformLocation | null, WebGLUniformLocation | null] {
+    let locations = this.paintFoldUniforms.get(program);
+    if (!locations) {
+      locations = [this.gl.getUniformLocation(program, "uPaintFold"),
+        this.gl.getUniformLocation(program, "uPaintMaskWeights")];
+      this.paintFoldUniforms.set(program, locations);
     }
-    return location;
+    return locations;
   }
 
   /** Gives a foldable paint program the current fold, or none. */
   private bindPaintFold(program: WebGLProgram): void {
     if (!(this.paintFoldUnit >= 0)) return;
     const fold = this.paintFold;
-    const opacity = fold?.opacity ?? 1, masked = fold?.mask ? 1 : 0;
     if (fold?.mask) this.bindOrderedTexture(this.paintFoldUnit, fold.mask);
-    const state = opacity + masked * 2;
+    // Each folded paint brings a fold of its own, so identity tells whether
+    // this program already holds it.
     const states = this.paintFoldStates ??= new Map();
-    if (states.get(program) === state) return;
-    states.set(program, state);
-    this.gl.uniform2f(this.paintFoldLocation(program), opacity, masked);
+    if (states.get(program) === fold) return;
+    states.set(program, fold);
+    const [location, weights] = this.paintFoldLocations(program);
+    if (!fold?.mask) { this.gl.uniform4f(location, fold?.opacity ?? 1, 0, 0, 0); return; }
+    const value = fold.weights;
+    this.gl.uniform4f(location, fold.opacity, 1, value[4], 0);
+    this.gl.uniform4f(weights, value[0], value[1], value[2], value[3]);
   }
 
   /**
@@ -4400,10 +4408,10 @@ export class WebGlFloorplanRenderer {
       // scaled by the chain's opacity and soft mask.
       const folding: WebGlPaintFolding | null = this.paintFoldUnit >= 0 ? {
         canFold: run => this.canFoldPaint(run),
-        draw: (run, opacity, mask) => {
+        draw: (run, opacity, mask, content) => {
           this.invalidateOrderedState();
           this.paintShapeOnly = false;
-          this.paintFold = { opacity, mask };
+          this.paintFold = { opacity, mask, weights: paintFoldMaskWeights(content) };
           profile?.add("foldedPaints");
           try {
             draw(run);

@@ -141,6 +141,12 @@ const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
 const CAMERA_DAMPING_ZOOM_EPSILON = 1e-5;
 const CAMERA_DAMPING_MAX_DT_MS = 64;
+/**
+ * Frames with unfinished GPU work, counting the one rendering now: a frame may
+ * encode while the previous one is still on the GPU, never while two are.
+ * See `requestFrame`.
+ */
+const MAX_GPU_FRAMES_IN_FLIGHT = 2;
 const PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC = 5;
 const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
 const PAN_INERTIA_VELOCITY_STALE_MS = 120;
@@ -1381,8 +1387,8 @@ export class WebGpuFloorplanRenderer {
   private externalFrameDriver = false;
   private isDisposed = false;
   private externalFramePending = false;
-  /** The GPU has not finished the last animation frame's work yet. */
-  private gpuFrameInFlight = false;
+  /** Animation frames whose GPU work has not finished yet. */
+  private gpuFramesInFlight = 0;
   /** A frame was requested while the GPU was busy; schedule it once the GPU is done. */
   private framePendingOnGpu = false;
 
@@ -3341,17 +3347,25 @@ export class WebGpuFloorplanRenderer {
     // WebGPU submission never blocks, so an animation-frame loop can queue
     // frames faster than the GPU finishes them: input then lags behind the
     // queue and the frame listener counts callbacks, not finished frames.
-    // Start the next frame only once the GPU has finished the previous one.
-    if (this.gpuFrameInFlight) {
+    // A frame therefore starts only while at most the one before it is still
+    // on the GPU. Its encoding overlaps that frame's GPU work, as WebGL's
+    // does, without a backlog: while the GPU keeps up with the display the
+    // previous frame is done before this one is submitted, and while it
+    // cannot, this frame waits only for the rest of that one. Waiting for the
+    // previous frame's completion instead kept encoding from ever overlapping
+    // GPU work, and a 1.7 ms encode plus a 3 ms GPU frame then presented
+    // only every third 240 Hz vsync.
+    if (this.gpuFramesInFlight >= MAX_GPU_FRAMES_IN_FLIGHT) {
       this.framePendingOnGpu = true;
       return;
     }
 
     this.rafHandle = requestAnimationFrame((timestamp) => {
       this.rafHandle = 0;
-      // Requests made while rendering, such as continuing a camera animation,
-      // wait for this frame's GPU work as well.
-      this.gpuFrameInFlight = true;
+      // This frame counts as in flight while it renders, so a request made
+      // meanwhile, such as continuing a camera animation, waits once the
+      // previous frame is still on the GPU too.
+      this.gpuFramesInFlight++;
       try {
         this.render(timestamp);
       } finally {
@@ -3362,7 +3376,7 @@ export class WebGpuFloorplanRenderer {
 
   private waitForGpuFrame(): void {
     const finished = (): void => {
-      this.gpuFrameInFlight = false;
+      this.gpuFramesInFlight = Math.max(0, this.gpuFramesInFlight - 1);
       if (!this.framePendingOnGpu || this.isDisposed) {
         return;
       }
@@ -4049,9 +4063,9 @@ export class WebGpuFloorplanRenderer {
             // straight onto the surface, scaled by its opacity and soft mask.
             canFold: run => run.count === 1 && this.fillRenderingEnabled && (run.kind === "fill" ||
               (run.kind === "gradient-fill" && !(this.gradientMeshRanges?.[run.first * 2 + 1] ?? 0))),
-            draw: (run, target, opacity, mask) => {
+            draw: (run, target, opacity, mask, content) => {
               this.performanceProfiler?.add("foldedPaints");
-              this.paintFolds?.begin(opacity, mask);
+              this.paintFolds?.begin(opacity, mask, content);
               pass = target;
               try { draw(run); } finally { this.paintFolds?.end(); }
             }

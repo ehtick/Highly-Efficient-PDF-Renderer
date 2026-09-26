@@ -154,13 +154,17 @@ try {
     folds.beginFrame();
     folds.bind(pass, 2);
     assert.deepEqual(bound.at(-1).offsets, [0], "unfolded draws bind the neutral slot");
-    assert.deepEqual([...writes.find(write => write.values.length === 4).values], [1, 0, 0, 0]);
+    assert.deepEqual([...writes.find(write => write.values.length === 8).values], [1, 0, 0, 0, 0, 0, 0, 0]);
     const maskView = { texture: {} };
     folds.begin(0.25, maskView); folds.bind(pass, 3); folds.end();
     assert.equal(bound.at(-1).index, 3);
     assert.deepEqual(bound.at(-1).offsets, [256], "the first fold takes slot 1");
     assert.equal(bound.at(-1).group.entries[1].resource, maskView, "the fold binds its mask");
-    assert.deepEqual([...writes.at(-1).values], [0.25, 1, 0, 0]);
+    assert.equal(bound.at(-1).group.entries[0].resource.size, 32, "each fold binds its opacity and mask weights");
+    assert.deepEqual([...writes.at(-1).values], [0.25, 1, 0, 0, 1, 0, 0, 0], "a converted mask is read from red");
+    // Unconverted luminosity content over a white backdrop: lum(rgb) - a + 1.
+    folds.begin(0.5, maskView, { subtype: "Luminosity", backdrop: [1, 1, 1], children: [] }); folds.end();
+    assert.deepEqual([...writes.at(-1).values], [...Float32Array.of(0.5, 1, 1, 0, 0.3, 0.59, 0.11, -1)]);
     folds.bind(pass, 2);
     assert.deepEqual(bound.at(-1).offsets, [0], "a fold ends with its draw");
     const first = bound.at(-1).group.entries[0].resource.buffer;

@@ -219,14 +219,36 @@ try {
       assert(entries.every(entry => entry.mesh.material.uniforms.uPrimitiveColor.value === entry.primitiveColor),
         "clipped gradient materials share the entry's live primitive color");
     }
+    // Gradient fill quads cover only the paint's part of its clip chain's
+    // bounds. Three always projects through local-to-clip, so unlike native it
+    // clamps projected quads too, with a margin every corner agrees on.
+    if (materialBackend === "webgl") {
+      assert.deepEqual([...materials[0].uniforms.uClipBounds.value], [20, 20, 80, 80],
+        "the clipped fill clamps to its nested clip's bounds");
+      assert.deepEqual([...materials[1].uniforms.uClipBounds.value], [-1e38, -1e38, 1e38, 1e38],
+        "the unclipped fill stays unbounded");
+      for (const material of materials.slice(0, 2)) {
+        assert.match(material.vertexShader, /vec4 quad = heprClippedPaintQuad\(minBounds, maxBounds, uClipBounds,/);
+        assert.match(material.vertexShader, /if \(any\(greaterThan\(quad\.xy, quad\.zw\)\)\)/,
+          "a paint and clip too far apart to share a pixel draw nothing");
+        assert.match(material.vertexShader, /vec2 world = mix\(quad\.xy, quad\.zw, corner01\);/);
+      }
+    } else {
+      for (const index of [0, 1]) {
+        assert.match(buildNodeShader(entries[index].mesh).vertexShader,
+          /heprClippedPaintQuad\(metaA\.zw, metaB\.xy, clipBounds,/, "Three WebGPU clamps gradient quads too");
+      }
+    }
     if (materialBackend === "webgl") {
       assert.deepEqual(materials.map(m => m.uniforms.uVectorClipIndex.value), [1, -1, 0]);
       assert.equal(materials[0].uniforms.uVectorClipTex.value, materials[2].uniforms.uVectorClipTex.value);
       for (const material of materials) {
         assert(material.fragmentShader.includes("outColor.a *= heprVectorClipAA(vLocal, clipAAWidth)"));
         assert(!material.fragmentShader.includes("outColor *= heprVectorClip(vLocal)"));
-        const main = material.fragmentShader.slice(material.fragmentShader.lastIndexOf("void main() {"));
-        assert(main.indexOf("float clipAAWidth") < main.indexOf("discard"),
+        // Foldable paints keep their body in heprUnfoldedPaint; main applies the fold.
+        const body = material.fragmentShader.includes("void heprUnfoldedPaint() {") ? "void heprUnfoldedPaint() {" : "void main() {";
+        const main = material.fragmentShader.slice(material.fragmentShader.lastIndexOf(body));
+        assert(main.includes("float clipAAWidth") && main.indexOf("float clipAAWidth") < main.indexOf("discard"),
           "Three WebGL derives the clip footprint before paint discards");
       }
     } else {
@@ -236,7 +258,7 @@ try {
         assert.match(shader, /vec4<f32>\( heprClipSource\.xyz, \( heprClipSource\.w \* heprVectorClipAA\(/,
           "Three WebGPU scales only alpha at the clip boundary");
         const main = shader.slice(shader.lastIndexOf("@fragment"));
-        assert(main.indexOf("heprClipAAWidth = heprClipPixelWidth") < main.indexOf("heprClipSource = heprGradient"),
+        assert(main.indexOf("heprClipAAWidth = heprClipPixelWidth") < main.search(/= heprGradient\w*Fragment\(/),
           `clip derivatives execute before the paint helper can discard: ${main}`);
       }
       assert(!/fn heprVectorClipAA\s*\(/.test(buildNodeShader(entries[1].mesh).fragmentShader),

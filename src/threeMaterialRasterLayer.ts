@@ -315,6 +315,10 @@ export class ThreeMaterialRasterLayer {
       Math.round(clamp01(alpha) * 255)
     );
 
+    // Called every frame; an unchanged color must not upload the texture again.
+    if (data[0] === rgba[0] && data[1] === rgba[1] && data[2] === rgba[2] && data[3] === rgba[3]) {
+      return;
+    }
     data[0] = rgba[0];
     data[1] = rgba[1];
     data[2] = rgba[2];

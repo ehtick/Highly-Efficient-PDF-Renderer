@@ -1,12 +1,14 @@
 import { STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
+import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
+import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
 import { WebGlPaintCompositor, type WebGlPaintFolding } from "./webGlPaintCompositor";
-import { PAINT_FOLD_MASK_UNIT, paintFoldFragmentGlsl } from "./nativePaintFold";
+import { PAINT_FOLD_MASK_UNIT, paintFoldFragmentGlsl, paintFoldMaskWeights } from "./nativePaintFold";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
@@ -19,7 +21,7 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePri
 import { WebGlPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
-import { buildVectorFillBandIndex, vectorFillBandStore, vectorFillBandIndex } from "./vectorFillBands";
+import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
@@ -380,6 +382,9 @@ uniform ivec2 uFillPathMetaTexSize;
 uniform sampler2D uFillSegmentTexA;
 uniform ivec2 uFillSegmentTexSize;
 uniform int uFillBandBase;
+// Per-path cell headers follow in the same store, from one less than this
+// texel: zero, the value of a uniform the host never sets, means none.
+uniform int uFillCellHeaders;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -390,6 +395,9 @@ flat out int vSegmentStart;
 flat out int vSegmentCount;
 /** (first band texel, band count, first band's y, band height); zero count scans linearly. */
 flat out vec4 vFillBands;
+/** (first level texel, level count, finest cell size, level step); zero count uses the bands. */
+flat out vec4 vFillCells;
+flat out vec2 vFillOrigin;
 flat out vec3 vColor;
 flat out float vAlpha;
 flat out float vFillRule;
@@ -418,6 +426,8 @@ void main() {
     vSegmentStart = 0;
     vSegmentCount = 0;
     vFillBands = vec4(0.0);
+    vFillCells = vec4(0.0);
+    vFillOrigin = vec2(0.0);
     vColor = vec3(0.0);
     vAlpha = 0.0;
     vFillRule = 0.0;
@@ -447,6 +457,9 @@ void main() {
   vSegmentCount = segmentCount;
   vFillBands = uFillBandBase < 0 ? vec4(0.0)
     : texelFetch(uFillSegmentTexA, coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
+  vFillCells = uFillCellHeaders <= 0 ? vec4(0.0)
+    : texelFetch(uFillSegmentTexA, coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
+  vFillOrigin = minBounds;
   vColor = vec3(metaB.z, metaB.w, metaC.z);
   vAlpha = alpha;
   vFillRule = metaC.x;
@@ -473,6 +486,8 @@ uniform int uFillBandEntries;
 flat in int vSegmentStart;
 flat in int vSegmentCount;
 flat in vec4 vFillBands;
+flat in vec4 vFillCells;
+flat in vec2 vFillOrigin;
 flat in vec3 vColor;
 flat in float vAlpha;
 flat in float vFillRule;
@@ -492,6 +507,16 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 
 ${FILL_COVERAGE_GLSL}
 
+vec4 heprCellFetchA(int index) {
+  return texelFetch(uFillSegmentTexA, coordFromIndex(index, uFillSegmentTexSize), 0);
+}
+
+vec4 heprCellFetchB(int index) {
+  return texelFetch(uFillSegmentTexB, coordFromIndex(index, uFillSegmentTexSize), 0);
+}
+
+${VECTOR_CELL_COVERAGE_GLSL}
+
 ${VECTOR_INSTANCE_CLIP_GLSL}
 
 void main() {
@@ -504,43 +529,49 @@ void main() {
     discard;
   }
 
-  // Average the winding number over the footprint box. Only a segment that
+  // Average the winding number over the footprint box. A path with a cell
+  // index reads only the cells under the box. Otherwise only a segment that
   // reaches the box's rows can contribute, so the bands spanning those rows
   // are the whole search. Each band integrates only its own rows, so a
   // segment listed in two bands contributes each part once.
   vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
   float winding = 0.0;
-  int bandCount = int(vFillBands.y);
-  int firstBand = 0;
-  int lastBand = 0;
-  if (bandCount > 0) {
-    float bandHeight = vFillBands.w;
-    firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-    lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-  }
-
-  for (int band = firstBand; band <= lastBand; band += 1) {
-    int count = vSegmentCount;
-    int entry = 0;
+  if (vFillCells.y > 0.0) {
+    // The cell index bounds this to the geometry near the pixel at any zoom.
+    winding = heprCellWinding(vFillCells, vFillOrigin, box, footprint);
+  } else {
+    int bandCount = int(vFillBands.y);
+    int firstBand = 0;
+    int lastBand = 0;
     if (bandCount > 0) {
-      vec4 range = texelFetch(uFillSegmentTexA,
-        coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
-      entry = int(range.x);
-      count = int(range.y);
+      float bandHeight = vFillBands.w;
+      firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+      lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
     }
-    vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
-    for (int i = 0; i < count; i += 1) {
-      int segment = vSegmentStart + i;
+
+    for (int band = firstBand; band <= lastBand; band += 1) {
+      int count = vSegmentCount;
+      int entry = 0;
       if (bandCount > 0) {
-        int packedIndex = entry + i;
-        vec4 packed = texelFetch(uFillSegmentTexA,
-          coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
-        segment = int(packed[packedIndex & 3]);
+        vec4 range = texelFetch(uFillSegmentTexA,
+          coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
+        entry = int(range.x);
+        count = int(range.y);
       }
-      vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
-      vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
-      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-        primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+      vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
+      for (int i = 0; i < count; i += 1) {
+        int segment = vSegmentStart + i;
+        if (bandCount > 0) {
+          int packedIndex = entry + i;
+          vec4 packed = texelFetch(uFillSegmentTexA,
+            coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
+          segment = int(packed[packedIndex & 3]);
+        }
+        vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
+        vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
+        winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+      }
     }
   }
 
@@ -1387,10 +1418,13 @@ export class WebGlFloorplanRenderer {
 
   private readonly uFillAAScreenPx: WebGLUniformLocation;
   private readonly uFillBandBase: WebGLUniformLocation;
+  private readonly uFillCellHeaders: WebGLUniformLocation;
   private readonly uFillBandEntries: WebGLUniformLocation;
   /** Texel offsets of the band index inside the fill segment store; -1 when absent. */
   private fillBandBase = -1;
   private fillBandEntries = 0;
+  /** Texel of path 0's cell header, or -1; the shaders take it plus one. */
+  private fillCellBase = -1;
 
   private readonly uFillUseLocalToClip: WebGLUniformLocation;
 
@@ -1523,11 +1557,14 @@ export class WebGlFloorplanRenderer {
   private readonly paintFoldUnit: number;
   /** Bound on the fold unit whenever no folded paint is drawing, so no surface stays there. */
   private paintFoldNeutralTexture: WebGLTexture | null = null;
-  /** The opacity and soft mask of the folded paint being drawn, if any. */
-  private paintFold: { opacity: number; mask: WebGLTexture | null } | null = null;
-  /** Per program, the fold uniform it holds: opacity, plus 2 when masked. */
-  private paintFoldStates?: Map<WebGLProgram, number>;
-  private readonly paintFoldUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
+  /**
+   * The opacity, soft mask and mask weights (see `paintFoldMaskWeights`) of
+   * the folded paint being drawn, if any.
+   */
+  private paintFold: { opacity: number; mask: WebGLTexture | null; weights: readonly number[] } | null = null;
+  /** Per program, the fold its uniforms hold; null is the neutral fold. */
+  private paintFoldStates?: Map<WebGLProgram, WebGlFloorplanRenderer["paintFold"]>;
+  private readonly paintFoldUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private readonly orderedInstanceVaos = new Set<number>();
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
@@ -1613,6 +1650,8 @@ export class WebGlFloorplanRenderer {
   /** Texel offsets of the band index inside the gradient segment store; -1 when absent. */
   private gradientFillBandBase = -1;
   private gradientFillBandEntries = 0;
+  /** Texel of path 0's cell header, or -1; the shader takes it plus one. */
+  private gradientFillCellBase = -1;
   private gradientFillSegmentTextureWidth = 1;
 
   private gradientFillSegmentTextureHeight = 1;
@@ -1894,6 +1933,7 @@ export class WebGlFloorplanRenderer {
       "uPrimitiveOverride",
       "uBandBase",
       "uBandEntries",
+      "uCellHeaders",
       "uClipBounds"
     ]);
     this.gradientStrokeUniforms = this.mustGetUniformMap(this.gradientStrokeProgram, [
@@ -1951,6 +1991,7 @@ export class WebGlFloorplanRenderer {
     this.uFillZoom = this.mustGetUniformLocation(this.fillProgram, "uZoom");
     this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
     this.uFillBandBase = this.mustGetUniformLocation(this.fillProgram, "uFillBandBase");
+    this.uFillCellHeaders = this.mustGetUniformLocation(this.fillProgram, "uFillCellHeaders");
     this.uFillBandEntries = this.mustGetUniformLocation(this.fillProgram, "uFillBandEntries");
     this.uFillUseLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uUseLocalToClip");
     this.uFillLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uLocalToClip");
@@ -3681,6 +3722,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform2i(uniforms.uSegmentTexSize, this.gradientFillSegmentTextureWidth, this.gradientFillSegmentTextureHeight);
       gl.uniform1i(uniforms.uBandBase, this.gradientFillBandBase);
       gl.uniform1i(uniforms.uBandEntries, this.gradientFillBandEntries);
+      gl.uniform1i(uniforms.uCellHeaders, this.gradientFillCellBase + 1);
       this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
       gl.uniform1f(uniforms.uAAScreenPx, 1);
       gl.uniform4f(
@@ -4089,7 +4131,9 @@ export class WebGlFloorplanRenderer {
   private uploadVectorClips(scene: VectorScene): void {
     const gl = this.gl;
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
-    const data = packVectorClips(scene.clipPaths);
+    // The clip GLSL reads cell storage, bounding each pixel's clip work at any
+    // zoom. Highlight overlays pack their own few clips with bands.
+    const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
@@ -4162,33 +4206,38 @@ export class WebGlFloorplanRenderer {
     this.paintFoldNeutralTexture = texture;
     for (const program of [this.fillProgram, this.gradientFillProgram, this.rasterProgram]) {
       gl.useProgram(program);
-      gl.uniform2f(this.paintFoldLocation(program), 1, 0);
+      gl.uniform4f(this.paintFoldLocations(program)[0], 1, 0, 0, 0);
       gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
-      (this.paintFoldStates ??= new Map()).set(program, 1);
+      (this.paintFoldStates ??= new Map()).set(program, null);
     }
     gl.useProgram(null);
   }
 
-  private paintFoldLocation(program: WebGLProgram): WebGLUniformLocation | null {
-    let location = this.paintFoldUniforms.get(program);
-    if (location === undefined) {
-      location = this.gl.getUniformLocation(program, "uPaintFold");
-      this.paintFoldUniforms.set(program, location);
+  private paintFoldLocations(program: WebGLProgram): [WebGLUniformLocation | null, WebGLUniformLocation | null] {
+    let locations = this.paintFoldUniforms.get(program);
+    if (!locations) {
+      locations = [this.gl.getUniformLocation(program, "uPaintFold"),
+        this.gl.getUniformLocation(program, "uPaintMaskWeights")];
+      this.paintFoldUniforms.set(program, locations);
     }
-    return location;
+    return locations;
   }
 
   /** Gives a foldable paint program the current fold, or none. */
   private bindPaintFold(program: WebGLProgram): void {
     if (!(this.paintFoldUnit >= 0)) return;
     const fold = this.paintFold;
-    const opacity = fold?.opacity ?? 1, masked = fold?.mask ? 1 : 0;
     if (fold?.mask) this.bindOrderedTexture(this.paintFoldUnit, fold.mask);
-    const state = opacity + masked * 2;
+    // Each folded paint brings a fold of its own, so identity tells whether
+    // this program already holds it.
     const states = this.paintFoldStates ??= new Map();
-    if (states.get(program) === state) return;
-    states.set(program, state);
-    this.gl.uniform2f(this.paintFoldLocation(program), opacity, masked);
+    if (states.get(program) === fold) return;
+    states.set(program, fold);
+    const [location, weights] = this.paintFoldLocations(program);
+    if (!fold?.mask) { this.gl.uniform4f(location, fold?.opacity ?? 1, 0, 0, 0); return; }
+    const value = fold.weights;
+    this.gl.uniform4f(location, fold.opacity, 1, value[4], 0);
+    this.gl.uniform4f(weights, value[0], value[1], value[2], value[3]);
   }
 
   /**
@@ -4359,10 +4408,10 @@ export class WebGlFloorplanRenderer {
       // scaled by the chain's opacity and soft mask.
       const folding: WebGlPaintFolding | null = this.paintFoldUnit >= 0 ? {
         canFold: run => this.canFoldPaint(run),
-        draw: (run, opacity, mask) => {
+        draw: (run, opacity, mask, content) => {
           this.invalidateOrderedState();
           this.paintShapeOnly = false;
-          this.paintFold = { opacity, mask };
+          this.paintFold = { opacity, mask, weights: paintFoldMaskWeights(content) };
           profile?.add("foldedPaints");
           try {
             draw(run);
@@ -4466,6 +4515,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform1f(this.uFillZoom, zoomValue);
       gl.uniform1f(this.uFillAAScreenPx, 1);
       gl.uniform1i(this.uFillBandBase, this.fillBandBase);
+      gl.uniform1i(this.uFillCellHeaders, this.fillCellBase + 1);
       gl.uniform1i(this.uFillBandEntries, this.fillBandEntries);
       gl.uniform1f(this.uFillUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
       if (this.localToClipRenderingEnabled) {
@@ -5470,16 +5520,16 @@ export class WebGlFloorplanRenderer {
     const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
     // As with ordinary fills, the band index follows the segments in their own
     // store; a store with no room for it renders by scanning each path in full.
-    const fillBands = buildVectorFillBandIndex({
+    const gradientStore = {
       pathCount: data.gradientFillPathCount, segmentCount: data.gradientFillSegmentCount,
       pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
       segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB
-    });
-    const fillStore = vectorFillBandStore(data.gradientFillSegmentsA, data.gradientFillSegmentCount,
-      fillBands, maxTextureSize);
+    };
+    const fillStore = vectorIndexedPathStore(gradientStore, buildVectorFillBandIndex(gradientStore), maxTextureSize);
     const fillSegmentDims = chooseTextureDimensions(fillStore.texels, maxTextureSize);
-    this.gradientFillBandBase = fillStore.pathBase;
-    this.gradientFillBandEntries = fillStore.entryBase;
+    this.gradientFillBandBase = fillStore.bandBase;
+    this.gradientFillBandEntries = fillStore.bandEntries;
+    this.gradientFillCellBase = fillStore.cellBase;
     this.gradientFillPathTextureWidth = fillPathDims.width;
     this.gradientFillPathTextureHeight = fillPathDims.height;
     this.gradientFillSegmentTextureWidth = fillSegmentDims.width;
@@ -5500,14 +5550,14 @@ export class WebGlFloorplanRenderer {
     }
     this.uploadFloatDataTexture(
       this.gradientFillTextures[4],
-      fillStore.data,
+      fillStore.dataA,
       fillStore.texels,
       fillSegmentDims
     );
     this.uploadFloatDataTexture(
       this.gradientFillTextures[5],
-      data.gradientFillSegmentsB,
-      data.gradientFillSegmentCount,
+      fillStore.dataB,
+      fillStore.dataB.length / 4,
       fillSegmentDims
     );
 
@@ -5584,12 +5634,13 @@ export class WebGlFloorplanRenderer {
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
     const pathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
-    // The band index follows the segments in the same store, so the texture is
-    // sized for both. A store too large to hold it simply goes without.
-    const bands = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, vectorFillBandIndex(scene), maxTextureSize);
-    const segmentDims = chooseTextureDimensions(bands.texels, maxTextureSize);
-    this.fillBandBase = bands.pathBase;
-    this.fillBandEntries = bands.entryBase;
+    // The band and cell indexes follow the segments in the same store, so the
+    // texture is sized for all three. A store too large for one goes without.
+    const indexed = vectorIndexedPathStore(vectorSceneFillStore(scene), vectorFillBandIndex(scene), maxTextureSize);
+    const segmentDims = chooseTextureDimensions(indexed.texels, maxTextureSize);
+    this.fillBandBase = indexed.bandBase;
+    this.fillBandEntries = indexed.bandEntries;
+    this.fillCellBase = indexed.cellBase;
 
     this.fillPathMetaTextureWidth = pathDims.width;
     this.fillPathMetaTextureHeight = pathDims.height;
@@ -5609,10 +5660,10 @@ export class WebGlFloorplanRenderer {
     pathMetaCData.set(scene.fillPathMetaC);
 
     const segmentDataA = new Float32Array(segmentTexelCount * 4);
-    segmentDataA.set(bands.data);
+    segmentDataA.set(indexed.dataA);
 
     const segmentDataB = new Float32Array(segmentTexelCount * 4);
-    segmentDataB.set(scene.fillSegmentsB);
+    segmentDataB.set(indexed.dataB);
 
     gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureA);
     configureFloatTexture(gl);

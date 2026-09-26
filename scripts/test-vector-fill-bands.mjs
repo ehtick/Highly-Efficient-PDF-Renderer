@@ -218,6 +218,8 @@ try {
 
   const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  const { vectorIndexedPathStore } = await import("../src/vectorCellIndex.ts");
+  let cellIndexedLayers = 0;
   for (const [segments, expectedBase] of [[dashedCircle(4), -1], [circle, circle.length]]) {
     const solid = sceneWith([segments]);
     solid.fillPathMetaC = new Float32Array([0, 0, 0, 1]);
@@ -238,9 +240,17 @@ try {
       const geometryData = uniforms.uFillSegmentTexA.value.image.data;
       assert.deepEqual(geometryData.subarray(0, solid.fillSegmentCount * 4), solid.fillSegmentsA);
       if (expectedBase >= 0) assert.deepEqual(geometryData.subarray(expectedBase * 4, combined.data.length), packed.data);
+      // The cell index follows the bands in the same store, as in native WebGL.
+      const indexed = vectorIndexedPathStore(vectorSceneFillStore(solid), buildVectorFillBandIndex(vectorSceneFillStore(solid)));
+      assert.equal(uniforms.uFillCellHeaders.value, indexed.cellBase + 1, "GL materials address the cell headers plus one");
+      assert.deepEqual(geometryData.subarray(0, indexed.dataA.length), indexed.dataA);
+      assert.deepEqual(uniforms.uFillSegmentTexB.value.image.data.subarray(0, indexed.dataB.length), indexed.dataB,
+        "the second segment texture carries the pieces' control points");
+      if (indexed.cellBase >= 0) cellIndexedLayers++;
     }
     fill.dispose(); gradient.dispose();
   }
+  assert.equal(cellIndexedLayers, 2, "the long circle is cell-indexed in both Three GL layers");
 
   // The count pass must use the same Float32 band height as the write passes.
   // With double precision, these first eight edges were counted in one band

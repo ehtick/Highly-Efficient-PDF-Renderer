@@ -1,7 +1,13 @@
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
-import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
+import { vectorFillBandIndex, buildVectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
+import { vectorIndexedPathStore } from "./vectorCellIndex";
+import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
+import { paintFoldFragmentWgsl } from "./nativePaintFold";
+import { WebGpuPaintFolds } from "./webGpuPaintFold";
+import { WebGpuFrameTimer } from "./webGpuFrameTimer";
+import { RenderPerformanceProfiler } from "./renderPerformance";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
@@ -135,6 +141,12 @@ const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
 const CAMERA_DAMPING_ZOOM_EPSILON = 1e-5;
 const CAMERA_DAMPING_MAX_DT_MS = 64;
+/**
+ * Frames with unfinished GPU work, counting the one rendering now: a frame may
+ * encode while the previous one is still on the GPU, never while two are.
+ * See `requestFrame`.
+ */
+const MAX_GPU_FRAMES_IN_FLIGHT = 2;
 const PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC = 5;
 const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
 const PAN_INERTIA_VELOCITY_STALE_MS = 120;
@@ -145,8 +157,8 @@ const CLEAR_COLOR = {
   a: 1
 };
 
-const CAMERA_UNIFORM_FLOATS = 20;
-const CAMERA_UNIFORM_BUFFER_BYTES = 80;
+const CAMERA_UNIFORM_FLOATS = 24;
+const CAMERA_UNIFORM_BUFFER_BYTES = 96;
 
 const BLIT_UNIFORM_FLOATS = 12;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
@@ -185,6 +197,7 @@ struct CameraUniforms {
   pad0 : f32,
   vectorOverride : vec4f,
   fillBands : vec4f,
+  fillCells : vec4f,
 };
 
 struct SegmentIdBuffer {
@@ -373,6 +386,7 @@ struct CameraUniforms {
   pad0 : f32,
   vectorOverride : vec4f,
   fillBands : vec4f,
+  fillCells : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -393,10 +407,13 @@ struct VsOut {
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
   @location(7) @interpolate(flat) bands : vec4f,
+  @location(8) @interpolate(flat) cells : vec4f,
+  @location(9) @interpolate(flat) origin : vec2f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
 ${VECTOR_FILL_BAND_INFO_WGSL}
+${VECTOR_FILL_CELL_INFO_WGSL}
 
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -422,6 +439,7 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
 
 ${FILL_COVERAGE_WGSL}
 ${FILL_COVERAGE_VERTEX_WGSL}
+${VECTOR_CELL_COVERAGE_WGSL}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
@@ -439,6 +457,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
   var out : VsOut;
   out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.x, uFillSegmentTexA);
+  out.cells = heprFillCellInfo(f32(pathIndex), uCamera.fillCells.x, uFillSegmentTexA);
+  out.origin = metaA.zw;
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0 || alpha <= 0.001) {
@@ -494,10 +514,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let fillSegDims = textureDimensions(uFillSegmentTexA);
 
-  // Average the winding number over the footprint box. The bands spanning its
-  // rows hold every segment that can contribute; each integrates its own rows.
+  // Average the winding number over the footprint box. A path with a cell
+  // index reads only the cells under the box; otherwise the bands spanning
+  // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
+  if (inData.cells.y > 0.0) {
+    winding = heprCellWinding(inData.cells, inData.origin, box, footprint, uFillSegmentTexA, uFillSegmentTexB);
+  } else {
 ${vectorFillBandLoopWgsl({
     bands: "inData.bands",
     y: "inData.local.y",
@@ -515,6 +539,7 @@ ${vectorFillBandLoopWgsl({
       primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
 `
   })}
+  }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
   // A companion stroke no longer hides a hard fill edge: thin filled shapes
@@ -543,6 +568,7 @@ struct CameraUniforms {
   pad0 : f32,
   vectorOverride : vec4f,
   fillBands : vec4f,
+  fillCells : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -839,6 +865,7 @@ struct CameraUniforms {
   pad0 : f32,
   vectorOverride : vec4f,
   fillBands : vec4f,
+  fillCells : vec4f,
 };
 
 struct RasterUniforms {
@@ -1334,6 +1361,10 @@ export class WebGpuFloorplanRenderer {
   private primitiveColors: NativePrimitiveColors | null = null;
   private primitiveHighlights: WebGpuPrimitiveHighlights | null = null;
   private readonly primitiveGradientLayout: any;
+  /** Fold inputs (see `paintFoldFragmentWgsl`): bind group 2 of fills, 3 of gradient fills. */
+  private paintFolds: WebGpuPaintFolds | null = null;
+  private performanceProfiler: RenderPerformanceProfiler | null = null;
+  private frameTimer: WebGpuFrameTimer | null = null;
   private primitiveGradientColors: WebGpuPrimitiveGradientColors | null = null;
 
   private sceneStats: SceneStats | null = null;
@@ -1356,8 +1387,8 @@ export class WebGpuFloorplanRenderer {
   private externalFrameDriver = false;
   private isDisposed = false;
   private externalFramePending = false;
-  /** The GPU has not finished the last animation frame's work yet. */
-  private gpuFrameInFlight = false;
+  /** Animation frames whose GPU work has not finished yet. */
+  private gpuFramesInFlight = 0;
   /** A frame was requested while the GPU was busy; schedule it once the GPU is done. */
   private framePendingOnGpu = false;
 
@@ -1456,6 +1487,8 @@ export class WebGpuFloorplanRenderer {
   private fillBandEntries = 0;
   private gradientFillBandBase = -1;
   private gradientFillBandEntries = 0;
+  private fillCellBase = -1;
+  private gradientFillCellBase = -1;
   private fillPathMetaTextureWidth = 1;
 
   private fillPathMetaTextureHeight = 1;
@@ -1835,14 +1868,16 @@ export class WebGpuFloorplanRenderer {
     const strokePipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.strokeBindGroupLayout, this.vectorClipBindGroupLayout]
     });
+    this.paintFolds = new WebGpuPaintFolds(this.gpuDevice);
     const fillPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.fillBindGroupLayout, this.vectorClipBindGroupLayout]
+      bindGroupLayouts: [this.fillBindGroupLayout, this.vectorClipBindGroupLayout, this.paintFolds.layout]
     });
     this.primitiveGradientLayout = this.gpuDevice.createBindGroupLayout({ entries: [
       { binding: 0, visibility: gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } }
     ] });
     const gradientFillPipelineLayout = this.gpuDevice.createPipelineLayout({
-      bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout]
+      bindGroupLayouts: [this.gradientFillBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout,
+        this.paintFolds.layout]
     });
     const gradientStrokePipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.gradientStrokeBindGroupLayout, this.vectorClipBindGroupLayout, this.primitiveGradientLayout]
@@ -1866,8 +1901,11 @@ export class WebGpuFloorplanRenderer {
 
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.highlightPipeline = this.createPipeline(HIGHLIGHT_SHADER_SOURCE, "vsMain", "fsMain", highlightPipelineLayout);
-    this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
-    this.gradientFillPipeline = this.createPipeline(GRADIENT_FILL_WGSL, "vsMain", "fsMain", gradientFillPipelineLayout);
+    // A group chain holding one fill or analytic gradient draws that paint
+    // straight onto the surface with the chain's opacity and soft mask.
+    this.fillPipeline = this.createPipeline(paintFoldFragmentWgsl(FILL_SHADER_SOURCE, 2), "vsMain", "fsMain", fillPipelineLayout);
+    this.gradientFillPipeline = this.createPipeline(paintFoldFragmentWgsl(GRADIENT_FILL_WGSL, 3), "vsMain", "fsMain",
+      gradientFillPipelineLayout);
     this.gradientStrokePipeline = this.createPipeline(GRADIENT_STROKE_WGSL, "vsMain", "fsMain", gradientStrokePipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
     this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout, true);
@@ -1947,7 +1985,9 @@ export class WebGpuFloorplanRenderer {
       throw new Error("Failed to acquire a WebGPU adapter.");
     }
 
-    const device = await adapter.requestDevice();
+    // Timestamp queries cost nothing until a performance capture asks for them.
+    const device = await adapter.requestDevice(adapter.features?.has?.("timestamp-query")
+      ? { requiredFeatures: ["timestamp-query"] } : undefined);
     let context: any = null;
     try {
       if (typeof device.addEventListener === "function") {
@@ -2450,10 +2490,13 @@ export class WebGpuFloorplanRenderer {
 
     const segmentDims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
-    const fillBands = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, vectorFillBandIndex(scene), maxTextureSize);
-    this.fillBandBase = fillBands.pathBase;
-    this.fillBandEntries = fillBands.entryBase;
-    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
+    // The band and cell indexes follow the segments in the same store, so the
+    // texture is sized for all three. A store too large for one goes without.
+    const fillStore = vectorIndexedPathStore(vectorSceneFillStore(scene), vectorFillBandIndex(scene), maxTextureSize);
+    this.fillBandBase = fillStore.bandBase;
+    this.fillBandEntries = fillStore.bandEntries;
+    this.fillCellBase = fillStore.cellBase;
+    const fillSegmentDims = chooseTextureDimensions(fillStore.texels, maxTextureSize);
     let textInstanceDims = chooseTextureDimensions(
       textLodUploadData?.combinedInstanceCount ?? scene.textInstanceCount,
       maxTextureSize
@@ -2518,8 +2561,8 @@ export class WebGpuFloorplanRenderer {
     this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
     this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
     this.fillPathMetaTextureC = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaC);
-    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillBands.data);
-    this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsB);
+    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillStore.dataA);
+    this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillStore.dataB);
 
     const textInstanceTexels = this.textInstanceTextureWidth * this.textInstanceTextureHeight;
     this.textInstanceTextureA = this.createFloatTexture(
@@ -3088,6 +3131,11 @@ export class WebGpuFloorplanRenderer {
     this.primitiveColors = null;
     this.primitiveGradientColors?.dispose();
     this.primitiveGradientColors = null;
+    this.paintFolds?.dispose();
+    this.performanceProfiler?.dispose();
+    this.performanceProfiler = null;
+    this.frameTimer?.dispose();
+    this.frameTimer = null;
     this.orderedRunCuller = null;
     this.scenePaintVisibility = null;
     if (this.rafHandle !== 0) {
@@ -3287,7 +3335,7 @@ export class WebGpuFloorplanRenderer {
     });
   }
 
-  private requestFrame(): void {
+  requestFrame(): void {
     if (this.externalFrameDriver) {
       this.externalFramePending = true;
       return;
@@ -3299,17 +3347,25 @@ export class WebGpuFloorplanRenderer {
     // WebGPU submission never blocks, so an animation-frame loop can queue
     // frames faster than the GPU finishes them: input then lags behind the
     // queue and the frame listener counts callbacks, not finished frames.
-    // Start the next frame only once the GPU has finished the previous one.
-    if (this.gpuFrameInFlight) {
+    // A frame therefore starts only while at most the one before it is still
+    // on the GPU. Its encoding overlaps that frame's GPU work, as WebGL's
+    // does, without a backlog: while the GPU keeps up with the display the
+    // previous frame is done before this one is submitted, and while it
+    // cannot, this frame waits only for the rest of that one. Waiting for the
+    // previous frame's completion instead kept encoding from ever overlapping
+    // GPU work, and a 1.7 ms encode plus a 3 ms GPU frame then presented
+    // only every third 240 Hz vsync.
+    if (this.gpuFramesInFlight >= MAX_GPU_FRAMES_IN_FLIGHT) {
       this.framePendingOnGpu = true;
       return;
     }
 
     this.rafHandle = requestAnimationFrame((timestamp) => {
       this.rafHandle = 0;
-      // Requests made while rendering, such as continuing a camera animation,
-      // wait for this frame's GPU work as well.
-      this.gpuFrameInFlight = true;
+      // This frame counts as in flight while it renders, so a request made
+      // meanwhile, such as continuing a camera animation, waits once the
+      // previous frame is still on the GPU too.
+      this.gpuFramesInFlight++;
       try {
         this.render(timestamp);
       } finally {
@@ -3320,7 +3376,7 @@ export class WebGpuFloorplanRenderer {
 
   private waitForGpuFrame(): void {
     const finished = (): void => {
-      this.gpuFrameInFlight = false;
+      this.gpuFramesInFlight = Math.max(0, this.gpuFramesInFlight - 1);
       if (!this.framePendingOnGpu || this.isDisposed) {
         return;
       }
@@ -3335,8 +3391,33 @@ export class WebGpuFloorplanRenderer {
     queue.onSubmittedWorkDone().then(finished, finished);
   }
 
+  /** Opt-in diagnostics, as in the WebGL renderer; allocates nothing until requested by the host. */
+  getPerformanceProfiler(): RenderPerformanceProfiler {
+    this.frameTimer ??= new WebGpuFrameTimer(this.gpuDevice);
+    return this.performanceProfiler ??= new RenderPerformanceProfiler({ gpuTimer: this.frameTimer });
+  }
+
+  /** A command encoder whose render passes a sampled capture frame times. */
+  private createFrameEncoder(): any {
+    const encoder = this.gpuDevice.createCommandEncoder();
+    return this.frameTimer?.instrument(encoder) ?? encoder;
+  }
+
   private render(timestamp: number = performance.now()): void {
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    profile?.beginFrame(timestamp);
+    try { this.renderFrame(timestamp, profile); }
+    finally {
+      profile?.add("drawCalls", this.frameDrawCalls);
+      profile?.endFrame();
+    }
+  }
+
+  private renderFrame(timestamp: number, profile: RenderPerformanceProfiler | null): void {
     this.frameDrawCalls = 0;
+    this.paintFolds?.beginFrame();
+    profile?.setFrameContext({ cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom,
+      viewportWidth: this.canvas.width, viewportHeight: this.canvas.height, unitsPerPixel: 1 / Math.max(this.zoom, 1e-6) });
     const isCameraAnimating = this.updateCameraWithDamping(timestamp);
     this.updatePanReleaseVelocitySample(timestamp);
     if (
@@ -3379,11 +3460,14 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
-    if (this.shouldUsePanCache(isCameraAnimating)) {
-      this.renderWithPanCache();
-    } else {
-      this.renderDirectToScreen();
-    }
+    profile?.beginSection("drawSubmission");
+    try {
+      if (this.shouldUsePanCache(isCameraAnimating)) {
+        this.renderWithPanCache();
+      } else {
+        this.renderDirectToScreen();
+      }
+    } finally { profile?.endSection("drawSubmission"); }
     this.capturePresentedFrameState();
 
     if (isCameraAnimating) {
@@ -3463,8 +3547,9 @@ export class WebGpuFloorplanRenderer {
       );
 
       const view = this.gpuContext.getCurrentTexture().createView();
-      const encoder = this.gpuDevice.createCommandEncoder();
+      const encoder = this.createFrameEncoder();
       const pass = beginPdfManagedRenderPass(encoder, {
+        label: "frame",
         colorAttachments: [
           {
             view,
@@ -3503,8 +3588,9 @@ export class WebGpuFloorplanRenderer {
     }
 
     const view = this.gpuContext.getCurrentTexture().createView();
-    const encoder = this.gpuDevice.createCommandEncoder();
+    const encoder = this.createFrameEncoder();
     const pass = beginPdfManagedRenderPass(encoder, {
+      label: "frame",
       colorAttachments: [
         {
           view,
@@ -3605,8 +3691,9 @@ export class WebGpuFloorplanRenderer {
     }
 
     const effectiveZoom = this.computeVectorMinifyZoom(viewportWidth, viewportHeight);
-    const encoder = this.gpuDevice.createCommandEncoder();
+    const encoder = this.createFrameEncoder();
     const pass = beginPdfManagedRenderPass(encoder, {
+      label: "minify",
       colorAttachments: [
         {
           view: this.vectorMinifyTexture.createView(),
@@ -3689,8 +3776,9 @@ export class WebGpuFloorplanRenderer {
       this.updateStrokeVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
       this.needsVisibleSetUpdate = false;
 
-      const encoder = this.gpuDevice.createCommandEncoder();
+      const encoder = this.createFrameEncoder();
       const pass = beginPdfManagedRenderPass(encoder, {
+        label: "panCache",
         colorAttachments: [
           {
             view: this.panCacheTexture.createView(),
@@ -3808,6 +3896,7 @@ export class WebGpuFloorplanRenderer {
     pass.setBindGroup(0, this.gradientFillBindGroup);
     this.primitiveGradientColors ??= new WebGpuPrimitiveGradientColors(this.gpuDevice, this.primitiveGradientLayout);
     pass.setBindGroup(2, this.primitiveGradientColors.bindGroup("gradient-fill", pathIndex));
+    if (!meshCount) this.paintFolds?.bind(pass, 3);
     if (meshCount) {
       pass.setVertexBuffer(0, this.gradientMeshBuffer);
       pass.draw(meshCount, 1, this.gradientMeshRanges[pathIndex * 2], pathIndex);
@@ -3862,7 +3951,8 @@ export class WebGpuFloorplanRenderer {
     for (const buffer of this.vectorClipBuffers) buffer.destroy();
     this.vectorClipBuffers = [];
     this.vectorClipBindGroups = [];
-    const data = packVectorClips(scene.clipPaths);
+    // The clip WGSL reads cell storage, bounding each pixel's clip work at any zoom.
+    const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
     const dims = chooseTextureDimensions(data.length / 4, this.maxTextureSize());
     this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
     const usage = (globalThis as any).GPUBufferUsage;
@@ -3914,6 +4004,7 @@ export class WebGpuFloorplanRenderer {
         pass.setPipeline(multiplyPass === undefined ? pipeline : this.multiplyPipeline(pipeline, multiplyPass));
         this.bindVectorClip(pass);
         pass.setBindGroup(0, bindGroup);
+        if (run.kind === "fill") this.paintFolds?.bind(pass, 2);
         pass.draw(4, run.count, 0, run.first);
         this.frameDrawCalls += 1;
         if (run.kind === "stroke") strokes += run.count;
@@ -3967,7 +4058,18 @@ export class WebGpuFloorplanRenderer {
             y: (bounds.minY - this.paintCameraCenterY) * this.paintZoom + this.paintViewportHeight / 2,
             width: (bounds.maxX - bounds.minX) * this.paintZoom,
             height: (bounds.maxY - bounds.minY) * this.paintZoom
-          }));
+          }), {
+            // A group chain holding one fill or analytic gradient draws it
+            // straight onto the surface, scaled by its opacity and soft mask.
+            canFold: run => run.count === 1 && this.fillRenderingEnabled && (run.kind === "fill" ||
+              (run.kind === "gradient-fill" && !(this.gradientMeshRanges?.[run.first * 2 + 1] ?? 0))),
+            draw: (run, target, opacity, mask, content) => {
+              this.performanceProfiler?.add("foldedPaints");
+              this.paintFolds?.begin(opacity, mask, content);
+              pass = target;
+              try { draw(run); } finally { this.paintFolds?.end(); }
+            }
+          });
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
@@ -3988,6 +4090,7 @@ export class WebGpuFloorplanRenderer {
       pass.setPipeline(this.fillPipeline);
       this.bindVectorClip(pass);
       pass.setBindGroup(0, this.fillBindGroup);
+      this.paintFolds?.bind(pass, 2);
       pass.draw(4, this.fillPathCount, 0, 0);
       this.frameDrawCalls += 1;
     }
@@ -4092,6 +4195,9 @@ export class WebGpuFloorplanRenderer {
     data[17] = this.fillBandEntries;
     data[18] = this.gradientFillBandBase;
     data[19] = this.gradientFillBandEntries;
+    // Cell headers are stored plus one: zero means the store has none.
+    data[20] = this.fillCellBase + 1;
+    data[21] = this.gradientFillCellBase + 1;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
@@ -4166,8 +4272,9 @@ export class WebGpuFloorplanRenderer {
     this.updateBlitUniforms(offsetPxX, offsetPxY, sampleScale);
 
     const view = this.gpuContext.getCurrentTexture().createView();
-    const encoder = this.gpuDevice.createCommandEncoder();
+    const encoder = this.createFrameEncoder();
     const pass = beginPdfManagedRenderPass(encoder, {
+      label: "frame",
       colorAttachments: [
         {
           view,
@@ -4721,13 +4828,16 @@ export class WebGpuFloorplanRenderer {
     }
     const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
-    const fillBands = vectorFillBandStore(data.gradientFillSegmentsA, data.gradientFillSegmentCount,
-      buildVectorFillBandIndex({ pathCount: data.gradientFillPathCount, segmentCount: data.gradientFillSegmentCount,
-        pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
-        segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB }), maxTextureSize);
-    this.gradientFillBandBase = fillBands.pathBase;
-    this.gradientFillBandEntries = fillBands.entryBase;
-    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
+    const gradientStore = {
+      pathCount: data.gradientFillPathCount, segmentCount: data.gradientFillSegmentCount,
+      pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
+      segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB
+    };
+    const fillStore = vectorIndexedPathStore(gradientStore, buildVectorFillBandIndex(gradientStore), maxTextureSize);
+    this.gradientFillBandBase = fillStore.bandBase;
+    this.gradientFillBandEntries = fillStore.bandEntries;
+    this.gradientFillCellBase = fillStore.cellBase;
+    const fillSegmentDims = chooseTextureDimensions(fillStore.texels, maxTextureSize);
     const strokeRunDims = chooseTextureDimensions(data.gradientStrokeRunCount, maxTextureSize);
     const strokeSegmentDims = chooseTextureDimensions(data.gradientStrokeSegmentCount, maxTextureSize);
 
@@ -4753,8 +4863,8 @@ export class WebGpuFloorplanRenderer {
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaB),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaC),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPaintMeta),
-      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, fillBands.data),
-      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsB)
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, fillStore.dataA),
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, fillStore.dataB)
     ];
     this.gradientStrokeTextures = [
       this.createFloatTexture(strokeRunDims.width, strokeRunDims.height, data.gradientStrokeRunMetaA),
@@ -5259,8 +5369,9 @@ export class WebGpuFloorplanRenderer {
 
   private clearToScreen(): void {
     const view = this.gpuContext.getCurrentTexture().createView();
-    const encoder = this.gpuDevice.createCommandEncoder();
+    const encoder = this.createFrameEncoder();
     const pass = beginPdfManagedRenderPass(encoder, {
+      label: "frame",
       colorAttachments: [
         {
           view,

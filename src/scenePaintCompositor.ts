@@ -61,12 +61,25 @@ export interface ScenePaintCompositorAdapter<Surface> {
    */
   canFold?(run: VectorDrawRun): boolean;
   /**
-   * Draws that leaf with Normal source-over straight onto the destination, its
-   * alpha scaled by `opacity` and, given a mask surface, by the mask's red
-   * channel at each pixel. A group chain holding only that leaf then needs no
-   * surface or composite pass of its own.
+   * Whether `drawFolded` can compute, at each pixel of `run`, a soft mask
+   * whose only paint is `maskRun`, drawn once over the mask's transparent
+   * backdrop. Such a mask then needs no surface or render of its own.
    */
-  drawFolded?(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void;
+  canFoldMaskPaint?(run: VectorDrawRun, maskRun: VectorDrawRun): boolean;
+  /**
+   * Draws that leaf with Normal source-over straight onto the destination, its
+   * alpha scaled by `opacity` and, given a mask surface, by the mask's value at
+   * each pixel. A group chain holding only that leaf then needs no surface or
+   * composite pass of its own. Without `content` the mask surface holds its
+   * converted value in red. With it, the surface holds that soft mask's
+   * rendered content, which the draw converts itself exactly as operation 4
+   * would (see `paintFoldMaskWeights`); such a mask never has a transfer
+   * function, so the conversion stays linear in the pixel. With `maskRun`,
+   * there is no surface: the draw computes that content itself, as
+   * `canFoldMaskPaint` agreed to.
+   */
+  drawFolded?(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined,
+    content?: ScenePaintMask, maskRun?: VectorDrawRun): void;
 }
 
 interface CompositeDiagnostics {
@@ -106,8 +119,9 @@ function compositeStatsAdapter<Surface>(adapter: ScenePaintCompositorAdapter<Sur
     },
     pass: (operation, destination) => { stats.passes++; adapter.pass(operation, destination); },
     canFold: adapter.canFold && (run => adapter.canFold!(run)),
-    drawFolded: adapter.drawFolded && ((run, destination, opacity, mask) => {
-      stats.folds++; adapter.drawFolded!(run, destination, opacity, mask);
+    canFoldMaskPaint: adapter.canFoldMaskPaint && ((run, maskRun) => adapter.canFoldMaskPaint!(run, maskRun)),
+    drawFolded: adapter.drawFolded && ((run, destination, opacity, mask, content, maskRun) => {
+      stats.folds++; adapter.drawFolded!(run, destination, opacity, mask, content, maskRun);
     })
   };
 }
@@ -291,6 +305,19 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
   };
 
   /**
+   * The one paint a soft mask holds, when it holds nothing else and no
+   * transfer function reshapes its value. Over the mask's transparent backdrop
+   * that paint's blend mode leaves its colour as it is, so the paint alone is
+   * the mask's content.
+   */
+  const maskPaint = (softMask: ScenePaintMask): VectorDrawRun | null => {
+    if (softMask.transfer?.length || !adapter.canFoldMaskPaint) return null;
+    const child = soleChild(softMask.children);
+    const run = child?.kind === "draw" ? leaf(child) : null;
+    return run && run.count === 1 ? { ...run, blendMode: undefined } : null;
+  };
+
+  /**
    * Plain source-over accumulation into one surface, for a list of nodes whose
    * enclosing group neither knocks out nor reads its own geometric shape.
    *
@@ -347,9 +374,19 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
         flushSpan();
         const folded = fold(node);
         if (folded) {
+          const softMask = folded.mask?.softMask;
+          const maskRun = softMask && maskPaint(softMask);
+          if (maskRun && adapter.canFoldMaskPaint!(folded.run, maskRun)) {
+            adapter.drawFolded!(folded.run, current, folded.opacity, undefined, softMask, maskRun);
+            continue;
+          }
           // The mask renders exactly as the group would have prepared it.
-          const mask = folded.mask && maskSurface(folded.mask.softMask!, depth + 2, boundsOf(folded.mask.children));
-          adapter.drawFolded!(folded.run, current, folded.opacity, mask);
+          // Without a transfer function the folded draw converts the rendered
+          // content itself, which saves the conversion pass and its surface.
+          const content = softMask && !softMask.transfer?.length ? softMask : undefined;
+          const extent = folded.mask && boundsOf(folded.mask.children);
+          const mask = softMask && (content ? maskContent(softMask, depth + 2, extent) : maskSurface(softMask, depth + 2, extent));
+          adapter.drawFolded!(folded.run, current, folded.opacity, mask, content);
           if (mask) drop(mask);
           continue;
         }
@@ -386,12 +423,16 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
    */
   const maskSurface = (softMask: ScenePaintMask, depth: number, bounds: Bounds | undefined): Surface => {
     const extent = spread(boundsOf(softMask.children), bounds);
-    const rendered = accumulate(softMask.children, blank(extent), depth);
+    const rendered = maskContent(softMask, depth, bounds);
     const mask = take();
     adapter.pass({ operation: 4, source: rendered, softMask, bounds: extent }, mask);
     drop(rendered);
     return mask;
   };
+
+  /** A soft mask's content, rendered but not yet converted, over the same rectangle as `maskSurface`. */
+  const maskContent = (softMask: ScenePaintMask, depth: number, bounds: Bounds | undefined): Surface =>
+    accumulate(softMask.children, blank(spread(boundsOf(softMask.children), bounds)), depth);
 
   /**
    * An isolated group that does not knock out and whose shape nothing reads

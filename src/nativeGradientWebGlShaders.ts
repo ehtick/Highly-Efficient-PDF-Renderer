@@ -1,4 +1,5 @@
 import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
@@ -68,6 +69,9 @@ uniform ivec2 uPathMetaTexSize;
 uniform sampler2D uSegmentTexA;
 uniform ivec2 uSegmentTexSize;
 uniform int uBandBase;
+// Per-path cell headers follow in the same store, from one less than this
+// texel; zero means none.
+uniform int uCellHeaders;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -81,6 +85,9 @@ flat out int vSegmentStart;
 flat out int vSegmentCount;
 /** (first band texel, band count, first band's y, band height); zero count scans linearly. */
 flat out vec4 vBands;
+/** (first level texel, level count, finest cell size, level step); zero count uses the bands. */
+flat out vec4 vCells;
+flat out vec2 vCellOrigin;
 flat out int vSourceGradientIndex;
 flat out int vMaskGradientIndex;
 flat out vec3 vSolidColor;
@@ -129,6 +136,8 @@ void main() {
     vSegmentStart = 0;
     vSegmentCount = 0;
     vBands = vec4(0.0);
+    vCells = vec4(0.0);
+    vCellOrigin = vec2(0.0);
     vSourceGradientIndex = -1;
     vMaskGradientIndex = -1;
     vSolidColor = vec3(0.0);
@@ -151,6 +160,9 @@ void main() {
   vSegmentCount = segmentCount;
   vBands = uBandBase < 0 ? vec4(0.0)
     : texelFetch(uSegmentTexA, coordFromIndex(uBandBase + pathIndex, uSegmentTexSize), 0);
+  vCells = uCellHeaders <= 0 ? vec4(0.0)
+    : texelFetch(uSegmentTexA, coordFromIndex(uCellHeaders - 1 + pathIndex, uSegmentTexSize), 0);
+  vCellOrigin = metaA.zw;
   vSourceGradientIndex = int(round(paintMeta.x));
   vMaskGradientIndex = int(round(paintMeta.y));
   vSolidColor = vec3(metaB.z, metaB.w, metaC.z);
@@ -181,6 +193,8 @@ ${GRADIENT_COMMON}
 flat in int vSegmentStart;
 flat in int vSegmentCount;
 flat in vec4 vBands;
+flat in vec4 vCells;
+flat in vec2 vCellOrigin;
 flat in int vSourceGradientIndex;
 flat in int vMaskGradientIndex;
 flat in vec3 vSolidColor;
@@ -196,6 +210,16 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 
 ${FILL_COVERAGE_GLSL}
 
+vec4 heprCellFetchA(int index) {
+  return texelFetch(uSegmentTexA, coordFromIndex(index, uSegmentTexSize), 0);
+}
+
+vec4 heprCellFetchB(int index) {
+  return texelFetch(uSegmentTexB, coordFromIndex(index, uSegmentTexSize), 0);
+}
+
+${VECTOR_CELL_COVERAGE_GLSL}
+
 void main() {
   // Evaluate the pixel footprint before alpha tests or per-fragment clipping.
   float dxLocal = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
@@ -204,42 +228,47 @@ void main() {
   vec2 footprint = max(vec2(dxLocal, dyLocal) * uAAScreenPx, vec2(1e-4));
   if (vSegmentCount <= 0 || vAlpha <= 0.001) discard;
 
-  // Average the winding number over the footprint box. The bands spanning the
-  // box's rows hold every segment that can contribute, and each integrates
-  // only its own rows, so a segment held by two bands is not counted twice.
+  // Average the winding number over the footprint box, through the cells under
+  // it when the path has a cell index. Otherwise the bands spanning the box's
+  // rows hold every segment that can contribute, and each integrates only its
+  // own rows, so a segment held by two bands is not counted twice.
   vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
   float winding = 0.0;
-  int bandCount = int(vBands.y);
-  int firstBand = 0;
-  int lastBand = 0;
-  if (bandCount > 0) {
-    float bandHeight = vBands.w;
-    firstBand = clamp(int(floor((box.y - vBands.z) / bandHeight)), 0, bandCount - 1);
-    lastBand = clamp(int(floor((box.y + footprint.y - vBands.z) / bandHeight)), 0, bandCount - 1);
-  }
-
-  for (int band = firstBand; band <= lastBand; band += 1) {
-    int count = vSegmentCount;
-    int entry = 0;
+  if (vCells.y > 0.0) {
+    winding = heprCellWinding(vCells, vCellOrigin, box, footprint);
+  } else {
+    int bandCount = int(vBands.y);
+    int firstBand = 0;
+    int lastBand = 0;
     if (bandCount > 0) {
-      vec4 range = texelFetch(uSegmentTexA, coordFromIndex(int(vBands.x) + band, uSegmentTexSize), 0);
-      entry = int(range.x);
-      count = int(range.y);
+      float bandHeight = vBands.w;
+      firstBand = clamp(int(floor((box.y - vBands.z) / bandHeight)), 0, bandCount - 1);
+      lastBand = clamp(int(floor((box.y + footprint.y - vBands.z) / bandHeight)), 0, bandCount - 1);
     }
-    vec2 rows = heprBandRows(vBands, band, bandCount, box);
-    for (int primitiveIndex = 0; primitiveIndex < count; primitiveIndex += 1) {
-      int segment = vSegmentStart + primitiveIndex;
+
+    for (int band = firstBand; band <= lastBand; band += 1) {
+      int count = vSegmentCount;
+      int entry = 0;
       if (bandCount > 0) {
-        int packedIndex = entry + primitiveIndex;
-        vec4 packed = texelFetch(uSegmentTexA,
-          coordFromIndex(uBandEntries + (packedIndex >> 2), uSegmentTexSize), 0);
-        segment = int(packed[packedIndex & 3]);
+        vec4 range = texelFetch(uSegmentTexA, coordFromIndex(int(vBands.x) + band, uSegmentTexSize), 0);
+        entry = int(range.x);
+        count = int(range.y);
       }
-      ivec2 coord = coordFromIndex(segment, uSegmentTexSize);
-      vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
-      vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
-      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-        primitiveB.z >= 0.5, box, rows.x, rows.y);
+      vec2 rows = heprBandRows(vBands, band, bandCount, box);
+      for (int primitiveIndex = 0; primitiveIndex < count; primitiveIndex += 1) {
+        int segment = vSegmentStart + primitiveIndex;
+        if (bandCount > 0) {
+          int packedIndex = entry + primitiveIndex;
+          vec4 packed = texelFetch(uSegmentTexA,
+            coordFromIndex(uBandEntries + (packedIndex >> 2), uSegmentTexSize), 0);
+          segment = int(packed[packedIndex & 3]);
+        }
+        ivec2 coord = coordFromIndex(segment, uSegmentTexSize);
+        vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
+        vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
+        winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          primitiveB.z >= 0.5, box, rows.x, rows.y);
+      }
     }
   }
 

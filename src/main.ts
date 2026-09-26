@@ -420,13 +420,13 @@ let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
   start(options: RenderPerformanceOptions = {}): string {
-    if (!(renderer instanceof WebGlFloorplanRenderer)) {
-      throw new Error("This performance capture currently supports native WebGL. Select WebGL before starting.");
+    if (!(renderer instanceof WebGlFloorplanRenderer) && !(renderer instanceof WebGpuFloorplanRenderer)) {
+      throw new Error("This performance capture supports the native WebGL and WebGPU renderers.");
     }
     captureProfiler?.stop();
     captureProfiler = renderer.getPerformanceProfiler();
     captureContext = {
-      document: lastParsedSceneLabel, backend: "webgl",
+      document: lastParsedSceneLabel, backend: renderer instanceof WebGlFloorplanRenderer ? "webgl" : "webgpu",
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       viewAtStart: renderer.getViewState(),
       vectorLod: uiControlManager.readVectorLodModeInput(), textLod: uiControlManager.readTextLodModeInput(),

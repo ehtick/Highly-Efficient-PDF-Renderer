@@ -25,7 +25,7 @@ export const GRADIENT_MESH_FRAGMENT_GLSL = GRADIENT_FILL_FRAGMENT_SHADER_SOURCE
   if (meshA.y >= 0.5 && (meshPoint.x < meshE.x || meshPoint.y < meshE.y || meshPoint.x > meshE.z || meshPoint.y > meshE.w)) discard;`);
 
 export const GRADIENT_MESH_WGSL = GRADIENT_FILL_WGSL
-  .replace("struct FillOut {", "struct FillOut {\n  @location(9) meshColor : vec4f,")
+  .replace("struct FillOut {", "struct FillOut {\n  @location(12) meshColor : vec4f,")
   .replace("fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {",
     `fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) paintIndex : u32,
     @location(0) meshPosition : vec2f, @location(1) meshColor : vec4f) -> FillOut {`)

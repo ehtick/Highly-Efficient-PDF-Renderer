@@ -36,6 +36,7 @@ import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
 import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import { RenderPerformanceProfiler, type RenderPerformanceOptions } from "./renderPerformance";
+import { ThreeWebGpuFrameTimer } from "./threeWebGpuFrameTimer";
 import { describeThreePerformanceScene, instrumentThreeWebGlCalls, withThreeRenderPerformance } from "./threeRenderPerformance";
 import {
   filenameFromUrl,
@@ -912,8 +913,8 @@ textSearchCaseButtonElement.addEventListener("click", () => {
  *
  * Start it from the console with `heprPerf.start()`, or with `?perf=1` in the
  * URL to capture from the first frame, then read it back with `heprPerf.stop()`.
- * GPU timings need the WebGL backend's timer-query extension; WebGPU reports
- * CPU sections only.
+ * GPU timings use the WebGL backend's timer-query extension, or on WebGPU the
+ * renderer's own timestamp queries.
  */
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureGlCalls: ReturnType<typeof instrumentThreeWebGlCalls> | null = null;
@@ -926,7 +927,9 @@ const performanceCapture = {
     const gl = activeThreeRendererBackend === "webgl"
       ? (renderer as THREE.WebGLRenderer).getContext() : undefined;
     captureProfiler = new RenderPerformanceProfiler({
-      gl: gl instanceof WebGL2RenderingContext ? gl : undefined
+      gl: gl instanceof WebGL2RenderingContext ? gl : undefined,
+      // WebGPU has no timer-query context; Three times its render passes instead.
+      gpuTimer: activeThreeRendererBackend === "webgpu" ? new ThreeWebGpuFrameTimer(renderer as never) : undefined
     });
     captureContext = {
       diagnosticsVersion: 2, threeRevision: THREE.REVISION, browser: navigator.userAgent,

@@ -187,14 +187,23 @@ assert(occupied.current, "the host query remains active");
   const report = described.getReport().gpu.operations;
   assert.equal(report.status, "available");
   assert.equal(report.frameMs.samples, 3);
-  assert.equal(report.frameMs.average, 3 + 1 + 0.5 + 0.25);
+  assert.equal(report.frameMs.average, 3 + 1 + 0.5 + 0.25 + 27 / 3);
+  assert.equal(report.frameMs.p50, 3 + 1 + 0.5 + 0.25);
   assert.equal(report.operationsPerFrame.average, 4);
-  assert.deepEqual(report.byLabel.map(entry => [entry.label, entry.operationsPerFrame, entry.msPerFrame]),
-    [["fill → offscreen", 1, 3], ["clear → offscreen", 1, 1], ["program#1 → screen", 1, 0.5], ["blit → screen", 1, 0.25]],
-    "undescribed programs get a stable ordinal and targets follow framebuffer bindings");
+  assert.deepEqual(report.byLabel.map(entry => [entry.label, entry.operationsPerFrame, entry.msPerFrame, entry.medianMsPerFrame]),
+    [["fill → offscreen", 1, 12, 3], ["clear → offscreen", 1, 1, 1], ["program#1 → screen", 1, 0.5, 0.5],
+      ["blit → screen", 1, 0.25, 0.25]],
+    "undescribed programs get a stable ordinal and targets follow framebuffer bindings; medians ignore the stall");
   const [slowest] = report.slowest;
-  assert.deepEqual({ ...slowest }, { label: "fill → offscreen", ms: 3, order: 0, call: "drawArraysInstanced",
+  assert.deepEqual({ ...slowest }, { label: "fill → offscreen", ms: 30, order: 0, call: "drawArraysInstanced",
     vertices: 4, instances: 10, pixels: null, target: "offscreen", viewport: [100, 50], scissor: null });
+  assert.deepEqual(report.typical.map(detail => [detail.label, detail.order, detail.ms, detail.frames]),
+    [["fill → offscreen", 0, 3, 3], ["clear → offscreen", 1, 1, 3], ["program#1 → screen", 2, 0.5, 3],
+      ["blit → screen", 3, 0.25, 3]], "each position's median over the frames");
+  assert.deepEqual(report.typical.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
+  assert.deepEqual(report.byPosition, [{ order: 0, label: "fill → offscreen", instances: 10, ms: 3 },
+    { order: 1, label: "clear → offscreen", instances: null, ms: 1 }, { order: 2, label: "program#1 → screen", instances: 1, ms: 0.5 },
+    { order: 3, label: "blit → screen", instances: null, ms: 0.25 }], "every position in frame order, briefly");
   assert.deepEqual(report.slowest.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
   assert.equal(report.slowest.find(detail => detail.call === "blitFramebuffer").pixels, 600);
   assert.equal(report.slowest.length, 12);
@@ -283,7 +292,115 @@ assert.equal(withoutRecords.counters.drawBatches.total, 7);
 assert.equal(correlated.frameContexts.length, 0, "recording can be disabled without storing per-frame context objects");
 assert.equal(correlated.frameGpuTimes.length, 0, "restart discards prior GPU-to-frame associations");
 correlated.dispose();
-console.log("Render profiling passed: opt-in CPU metrics, bounded captures, asynchronous GPU sampling, disjoint clocks and cleanup.");
+// An integration without WebGL can time its own frames: the profiler asks it
+// for every fourth frame and collects what completes, without waiting.
+{
+  const { GpuOperationStats } = await import("../src/renderPerformance.ts");
+  assert.equal(new GpuOperationStats().frames, 0);
+  const begun = [], results = [];
+  let cancelled = 0;
+  const timer = {
+    unavailableReason: null, note: "external timer note",
+    beginFrame(frame) { begun.push(frame); return true; },
+    endFrame() {},
+    takeResults() { return results.splice(0); },
+    cancel() { cancelled++; return 1; }
+  };
+  const external = new RenderPerformanceProfiler({ gpuTimer: timer, now: () => 0 });
+  external.start({ maxFrames: 12, gpuOperations: true });
+  const pass = (label, ms, order) => ({ label, ms, order, call: "renderPass", vertices: null, instances: 2,
+    pixels: null, target: "offscreen", viewport: [0, 0], scissor: null });
+  for (let frame = 0; frame < 9; frame++) {
+    external.beginFrame(frame * 10);
+    external.endFrame();
+    if (frame === 0) results.push({ frame: 0, ms: 3, operations: [pass("span", 1, 0), pass("fold", 0.5, 1)] });
+    if (frame === 4) results.push({ frame: 4, ms: null });
+  }
+  assert.deepEqual(begun, [0, 4, 8], "every fourth frame is sampled");
+  const report = external.stop();
+  assert.equal(report.gpu.status, "available");
+  assert.deepEqual([report.gpu.frameMs.samples, report.gpu.frameMs.p50], [1, 3]);
+  assert.equal(report.gpu.droppedSamples, 2, "an unusable frame and one still in flight are dropped");
+  assert.equal(cancelled, 1, "stopping cancels what is in flight");
+  assert.deepEqual(report.gpu.operations.byLabel.map(entry => [entry.label, entry.msPerFrame]), [["span", 1], ["fold", 0.5]]);
+  assert.deepEqual(report.gpu.operations.byPosition.map(entry => [entry.order, entry.label, entry.instances]), [[0, "span", 2], [1, "fold", 2]]);
+  assert.equal(report.notes.at(-1), "external timer note");
+  const missing = new RenderPerformanceProfiler({ gpuTimer: { ...timer, unavailableReason: "no timestamps" }, now: () => 0 });
+  missing.start({ maxFrames: 2 });
+  assert.deepEqual([missing.getReport().gpu.status, missing.getReport().gpu.reason], ["unavailable", "no timestamps"]);
+  missing.dispose();
+}
+
+// Native WebGPU times every render pass of a sampled frame with timestamps.
+{
+  const { WebGpuFrameTimer } = await import("../src/webGpuFrameTimer.ts");
+  assert.match(new WebGpuFrameTimer({ features: new Set() }).unavailableReason, /timestamp-query/);
+  const passes = [], submitted = [];
+  let readback = null;
+  const device = {
+    features: new Set(["timestamp-query"]),
+    createQuerySet: descriptor => ({ descriptor }),
+    createBuffer(descriptor) {
+      const buffer = { descriptor, mapAsync: async () => {}, unmap() {}, destroy() {},
+        getMappedRange: () => {
+          // Pass i runs from 1000 + 100 i to 1000 + 100 i + 40 (ns x 1000).
+          const times = new BigUint64Array(passes.length * 2);
+          passes.forEach((_, i) => { times[i * 2] = BigInt((1000 + 100 * i) * 1000); times[i * 2 + 1] = BigInt((1040 + 100 * i) * 1000); });
+          return times.buffer;
+        } };
+      if (descriptor.usage & 1) readback = buffer;
+      return buffer;
+    },
+    createCommandEncoder: () => ({ commands: [], resolveQuerySet(...args) { this.commands.push(["resolve", ...args]); },
+      copyBufferToBuffer(...args) { this.commands.push(["copy", ...args]); }, finish() { return this.commands; } }),
+    queue: { submit(buffers) { submitted.push(...buffers); } }
+  };
+  const encoder = { beginRenderPass(descriptor) { passes.push(descriptor); return { draw() {}, end() {} }; } };
+  const timer = new WebGpuFrameTimer(device);
+  assert.equal(timer.unavailableReason, null);
+  assert.equal(timer.instrument(encoder), encoder, "encoders outside sampled frames are left alone");
+  assert.equal(timer.beginFrame(4), true);
+  const timed = timer.instrument(encoder);
+  const span = timed.beginRenderPass({ label: "span", colorAttachments: [] });
+  span.draw(4); span.draw(4); span.end();
+  timed.beginRenderPass({ label: "frame", colorAttachments: [] }).end();
+  assert.deepEqual(passes.map(pass => [pass.timestampWrites.beginningOfPassWriteIndex, pass.timestampWrites.endOfPassWriteIndex]),
+    [[0, 1], [2, 3]], "each pass writes its own pair of timestamps");
+  timer.endFrame();
+  assert.deepEqual(submitted.map(buffer => buffer.map(command => command[0])), [["resolve", "copy"]],
+    "one command buffer resolves the whole frame");
+  assert.ok(readback);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const [result] = timer.takeResults();
+  assert.equal(result.frame, 4);
+  assert.ok(Math.abs(result.ms - 0.14) < 1e-9, "the frame spans its first pass's start to its last pass's end");
+  assert.deepEqual(result.operations.map(operation => [operation.label, operation.instances, operation.target]),
+    [["span", 2, "offscreen"], ["frame", 0, "screen"]]);
+  assert.ok(result.operations.every(operation => Math.abs(operation.ms - 0.04) < 1e-9));
+  timer.dispose();
+}
+
+// Three WebGPU turns its own timestamp tracking on for a sampled frame only.
+{
+  const { ThreeWebGpuFrameTimer } = await import("../src/threeWebGpuFrameTimer.ts");
+  const backend = { trackTimestamp: false, device: { features: new Set(["timestamp-query"]) } };
+  let trackedAtResolve = null;
+  const renderer = { backend, resolveTimestampsAsync() { trackedAtResolve = backend.trackTimestamp; return Promise.resolve(2.5); } };
+  const timer = new ThreeWebGpuFrameTimer(renderer);
+  assert.equal(timer.beginFrame(8), true);
+  assert.equal(backend.trackTimestamp, true);
+  timer.endFrame();
+  assert.equal(trackedAtResolve, true, "tracking is still on as the resolve starts");
+  assert.equal(backend.trackTimestamp, false, "and off again for unsampled frames");
+  assert.equal(timer.beginFrame(12), false, "one frame resolves at a time");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(timer.takeResults(), [{ frame: 8, ms: 2.5 }]);
+  assert.equal(timer.beginFrame(12), true);
+  assert.equal(timer.cancel(), 1);
+  assert.equal(backend.trackTimestamp, false);
+}
+
+console.log("Render profiling passed: opt-in CPU metrics, bounded captures, asynchronous GPU sampling, WebGPU timestamps, disjoint clocks and cleanup.");
 
 function fakeGl(options = {}) {
   const state = { calls: [], queries: [], disjoint: false, current: null };
@@ -334,7 +451,9 @@ function operationGl() {
     }
     getQueryParameter(query, parameter) {
       assert.equal(query.deleted, false);
-      return parameter === 11 ? query.available : durations[query.call] * 1_000_000;
+      // The first timed frame's fill stalls, as a cold frame can.
+      const stall = query.call === "drawArraysInstanced" && query.frame === 2 ? 10 : 1;
+      return parameter === 11 ? query.available : durations[query.call] * stall * 1_000_000;
     }
     deleteQuery(query) { assert.equal(query.deleted, false); query.deleted = true; }
     useProgram() {} bindFramebuffer() {} viewport() {} scissor() {} enable() {} disable() {}

@@ -167,6 +167,10 @@ try {
   assert.match(GRADIENT_MESH_FRAGMENT_GLSL, /vec4 source = vMeshColor;/);
   assert.match(GRADIENT_MESH_WGSL, /let pathIndex = i32\(paintIndex\);/);
   assert.match(GRADIENT_MESH_WGSL, /let source = inData.meshColor;/);
+  // The mesh color joins the fill's varyings; a shared location fails pipeline creation.
+  const meshVaryings = [...GRADIENT_MESH_WGSL.match(/struct FillOut \{[\s\S]*?\};/)[0].matchAll(/@location\((\d+)\)/g)]
+    .map(match => match[1]);
+  assert.equal(new Set(meshVaryings).size, meshVaryings.length, `mesh varyings use distinct locations: ${meshVaryings}`);
   console.log("vector shading mesh: function/free-form/lattice/Coons/tensor, bounded subdivision, geometry, picking, Three, composition and HEP passed");
 } finally { hooks.deregister(); }
 

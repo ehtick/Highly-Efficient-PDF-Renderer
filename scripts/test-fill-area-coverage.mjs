@@ -241,7 +241,9 @@ for (const [file, language] of [
   const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
   assert(source.includes(`FILL_COVERAGE_${language}`), `${file} includes the shared area filter`);
   assert(source.includes("heprSegmentCoverage("), `${file} integrates segments over the footprint`);
-  assert(source.includes(`FILL_COVERAGE_VERTEX_${language}`) && source.includes("heprCoverageMargin("),
+  // Clip-clamped paint quads take the same margin through heprClippedPaintQuad.
+  assert(source.includes(`FILL_COVERAGE_VERTEX_${language}`) &&
+    (source.includes("heprCoverageMargin(") || source.includes("heprClippedPaintQuad(")),
     `${file} widens quads to reach subpixel shapes`);
   assert.doesNotMatch(source, /clamp\(0\.5 - signedDistance/, `${file} has no single-edge fill filter left`);
 }

@@ -10,6 +10,7 @@ try {
   const { compositeScenePaintGraph, pdfCompositeScissorRect } = await import("../src/scenePaintCompositor.ts");
   const { PDF_BLEND_MODES } = await import("../src/scenePaintGraph.ts");
   const { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_WGSL } = await import("../src/pdfCompositeShaders.ts");
+  const { paintFoldMaskWeights } = await import("../src/nativePaintFold.ts");
   const close = (actual, expected, tolerance = 1e-7) => actual.forEach((v, i) => assert(Math.abs(v - expected[i]) <= tolerance,
     `channel ${i}: ${v} != ${expected[i]}`));
   close(compositePdfPixel([0,0,1,1],[0.5,0,0,0.5]),[0.5,0,0.5,1]);
@@ -27,6 +28,9 @@ try {
 
   render.blending = false;
   render.folding = false;
+  render.foldedContent = 0;
+  render.maskPaints = false;
+  render.maskPaintFolds = 0;
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null) {
     const alive = new Set(); let draws=0;
     render.spans=[]; render.passes=0; render.surfaces=0; render.folds=0;
@@ -65,12 +69,23 @@ try {
         else s.pixel=[...source];
       },
       // A folded leaf scales its premultiplied colour by the chain's opacity and
-      // mask, then composites Normal onto the destination in a single draw.
+      // mask, then composites Normal onto the destination in a single draw. The
+      // mask value comes from the shipped weights, so a mask handed over as raw
+      // content checks their linear conversion against operation 4 above.
+      // With mask paints on, a folded leaf also computes a mask made of one
+      // paint itself: that paint alone over the mask's transparent backdrop.
       ...(render.folding ? {
         canFold: run => run.count === 1,
-        drawFolded(run, s, opacity, mask) {
+        canFoldMaskPaint: (run, maskRun) => render.maskPaints && maskRun.count === 1 && !maskRun.blendMode,
+        drawFolded(run, s, opacity, mask, content, maskRun) {
           render.folds++;
-          const scale = opacity * (mask ? mask.pixel[0] : 1);
+          if (content) render.foldedContent++;
+          if (maskRun) { assert.equal(mask, undefined, "a computed mask has no surface"); render.maskPaintFolds++; }
+          const pixel = maskRun ? compositePdfPixel(zero, paints[maskRun.first].color) : mask?.pixel;
+          const weights = paintFoldMaskWeights(content);
+          const value = pixel ? Math.min(1, Math.max(0, weights[4] +
+            pixel.reduce((sum, channel, index) => sum + channel * weights[index], 0))) : 1;
+          const scale = opacity * value;
           s.pixel = compositePdfPixel(s.pixel, paints[run.first].color.map(v => v * scale));
         }
       } : {})
@@ -229,20 +244,32 @@ try {
   render.blending = false;
 
   // Broschuere's fades: an opacity group around a soft-masked group around one
-  // fill. Folding draws that fill once, scaled by 0.47 and the mask; only the
-  // mask's own conversion pass remains.
-  const fade = [g([g([d(0)],{softMask:{children:[d(1)],subtype:"Luminosity"}})],{alpha:0.47})];
+  // fill. Folding draws that fill once, scaled by 0.47 and the mask, and the
+  // draw converts the mask's rendered luminosity itself, so no pass remains. A
+  // transfer function is not linear and keeps the mask's conversion pass.
+  const fadeMask = {children:[d(1)],subtype:"Luminosity",backdrop:[0.9,0.2,0.4]};
   const fadePaints = [red, {color:[0.2,0.6,0.3,0.8],shape:1}];
-  for (const blending of [false, true]) {
-    render.blending = blending;
-    const composed = render(fade, fadePaints, [0.3,0.4,0.5,1]);
-    const composedPasses = render.passes, composedSurfaces = render.surfaces;
-    render.folding = true;
-    close(render(fade, fadePaints, [0.3,0.4,0.5,1]), composed, 1e-12);
-    assert.deepEqual({folds:render.folds,passes:render.passes}, {folds:1,passes:1},
-      "the fade draws once, keeping only the mask's luminosity pass");
-    assert(render.surfaces < composedSurfaces && render.passes < composedPasses, "folding saves surfaces and passes");
-    render.folding = false;
+  for (const [transfer, passes] of [[undefined, 0], [new Float32Array([0.1, 0.8, 1]), 1]]) {
+    const fade = [g([g([d(0)],{softMask:{...fadeMask,...(transfer ? {transfer} : {})}})],{alpha:0.47})];
+    for (const blending of [false, true]) {
+      render.blending = blending;
+      const composed = render(fade, fadePaints, [0.3,0.4,0.5,1]);
+      const composedPasses = render.passes, composedSurfaces = render.surfaces;
+      render.folding = true;
+      close(render(fade, fadePaints, [0.3,0.4,0.5,1]), composed, 1e-12);
+      assert.deepEqual({folds:render.folds,passes:render.passes}, {folds:1,passes},
+        transfer ? "a transferred mask keeps its conversion pass" : "the fade draws once and converts its own mask");
+      assert(render.surfaces < composedSurfaces && render.passes < composedPasses, "folding saves surfaces and passes");
+      // A mask of one paint needs no surface when the fold computes it.
+      const foldedSurfaces = render.surfaces;
+      render.maskPaints = true; render.maskPaintFolds = 0;
+      close(render(fade, fadePaints, [0.3,0.4,0.5,1]), composed, 1e-12);
+      assert.equal(render.maskPaintFolds, transfer ? 0 : 1, transfer ? "a transfer keeps the mask's surface"
+        : "the fade computes its one-paint mask");
+      if (!transfer) assert(render.surfaces < foldedSurfaces, "and so saves the mask's surface");
+      render.maskPaints = false;
+      render.folding = false;
+    }
   }
 
   // Randomized graphs: folding changes nothing but cost. Isolation, knockout,
@@ -278,9 +305,14 @@ try {
     render.folding = true;
     close(render(roots, paints, backdrop, visible), expected, 1e-9);
     folded += render.folds;
+    render.maskPaints = true;
+    close(render(roots, paints, backdrop, visible), expected, 1e-9);
+    render.maskPaints = false;
     render.folding = false;
   }
   assert(folded > 300, `randomized graphs exercise folding (${folded} folded paints)`);
+  assert(render.foldedContent > 50, `and folds converting their mask's content (${render.foldedContent})`);
+  assert(render.maskPaintFolds > 50, `and folds computing a one-paint mask (${render.maskPaintFolds})`);
   render.blending = false;
 
   assert(PDF_COMPOSITE_FRAGMENT_GLSL.includes("pdfSetLum"));

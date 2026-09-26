@@ -1,5 +1,381 @@
 # Broschuere rendering performance investigation
 
+## Half the Three render calls, and WebGPU frame pacing (September 26)
+
+Captures at fit-all, with mask-content folding and lighting off in Three:
+
+| Backend | Frame interval p50 | CPU p50 | GPU p50 |
+| --- | --- | --- | --- |
+| Native WebGL | 4.2 ms (238 FPS) | 1.9–2.5 ms | 3.7–3.8 ms |
+| Native WebGPU | 12.5 ms (80 FPS) | 1.7 ms | 3.0 ms |
+| Three WebGL | 8.4 ms (119 FPS) | 6.2–6.7 ms | 5.8–6.3 ms |
+| Three WebGPU | 25 ms (40 FPS) | 19.9–21.2 ms | 3.2 ms |
+
+### Native WebGPU frame pacing
+
+Native WebGPU needed about 4.7 ms of CPU and GPU time but presented every
+third 240 Hz vsync. Its loop waited for each frame's `onSubmittedWorkDone`
+before it requested the next animation frame. Encoding therefore never
+overlapped GPU work, and a frame plus the completion's trip back to the page
+missed two vsyncs.
+
+A frame may now start while the frame before it is still on the GPU, but never
+while two frames are. This is not a queue of finished frames waiting to be
+shown. Here the next frame spends 1.7 ms encoding, which is longer than the
+0.5 ms or so the previous frame still needs on the GPU. So the previous frame
+has finished before the next one is submitted, and input waits for nothing.
+Only a GPU slower than the display makes a frame wait, and then only for the
+rest of the one frame ahead of it. Chrome gives WebGL the same overlap: its
+next animation frame does not wait for the GPU either. Afterwards native WebGPU
+ran close to native WebGL.
+
+### Three: one render call per surface, not per operation
+
+Three WebGPU gives every `renderer.render()` call its own command encoder,
+render pass and `queue.submit`. Chrome's `GPUQueue::submit` flushes to the GPU
+process at once (`FlushNow()`), so each call costs about 110 µs of page time
+here. Three's own JavaScript is about 34 µs of that in the mock-device run.
+The compositor made 149 calls a frame, and cutting the call count is the fix
+that stays within Three's normal rendering.
+
+- **Batching.** Consecutive compositor operations into the same surface now
+  share one host render.
+  - Each queued mesh applies its own state in `onBeforeRender` and restores it
+    in `onAfterRender`. That state is a folded paint's opacity and mask, shape
+    coverage, or a composite pass's inputs. Three WebGPU reads per-object
+    uniforms and textures as it draws each mesh. WebGL uploads them again
+    because `uniformsNeedUpdate` is set.
+  - A paint drawn twice in one batch uses a separate stand-in mesh and subset
+    buffer each time.
+  - Composite passes cover their rectangle with a unit quad placed by a
+    clip-space uniform instead of a scissor. Three sets the scissor per render
+    call, so a scissored pass could not join a batch.
+  - A batch renders before anything writes a surface it reads or draws into.
+- **Computed gradient masks.** 28 of the 29 folded masks were one axial
+  gradient over the page, under one four-edge clip inside the folded paint's
+  own clip. Rendering each one cost a clear and a render. It also split the
+  running surface's batch in two.
+  - The folded paint now computes such a mask at each fragment. It uses the
+    gradient's colour table, bound in place of the mask surface, and a
+    pixel-to-gradient homography. Coverage comes from up to eight half-planes
+    for the paint's outline and its one extra clip.
+  - Anything else keeps the rendered mask: a mesh gradient, a gradient masked
+    by another, a curved or concave outline or clip, a deeper clip chain, a
+    colour override, or geometry behind the camera.
+- **Smaller fixes.**
+  - The blend pass material was `transparent` and double-sided, and Three r185
+    draws such a material twice, back faces first. That cost 12 wasted draws a
+    frame.
+  - The page background texture was re-uploaded every frame because its colour
+    was set unconditionally.
+  - Pass inputs switched between nearest and linear placeholders, which made
+    Three free and recreate a sampler every frame.
+  - The compositor's scene and camera no longer update their world matrices on
+    every call.
+
+In the mock-device run, a frame now makes 71 compositor render calls (was
+149), 3 clears and 75 queue submissions (was 153), and 193 indexed draws (was
+220). A capture is needed to see what that buys in Chrome. At about 110 µs
+per call, it should roughly halve Three WebGPU's CPU time. Three WebGL makes
+the same calls, so it should gain too.
+
+The remaining calls are mostly masked isolated groups, whose mask content
+renders and then converts in a pass of its own. The rest are blend-mode groups,
+which copy their backdrop, and three non-isolated groups.
+
+## Three WebGPU: where the CPU time goes (September 26)
+
+Captures after the changes below, at fit-all on the same machine:
+
+| Backend | Frame interval p50 | CPU p50 | GPU p50 |
+| --- | --- | --- | --- |
+| Native WebGL | 4.2 ms (238 FPS) | 2.4 ms | 4.6 ms |
+| Three WebGL | 8.4 ms (119 FPS) | 6.7 ms | 7.9 ms |
+| Three WebGPU | 29.2 ms (34 FPS) | 24.9 ms | 8.5 ms |
+
+Three WebGPU is bound by CPU. Of its 24.9 ms, 12.4 ms go to about 104
+`renderer.render()` calls that draw paints and 7.0 ms to 73 that run passes,
+about 110 µs per call. Each call begins a command encoder and a render pass
+and submits them: 182 of each per frame.
+
+Driving the real WebGPURenderer and Three object against a mock device in
+Node measures Three's own JavaScript at 6.9 ms per frame, so the rest of the
+browser's cost is most likely in its WebGPU calls. Two findings from that
+profile are fixed:
+
+- With lighting enabled, WebGPURenderer rehashes the scene's lights node once
+  per render call, which was 16–20% of the JavaScript. The compositor now turns
+  lighting off while it renders; none of its materials are lit.
+- 35 soft masks are one gradient each with a luminosity conversion and no
+  transfer function, and 29 of them feed folded paints. Both conversions are
+  linear in the premultiplied pixel, so the folded paint now reads the mask's
+  rendered content and converts it itself, as `dot(pixel, weights) + bias`.
+  That saves 29 passes on every backend.
+
+In the mock-device run, Three WebGPU now makes 149 render calls (was 178) and
+44 composite passes (was 73), and its JavaScript takes 4.8 ms per frame.
+
+## Three and WebGPU: native WebGL's savings, and captures (September 26)
+
+The first three differences below are now fixed; no captures yet.
+
+- Three's gradient quads are clamped to their clip chain's bounds. Three always
+  projects through local-to-clip, so the margin is the largest at any of the
+  clamped rectangle's corners. On Broschuere this shades 0.26 M gradient pixels
+  instead of 1.87 M.
+- Three (WebGL and WebGPU) and native WebGPU fold single-paint group chains
+  holding a fill or an analytic gradient fill. All 29 folds on Broschuere are
+  such fills (21) and gradients (8), each with a soft mask. The compositor then
+  issues 55 clears, 61 passes, 12 copies and 75 spans plus 29 folded draws,
+  instead of 104 clears, 110 passes, 12 copies and 104 spans.
+- On WebGPU a clear waits for the next pass into its surface, which clears as
+  it loads. Native WebGPU then encodes 171 render passes for Broschuere instead
+  of about 320, and only 4 of them only clear. Three WebGPU does the same with
+  `autoClear`, saving each clear's pass and submission.
+- `heprPerf` captures native WebGPU, with CPU sections and GPU times from
+  timestamp queries on every render pass, and Three WebGPU through Three's
+  timestamps.
+
+## Three WebGL: what the first capture shows (September 26)
+
+At fit-all, Three WebGL frames arrive 8.4 ms apart at the median (120 FPS)
+and 10.5 ms on average. CPU time is 7.3 ms per frame, against 2.3–2.7 ms
+native. The GPU command span is 8.2 ms. Fills and gradient fills match native
+draw for draw (same instance counts), and so do their stores (579 cell-indexed
+fill paths), clip packing and shaders. Three frames the document smaller,
+though, at zoom 0.183 against native's 0.224; at that zoom the fill model
+predicts 2.08 ms for native, against 2.26 ms at 0.224.
+
+Four differences account for the gap:
+
+- Three's gradient quads cover the whole path, not its intersection with the
+  clip chain's bounds. That is 1.87 M pixels per frame against native's
+  0.26 M, and gradient fills take 2.14 ms against 1.01 ms.
+- Three does not fold single-paint group chains. The shared compositor then
+  issues 104 clears, 122 passes and copies, and 104 spans, where native WebGL
+  issues 55, 73, and 75 spans plus 29 folded draws. The capture's 105 clears
+  and 122 passes match the unfolded counts.
+- Each `renderer.render()` costs about 14 µs of CPU per mesh (native: about
+  6 µs per operation), and a frame makes 229 of them: 105 draw groups and
+  124 passes.
+- Fills take 3.56 ms, against the 2.08 ms the model predicts, with the same
+  program and data. The capture cannot tell why. One candidate is a GPU held
+  at lower clocks while a CPU-bound frame keeps it waiting. To be rechecked
+  once the CPU cost falls.
+
+Native WebGPU cannot be captured yet: `heprPerf` in the native viewer supports
+WebGL only, and Three WebGPU reports CPU sections without GPU times. Native
+WebGPU does not fold either, and there a clear, a span and a pass each begin
+their own render pass, about 340 per frame.
+
+## WebGPU and Three: the same indexes (September 26)
+
+Native WebGPU, Three WebGL and Three WebGPU now use the fill cells, gradient
+fill cells and cell-indexed clips that native WebGL uses. Clip antialiasing is
+also sample-only on all four. Three WebGL already ran native WebGL's GLSL, so it
+needed only the stores and the cell uniform. The WGSL cell coverage matches
+the GLSL on every test box to 1e-12. The WGSL clip was translated to C++ and
+compared with a brute-force point-in-polygon test over 9,919 points per layout
+(cells and bands): 0 mismatches in point tests and in 4×4 sample coverage.
+Each of ten deliberate errors in it was caught. No captures yet.
+
+The native WebGPU gradient mesh shader has not compiled since the band header
+joined the gradient fill's varyings (49ffc7a): both used location 9. The mesh
+color now has a location of its own.
+
+## Native WebGL: a draw's pieces come from memory (September 26)
+
+With one texel per line, frames arrive 5.5 ms apart on average at fit-all
+(181 FPS, up from 175) and 4.2 ms at the median. The GPU command span fell from
+5.1 to 4.8 ms p50. The capture now times every operation position
+(`byPosition`), and their medians attribute 3.8 ms of the frame. Fills take
+2.25 ms of that, gradient fills 1.03 ms, and everything else, including 55
+clears and 35 soft-mask passes, 0.5 ms. The logo draws fell as the model
+predicted: #303 from 0.21 to 0.13 ms, #60 from 0.10 to 0.06 ms. #354, whose
+densest path is 60% quadratics, stayed at 0.22 ms.
+
+Fitted over all 80 fill draws, a draw costs about 0.7 µs per dependent read
+step of its worst pixel, plus about 0.1 ms per million texel fetches
+(R² 0.74). A step of 0.4–0.8 µs is about one trip to GPU memory. A draw's
+pieces are rarely cached: the piece textures (39 MB) exceed the L2 cache, and
+each draw reads different paths. Coarser cells than half the footprint model
+20% worse; finer ones gain 1–10%, depending on where each path's cell sizes
+fall.
+
+Reading more pieces per step did not pay off. Line cells read eight texels
+per step and curve cells four pieces per step; the fitted model predicted
+fills falling from 2.26 to 1.56 ms, and the capture measured 2.25 against
+2.26 ms. The logo draw #303 fell from 0.131 to 0.114 ms, but the wide draws
+each grew by 5–8 µs, and #354 stayed at 0.22 ms. #354 is limited by curve
+arithmetic, not by fetches, and the step model overrates wider reads. The
+change was reverted. Native WebGL now runs at 240 FPS at the median while
+panning at fit-all, with about 4.7 ms of GPU time per frame.
+
+## Native WebGL: fills fetch one texel per line (September 26)
+
+Captures at fit-all after sample-only clip antialiasing. Frames now arrive
+4.2 ms apart at the median on the 240 Hz display, 240 FPS, but 5.7 ms on
+average (175 FPS): about a third of frames miss a refresh. The GPU command span
+fell from 6.5 to 5.1 ms p50, and CPU time is 2.4 ms p50 and 4.7 ms p95. Timed
+operations sum to 4.9 ms. Gradient fills fell from 2.7 to 1.0 ms per frame
+(the model predicted −57%, the capture shows −63%). Fills fell only from 3.0
+to 2.8 ms and are now most of the frame. Clears come next, at 0.6 ms for 55
+per frame.
+
+Fill draws cost time in two ways. Tiny dense draws, such as logos of 555–692
+segments in 7×6 pixels, last as long as their slowest pixel. Reading one piece
+ahead cut them by 12–19%. Wide draws of 40,000–67,000 pixels have worst pixels
+under 200 units, yet take 0.07–0.10 ms. The frame's fills do 11.2 M units of
+work, and those draws get through it at about 8 G units/s, so fetch
+throughput matters too. 99.5% of cell pieces are lines, yet each piece took
+two RGBA32F texels. The two piece textures hold 1099² texels each, 39 MB
+together, more than the GPU's 24 MB L2 cache.
+
+- **One texel per line.** A piece now keeps its endpoints in texture A and a
+  curve's control point and flag in B. A cell holding a curve (1,017 of
+  27,552 cells in this frame) stores its piece count negated. Other cells read
+  their lines four at a time, one texel each. In the model, the fill draws'
+  worst-pixel read steps drop from 6.6k to 2.7k and total fetches from 11.4 M
+  to 9.5 M. Gradient fills use the same cells.
+
+Two questions remain open. Draw #354 is bound by curve arithmetic: its densest
+path is 60% quadratics, so its cells take the curve loop. Draws #303 and #60
+draw the same logo with the same modelled work, yet #303 takes twice as long.
+The profiler now lists every operation position (`byPosition`), so the next
+capture can account for all 364 operations, not just the slowest 16.
+
+## Native WebGL: draws last as long as their slowest pixels (September 25)
+
+After the previous round, a `gpuOperations` capture panning at fit-all
+measured fills at 3.0 ms and gradient fills at 2.7 ms per frame (medians),
+against a model that predicted about 2.0 and 1.5 ms. The capture's per-position
+medians (`typical`) show why. The most expensive draws are tiny: a fill draw
+covering 426 pixels takes 0.26 ms, and gradient fills of 182 pixels take 0.23
+ms, while a fill covering 67,000 pixels takes 0.12 ms.
+
+The model ranks draws by their slowest pixel, the one with the most
+dependent texture reads. That ranking reproduces the capture's list almost in
+order. For gradient fills, the draws whose worst pixel does 1,100–1,450 units
+of work take 0.22–0.27 ms, and those near 550 take about 0.15 ms: roughly 0.2
+µs per unit, about one texture read's latency plus its arithmetic. Summed over
+the frame, the slowest pixel of each fill and gradient-fill draw comes to 27k
+units, about 6 ms of a 7 ms frame. Pixel counts and total work barely matter.
+Draws effectively run one after another, and each takes as long as its
+slowest group of 32 pixels. Untimed spans match the timed sums, so this is
+not an artefact of the per-operation queries.
+
+Those worst pixels come from small, very dense geometry. One fill path packs
+688 segments into 7×5 pixels. Gradient clips are flattened into 1,027–4,824
+edges; at a clip's edge the worst pixel spent 566 units on the distance probe
+and another 875 on its samples.
+
+- **Clip antialiasing from the samples alone.** The distance probe only
+  decided whether to sample, but the 16 samples already give inside or
+  outside. Each node now clears the bits of the samples outside it, reading
+  cells about the size of the sample spread (0.75 pixels) rather than the
+  probe's 1.5. Antialiased clips no longer run the point test either. In the model, the
+  sum of gradient draws' worst pixels drops from 13.2k to 5.7k units at
+  fit-all, and from 3.5k to 2.1k at zoom 0.56.
+- **Reads before use.** Sample loops read four edges before testing any, and
+  fill cells read the next piece and the next cell's record before computing
+  the current piece. The dependent latencies then overlap instead of adding
+  up. The model counts reads, not latency, so it cannot estimate this.
+
+Coverage is unchanged. The shipped clip GLSL compiled as C++ still matches
+brute-force 16-sample coverage on every checked query, for cells and bands,
+and catches broken closures, rows, band rows, rectangle bounds and unroll
+masks. `test-vector-cell-index` evaluates the read-ahead fill loop and fails
+if the read-ahead or the pair mask is off by one.
+
+## Native WebGL: after the cell index (September 25)
+
+Two captures at fit-all (zoom 0.224, panning), one with `gpuOperations`,
+measure the cell index. The GPU command span fell from 15.3 ms p50 to 6.6–6.7
+ms. Frames now arrive 8.3 ms apart at the median on a 240 Hz display, which is
+120 FPS: the GPU still misses every other refresh. CPU time per frame is 3.1 ms
+p50 and 6.7 ms p95.
+
+The timed operations sum to 6.7 ms p50, matching the span. Means per frame
+were gradient fills 3.4 ms, fills 2.8 ms, clears 0.8 ms (55 per frame), text
+0.6 ms, blits 0.5 ms and compositor passes 0.4 ms. The first timed frame after
+the view settled took 89 ms and inflates each of these means; the profiler now
+also reports medians (see the manual).
+
+The frame model, updated for cells, explains most of the remaining gradient
+time. At a clip's boundary, each of the 16 antialiasing samples walked the
+whole clip chain again, which made up two thirds of the clip work. Fills spend
+theirs on dense small paths, such as 1,294 segments in 49×49 pixels: with a
+level step of four, a pixel read cells up to four times its size.
+
+- **Clip samples in one pass.** A clip node with an edge near the pixel now
+  clears the bits of the samples outside it, reading the cells or bands the
+  probe already chose. Nodes with no edge in reach hold every sample or none.
+  The frame model's sample work drops from 0.49 M to 0.09 M units, and the
+  gradient fills' total from 0.74 M to 0.35 M.
+- **Finer fill cells.** A pixel reads the finest level whose cells are at least
+  half its footprint, up to 3×3 cells. Fill work drops from 1.14 M to 0.88 M
+  units at fit-all and from 0.79 M to 0.63 M at zoom 0.158, with no change in
+  memory. Level step 2, compared with step 1, fits 579 paths instead of 109 in
+  the same budget.
+
+Both keep coverage unchanged. The shipped clip GLSL, compiled as C++ with
+float32 arithmetic, matches brute-force 16-sample coverage on 9,833 queries
+for cell and band layouts, and fails when its closures, row selection, band
+rows or rectangle test are broken. The same check against a JS mirror runs in
+`test-vector-cell-index`.
+
+The cell uniforms now count from one: Three's WebGL materials reuse the core
+fill shader without setting them, and a zero base would have read segment data
+as cell headers. Zero now means that no path has cells.
+
+## Native WebGL: per-operation GPU times and the cell index (September 25)
+
+A `gpuOperations` capture (zoom 0.158, panning) settled where the frame's GPU
+time goes. The timed operations sum to 16.2 ms p50 against a 15.8 ms command
+span, so the GPU is busy, not waiting for commands:
+
+| Operations | Per frame | GPU ms per frame |
+| --- | ---: | ---: |
+| Gradient fills | 64 | 7.96 |
+| Fills | 80 | 7.15 |
+| Clears, raster, text, blits, composites, strokes | 220 | about 1.6 |
+
+One fill draw of 13 paths took about 2.1 ms in every timed frame. Three of
+its paths have 1,540–1,708 segments in only 12–13 horizontal bands, each 0.01
+px tall at that zoom, so every pixel's footprint covered all the bands and
+visited every segment about twice: 3,000 on average, 6,100 at worst. Gradient
+fills are mostly four-segment rectangles, but their clips are polygons of
+1,027–4,096 flattened edges in bands 0.03–0.25 px tall; the antialiased clip
+probe visited 350–570 edges per pixel. Bands only divide paths vertically, so
+once they are thinner than a pixel they stop limiting the work. That is why
+zooming out never made frames cheaper.
+
+Native WebGL now indexes fills, gradient fills and clip polygons with a
+multi-level grid of cells (`src/vectorCellIndex.ts`). A pixel reads the finest
+level whose cells span its footprint, splits its box at the cells' column
+edges, evaluates only the segment pieces in those cells exactly, and accounts
+for everything right of a column through a few closures per cell: the
+vertical extents of right-hand geometry telescope to the points where the
+path crosses the column's edge. Coverage matches the unindexed sum up to
+rounding; `test-vector-cell-index` checks exact agreement on dyadic geometry,
+Float32 and curve tolerances elsewhere, and 7,078 clip winding and distance
+probes against brute force.
+
+Modelled per-tile work at the captured view (the slowest pixel of each 8×4
+block, summed; it matched the measured 15 ms before this change):
+
+| Work | Bands | Cells |
+| --- | ---: | ---: |
+| Fill segment visits | 1.08 M | 0.45 M |
+| Gradient clip edge visits | 0.97 M | 0.30 M |
+
+Fill iterations also drop from three dependent fetches to two independent
+ones. Of the remaining clip work, 0.18 M is antialiasing samples, each still a
+full point test; evaluating all 16 samples in the probe's pass over the same
+cells would remove most of it. The index adds about 0.3 s to scene upload for
+this document and uses 1.2 M texels for fills (from 0.24 M segments) and 0.4 M
+for clips. Only a new capture can show the resulting frame time.
+
 ## Native WebGL fit-all: follow-up capture (September 25)
 
 A capture after the changes below (same document, viewport, DPR, zoom 0.224,

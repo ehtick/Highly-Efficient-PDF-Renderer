@@ -1,9 +1,11 @@
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
-import { vectorFillBandIndex, vectorFillBandStore } from "./vectorFillBands";
+import { vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
+import { vectorIndexedPathStore } from "./vectorCellIndex";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { enableThreeNodePaintFold, enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
@@ -77,8 +79,11 @@ export class ThreeMaterialFillLayer {
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
     const pathTextureSize = chooseTextureSize(fillPathCount);
-    const bands = vectorFillBandStore(scene.fillSegmentsA, fillSegmentCount, vectorFillBandIndex(scene));
-    const segmentTextureSize = chooseTextureSize(bands.texels);
+    // The band and cell indexes follow the segments in the same store, so the
+    // texture is sized for all three. A store too large for one goes without.
+    const store = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathCount: fillPathCount,
+      segmentCount: fillSegmentCount }, vectorFillBandIndex(scene));
+    const segmentTextureSize = chooseTextureSize(store.texels);
 
     this.fillPathMetaTextureA = createFloatTexture(
       scene.fillPathMetaA,
@@ -99,14 +104,14 @@ export class ThreeMaterialFillLayer {
       pathTextureSize.height
     );
     this.fillSegmentTextureA = createFloatTexture(
-      bands.data,
-      bands.texels,
+      store.dataA,
+      store.texels,
       segmentTextureSize.width,
       segmentTextureSize.height
     );
     this.fillSegmentTextureB = createFloatTexture(
-      scene.fillSegmentsB,
-      fillSegmentCount,
+      store.dataB,
+      store.dataB.length / 4,
       segmentTextureSize.width,
       segmentTextureSize.height
     );
@@ -152,8 +157,9 @@ export class ThreeMaterialFillLayer {
         fillSegmentTextureB: this.fillSegmentTextureB,
         fillPathTextureWidth: pathTextureSize.width,
         fillSegmentTextureWidth: segmentTextureSize.width,
-        fillBandBase: bands.pathBase,
-        fillBandEntries: bands.entryBase,
+        fillBandBase: store.bandBase,
+        fillBandEntries: store.bandEntries,
+        fillCellBase: store.cellBase,
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
@@ -163,11 +169,12 @@ export class ThreeMaterialFillLayer {
       state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
       this.webGpuState = state;
       material = state.material;
+      enableThreeNodePaintFold(state.material);
     } else {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
         vertexShader: normalizeThreeRawShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeThreeRawShaderSource(CORE_FILL_FRAGMENT_SHADER_SOURCE, true),
+        fragmentShader: normalizeThreeRawShaderSource(threePaintFoldFragmentGlsl(CORE_FILL_FRAGMENT_SHADER_SOURCE), true),
         transparent: false,
         depthTest: false,
         depthWrite: false,
@@ -177,8 +184,10 @@ export class ThreeMaterialFillLayer {
           uFillPathMetaTexA: { value: this.fillPathMetaTextureA },
           uFillPathMetaTexB: { value: this.fillPathMetaTextureB },
           uFillPathMetaTexC: { value: this.fillPathMetaTextureC },
-          uFillBandBase: { value: bands.pathBase },
-          uFillBandEntries: { value: bands.entryBase },
+          uFillBandBase: { value: store.bandBase },
+          uFillBandEntries: { value: store.bandEntries },
+          // Stored plus one: zero means the store has no cell index.
+          uFillCellHeaders: { value: store.cellBase + 1 },
           uFillSegmentTexA: { value: this.fillSegmentTextureA },
           uFillSegmentTexB: { value: this.fillSegmentTextureB },
           uFillPathMetaTexSize: {
@@ -196,6 +205,8 @@ export class ThreeMaterialFillLayer {
           uVectorOverride: { value: this.vectorOverrideUniform }
         }
       });
+      // A group chain holding one fill draws it straight onto the surface.
+      enableThreeRawPaintFold(material as THREE.RawShaderMaterial);
     }
     configureStraightAlphaBlending(material);
 

@@ -8,6 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 } });
 try {
   const { WebGpuPaintCompositor, beginPdfManagedRenderPass } = await import("../src/webGpuPaintCompositor.ts");
+  const { WebGpuPaintFolds } = await import("../src/webGpuPaintFold.ts");
   const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
@@ -93,6 +94,88 @@ try {
   assert.equal(transferUpload.layout.bytesPerRow, 32);
   assert.deepEqual([...transferUpload.pixels.slice(0, 17)], [...transfer]);
   nextPass.end(); nextEncoder.finish();
+
+  // A group chain holding one fill folds onto it: the fill draws straight onto
+  // the parent surface with the chain's opacity and the mask surface's view.
+  const foldEncoder = makeEncoder(), foldPass = beginPdfManagedRenderPass(foldEncoder,
+    { colorAttachments: [{ view: target.createView(), loadOp: "load", storeOp: "store" }] });
+  const folded = [];
+  draws.length = 0;
+  compositor.render(masked, foldPass, 6, 6, draw, () => true, null, null, {
+    canFold: run => run.kind === "fill",
+    draw(run, pass, opacity, mask) { folded.push({ run, opacity, mask }); pass.draw(3); }
+  });
+  assert.deepEqual(folded.map(fold => [fold.run.first, fold.opacity]), [[0, 0.5]], "the masked group folds onto its fill");
+  assert.ok([...compositor.all].some(surface => surface.view === folded[0].mask), "the fold reads the mask surface");
+  assert.deepEqual(draws.map(draw => draw.run.map(run => run.first)), [[1]], "only the mask's content draws as a span");
+  foldPass.end(); foldEncoder.finish();
+
+  // A clear rides on the next pass that renders into its surface, rather than
+  // costing a render pass of its own; a surface read first is cleared first.
+  {
+    const log = [], parentView = { texture: {} };
+    const logEncoder = {
+      beginRenderPass(descriptor) {
+        const attachment = descriptor.colorAttachments[0];
+        const entry = { view: attachment.view, loadOp: attachment.loadOp, clearValue: attachment.clearValue, draws: 0 };
+        log.push(entry);
+        return { setPipeline() {}, setBindGroup(_index, group) { entry.reads = group.entries?.map(e => e.resource); },
+          setScissorRect() {}, draw() { entry.draws++; }, end() {} };
+      },
+      copyTextureToTexture() { log.push({ copy: true }); }, finish() {}
+    };
+    const runPasses = graph => {
+      log.length = 0;
+      const parentPass = beginPdfManagedRenderPass(logEncoder, { colorAttachments: [{ view: parentView, loadOp: "load", storeOp: "store" }] });
+      compositor.render(graph, parentPass, 6, 6, draw, () => true);
+      parentPass.end();
+      return log.filter(entry => !entry.copy && entry.view !== parentView);
+    };
+    const passes = runPasses(masked);
+    assert.deepEqual(passes.filter(entry => entry.draws === 0), [], "no pass only clears");
+    assert.ok(passes.some(entry => entry.loadOp === "clear" && entry.clearValue.a === 0 && entry.draws > 0),
+      "a span pass clears its surface as it loads");
+    const emptyMask = { ...masked, paintGraph: { roots: [{ ...masked.paintGraph.roots[0],
+      softMask: { subtype: "Alpha", children: [] } }] } };
+    const emptyPasses = runPasses(emptyMask);
+    const clearOnly = emptyPasses.findIndex(entry => entry.draws === 0);
+    assert.ok(clearOnly >= 0, "an empty mask's surface is still cleared");
+    assert.equal(emptyPasses[clearOnly].loadOp, "clear");
+    assert.ok(emptyPasses.slice(clearOnly + 1).some(entry => entry.reads?.some(read => read === emptyPasses[clearOnly].view)),
+      "before the mask pass reads it");
+  }
+
+  // Fold slots: the neutral fold sits at offset 0, each fold of a frame takes a
+  // slot of its own, and an outgrown buffer lives until the next frame.
+  {
+    const bound = [], folds = new WebGpuPaintFolds(device);
+    const pass = { setBindGroup(index, group, offsets) { bound.push({ index, group, offsets }); } };
+    writes.length = 0;
+    folds.beginFrame();
+    folds.bind(pass, 2);
+    assert.deepEqual(bound.at(-1).offsets, [0], "unfolded draws bind the neutral slot");
+    assert.deepEqual([...writes.find(write => write.values.length === 8).values], [1, 0, 0, 0, 0, 0, 0, 0]);
+    const maskView = { texture: {} };
+    folds.begin(0.25, maskView); folds.bind(pass, 3); folds.end();
+    assert.equal(bound.at(-1).index, 3);
+    assert.deepEqual(bound.at(-1).offsets, [256], "the first fold takes slot 1");
+    assert.equal(bound.at(-1).group.entries[1].resource, maskView, "the fold binds its mask");
+    assert.equal(bound.at(-1).group.entries[0].resource.size, 32, "each fold binds its opacity and mask weights");
+    assert.deepEqual([...writes.at(-1).values], [0.25, 1, 0, 0, 1, 0, 0, 0], "a converted mask is read from red");
+    // Unconverted luminosity content over a white backdrop: lum(rgb) - a + 1.
+    folds.begin(0.5, maskView, { subtype: "Luminosity", backdrop: [1, 1, 1], children: [] }); folds.end();
+    assert.deepEqual([...writes.at(-1).values], [...Float32Array.of(0.5, 1, 1, 0, 0.3, 0.59, 0.11, -1)]);
+    folds.bind(pass, 2);
+    assert.deepEqual(bound.at(-1).offsets, [0], "a fold ends with its draw");
+    const first = bound.at(-1).group.entries[0].resource.buffer;
+    for (let fold = 0; fold < 64; fold++) { folds.begin(1, null); folds.end(); }
+    folds.bind(pass, 2);
+    assert.notEqual(bound.at(-1).group.entries[0].resource.buffer, first, "more folds than slots grow the buffer");
+    assert.equal(first.destroyed, undefined, "the outgrown buffer stays alive for this frame's commands");
+    folds.beginFrame();
+    assert.equal(first.destroyed, true, "and is released by the next frame");
+    folds.dispose();
+  }
   assert(firstTextures.some(texture => texture.descriptor.size[0] === 4 && texture.destroyed),
     "obsolete target sizes are released when the renderer advances to its next submitted-frame encoder");
 
@@ -124,7 +207,7 @@ try {
   assert(Math.abs(bounded.width / bounded.height - 4096 / 2160) < .01, "resolution downgrade preserves projection aspect ratio");
   assert.equal(choosePdfCompositeResolution(scene, 320, 200).scale, 1, "ordinary viewports retain full resolution");
   assert.equal(pdfShapeCoverageWgsl("let color = textureSample(x,y,z) * uRaster.matrixB.z;"), "let color = textureSample(x,y,z) ;");
-  console.log("native paint compositor: queue-write isolation, resize lifetime, transfer atlas, failure cleanup, resolution budgets and shape opacity passed");
+  console.log("native paint compositor: queue-write isolation, resize lifetime, transfer atlas, folding, failure cleanup, resolution budgets and shape opacity passed");
 } finally { hooks.deregister(); }
 
 function makeEncoder() {

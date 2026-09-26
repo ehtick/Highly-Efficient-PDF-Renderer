@@ -178,6 +178,9 @@ try {
     spanHost.draws.length = 0;
     const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
       width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
+    // A pass covers its rectangle with geometry placed by a clip-space uniform,
+    // which it sets as it draws.
+    spanHost.rectOf = mesh => mesh.geometry.getAttribute("aSegmentIndex") ? undefined : spanCompositor.passRect.toArray();
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true, boundedProject);
     const boundedClears = spanHost.clears.filter(clear => clear.scissorTest);
     if (backend === "webgl") {
@@ -191,13 +194,14 @@ try {
     assert.ok(blended, "group opacity uses the hardware blending pass");
     assert.equal(blended.blendSrc, THREE.OneFactor, "effect output is premultiplied on both backends");
     assert.equal(blended.blendDst, THREE.OneMinusSrcAlphaFactor);
-    assert.equal(blended.scissorTest, true);
-    assert.ok(backend === "webgpu" ? blended.scissor[1] > 140 : blended.scissor[1] < 100,
-      "WebGPU target scissors convert the shared bottom-left rectangle to top-left");
-    assert.ok(blended.scissor[2] < 30 && blended.scissor[3] < 30,
-      "a small effect does not shade the full target");
+    // Three sets a scissor per render call, so a scissored pass could never
+    // share a render with the draws around it.
+    assert.ok(effects.every(draw => !draw.scissorTest), "passes restrict themselves with geometry, not a scissor");
+    const [minX, minY, maxX, maxY] = blended.rect;
+    assert.ok(maxX - minX < 30 / 160 && maxY - minY < 30 / 120, "a small effect does not shade the full target");
+    assert.ok(minY < 0 && maxY < 0, "clip space counts the shared bottom-left rectangle upwards on both backends");
     assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
-    assert.ok(effects.some(draw => !draw.scissorTest), "pooled target scissors reset for the full root copy");
+    assert.ok(effects.some(draw => draw.rect.join() === "-1,-1,1,1"), "the root copy covers the whole target");
     spanHost.draws.length = 0;
     spanHost.clears.length = 0;
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
@@ -224,11 +228,13 @@ try {
     spanCompositor.renderer = spanHost;
     spanHost.draws.length = 0;
     const partialTarget = spanCompositor.acquire();
+    // Draws queue into a batch that renders when something needs its result.
     spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    spanCompositor.flush();
     assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5]], "subset membership uses canonical origins");
     assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2]], "clip roots are gathered with instance IDs");
     const proxy = spanCompositor.proxies.get(proxySource);
-    const originalPartial = proxy.partialGeometry;
+    const originalPartial = proxy.partialGeometries[0];
     const originalIds = originalPartial.getAttribute("aSegmentIndex");
     const originalClips = originalPartial.getAttribute("aVectorClipIndex");
     const borrowedCorner = geometry.getAttribute("aCorner"), borrowedIndex = geometry.index;
@@ -242,36 +248,42 @@ try {
       assert.equal(originalPartial.index, null, "borrowed indices cannot be disposed");
     });
     geometry.instanceCount = 3;
+    spanCompositor.collect([proxySource]);
     spanCompositor.draw([{ kind: "stroke", first: 9, count: 1 }], partialTarget, false);
-    assert.equal(proxy.partialGeometry, originalPartial,
+    spanCompositor.flush();
+    assert.equal(proxy.partialGeometries[0], originalPartial,
       "revealing more instances reuses the source-sized partial allocation");
     assert.equal(partialDisposals, 0);
     geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(f([10, 5, 12, 5]), 1));
     geometry.setAttribute("aVectorClipIndex", new THREE.InstancedBufferAttribute(f([1, 2, 3, 4]), 1));
     geometry.instanceCount = 4;
     spanHost.draws.length = 0;
-    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    // A frame starts by collecting its meshes, before anything is queued.
+    spanCompositor.collect([proxySource]);
     assert.equal(partialDisposals, 1, "growing source capacity retires the previous owned GPU buffers");
-    assert.notEqual(proxy.partialGeometry, originalPartial);
+    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    spanCompositor.flush();
+    assert.notEqual(proxy.partialGeometries[0], originalPartial);
     assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5, 5]]);
     assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2, 4]]);
     assert.equal(geometry.getAttribute("aCorner"), borrowedCorner);
     assert.equal(geometry.index, borrowedIndex);
     const originalGeometryForRuns = spanCompositor.geometryForRuns;
     let inputCount = 0;
-    spanCompositor.geometryForRuns = function(entry, runs) {
+    spanCompositor.geometryForRuns = function(entry, runs, use) {
       inputCount = runs.length;
-      return originalGeometryForRuns.call(this, entry, runs);
+      return originalGeometryForRuns.call(this, entry, runs, use);
     };
     spanCompositor.draw([{ kind: "stroke", first: 3, count: 7 }], partialTarget, false);
+    spanCompositor.flush();
     assert.equal(inputCount, 1, "a merged run reaching three ranges on one proxy is collected only once");
     spanCompositor.geometryForRuns = originalGeometryForRuns;
     assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: [{ first: 3, count: 7 }] }, [
       { kind: "stroke", first: 7, count: 3 }, { kind: "stroke", first: 3, count: 4 }
-    ]), geometry, "adjacent inputs jointly cover a range without copying or uploading instances");
+    ], 0), geometry, "adjacent inputs jointly cover a range without copying or uploading instances");
     const overlap = spanCompositor.geometryForRuns(proxy, [
       { kind: "stroke", first: 3, count: 7 }, { kind: "stroke", first: 7, count: 1 }
-    ]);
+    ], 0);
     assert.equal(overlap, geometry, "a shorter overlapping input cannot hide the enclosing range's tail");
     let rangeReads = 0;
     const manyRanges = Array.from({ length: 4096 }, (_, index) => ({
@@ -279,11 +291,11 @@ try {
     }));
     const manyRuns = manyRanges.map(range => ({ kind: "stroke", first: range.first, count: 1 }));
     rangeReads = 0;
-    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: manyRanges }, manyRuns), geometry);
+    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: manyRanges }, manyRuns, 0), geometry);
     assert.ok(rangeReads < manyRanges.length * 4,
       "large scheduled meshes must not rescan the entire input span for each canonical range");
     let replacementDisposals = 0;
-    proxy.partialGeometry.addEventListener("dispose", () => replacementDisposals++);
+    proxy.partialGeometries[0].addEventListener("dispose", () => replacementDisposals++);
     spanCompositor.release(partialTarget); spanCompositor.renderer = null;
     spanCompositor.dispose(); spanStroke.dispose();
     assert.equal(partialDisposals, 1, "retired partial geometry is disposed only once");
@@ -367,6 +379,8 @@ try {
     for (const mesh of slotMeshes) { mesh.geometry.dispose(); mesh.material.dispose(); }
 
     testProxyReplacement(ThreePaintCompositor, backend);
+    await testFolding(ThreePaintCompositor, backend);
+    await testGradientMaskFolding(ThreePaintCompositor, backend);
 
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
@@ -383,7 +397,7 @@ try {
   matrix.elements[3] = 4;
   assert.equal(projectThreePdfCompositeBounds({ minX: -1, minY: -1, maxX: 1, maxY: 1 }, matrix, 200, 100), null,
     "a rectangle crossing the perspective near plane conservatively keeps a full pass");
-  console.log("Three PDF compositor state, canonical subsets, shape coverage, pooling, and staged raster updates passed");
+  console.log("Three PDF compositor state, canonical subsets, shape coverage, folding, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
 
 function makeRenderer(backend = "webgpu") {
@@ -392,6 +406,8 @@ function makeRenderer(backend = "webgpu") {
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
     clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], clears: [], targets: [], fail: false,
+    // WebGPURenderer's lighting manager; WebGLRenderer has none.
+    ...(backend === "webgpu" ? { lighting: { enabled: true } } : {}), litRenders: 0,
     getRenderTarget() { return this.target; },
     setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; this.targets.push(target); },
     getActiveCubeFace() { return this.cube; }, getActiveMipmapLevel() { return this.mip; },
@@ -412,9 +428,14 @@ function makeRenderer(backend = "webgpu") {
         camera.coordinateSystem = this.coordinateSystem;
         camera.updateProjectionMatrix();
       }
+      if (this.lighting?.enabled) this.litRenders++;
       if (this.fail) throw new Error("synthetic draw failure");
       assert.equal(this.scissorTest, this.target.scissorTest, "WebGPU also needs the renderer scissor-test flag");
-      for (const mesh of scene.children) {
+      // Like Three: meshes draw in render order, each between its own hooks,
+      // which is where the compositor applies a batched mesh's state.
+      for (const mesh of [...scene.children].sort((a, b) => a.renderOrder - b.renderOrder)) {
+        mesh.onBeforeRender(this, scene, camera, mesh.geometry, mesh.material, null);
+        this.onMesh?.(mesh);
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
         this.draws.push({ call: this.call,
           tag: mesh.material.uniforms?.uTestTag?.value,
@@ -423,15 +444,180 @@ function makeRenderer(backend = "webgpu") {
           clips: mesh.geometry.getAttribute("aVectorClipIndex") && Array.from({ length: mesh.geometry.instanceCount },
             (_, i) => mesh.geometry.getAttribute("aVectorClipIndex").getX(i)),
           blending: mesh.material.blending, blendSrc: mesh.material.blendSrc, blendDst: mesh.material.blendDst,
-          scissor: this.target.scissor.toArray(), scissorTest: this.target.scissorTest });
+          scissor: this.target.scissor.toArray(), scissorTest: this.target.scissorTest, rect: this.rectOf?.(mesh) });
+        mesh.onAfterRender(this, scene, camera, mesh.geometry, mesh.material, null);
       }
     }
   };
 }
+// A Normal group holding one fill, with an opacity and a soft mask, folds onto
+// that fill: it draws straight onto the parent surface with the chain's
+// factors, and needs no surface, clear or composite pass of its own.
+async function testFolding(ThreePaintCompositor, backend) {
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { threePaintFoldState } = await import("../src/threePaintFold.ts");
+  const square = (x, y, size) => [[x, y], [x + size, y], [x + size, y + size], [x, y + size]];
+  const paths = [square(1, 1, 4), square(2, 2, 6)];
+  const a = [], b = [], metaA = [], metaB = [], metaC = [];
+  for (const points of paths) {
+    const start = a.length / 4;
+    points.forEach(([x0, y0], index) => { const [x1, y1] = points[(index + 1) % points.length];
+      a.push(x0, y0, x0, y0); b.push(x1, y1, 0, 0); });
+    const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+    metaA.push(start, points.length, Math.min(...xs), Math.min(...ys));
+    metaB.push(Math.max(...xs), Math.max(...ys), 1, 0);
+    metaC.push(0, 0, 0, 1);
+  }
+  const f = values => Float32Array.from(values);
+  const group = { kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
+    softMask: { subtype: "Alpha", children: [{ kind: "draw", runIndex: 1 }] }, children: [{ kind: "draw", runIndex: 0 }] };
+  const scene = Object.assign(createEmptyVectorScene(), {
+    pageRects: f([0, 0, 10, 10]), pageBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    fillPathCount: 2, fillSegmentCount: a.length / 4, fillPathMetaA: f(metaA), fillPathMetaB: f(metaB),
+    fillPathMetaC: f(metaC), fillSegmentsA: f(a), fillSegmentsB: f(b),
+    drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
+    paintGraph: { roots: [group] }
+  });
+  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, vectorOverride: [0, 0, 0, 0] });
+  const compositor = new ThreePaintCompositor(backend);
+  const host = makeRenderer(backend);
+  const folds = [], clearingRenders = [];
+  const render = host.render.bind(host);
+  host.render = (renderScene, camera) => {
+    if (host.autoClear) clearingRenders.push(host.target);
+    render(renderScene, camera);
+  };
+  host.onMesh = mesh => {
+    const ids = mesh.geometry.getAttribute("aFillPathIndex");
+    if (ids) folds.push({ ids: Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
+      fold: threePaintFoldState(mesh.material) });
+  };
+  const profiler = new RenderPerformanceProfiler();
+  profiler.start({ gpu: false, maxFrames: 1 });
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => compositor.render(host, scene, [fill.mesh], 32, 24, () => true));
+  profiler.endFrame();
+  const counters = profiler.getReport().counters;
+  profiler.dispose();
+  assert.equal(counters["three.foldedPaints"]?.total, 1, `${backend}: the masked group folds onto its fill`);
+  const masked = folds.find(draw => draw.fold?.masked);
+  assert.ok(masked, `${backend}: the folded fill draws with its mask`);
+  assert.deepEqual(masked.ids, [0], "only the folded paint draws, from its own one-instance geometry");
+  assert.equal(masked.fold.opacity, 0.5, "the fold carries the group's opacity");
+  assert.ok([...compositor.surfaces].some(target => target.texture === masked.fold.mask), "the mask is a compositor surface");
+  // The mask surface holds the mask's rendered content; the fold reads its alpha.
+  assert.deepEqual(masked.fold.weights, [0, 0, 0, 1, 0], "the folded fill converts the alpha mask's content itself");
+  const neutral = { opacity: 1, masked: false, mask: null, weights: null };
+  assert.deepEqual(folds.filter(draw => draw !== masked).map(draw => draw.fold),
+    folds.filter(draw => draw !== masked).map(() => neutral), "every other draw keeps the neutral fold");
+  assert.deepEqual(threePaintFoldState(fill.mesh.material), neutral, "the fold is restored after drawing");
+  // Folding saves the group's surface, its clear and its composite, and the
+  // folded draw converts the mask's content, which saves the mask's pass. What
+  // is left is the backdrop copy and the mask content's own surface.
+  assert.equal(counters["three.compositePasses"]?.total, 1, `${backend}: only the copy needs a pass`);
+  assert.equal(counters["three.clears"]?.total, 2, `${backend}: only the backdrop and the mask content are cleared`);
+  // A WebGPU clear is a render pass and submission of its own, so it rides on
+  // the next render into its target. The backdrop is read (copied) before
+  // anything renders into it, so its clear alone is encoded by itself.
+  if (backend === "webgpu") {
+    assert.equal(host.clears.length, 1, "webgpu: only the backdrop, read first, clears on its own");
+    assert.equal(counters["three.clearPasses"]?.total, 1);
+    assert.equal(clearingRenders.length, 1, "webgpu: the mask content's clear happens as its draw loads");
+  } else {
+    assert.equal(host.clears.length, 2, "webgl: scissored clears stay separate calls");
+    assert.equal(clearingRenders.length, 0);
+  }
+  assert.equal(host.autoClear, true, "the host's own clear setting is restored");
+  if (backend === "webgpu") {
+    // No compositor material is lit, and a lit render rehashes the lights node.
+    assert.equal(host.litRenders, 0, "webgpu: compositor renders run with lighting off");
+    assert.equal(host.lighting.enabled, true, "webgpu: the host's lighting is restored");
+  }
+  compositor.dispose(); fill.dispose();
+}
+
+// Broschuere's fades: a luminosity mask made of one gradient fill over the
+// page. Given the projection, the folded fill computes that mask itself, so the
+// gradient never renders, no mask surface is taken, and the root copy and the
+// folded draw share one host render.
+async function testGradientMaskFolding(ThreePaintCompositor, backend) {
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  const { threePaintFoldState } = await import("../src/threePaintFold.ts");
+  const f = values => Float32Array.from(values);
+  const square = [[1, 1], [5, 1], [5, 5], [1, 5]];
+  const lut = new Uint8Array(1024 * 4);
+  for (let x = 0; x < 1024; x++) lut.set([x >> 2, 255 - (x >> 2), 128, 255], x * 4);
+  const scene = Object.assign(createEmptyVectorScene(), {
+    pageRects: f([0, 0, 10, 10]), pageBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    fillPathCount: 1, fillSegmentCount: 4, fillPathMetaA: f([0, 4, 1, 1]), fillPathMetaB: f([5, 5, 1, 0]),
+    fillPathMetaC: f([0, 0, 0, 1]),
+    fillSegmentsA: f(square.flatMap(([x, y]) => [x, y, x, y])),
+    fillSegmentsB: f(square.flatMap((_, index) => [...square[(index + 1) % 4], 0, 0])),
+    gradientCount: 1, gradientMetaA: f([0, 0, 0, 0]), gradientMetaB: f([1, 0, 0, 1]), gradientMetaC: f([0, 0, 0, 0]),
+    gradientMetaD: f([10, 0, 0, 0]), gradientMetaE: f([0, 0, 0, 0]), gradientLut: lut,
+    gradientFillPathCount: 1, gradientFillSegmentCount: 4, gradientFillPathMetaA: f([0, 4, 0, 0]),
+    gradientFillPathMetaB: f([10, 10, 0, 0]), gradientFillPathMetaC: f([0, 0, 0, 1]), gradientFillPaintMeta: f([0, -1, 0, 0]),
+    gradientFillSegmentsA: f([0, 0, 0, 0, 10, 0, 10, 0, 10, 10, 10, 10, 0, 10, 0, 10]),
+    gradientFillSegmentsB: f([10, 0, 0, 0, 10, 10, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0]),
+    drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "gradient-fill", first: 0, count: 1 }],
+    paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
+      softMask: { subtype: "Luminosity", children: [{ kind: "draw", runIndex: 1 }] }, children: [{ kind: "draw", runIndex: 0 }] }] }
+  });
+  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, vectorOverride: [0, 0, 0, 0] });
+  const gradient = new ThreeMaterialGradientLayer(scene, { materialBackend: backend, strokeCurveEnabled: true,
+    vectorOverride: [0, 0, 0, 0] });
+  const gradientMaterials = new Set(gradient.getOrderedPaintMeshes().map(entry => entry.material));
+  const clipFromData = new THREE.Matrix4().makeScale(0.2, 0.2, 1).premultiply(new THREE.Matrix4().makeTranslation(-1, -1, 0));
+  const compositor = new ThreePaintCompositor(backend);
+  const host = makeRenderer(backend);
+  const folds = [];
+  let gradientDraws = 0;
+  host.onMesh = mesh => {
+    if (gradientMaterials.has(mesh.material)) gradientDraws++;
+    const state = threePaintFoldState(mesh.material);
+    if (state?.masked) folds.push(state);
+  };
+  const frame = matrix => {
+    folds.length = 0; gradientDraws = 0; host.call = 0;
+    const profiler = new RenderPerformanceProfiler();
+    profiler.start({ gpu: false, maxFrames: 1 });
+    profiler.beginFrame();
+    withThreeRenderPerformance(profiler, () => compositor.render(host, scene, [fill.mesh, gradient.group], 32, 24,
+      () => true, null, matrix));
+    profiler.endFrame();
+    const counters = profiler.getReport().counters;
+    profiler.dispose();
+    return counters;
+  };
+  let counters = frame(clipFromData);
+  assert.equal(counters["three.computedMasks"]?.total, 1, `${backend}: the fold computes its gradient mask`);
+  assert.equal(gradientDraws, 0, `${backend}: the mask's gradient never renders`);
+  assert.equal(folds.length, 1);
+  assert.equal(folds[0].opacity, 0.5);
+  assert.ok(folds[0].mask?.image?.width === 1024 && folds[0].mask.image.data[4] === lut[4],
+    "the fold reads the gradient's colour table in place of a mask surface");
+  assert.ok(folds[0].gradient?.length === 60, "the fold carries the gradient mask's description");
+  assert.equal(host.call, 1, `${backend}: the root copy and the folded draw share one host render`);
+  assert.equal(counters["three.hostRenders"]?.total, 1);
+  assert.equal(threePaintFoldState(fill.mesh.material).masked, false, "the fold is restored after drawing");
+  // Without the projection, the mask renders into a surface as before.
+  counters = frame(null);
+  assert.equal(counters["three.computedMasks"]?.total ?? 0, 0);
+  assert.equal(gradientDraws, 1, `${backend}: without a projection the gradient renders the mask`);
+  assert.ok(folds.length === 1 && !folds[0].gradient, "and the fold reads that surface");
+  compositor.dispose(); fill.dispose(); gradient.dispose();
+}
+
 function snapshot(renderer) {
   return { target: renderer.target.uuid, viewport: renderer.viewport.toArray(), scissor: renderer.scissor.toArray(),
     scissorTest: renderer.scissorTest, color: renderer.clearColor.toArray(), alpha: renderer.clearAlpha,
-    autoClear: renderer.autoClear, xr: renderer.xr.enabled, cube: renderer.cube, mip: renderer.mip };
+    autoClear: renderer.autoClear, xr: renderer.xr.enabled, lighting: renderer.lighting?.enabled,
+    cube: renderer.cube, mip: renderer.mip };
 }
 
 // A zoom replan replaces the scheduled meshes but retains canonical paint IDs.
@@ -466,7 +652,7 @@ function testProxyReplacement(ThreePaintCompositor, backend) {
   const survivor = meshes[0], survivorProxy = compositor.proxies.get(survivor);
   for (const mesh of meshes) {
     const proxy = compositor.proxies.get(mesh);
-    const partial = compositor.geometryForRuns(proxy, [mesh.userData.heprDrawRun]);
+    const partial = compositor.geometryForRuns(proxy, [mesh.userData.heprDrawRun], 0);
     assert.notEqual(partial, mesh.geometry);
     partial.addEventListener("dispose", () => partialDisposals++);
   }
@@ -493,7 +679,7 @@ function testProxyReplacement(ThreePaintCompositor, backend) {
   assert.equal(compositor.proxies.size, batchCount + 2);
   assert.equal(compositor.proxies.get(retained), retainedProxy);
   assert.equal(compositor.proxies.get(survivor), survivorProxy);
-  assert.ok(survivorProxy.partialGeometry);
+  assert.ok(survivorProxy.partialGeometries[0]);
   assert.equal(partialDisposals, batchCount - 1, "only removed proxies release their subset buffers");
   assert.equal(sourceDisposals, 0, "compositor cleanup never disposes borrowed layer geometry");
   for (const mesh of meshes.slice(1)) assert.equal(compositor.proxies.has(mesh), false);

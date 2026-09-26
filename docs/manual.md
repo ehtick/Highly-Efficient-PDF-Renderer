@@ -373,6 +373,8 @@ and blit gets its own GPU timer query. `gpu.operations` then reports:
   its median over the timed frames that reached it (`frames`). When frames issue
   the same operations, as while panning at one zoom with the whole document in
   view, this names the draws that cost time in every frame.
+- `byPosition`, every such position in frame order, with its label, instance
+  count and median, so that the whole frame can be accounted for.
 
 Each timed operation runs between its own queries, so the GPU cannot overlap it
 with its neighbours, and those frames run slower. Operation times can therefore
@@ -496,7 +498,8 @@ nearby edges and then tests each sample through the whole clip chain.
 
 These shaders issue several texture reads before using any: most of a
 pixel's time is the latency of its reads, and a draw takes as long as its
-slowest pixels.
+slowest pixels. A fill cell's line pieces take one texel each, read four at a
+time; only the few cells holding a curve read a second texel per piece.
 
 For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad

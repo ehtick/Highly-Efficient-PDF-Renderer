@@ -1,5 +1,38 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL: fills fetch one texel per line (September 26)
+
+Captures at fit-all after sample-only clip antialiasing. Frames now arrive
+4.2 ms apart at the median on the 240 Hz display, 240 FPS, but 5.7 ms on
+average (175 FPS): about a third of frames miss a refresh. The GPU command span
+fell from 6.5 to 5.1 ms p50, and CPU time is 2.4 ms p50 and 4.7 ms p95. Timed
+operations sum to 4.9 ms. Gradient fills fell from 2.7 to 1.0 ms per frame
+(the model predicted −57%, the capture shows −63%). Fills fell only from 3.0
+to 2.8 ms and are now most of the frame. Clears come next, at 0.6 ms for 55
+per frame.
+
+Fill draws cost time in two ways. Tiny dense draws, such as logos of 555–692
+segments in 7×6 pixels, last as long as their slowest pixel. Reading one piece
+ahead cut them by 12–19%. Wide draws of 40,000–67,000 pixels have worst pixels
+under 200 units, yet take 0.07–0.10 ms. The frame's fills do 11.2 M units of
+work, and those draws get through it at about 8 G units/s, so fetch
+throughput matters too. 99.5% of cell pieces are lines, yet each piece took
+two RGBA32F texels. The two piece textures hold 1099² texels each, 39 MB
+together, more than the GPU's 24 MB L2 cache.
+
+- **One texel per line.** A piece now keeps its endpoints in texture A and a
+  curve's control point and flag in B. A cell holding a curve (1,017 of
+  27,552 cells in this frame) stores its piece count negated. Other cells read
+  their lines four at a time, one texel each. In the model, the fill draws'
+  worst-pixel read steps drop from 6.6k to 2.7k and total fetches from 11.4 M
+  to 9.5 M. Gradient fills use the same cells.
+
+Two questions remain open. Draw #354 is bound by curve arithmetic: its densest
+path is 60% quadratics, so its cells take the curve loop. Draws #303 and #60
+draw the same logo with the same modelled work, yet #303 takes twice as long.
+The profiler now lists every operation position (`byPosition`), so the next
+capture can account for all 364 operations, not just the slowest 16.
+
 ## Native WebGL: draws last as long as their slowest pixels (September 25)
 
 After the previous round, a `gpuOperations` capture panning at fit-all

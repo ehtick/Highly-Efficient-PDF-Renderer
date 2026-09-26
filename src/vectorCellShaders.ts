@@ -4,7 +4,9 @@
  * The caller defines heprCellFetchA/B(index) over its segment textures, and
  * includes FILL_COVERAGE_GLSL first. `cells` is the path's header: first
  * level texel, level count, finest cell size and the log2 size ratio between
- * levels; `origin` is its grid origin.
+ * levels; `origin` is its grid origin. A piece keeps its endpoints in A and a
+ * curve's control point and flag in B; a cell holding a curve negates its
+ * piece count (see vectorPathCellStore).
  * The finest level whose cells span half the footprint keeps the box within
  * three columns and three rows: smaller cells than the footprint hold fewer
  * pieces the box does not reach, which outweighs reading more of them.
@@ -30,10 +32,10 @@ float heprCellWinding(vec4 cells, vec2 origin, vec4 box, vec2 footprint) {
   int lastRow = int(clamp(floor((box.y + footprint.y - origin.y) / size), 0.0, grid.z - 1.0));
   vec4 rowGrid = vec4(0.0, 0.0, origin.y, size);
   float winding = 0.0;
-  // Reads run one ahead of their use: the next cell's record and the next
-  // piece are requested before this piece's coverage is computed, so their
-  // latency overlaps it. A pixel's time is mostly that latency, and a draw
-  // lasts as long as its slowest pixels.
+  // Reads run ahead of their use: the next cell's record before this cell's
+  // pieces, four lines before any of them is computed, a curve cell's next
+  // piece before this one. Their latencies then overlap. A pixel's time is
+  // mostly that latency, and a draw lasts as long as its slowest pixels.
   for (int row = firstRow; row <= lastRow; row += 1) {
     vec2 rows = heprBandRows(rowGrid, row, int(grid.z), box);
     int rowBase = int(grid.x + float(row) * grid.y);
@@ -48,17 +50,37 @@ float heprCellWinding(vec4 cells, vec2 origin, vec4 box, vec2 footprint) {
         vec4 part = vec4(low, box.y, 1.0 / (high - low), box.w);
         float cellWinding = 0.0;
         int first = int(cell.x);
-        int count = int(cell.y);
-        vec4 nextA = heprCellFetchA(first);
-        vec4 nextB = heprCellFetchB(first);
-        for (int piece = 0; piece < count; piece += 1) {
-          vec4 a = nextA;
-          vec4 b = nextB;
-          int following = first + min(piece + 1, count - 1);
-          nextA = heprCellFetchA(following);
-          nextB = heprCellFetchB(following);
-          cellWinding += heprSegmentCoverage(vec2(a.x, a.y), vec2(a.z, a.w), vec2(b.x, b.y), b.z >= 0.5,
-            part, rows.x, rows.y);
+        int count = int(abs(cell.y));
+        int last = first + count - 1;
+        if (cell.y > 0.0) {
+          // Lines only, one texel each. Reads past the end repeat the last
+          // line; an empty row range makes them add nothing.
+          for (int piece = 0; piece < count; piece += 4) {
+            vec4 l0 = heprCellFetchA(first + piece);
+            vec4 l1 = heprCellFetchA(min(first + piece + 1, last));
+            vec4 l2 = heprCellFetchA(min(first + piece + 2, last));
+            vec4 l3 = heprCellFetchA(min(first + piece + 3, last));
+            cellWinding += heprSegmentCoverage(vec2(l0.x, l0.y), vec2(l0.x, l0.y), vec2(l0.z, l0.w), false,
+              part, rows.x, rows.y);
+            cellWinding += heprSegmentCoverage(vec2(l1.x, l1.y), vec2(l1.x, l1.y), vec2(l1.z, l1.w), false,
+              part, rows.x, piece + 1 < count ? rows.y : rows.x);
+            cellWinding += heprSegmentCoverage(vec2(l2.x, l2.y), vec2(l2.x, l2.y), vec2(l2.z, l2.w), false,
+              part, rows.x, piece + 2 < count ? rows.y : rows.x);
+            cellWinding += heprSegmentCoverage(vec2(l3.x, l3.y), vec2(l3.x, l3.y), vec2(l3.z, l3.w), false,
+              part, rows.x, piece + 3 < count ? rows.y : rows.x);
+          }
+        } else if (count > 0) {
+          vec4 nextA = heprCellFetchA(first);
+          vec4 nextB = heprCellFetchB(first);
+          for (int piece = 0; piece < count; piece += 1) {
+            vec4 a = nextA;
+            vec4 b = nextB;
+            int following = min(first + piece + 1, last);
+            nextA = heprCellFetchA(following);
+            nextB = heprCellFetchB(following);
+            cellWinding += heprSegmentCoverage(vec2(a.x, a.y), vec2(b.x, b.y), vec2(a.z, a.w), b.z >= 0.5,
+              part, rows.x, rows.y);
+          }
         }
         int closures = int(cell.z);
         int closureCount = int(cell.w);

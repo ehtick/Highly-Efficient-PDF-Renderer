@@ -133,7 +133,34 @@ try {
   fillCase("far from the origin", store([ring(300, 60, 4096, -2048)]), { tolerance: 5e-3, minFootprint: -2 });
   // Curves: the coverage function flattens pieces that cross a box side, so
   // compare both against a finely subdivided box.
-  fillCase("quadratic rings", store([ring(64, 30), ring(48, 12, 60, 10)], true), { tolerance: 2e-3, reference: "fine", boxes: 150 });
+  const curved = fillCase("quadratic rings", store([ring(64, 30), ring(48, 12, 60, 10)], true), { tolerance: 2e-3, reference: "fine", boxes: 150 });
+  // Pieces: endpoints in A, a curve's control point and flag in B. A cell with
+  // a curve negates its piece count; the others read one texel per line.
+  {
+    const texel = (data, index) => [...data.subarray(index * 4, index * 4 + 4)];
+    const cellCounts = (indexed, pathCount) => {
+      const counts = [];
+      for (let path = 0; path < pathCount; path++) {
+        const header = texel(indexed.dataA, indexed.cellBase + path);
+        for (let level = 0; level < header[1]; level++) {
+          const grid = texel(indexed.dataA, header[0] + level);
+          for (let cell = 0; cell < grid[1] * grid[2]; cell++) counts.push(texel(indexed.dataA, grid[0] + cell));
+        }
+      }
+      return counts;
+    };
+    const curveCells = cellCounts(curved, 2);
+    assert(curveCells.some(cell => cell[1] < 0) && curveCells.some(cell => cell[1] > 0), "curve rings mix curve and line cells");
+    for (const cell of curveCells) {
+      const flags = Array.from({ length: Math.abs(cell[1]) }, (_, piece) => curved.dataB[(cell[0] + piece) * 4 + 2]);
+      assert.equal(cell[1] < 0, flags.some(flag => flag >= 0.5), "negated exactly when the cell holds a curve");
+    }
+    const lines = vectorIndexedPathStore(store([ring(200, 40)]), null, 4096);
+    assert(cellCounts(lines, 1).every(cell => cell[1] >= 0), "a path of lines keeps every count positive");
+    const [first] = cellCounts(lines, 1).filter(cell => cell[1] > 0);
+    const endpoints = texel(lines.dataA, first[0]);
+    assert(endpoints[0] !== endpoints[2] || endpoints[1] !== endpoints[3], "a line piece holds both endpoints in A");
+  }
 
   // The dashed rule: bounded work however far the view zooms out.
   const rule = merged(dashes(400));
@@ -151,7 +178,7 @@ try {
       for (let x = -footprint; x < 1200; x += footprint * 0.37) {
         let visits = 0;
         const c0 = Math.min(Math.max(Math.floor(x / size), 0), grid.y - 1), c1 = Math.min(Math.max(Math.floor((x + footprint) / size), 0), grid.y - 1);
-        for (let column = c0; column <= c1; column++) { const cell = fetchA(grid.x + column); visits += cell.y + cell.w; }
+        for (let column = c0; column <= c1; column++) { const cell = fetchA(grid.x + column); visits += Math.abs(cell.y) + cell.w; }
         worstVisits = Math.max(worstVisits, visits);
       }
     }

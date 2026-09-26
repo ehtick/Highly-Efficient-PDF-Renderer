@@ -201,6 +201,9 @@ assert(occupied.current, "the host query remains active");
     [["fill → offscreen", 0, 3, 3], ["clear → offscreen", 1, 1, 3], ["program#1 → screen", 2, 0.5, 3],
       ["blit → screen", 3, 0.25, 3]], "each position's median over the frames");
   assert.deepEqual(report.typical.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
+  assert.deepEqual(report.byPosition, [{ order: 0, label: "fill → offscreen", instances: 10, ms: 3 },
+    { order: 1, label: "clear → offscreen", instances: null, ms: 1 }, { order: 2, label: "program#1 → screen", instances: 1, ms: 0.5 },
+    { order: 3, label: "blit → screen", instances: null, ms: 0.25 }], "every position in frame order, briefly");
   assert.deepEqual(report.slowest.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
   assert.equal(report.slowest.find(detail => detail.call === "blitFramebuffer").pixels, 600);
   assert.equal(report.slowest.length, 12);

@@ -350,9 +350,9 @@ export interface VectorPathCellStoreOptions extends VectorCellOptions {
 
 /** Index payload for one texture pair, starting at `base`. */
 export interface VectorPathCellStore {
-  /** Texels [base, texels) of texture A: pieces, then the index records. */
+  /** Texels [base, texels) of texture A: the pieces' endpoints, then the index records. */
   readonly dataA: Float32Array;
-  /** Texels [base, base + pieces) of texture B: the pieces' second halves. */
+  /** Texels [base, base + pieces) of texture B: the pieces' control points and curve flags. */
   readonly dataB: Float32Array;
   /** Texel count of texture A including everything before `base`. */
   readonly texels: number;
@@ -370,12 +370,16 @@ const STORE_DEFAULTS: Required<VectorCellOptions> = { targetPieces: 12, levelSte
 
 /**
  * Lays indexed paths out from `base` in the textures the shaders already
- * sample. Pieces are segments appended to both textures; A then holds per
- * path (first level texel, level count, finest cell size, level step), per
- * level (first cell texel, columns, rows, 0), per cell (first piece, piece
- * count, first closure texel, closure texel count), and the closure pairs.
- * Every index is absolute. Paths with the most segments gain the most and are
- * indexed first, within a budget proportional to the store; a path left out
+ * sample. Pieces are appended to both textures, unlike the segments before
+ * them: A holds a piece's endpoints (x0, y0, x2, y2), all a line needs, and B
+ * its control point and curve flag. A then holds per path (first level texel,
+ * level count, finest cell size, level step), per level (first cell texel,
+ * columns, rows, 0), per cell (first piece, piece count, first closure texel,
+ * closure texel count), and the closure pairs. A cell with a curve among its
+ * pieces stores its piece count negated, so a cell of lines, nearly every
+ * cell, reads one texel per piece. Every index is absolute. Paths with the
+ * most segments gain the most and are indexed first, within a budget
+ * proportional to the store; a path left out
  * has a zero level count and keeps its band index or linear scan.
  */
 export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSize = 2048,
@@ -391,6 +395,7 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
     options.budget ?? Math.max(CELL_STORE_MIN_BUDGET, segmentCount * CELL_STORE_TEXELS_PER_SEGMENT));
   if (budget <= 0) return empty;
   const cellOptions = { ...STORE_DEFAULTS, ...options };
+  const curveThreshold = options.curveThreshold ?? 0.5;
   const order = Array.from({ length: pathCount }, (_, path) => path)
     .filter(path => store.pathMetaA[path * 4 + 1] >= MIN_INDEXED_SEGMENTS)
     .sort((a, b) => store.pathMetaA[b * 4 + 1] - store.pathMetaA[a * 4 + 1] || a - b);
@@ -403,7 +408,7 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
     if (pieces + levels + cells + pairs + count > budget) continue;
     const index = buildVectorPathCells(store.segmentsA, store.segmentsB, store.pathMetaA[meta], count,
       [store.pathMetaA[meta + 2], store.pathMetaA[meta + 3], store.pathMetaB[meta], store.pathMetaB[meta + 1]],
-      options.curveThreshold ?? 0.5, cellOptions);
+      curveThreshold, cellOptions);
     if (!index) continue;
     const size = index.pieceCount + index.levels.length + index.cellCount + index.closurePairCount;
     if (pieces + levels + cells + pairs + size > budget) continue;
@@ -432,17 +437,19 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
       const source = grid.pieces;
       for (let offset = 0; offset < source.length; offset += 8, piece++) {
         const target = at(piece);
-        for (let channel = 0; channel < 4; channel++) {
-          dataA[target + channel] = source[offset + channel];
-          dataB[target + channel] = source[offset + 4 + channel];
-        }
+        dataA[target] = source[offset]; dataA[target + 1] = source[offset + 1];
+        dataA[target + 2] = source[offset + 4]; dataA[target + 3] = source[offset + 5];
+        dataB[target] = source[offset + 2]; dataB[target + 1] = source[offset + 3];
+        dataB[target + 2] = source[offset + 6];
       }
       dataA.set(grid.closures, at(pair));
       pair += grid.closures.length / 4;
       const records = grid.cells;
       for (let local = 0; local < cellCount; local++) {
-        write(cell++, firstPiece + records[local * 4], records[local * 4 + 1],
-          firstPair + records[local * 4 + 2], records[local * 4 + 3]);
+        const first = records[local * 4], count = records[local * 4 + 1];
+        let curved = false;
+        for (let index = first; index < first + count && !curved; index++) curved = source[index * 8 + 6] >= curveThreshold;
+        write(cell++, firstPiece + first, curved ? -count : count, firstPair + records[local * 4 + 2], records[local * 4 + 3]);
       }
     }
   }

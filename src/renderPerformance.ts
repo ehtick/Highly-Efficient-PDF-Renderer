@@ -92,6 +92,8 @@ export interface RenderPerformanceReport {
       slowest: GpuOperationDetail[];
       /** The slowest operation positions by median time over the timed frames. */
       typical: GpuOperationTypical[];
+      /** Every position the timed frames usually reach, in frame order. */
+      byPosition: GpuOperationPosition[];
     } | null;
   };
   notes: readonly string[];
@@ -564,6 +566,14 @@ export interface GpuOperationTypical extends GpuOperationDetail {
   frames: number;
 }
 
+/** One operation position, briefly: enough to account for a whole frame. */
+export interface GpuOperationPosition {
+  order: number;
+  label: string;
+  instances: number | null;
+  ms: number;
+}
+
 interface GpuOperationTotals {
   status: "available" | "unavailable" | "disjoint";
   reason: string | null;
@@ -575,6 +585,7 @@ interface GpuOperationTotals {
   byLabel: GpuOperationLabel[];
   slowest: GpuOperationDetail[];
   typical: GpuOperationTypical[];
+  byPosition: GpuOperationPosition[];
 }
 
 interface PendingOperation extends Omit<GpuOperationDetail, "ms"> { query: WebGLQuery }
@@ -723,15 +734,18 @@ class GpuOperationTimer {
       return { label, operationsPerFrame: entry.calls / frames, msPerFrame: entry.ms / frames,
         medianMsPerFrame: median(perFrame), maxMs: entry.maxMs };
     }).sort((a, b) => b.medianMsPerFrame - a.medianMsPerFrame || b.msPerFrame - a.msPerFrame);
-    const typical = [...this.positions.values()]
-      .filter(position => position.ms.length * 2 >= this.frameMs.length)
+    const usual = [...this.positions.values()].filter(position => position.ms.length * 2 >= this.frameMs.length);
+    const typical = usual
       .map(position => ({ ...copy(position.detail), ms: median(position.ms), frames: position.ms.length }))
       .sort((a, b) => b.ms - a.ms || a.order - b.order)
       .slice(0, SLOWEST);
+    const byPosition = usual
+      .map(({ detail, ms }) => ({ order: detail.order, label: detail.label, instances: detail.instances, ms: median(ms) }))
+      .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
     return {
       status: this.status, reason: this.reason, sampleEvery: GPU_OPERATION_SAMPLE_EVERY,
       droppedFrames: this.droppedFrames, frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
-      byLabel, slowest: this.slowest.map(copy), typical
+      byLabel, slowest: this.slowest.map(copy), typical, byPosition
     };
   }
 

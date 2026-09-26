@@ -1,5 +1,8 @@
-import { buildVectorFillBandIndex, vectorFillBandStore, type VectorFillBandStore } from "./vectorFillBands";
+import { buildVectorFillBandIndex } from "./vectorFillBands";
+import { vectorIndexedPathStore, type VectorIndexedPathStore } from "./vectorCellIndex";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
+import { CLIPPED_PAINT_QUAD_GLSL } from "./fillCoverageShaders";
+import { UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
@@ -7,6 +10,7 @@ import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
+import { enableThreeNodePaintFold, enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 
 import {
   CORE_FILL_FRAGMENT_SHADER_SOURCE,
@@ -277,16 +281,18 @@ export class ThreeMaterialGradientLayer {
     }
 
     const pathSize = chooseTextureSize(pathCount);
-    const bands = vectorFillBandStore(scene.gradientFillSegmentsA!, segmentCount, buildVectorFillBandIndex({
+    const clipBounds = vectorClipChainBounds(this.scene.clipPaths);
+    const gradientStore = {
       pathCount, segmentCount, pathMetaA: scene.gradientFillPathMetaA!, pathMetaB: scene.gradientFillPathMetaB!,
       segmentsA: scene.gradientFillSegmentsA!, segmentsB: scene.gradientFillSegmentsB!
-    }));
-    const segmentSize = chooseTextureSize(bands.texels);
+    };
+    const store = vectorIndexedPathStore(gradientStore, buildVectorFillBandIndex(gradientStore));
+    const segmentSize = chooseTextureSize(store.texels);
     const pathMetaA = this.own(createFloatTexture(scene.gradientFillPathMetaA, pathCount, pathSize.width, pathSize.height));
     const pathMetaB = this.own(createFloatTexture(scene.gradientFillPathMetaB, pathCount, pathSize.width, pathSize.height));
     const pathMetaC = this.own(createFloatTexture(scene.gradientFillPathMetaC, pathCount, pathSize.width, pathSize.height));
-    const segmentA = this.own(createFloatTexture(bands.data, bands.texels, segmentSize.width, segmentSize.height));
-    const segmentB = this.own(createFloatTexture(scene.gradientFillSegmentsB, segmentCount, segmentSize.width, segmentSize.height));
+    const segmentA = this.own(createFloatTexture(store.dataA, store.texels, segmentSize.width, segmentSize.height));
+    const segmentB = this.own(createFloatTexture(store.dataB, store.dataB.length / 4, segmentSize.width, segmentSize.height));
 
     const meshes = this.scene.gradientMeshIndices?.length ? buildGradientMeshRenderData(this.scene) : null;
     for (let pathIndex = 0; pathIndex < pathCount; pathIndex += 1) {
@@ -298,6 +304,10 @@ export class ThreeMaterialGradientLayer {
       const meshCount = meshes?.ranges[pathIndex * 2 + 1] ?? 0;
       const geometry = meshCount ? createMeshGeometry(meshes!.vertices, meshes!.ranges[pathIndex * 2], meshCount, pathIndex) : createFillGeometry(pathIndex);
       const primitiveColor = new THREE.Vector4(0, 0, 0, 0);
+      // The quad covers only the paint's part of its clip chain's bounds.
+      const clip = this.fillClipIndices[pathIndex];
+      const quadBounds = new THREE.Vector4().fromArray(clip >= 0 && clip * 4 + 3 < clipBounds.length
+        ? clipBounds.subarray(clip * 4, clip * 4 + 4) : UNBOUNDED_VECTOR_CLIP_BOUNDS);
 
       let material: THREE.Material;
       let fillState: ThreeWebGpuGradientFillMaterialState | undefined;
@@ -311,12 +321,17 @@ export class ThreeMaterialGradientLayer {
           fillSegmentTextureB: segmentB,
           fillPathTextureWidth: pathSize.width,
           fillSegmentTextureWidth: segmentSize.width,
-          fillBandBase: bands.pathBase,
-          fillBandEntries: bands.entryBase,
+          fillBandBase: store.bandBase,
+          fillBandEntries: store.bandEntries,
+          fillCellBase: store.cellBase,
+          clipBounds: quadBounds,
           ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex),
           primitiveColor
         });
         material = fillState.material;
+        // A group chain holding one analytic gradient draws it straight onto
+        // the surface. Patch meshes can overlap themselves and keep their group.
+        if (!meshCount) enableThreeNodePaintFold(material);
       } else {
         material = this.createWebGlFillMaterial(
           pathMetaA,
@@ -329,14 +344,16 @@ export class ThreeMaterialGradientLayer {
           gradients,
           sourceGradientIndex,
           maskGradientIndex,
-          bands
+          store,
+          quadBounds,
+          !meshCount
         );
         if (meshCount) {
           const raw = material as THREE.RawShaderMaterial;
           raw.vertexShader = raw.vertexShader
             .replace("layout(location = 0) in vec2 aCorner;", "in vec2 aMeshPosition;\nin vec4 aMeshColor;\nout vec4 vMeshColor;\nlayout(location = 0) in vec2 aCorner;")
             .replace("void main() {", "void main() {\n  vMeshColor = aMeshColor;")
-            .replace("vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);", "vec2 world = aMeshPosition;");
+            .replace("vec2 world = mix(quad.xy, quad.zw, corner01);", "vec2 world = aMeshPosition;");
           raw.fragmentShader = raw.fragmentShader
             .replace("uniform vec4 uVectorOverride;", "in vec4 vMeshColor;\nuniform vec4 uVectorOverride;")
             .replace("vec4 sourcePaint = heprSamplePdfGradient(vLocal, uSourceGradientIndex);", "vec4 sourcePaint = vMeshColor * heprSamplePdfGradient(vLocal, uSourceGradientIndex).a;");
@@ -510,12 +527,15 @@ export class ThreeMaterialGradientLayer {
     gradients: GradientTextureSet,
     sourceGradientIndex: number,
     maskGradientIndex: number,
-    bands: VectorFillBandStore
+    store: VectorIndexedPathStore,
+    clipBounds: THREE.Vector4,
+    foldable: boolean
   ): THREE.RawShaderMaterial {
+    const fragment = buildGradientFillFragmentShader();
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
-      vertexShader: normalizeThreeRawShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeThreeRawShaderSource(buildGradientFillFragmentShader(), true),
+      vertexShader: normalizeThreeRawShaderSource(GRADIENT_FILL_VERTEX_SHADER_SOURCE),
+      fragmentShader: normalizeThreeRawShaderSource(foldable ? threePaintFoldFragmentGlsl(fragment) : fragment, true),
       transparent: false,
       depthTest: false,
       depthWrite: false,
@@ -525,8 +545,11 @@ export class ThreeMaterialGradientLayer {
         uFillPathMetaTexA: { value: pathMetaA },
         uFillPathMetaTexB: { value: pathMetaB },
         uFillPathMetaTexC: { value: pathMetaC },
-        uFillBandBase: { value: bands.pathBase },
-        uFillBandEntries: { value: bands.entryBase },
+        uFillBandBase: { value: store.bandBase },
+        uFillBandEntries: { value: store.bandEntries },
+        // Stored plus one: zero means the store has no cell index.
+        uFillCellHeaders: { value: store.cellBase + 1 },
+        uClipBounds: { value: clipBounds },
         uFillSegmentTexA: { value: segmentA },
         uFillSegmentTexB: { value: segmentB },
         uFillPathMetaTexSize: { value: new Int32Array([pathSize.width, pathSize.height]) },
@@ -541,6 +564,7 @@ export class ThreeMaterialGradientLayer {
         ...createWebGlGradientUniforms(gradients, sourceGradientIndex, maskGradientIndex)
       }
     });
+    if (foldable) enableThreeRawPaintFold(material);
     configureStraightAlphaBlending(material);
     return material;
   }
@@ -665,6 +689,32 @@ function withAntialiasedGradientClip(source: string): string {
   float clipPixelY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
   float clipAAWidth = max(max(clipPixelX, clipPixelY), 1e-4);`)
     .replaceAll("outColor *= heprVectorClip(vLocal);", "outColor.a *= heprVectorClipAA(vLocal, clipAAWidth);");
+}
+
+/**
+ * The solid fill vertex stage with its quad clamped to the paint's clip chain,
+ * as native gradients are: a page-sized gradient under a small clip would
+ * otherwise shade the whole page. Three always projects through its
+ * local-to-clip matrix, so the clamp uses a margin all four corners agree on.
+ */
+const GRADIENT_FILL_VERTEX_SHADER_SOURCE = replaceShaderSource(replaceShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE,
+  "void main() {", `uniform vec4 uClipBounds;\n${CLIPPED_PAINT_QUAD_GLSL}\nvoid main() {`),
+  `  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
+    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);`,
+  `  vec4 quad = heprClippedPaintQuad(minBounds, maxBounds, uClipBounds, uUseLocalToClip, uLocalToClip, uZoom, uViewport);
+  if (any(greaterThan(quad.xy, quad.zw))) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vSegmentCount = 0;
+    return;
+  }
+  vec2 world = mix(quad.xy, quad.zw, corner01);`);
+
+/** Replaces exactly one occurrence, so a changed base shader fails loudly instead of silently. */
+function replaceShaderSource(source: string, from: string, to: string): string {
+  const at = source.indexOf(from);
+  if (at < 0 || source.indexOf(from, at + 1) >= 0) throw new Error(`Shader source has no unique ${JSON.stringify(from)}.`);
+  return source.slice(0, at) + to + source.slice(at + from.length);
 }
 
 function buildGradientFillFragmentShader(): string {

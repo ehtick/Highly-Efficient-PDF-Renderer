@@ -3,6 +3,7 @@ import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageSha
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
+import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
 
 const CAMERA_STRUCT = /* wgsl */ `
 struct CameraUniforms {
@@ -18,6 +19,7 @@ struct CameraUniforms {
   pad0 : f32,
   vectorOverride : vec4f,
   fillBands : vec4f,
+  fillCells : vec4f,
 };
 `;
 
@@ -168,8 +170,10 @@ ${CAMERA_STRUCT}
 ${gradientBindings(7)}
 ${GRADIENT_FUNCTIONS}
 ${VECTOR_FILL_BAND_INFO_WGSL}
+${VECTOR_FILL_CELL_INFO_WGSL}
 ${FILL_COVERAGE_WGSL}
 ${FILL_COVERAGE_VERTEX_WGSL}
+${VECTOR_CELL_COVERAGE_WGSL}
 
 struct FillOut {
   @builtin(position) position : vec4f,
@@ -183,6 +187,8 @@ struct FillOut {
   @location(7) @interpolate(flat) sourceGradient : i32,
   @location(8) @interpolate(flat) maskGradient : i32,
   @location(9) @interpolate(flat) bands : vec4f,
+  @location(10) @interpolate(flat) cells : vec4f,
+  @location(11) @interpolate(flat) origin : vec2f,
 };
 
 @vertex
@@ -198,6 +204,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let alpha = metaC.w;
   var out : FillOut;
   out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.z, uSegmentsA);
+  out.cells = heprFillCellInfo(f32(pathIndex), uCamera.fillCells.y, uSegmentsA);
+  out.origin = metaA.zw;
   // Reach pixels whose footprint touches a path narrower than a pixel.
   let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
   // Clamp to the clip chain, whose antialiasing reaches under a pixel past its
@@ -243,10 +251,14 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   let footprint = max(vec2f(dx, dy) * uCamera.fillAAScreenPx, vec2f(1e-4));
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) { discard; }
   let dimensions = textureDimensions(uSegmentsA);
-  // Average the winding number over the footprint box. The bands spanning its
-  // rows hold every segment that can contribute; each integrates its own rows.
+  // Average the winding number over the footprint box. A path with a cell
+  // index reads only the cells under the box; otherwise the bands spanning
+  // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
+  if (inData.cells.y > 0.0) {
+    winding = heprCellWinding(inData.cells, inData.origin, box, footprint, uSegmentsA, uSegmentsB);
+  } else {
 ${vectorFillBandLoopWgsl({
     bands: "inData.bands",
     y: "inData.local.y",
@@ -264,6 +276,7 @@ ${vectorFillBandLoopWgsl({
       primitiveB.z >= 0.5, box, rows.x, rows.y);
 `
   })}
+  }
   let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);

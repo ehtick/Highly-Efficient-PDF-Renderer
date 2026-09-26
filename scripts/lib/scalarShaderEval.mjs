@@ -7,6 +7,8 @@ const helpers = {
   log2: Math.log2, exp2: value => 2 ** value,
   vec2: (x, y) => ({ x, y }),
   vec4: (x, y, z, w) => ({ x, y, z, w }),
+  // WGSL integer coordinates: i32 division truncates.
+  vec2i: (x, y) => ({ x: Math.trunc(x), y: Math.trunc(y) }),
   toFloat: value => value,
   toInt: value => Math.trunc(value),
   select: (whenFalse, whenTrue, condition) => condition ? whenTrue : whenFalse
@@ -30,12 +32,16 @@ export function evaluateGlsl(source, extra) {
     .replace(/\bint\(/g, "toInt("), extra);
 }
 
-export function evaluateWgsl(source) {
+// `extra` supplies what the source does not define, such as textureLoad and
+// textureDimensions over plain JS textures.
+export function evaluateWgsl(source, extra) {
   return compile(source
     .replace(/\bfn\s+(hepr\w+)\s*\(([^)]*)\)\s*->\s*[\w<>]+\s*\{/g, (_, name, params) =>
       `function ${name}(${params.split(",").map(param => param.split(":")[0].trim()).join(", ")}) {`)
     .replace(/\bvar\s+/g, "let ")
     .replace(/\bvec2<f32>\(/g, "vec2(")
+    .replace(/\bvec4<f32>\(/g, "vec4(")
+    .replace(/\bvec2<i32>\(/g, "vec2i(")
     .replace(/\bf32\(/g, "toFloat(")
-    .replace(/\bi32\(/g, "toInt("));
+    .replace(/\bi32\(/g, "toInt("), extra);
 }

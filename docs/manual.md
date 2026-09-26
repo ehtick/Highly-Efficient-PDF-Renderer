@@ -327,8 +327,8 @@ Canonical clipping metadata remains intact. WebGL retains compatible texture and
 vertex state between batches; devices without enough combined texture units use
 the original binding layout.
 
-For temporary performance captures in the main viewer, select **WebGL**, load the
-drawing, then run this in the browser console:
+For temporary performance captures in the main viewer, select **WebGL** or
+**WebGPU**, load the drawing, then run this in the browser console:
 
 ```js
 heprPerf.start({ maxFrames: 1200 });
@@ -380,6 +380,18 @@ Each timed operation runs between its own queries, so the GPU cannot overlap it
 with its neighbours, and those frames run slower. Operation times can therefore
 add up to more than an untimed span. The context's own methods are restored
 when the capture stops.
+
+On WebGPU, GPU times come from timestamp queries, which the native renderer
+requests when the adapter supports them. Every render pass of a sampled frame
+writes a timestamp at its start and end. `gpu.frameMs` spans the frame's first
+pass's start to its last pass's end. With `gpuOperations`, each operation is a
+whole render pass, and its `instances` count the pass's draws. Compositor passes
+are labelled `span`, `fold`, `clear` and `composite:<kind>`, and the pass that
+presents to the canvas is `frame`. Chrome rounds WebGPU timestamps to 100 µs
+unless its WebGPU developer features (`chrome://flags`) are enabled, so pass
+times need that flag. The Three example on WebGPU uses Three's own timestamps:
+its `gpu.frameMs` is the sum of the frame's render passes, without the gaps
+between them.
 
 The Three example also exposes `heprPerf`. Reports with
 `context.diagnosticsVersion: 2` include the source kind (PDF/HEP), scene
@@ -476,7 +488,7 @@ memory budget. Both native and Three WebGL/WebGPU rendering benefit; these
 gradient-specific console counters remain native WebGL only.
 
 Bands stop helping once they are thinner than a pixel: every pixel then visits
-all the segments in its rows. Native WebGL therefore indexes fill paths,
+all the segments in its rows. Every backend therefore indexes fill paths,
 gradient fill paths and clip polygons with a multi-level grid of cells as
 well (`src/vectorCellIndex.ts`). A fill pixel reads the finest level whose
 cells are at least half its footprint, so it visits at most three cells each
@@ -485,16 +497,19 @@ rounding. The index is built when a scene is uploaded (about 0.3 s for the
 Broschuere HEP). A fill store's index may add up to four texels per segment;
 paths are indexed from the largest down, and a path left out keeps its bands.
 A clip polygon's index may use twelve texels per edge within the clip
-texture's limit, else it keeps bands too. Native WebGPU and Three still use
-bands; their shaders read the same uniforms, and a host that never sets the
-cell uniforms (`uFillCellHeaders`, `uCellHeaders`) leaves them at zero, which
-means no cells.
+texture's limit, else it keeps bands too. Native WebGPU passes the cell
+headers in its camera uniforms, Three's WebGL materials set `uFillCellHeaders`
+and its node materials take `fillCellBase`. Three's layers do not know the
+device's texture limit, so their stores stay within 2048 × 2048 texels and a
+very large scene indexes fewer paths there. A host that reuses the GL fill
+shaders and never sets the cell uniforms (`uFillCellHeaders`, `uCellHeaders`)
+leaves them at zero, which means no cells.
 
 Antialiased clips test a 4×4 grid of samples over the pixel. Each node of the
 clip chain clears the bits of the samples outside it, reading only the cells
 (or bands) that hold the samples, and the pixel's coverage is the share of
-samples left. Native WebGL and Three WebGL do this; WebGPU still probes for
-nearby edges and then tests each sample through the whole clip chain.
+samples left. Every backend does this; the GLSL and WGSL clips read the same
+layout.
 
 These shaders issue several texture reads before using any: most of a
 pixel's time is the latency of its reads, and a draw takes as long as its
@@ -519,13 +534,24 @@ Both native renderers clamp each analytic gradient fill's quad to its clip
 chain's bounds, widened by the one-pixel coverage margin; nothing outside them
 survives the clip. `gradientAnalyticFillQuadPixelsEstimate` sums the clamped
 quads the same way, so it can be compared with the unclamped bounding-quad
-estimate above. Projected views keep whole quads and are excluded.
+estimate above. Projected views keep whole quads and are excluded. The Three
+materials clamp their gradient quads too. Three always projects through its
+local-to-clip matrix, so the margin there is the largest at any corner of the
+clamped rectangle, which all four corners agree on.
 
 `foldedPaints` counts compositor group chains drawn as a single paint. A chain
 of Normal-blend groups holding one fill path, analytic gradient fill or image
 (no knockout, at most one soft mask) scales that paint by the groups' opacity
 and mask instead of rendering group surfaces and composite passes. Native
 WebGL folds these chains; its soft mask is still prepared on its own surface.
+Native WebGPU and both Three backends fold fills and analytic gradient fills
+(`three.foldedPaints` in Three), but not images.
+
+On WebGPU a clear is a render pass of its own, and in Three also a queue
+submission. The native and Three compositors therefore clear a surface as the
+next pass that renders into it loads. A surface that is read, or partly copied
+into, before anything renders into it is still cleared on its own
+(`three.clearPasses` in Three).
 
 The [Broschuere gradient investigation](broschuere-gradient-performance.md)
 documents a dense polygon-clip hotspot and recommended comparison captures.

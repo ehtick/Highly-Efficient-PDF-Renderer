@@ -7,9 +7,9 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 
 try {
-  const { evaluateGlsl } = await import("./lib/scalarShaderEval.mjs");
-  const { FILL_COVERAGE_GLSL } = await import("../src/fillCoverageShaders.ts");
-  const { VECTOR_CELL_COVERAGE_GLSL } = await import("../src/vectorCellShaders.ts");
+  const { evaluateGlsl, evaluateWgsl } = await import("./lib/scalarShaderEval.mjs");
+  const { FILL_COVERAGE_GLSL, FILL_COVERAGE_WGSL } = await import("../src/fillCoverageShaders.ts");
+  const { VECTOR_CELL_COVERAGE_GLSL, VECTOR_CELL_COVERAGE_WGSL } = await import("../src/vectorCellShaders.ts");
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
@@ -90,6 +90,13 @@ try {
     const fetchA = fetchFrom(indexed.dataA), fetchB = fetchFrom(indexed.dataB);
     const coverage = evaluateGlsl(FILL_COVERAGE_GLSL + VECTOR_CELL_COVERAGE_GLSL,
       { heprCellFetchA: fetchA, heprCellFetchB: fetchB });
+    // The WGSL port reads the same store through textures of an odd width.
+    const texture = data => ({ width: 97, fetch: fetchFrom(data) });
+    const wgsl = evaluateWgsl(FILL_COVERAGE_WGSL + VECTOR_CELL_COVERAGE_WGSL, {
+      textureDimensions: tex => ({ x: tex.width }),
+      textureLoad: (tex, coord) => tex.fetch(coord.y * tex.width + coord.x)
+    });
+    const textureA = texture(indexed.dataA), textureB = texture(indexed.dataB);
     const A = pathStore.segmentsA, B = pathStore.segmentsB;
     let worst = 0, scanWorst = 0;
     for (let path = 0; path < pathStore.pathCount; path++) {
@@ -115,6 +122,8 @@ try {
         const px = minX - fx + random() * (maxX - minX + 2 * fx), py = minY - fy + random() * (maxY - minY + 2 * fy);
         const box = { x: px - 0.5 * fx, y: py - 0.5 * fy, z: 1 / fx, w: 1 / fy };
         const cells = coverage.heprCellWinding(header, { x: minX, y: minY }, box, { x: fx, y: fy });
+        const wgslCells = wgsl.heprCellWinding(header, { x: minX, y: minY }, box, { x: fx, y: fy }, textureA, textureB);
+        assert(Math.abs(wgslCells - cells) <= 1e-12, `${name}: WGSL matches GLSL (${wgslCells} vs ${cells})`);
         const plain = scan(box);
         const truth = reference === "fine" ? scan(box, 128) : plain;
         worst = Math.max(worst, Math.abs(cells - truth));

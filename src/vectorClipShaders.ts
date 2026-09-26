@@ -252,97 +252,242 @@ float heprClipCellLevel(vec4 cells, float reach) {
 }
 ` + VECTOR_CLIP_POINT_GLSL + VECTOR_CLIP_AA_GLSL;
 
-function vectorClipWgsl(antialias: boolean): string {
-  return `
-fn ${antialias ? "heprVectorClipAA" : "heprVectorClip"}(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>${antialias ? ", aaWidth: f32" : ""}) -> f32 {
-  ${antialias ? "" : "let aaWidth = 0.0;"}
-  let width = i32(textureDimensions(clipTexture).x);
-  var needsSampling = false;
-  let radius = aaWidth * 0.75;
+// The same tests in WGSL. The clip texture is a parameter, as TSL functions
+// cannot name globals. The point test comes first in its source, for TSL, and
+// the antialiased source includes it.
+export const VECTOR_CLIP_WGSL = /* wgsl */ `
+fn heprVectorClip(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>) -> f32 {
   var index = i32(clipIndex);
   for (var depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
     if (index < 0) { break; }
-    let node = textureLoad(clipTexture, vec2<i32>(index % width, index / width), 0);
+    let node = heprClipTexel(clipTexture, index);
     if (node.z < 0.0) {
-      let offset = i32(node.y);
-      let bounds = textureLoad(clipTexture, vec2<i32>(offset % width, offset / width), 0);
-      if (aaWidth > 0.0) {
-        if (any(bounds.xy >= bounds.zw)) { return 0.0; }
-        let inset = min(point - bounds.xy, bounds.zw - point);
-        if (min(inset.x, inset.y) <= -radius) { return 0.0; }
-        needsSampling = needsSampling || min(inset.x, inset.y) < radius;
-      } else {
-        if (any(point < bounds.xy) || any(point >= bounds.zw)) { return 0.0; }
-      }
+      let bounds = heprClipTexel(clipTexture, i32(node.y));
+      // Match polygon winding at boundaries: include min, exclude max.
+      if (any(point < bounds.xy) || any(point >= bounds.zw)) { return 0.0; }
       index = i32(node.x);
       continue;
     }
-    var firstBand = 0;
-    var lastBand = 0;
-    var rowBand = 0;
-    var bands = vec4<f32>(0.0);
-    if (node.w >= 2.0) {
-      let offset = i32(node.y);
-      bands = textureLoad(clipTexture, vec2<i32>(offset % width, offset / width), 0);
-      rowBand = i32(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
-      firstBand = i32(clamp(floor((point.y - radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
-      lastBand = i32(clamp(floor((point.y + radius - bands.y) / bands.z), 0.0, bands.w - 1.0));
-    }
+    let flags = i32(node.w);
     var winding = 0;
-    var minDistance = radius;
-    for (var band = firstBand; band <= lastBand; band++) {
-      var firstEdge = i32(node.y);
-      var edgeCount = i32(node.z);
-      if (node.w >= 2.0) {
-        let tableOffset = i32(bands.x) + band;
-        let range = textureLoad(clipTexture, vec2<i32>(tableOffset % width, tableOffset / width), 0);
-        firstEdge = i32(range.x);
-        edgeCount = i32(range.y);
-      }
-      for (var edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
-        if (edge >= edgeCount) { break; }
-        let offset = firstEdge + edge;
-        let line = textureLoad(clipTexture, vec2<i32>(offset % width, offset / width), 0);
-        if (band == rowBand && (line.y > point.y) != (line.w > point.y)) {
+    if ((flags & 4) != 0) {
+      let cells = heprClipTexel(clipTexture, i32(node.y));
+      let origin = heprClipTexel(clipTexture, i32(node.y) + 1);
+      let grid = heprClipTexel(clipTexture, i32(cells.x));
+      let home = clamp(floor((point - origin.xy) / cells.z), vec2<f32>(0.0), grid.yz - vec2<f32>(1.0));
+      let cell = heprClipTexel(clipTexture, i32(grid.x + home.y * grid.y + home.x));
+      for (var piece = 0; piece < i32(cell.y); piece++) {
+        let line = heprClipTexel(clipTexture, i32(cell.x) + piece);
+        if ((line.y > point.y) != (line.w > point.y)) {
           let x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
           if (x > point.x) { winding += select(-1, 1, line.w > line.y); }
         }
-        if (aaWidth > 0.0 && all(point >= min(line.xy, line.zw) - vec2<f32>(radius)) &&
-            all(point <= max(line.xy, line.zw) + vec2<f32>(radius))) {
-          let delta = line.zw - line.xy;
-          let squaredLength = dot(delta, delta);
-          var t = 0.0;
-          if (squaredLength > 0.0) { t = clamp(dot(point - line.xy, delta) / squaredLength, 0.0, 1.0); }
-          minDistance = min(minDistance, length(point - (line.xy + t * delta)));
+      }
+      for (var closure = 0; closure < i32(cell.w); closure++) {
+        let pair = heprClipTexel(clipTexture, i32(cell.z) + closure);
+        if (pair.x <= point.y) { winding -= i32(pair.y); }
+        if (pair.z <= point.y) { winding -= i32(pair.w); }
+      }
+    } else {
+      var firstEdge = i32(node.y);
+      var edgeCount = i32(node.z);
+      if ((flags & 2) != 0) {
+        let bands = heprClipTexel(clipTexture, i32(node.y));
+        // Clamp in float before converting: far-offscreen points can exceed i32.
+        let band = i32(clamp(floor((point.y - bands.y) / bands.z), 0.0, bands.w - 1.0));
+        let range = heprClipTexel(clipTexture, i32(bands.x) + band);
+        firstEdge = i32(range.x);
+        edgeCount = i32(range.y);
+      }
+      for (var edge = 0; edge < edgeCount; edge++) {
+        let line = heprClipTexel(clipTexture, firstEdge + edge);
+        if ((line.y > point.y) != (line.w > point.y)) {
+          let x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
+          if (x > point.x) { winding += select(-1, 1, line.w > line.y); }
         }
       }
     }
-    let inside = select(winding != 0, abs(winding) % 2 != 0, (i32(node.w) & 1) != 0);
-    if (aaWidth > 0.0) {
-      if (minDistance < radius) { needsSampling = true; }
-      else if (!inside) { return 0.0; }
-    } else if (!inside) { return 0.0; }
+    let inside = select(winding != 0, abs(winding) % 2 != 0, (flags & 1) != 0);
+    if (!inside) { return 0.0; }
     index = i32(node.x);
   }
   if (index >= 0) { return 0.0; }
-  ${antialias ? `
-  if (needsSampling) {
-    var coverage = 0.0;
-    for (var y = 0; y < 4; y++) {
-      for (var x = 0; x < 4; x++) {
-        let offset = (vec2<f32>(f32(x), f32(y)) + vec2<f32>(0.5)) * 0.25 - vec2<f32>(0.5);
-        coverage += heprVectorClip(point + offset * aaWidth, clipIndex, clipTexture);
-      }
-    }
-    return coverage * 0.0625;
-  }` : ""}
   return 1.0;
 }
+
+fn heprClipTexel(clipTexture: texture_2d<f32>, index: i32) -> vec4<f32> {
+  let width = i32(textureDimensions(clipTexture).x);
+  return textureLoad(clipTexture, vec2<i32>(index % width, index / width), 0);
+}
 `;
+
+// As VECTOR_CLIP_AA_GLSL: a 4x4 grid of samples, one bit each, cleared node
+// by node; four edges read per iteration.
+export const VECTOR_CLIP_AA_WGSL = /* wgsl */ `
+fn heprVectorClipAA(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>, aaWidth: f32) -> f32 {
+  // Sample offsets in pixels: the centres of a 4x4 grid over the pixel.
+  let offsets = vec4<f32>(-0.375, -0.125, 0.125, 0.375);
+  let sampleX = point.x + offsets * aaWidth;
+  let sampleY = point.y + offsets * aaWidth;
+  let span = 0.75 * aaWidth;
+  var samples = 0xFFFFu;
+  var index = i32(clipIndex);
+  for (var depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
+    if (index < 0) { break; }
+    let node = heprClipTexel(clipTexture, index);
+    if (node.z < 0.0) {
+      samples &= heprClipRectSamples(heprClipTexel(clipTexture, i32(node.y)), sampleX, sampleY);
+    } else {
+      samples &= heprClipPolygonSamples(clipTexture, node, sampleX, sampleY, span);
+    }
+    if (samples == 0u) { return 0.0; }
+    index = i32(node.x);
+  }
+  if (index >= 0) { return 0.0; }
+  return f32(countOneBits(samples)) * 0.0625;
 }
 
-export const VECTOR_CLIP_WGSL = vectorClipWgsl(false);
-export const VECTOR_CLIP_AA_WGSL = vectorClipWgsl(true) + VECTOR_CLIP_WGSL;
+fn heprClipSampleBits(inside: vec4<bool>) -> u32 {
+  return select(0u, 1u, inside.x) | select(0u, 2u, inside.y) | select(0u, 4u, inside.z) | select(0u, 8u, inside.w);
+}
+
+fn heprClipSampleGrid(row0: u32, row1: u32, row2: u32, row3: u32) -> u32 {
+  return row0 | (row1 << 4u) | (row2 << 8u) | (row3 << 12u);
+}
+
+// The point test's rule: include min, exclude max.
+fn heprClipRectSamples(bounds: vec4<f32>, sampleX: vec4<f32>, sampleY: vec4<f32>) -> u32 {
+  let columns = heprClipSampleBits((sampleX >= vec4<f32>(bounds.x)) & (sampleX < vec4<f32>(bounds.z)));
+  let rows = (sampleY >= vec4<f32>(bounds.y)) & (sampleY < vec4<f32>(bounds.w));
+  return heprClipSampleGrid(select(0u, columns, rows.x), select(0u, columns, rows.y),
+    select(0u, columns, rows.z), select(0u, columns, rows.w));
+}
+
+// The finest level whose cells are at least the given width.
+fn heprClipCellLevel(cells: vec4<f32>, reach: f32) -> f32 {
+  var level = clamp(ceil(log2(max(reach / cells.z, 1.0)) / cells.w), 0.0, cells.y - 1.0);
+  if (cells.z * exp2(level * cells.w) < reach && level < cells.y - 1.0) { level += 1.0; }
+  return level;
+}
+
+fn heprClipMask(condition: vec4<bool>) -> vec4<f32> {
+  return select(vec4<f32>(0.0), vec4<f32>(1.0), condition);
+}
+
+// One edge's ray crossings, with the point test's arithmetic, for the samples
+// whose edge list this is: rows and columns select them.
+fn heprClipSampleCrossings(line: vec4<f32>, sampleX: vec4<f32>, sampleY: vec4<f32>, rows: vec4<f32>,
+    columns: vec4<f32>, winding0: ptr<function, vec4<f32>>, winding1: ptr<function, vec4<f32>>,
+    winding2: ptr<function, vec4<f32>>, winding3: ptr<function, vec4<f32>>) {
+  var crossing = abs(heprClipMask(vec4<f32>(line.y) > sampleY) - heprClipMask(vec4<f32>(line.w) > sampleY)) * rows;
+  if (any(crossing > vec4<f32>(0.0))) {
+    let x = line.x + (sampleY - line.y) / (line.w - line.y) * (line.z - line.x);
+    crossing *= select(-1.0, 1.0, line.w > line.y);
+    *winding0 += crossing.x * columns * heprClipMask(vec4<f32>(x.x) > sampleX);
+    *winding1 += crossing.y * columns * heprClipMask(vec4<f32>(x.y) > sampleX);
+    *winding2 += crossing.z * columns * heprClipMask(vec4<f32>(x.z) > sampleX);
+    *winding3 += crossing.w * columns * heprClipMask(vec4<f32>(x.w) > sampleX);
+  }
+}
+
+// Edges first..first+count-1, four per iteration: all four are read before
+// any is used. Reads past the end repeat the last edge and count for nothing.
+fn heprClipSampleEdges(clipTexture: texture_2d<f32>, first: i32, count: i32, sampleX: vec4<f32>,
+    sampleY: vec4<f32>, rows: vec4<f32>, columns: vec4<f32>, winding0: ptr<function, vec4<f32>>,
+    winding1: ptr<function, vec4<f32>>, winding2: ptr<function, vec4<f32>>, winding3: ptr<function, vec4<f32>>) {
+  let last = first + count - 1;
+  for (var edge = 0; edge < count; edge += 4) {
+    let line0 = heprClipTexel(clipTexture, first + edge);
+    let line1 = heprClipTexel(clipTexture, min(first + edge + 1, last));
+    let line2 = heprClipTexel(clipTexture, min(first + edge + 2, last));
+    let line3 = heprClipTexel(clipTexture, min(first + edge + 3, last));
+    heprClipSampleCrossings(line0, sampleX, sampleY, rows, columns, winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line1, sampleX, sampleY, select(vec4<f32>(0.0), rows, edge + 1 < count), columns,
+      winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line2, sampleX, sampleY, select(vec4<f32>(0.0), rows, edge + 2 < count), columns,
+      winding0, winding1, winding2, winding3);
+    heprClipSampleCrossings(line3, sampleX, sampleY, select(vec4<f32>(0.0), rows, edge + 3 < count), columns,
+      winding0, winding1, winding2, winding3);
+  }
+}
+
+// Closure pairs (y, weight, y, weight): the winding of geometry right of the
+// cell's column, for samples at or above each y.
+fn heprClipClosuresBelow(pair: vec4<f32>, sampleY: vec4<f32>) -> vec4<f32> {
+  return pair.y * step(vec4<f32>(pair.x), sampleY) + pair.w * step(vec4<f32>(pair.z), sampleY);
+}
+
+fn heprClipSampleInside(winding: vec4<f32>, evenOdd: bool) -> u32 {
+  var value = abs(winding);
+  if (evenOdd) { value -= 2.0 * floor(0.5 * value); }
+  return heprClipSampleBits(value > vec4<f32>(0.5));
+}
+
+// Samples inside one polygon node; span is the samples' extent in each axis.
+fn heprClipPolygonSamples(clipTexture: texture_2d<f32>, node: vec4<f32>, sampleX: vec4<f32>, sampleY: vec4<f32>,
+    span: f32) -> u32 {
+  let flags = i32(node.w);
+  var winding0 = vec4<f32>(0.0);
+  var winding1 = vec4<f32>(0.0);
+  var winding2 = vec4<f32>(0.0);
+  var winding3 = vec4<f32>(0.0);
+  if ((flags & 4) != 0) {
+    let cells = heprClipTexel(clipTexture, i32(node.y));
+    let origin = heprClipTexel(clipTexture, i32(node.y) + 1);
+    let level = heprClipCellLevel(cells, span);
+    let size = cells.z * exp2(level * cells.w);
+    let grid = heprClipTexel(clipTexture, i32(cells.x + level));
+    // As in the point test, each sample takes its own cell's pieces and closures.
+    let columnOf = clamp(floor((sampleX - origin.x) / size), vec4<f32>(0.0), vec4<f32>(grid.y - 1.0));
+    let rowOf = clamp(floor((sampleY - origin.y) / size), vec4<f32>(0.0), vec4<f32>(grid.z - 1.0));
+    for (var row = i32(rowOf.x); row <= i32(rowOf.w); row++) {
+      let rows = heprClipMask(rowOf == vec4<f32>(f32(row)));
+      for (var column = i32(columnOf.x); column <= i32(columnOf.w); column++) {
+        let columns = heprClipMask(columnOf == vec4<f32>(f32(column)));
+        let cell = heprClipTexel(clipTexture, i32(grid.x) + row * i32(grid.y) + column);
+        heprClipSampleEdges(clipTexture, i32(cell.x), i32(cell.y), sampleX, sampleY, rows, columns,
+          &winding0, &winding1, &winding2, &winding3);
+        let closures = i32(cell.z);
+        let closureCount = i32(cell.w);
+        for (var closure = 0; closure < closureCount; closure += 2) {
+          let pair0 = heprClipTexel(clipTexture, closures + closure);
+          let pair1 = heprClipTexel(clipTexture, closures + min(closure + 1, closureCount - 1));
+          var below = heprClipClosuresBelow(pair0, sampleY);
+          if (closure + 1 < closureCount) { below += heprClipClosuresBelow(pair1, sampleY); }
+          below *= rows;
+          winding0 -= below.x * columns;
+          winding1 -= below.y * columns;
+          winding2 -= below.z * columns;
+          winding3 -= below.w * columns;
+        }
+      }
+    }
+  } else {
+    let banded = (flags & 2) != 0;
+    var bands = vec4<f32>(0.0);
+    var bandOf = vec4<f32>(0.0);
+    if (banded) {
+      bands = heprClipTexel(clipTexture, i32(node.y));
+      bandOf = clamp(floor((sampleY - bands.y) / bands.z), vec4<f32>(0.0), vec4<f32>(bands.w - 1.0));
+    }
+    for (var band = i32(bandOf.x); band <= i32(bandOf.w); band++) {
+      var firstEdge = i32(node.y);
+      var edgeCount = i32(node.z);
+      if (banded) {
+        let range = heprClipTexel(clipTexture, i32(bands.x) + band);
+        firstEdge = i32(range.x);
+        edgeCount = i32(range.y);
+      }
+      // An edge can appear in several bands; each sample row counts its own.
+      heprClipSampleEdges(clipTexture, firstEdge, edgeCount, sampleX, sampleY,
+        heprClipMask(bandOf == vec4<f32>(f32(band))), vec4<f32>(1.0), &winding0, &winding1, &winding2, &winding3);
+    }
+  }
+  let evenOdd = (flags & 1) != 0;
+  return heprClipSampleGrid(heprClipSampleInside(winding0, evenOdd), heprClipSampleInside(winding1, evenOdd),
+    heprClipSampleInside(winding2, evenOdd), heprClipSampleInside(winding3, evenOdd));
+}
+` + VECTOR_CLIP_WGSL;
 
 export const VECTOR_INSTANCE_CLIP_GLSL = `flat in float vVectorClipIndex;\n` +
   VECTOR_CLIP_GLSL.replaceAll("int(uVectorClipIndex)", "int(uVectorClipIndex < -1.5 ? vVectorClipIndex : uVectorClipIndex)");

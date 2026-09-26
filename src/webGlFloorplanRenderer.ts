@@ -4128,8 +4128,8 @@ export class WebGlFloorplanRenderer {
   private uploadVectorClips(scene: VectorScene): void {
     const gl = this.gl;
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
-    // Native WebGL's clip GLSL reads cell storage, bounding each pixel's clip
-    // work at any zoom; other consumers of the shared packer keep bands.
+    // The clip GLSL reads cell storage, bounding each pixel's clip work at any
+    // zoom. Highlight overlays pack their own few clips with bands.
     const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);

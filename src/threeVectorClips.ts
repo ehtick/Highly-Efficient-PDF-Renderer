@@ -4,6 +4,7 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
 import { VECTOR_CLIP_WGSL, VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
+import { copyThreePaintFold } from "./threePaintFold";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
 const antialiasedNodeClips = new WeakSet<THREE.Material>();
@@ -29,7 +30,9 @@ export function registerThreeNodeClipPosition(material: THREE.Material, world: u
 }
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
-  const data = packVectorClips(scene.clipPaths);
+  // Both the GLSL and WGSL clips read cell storage, bounding each pixel's clip
+  // work at any zoom.
+  const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
   const width = Math.min(4096, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
   const height = Math.ceil(data.length / 4 / width);
   if (height > 4096) throw new RangeError("Vector clip texture exceeds material capacity.");
@@ -76,6 +79,7 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
   if (!texture) throw new Error("Clipped material has no vector clip texture.");
   const material = source.clone();
   copyThreePdfShapeUniform(source, material);
+  copyThreePaintFold(source, material);
   if (source instanceof THREE.RawShaderMaterial && material instanceof THREE.RawShaderMaterial) {
     // The shared core shaders already fall back to the instance stream when the
     // uniform selects it, so only the uniform changes.

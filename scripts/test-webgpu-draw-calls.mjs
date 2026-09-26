@@ -51,22 +51,42 @@ try {
     for (const source of banded) {
       assert.match(source, /heprBandRows\(bandInfo, band, bandCount, box\)/, "each band integrates only its own rows, so neighbouring bands cannot duplicate winding");
       assert.match(source, /packedIndex & 3/, "band entries use packed component addressing");
+      assert.match(source, /heprFillCellInfo\(f32\(pathIndex\), uCamera\.fillCells\.[xy]/, "each path loads its cell header");
+      assert.match(source, /heprCellWinding\(inData\.cells, inData\.origin, box, footprint/,
+        "an indexed path reads only the cells under the pixel");
+      assert.match(source, /fn heprUnfoldedPaint\(inData: \w+\) -> vec4f/, "a folded group chain scales the paint itself");
     }
+    assert.deepEqual(banded.map(source => /@group\((\d)\) @binding\(0\) var<uniform> uPaintFold/.exec(source)?.[1]), ["2", "3"],
+      "fills take their fold in group 2, gradient fills after their colour override in group 3");
     const text = device.shaders.find(source => source.includes("uTextGlyphSegmentTexA"));
     assert(text, "the actual native text pipeline is generated");
     assert.doesNotMatch(text, /i < 2048/, "valid long outlines have no fixed shader ceiling");
     assert.match(text, /i < inData.segmentCount/, "native text traverses the complete glyph");
     frame();
-    assert.deepEqual(device.cameraData.slice(16), [-1, 0, -1, 0], "unindexed fill bindings are disabled");
-    Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125 });
+    assert.deepEqual(device.cameraData.slice(16), [-1, 0, -1, 0, 0, 0, 0, 0], "unindexed fill bindings are disabled");
+    Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125,
+      fillCellBase: 140, gradientFillCellBase: 170 });
     frame();
-    assert.deepEqual(device.cameraData.slice(16), [41, 87, 91, 125], "both fill stores upload distinct band addresses");
+    // Cell headers are uploaded plus one, so zero disables them.
+    assert.deepEqual(device.cameraData.slice(16), [41, 87, 91, 125, 141, 171, 0, 0],
+      "both fill stores upload distinct band and cell addresses");
   }
 
   {
     const { renderer, frame } = create();
     assert.equal(frame(), 5, "background, raster, fill, stroke and text each submit one command");
     assert.equal(frame(), 5, "draw-call statistics reset each frame");
+    // heprPerf captures native WebGPU too; this device cannot time the GPU.
+    const profiler = renderer.getPerformanceProfiler();
+    assert.equal(renderer.getPerformanceProfiler(), profiler);
+    profiler.start({ maxFrames: 3 });
+    frame(); frame();
+    const captured = profiler.stop();
+    assert.equal(captured.frames, 2);
+    assert.equal(captured.counters.drawCalls.p50, 5);
+    assert.ok(captured.cpuSections.drawSubmission, "frames record their draw submission");
+    assert.equal(captured.gpu.status, "unavailable");
+    assert.match(captured.gpu.reason, /timestamp-query/);
     renderer.setPrimitiveHighlights({ count: 2, selectionCount: 1, clipPaths: [],
       segments: new Float32Array(16) });
     Object.assign(renderer, {
@@ -163,7 +183,7 @@ function makeDevice() {
     draws: 0, copies: 0, shaders: [], cameraData: null,
     limits: { maxTextureDimension2D: 2048 },
     queue: { writeBuffer(_buffer, _offset, data) {
-      if (data instanceof Float32Array && data.length === 20) device.cameraData = [...data];
+      if (data instanceof Float32Array && data.length === 24) device.cameraData = [...data];
     }, writeTexture() {}, submit() {} },
     createShaderModule: descriptor => { device.shaders.push(descriptor.code); return descriptor; },
     createBindGroupLayout: descriptor => descriptor,

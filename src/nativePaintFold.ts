@@ -26,3 +26,27 @@ void main() {
 }
 `;
 }
+
+/**
+ * `paintFoldFragmentGlsl` for a straight-alpha WGSL paint pipeline: `fsMain`
+ * becomes a helper, and the new entry scales its alpha by `uPaintFold.x` and,
+ * when `uPaintFold.y` is set, by the mask surface's red channel at this pixel.
+ * The inputs sit in bind group `group`; the neutral fold (1, 0) changes nothing.
+ */
+export function paintFoldFragmentWgsl(source: string, group: number): string {
+  const signature = /@fragment\s+fn fsMain\(inData\s*:\s*(\w+)\)\s*->\s*@location\(0\)\s*vec4f/;
+  const match = source.match(signature);
+  if (!match) throw new Error("Folded paint shader has no supported fragment entry point.");
+  return source.replace(signature, `fn heprUnfoldedPaint(inData: ${match[1]}) -> vec4f`) + `
+@group(${group}) @binding(0) var<uniform> uPaintFold : vec4f;
+@group(${group}) @binding(1) var uPaintMask : texture_2d<f32>;
+
+@fragment
+fn fsMain(inData: ${match[1]}) -> @location(0) vec4f {
+  let color = heprUnfoldedPaint(inData);
+  var fold = uPaintFold.x;
+  if (uPaintFold.y > 0.5) { fold *= textureLoad(uPaintMask, vec2<i32>(inData.position.xy), 0).r; }
+  return vec4f(color.rgb, color.a * fold);
+}
+`;
+}

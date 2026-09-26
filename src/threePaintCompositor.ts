@@ -4,6 +4,7 @@ import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeProjector, type PdfCompositeOperation, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_FRAGMENT_GLSL, pdfCompositeFunctions } from "./pdfCompositeShaders";
 import { setThreePdfShapeOnly } from "./threePdfShape";
+import { canFoldThreePaint, setThreePaintFold } from "./threePaintFold";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 import { scenePaintNodeBounds } from "./scenePaintGraph";
@@ -51,7 +52,12 @@ interface ProxyEntry {
   partialGeometry?: THREE.InstancedBufferGeometry;
   ranges?: readonly { first: number; count: number }[];
   origins?: Uint32Array;
+  /** One-instance geometries of this mesh's folded paints, by canonical index. */
+  foldGeometries?: Map<number, THREE.InstancedBufferGeometry>;
 }
+
+/** A group chain's factors, applied to the one paint it was folded onto. */
+interface PaintFold { opacity: number; mask: THREE.Texture | null }
 
 /** Index of the soft-mask input in the shared composite binding order. */
 const MASK_BINDING = 5;
@@ -138,6 +144,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private readonly backdropColor = new THREE.Vector3();
   private readonly presentationBinding: TextureBinding;
   private readonly linearPresentation = { value: 0 };
+  /**
+   * WebGPU clears not yet encoded. There a clear is a render pass and a queue
+   * submission of its own, so it waits for the next render into its target,
+   * which clears as it loads; a target read before that is cleared first.
+   */
+  private readonly pendingClears = new Map<THREE.RenderTarget, readonly [number, number, number, number]>();
+  /** The pending clear of the target just bound, for its next render. */
+  private clearOnRender: readonly [number, number, number, number] | null = null;
   private renderer: ThreePaintHostRenderer | null = null;
   private output: THREE.RenderTarget | null = null;
   private width = 0;
@@ -315,6 +329,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       }
       this.drawMeshes(backgrounds, backdrop, false);
       this.output = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
+      this.flushClear(this.output);
       this.presentationBinding.value = this.output.texture;
       // Raw GL paints use display values internally. A postprocessing target
       // expects working-linear color and applies its output transfer afterward.
@@ -323,6 +338,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     } finally {
       if (presented) this.release(presented);
       if (backdrop) this.release(backdrop);
+      this.pendingClears.clear(); this.clearOnRender = null;
       this.internalScene.clear();
       renderer.setViewport(saved.viewport); renderer.setScissor(saved.scissor); renderer.setScissorTest(saved.scissorTest);
       // Binding a target restores its own physical viewport/scissor. Global
@@ -348,18 +364,29 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     getThreeRenderPerformance()?.add("three.newSurfaces");
     return target;
   }
-  release(target: THREE.RenderTarget): void { this.pool.push(target); }
+  release(target: THREE.RenderTarget): void { this.pendingClears.delete(target); this.pool.push(target); }
   clear(target: THREE.RenderTarget, color: readonly [number, number, number, number] = [0, 0, 0, 0], bounds?: Bounds): void {
     const rect = pdfCompositeScissorRect(bounds, this.project, this.viewportWidth, this.viewportHeight,
       this.width, this.height);
     if (rect && (rect.width === 0 || rect.height === 0)) return;
-    // WebGPU attachment clears cover the whole surface regardless of scissor;
-    // keep that fast clear there. WebGL can restrict the existing clear call.
-    this.target(target, this.backend === "webgl" ? rect : null);
-    this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
     const profile = getThreeRenderPerformance();
     profile?.add("three.clears");
     profile?.add("three.clearPixels", this.backend === "webgl" && rect ? rect.width * rect.height : this.width * this.height);
+    // WebGPU attachment clears cover the whole surface regardless of scissor;
+    // keep that fast clear there, deferred. WebGL can restrict the clear call.
+    if (this.backend === "webgpu") { this.pendingClears.set(target, color); return; }
+    this.target(target, rect);
+    this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
+    this.renderer!.clear(true, false, false);
+  }
+  /** Encodes a target's pending clear before something reads it. */
+  private flushClear(target: THREE.RenderTarget | undefined): void {
+    const color = target && this.pendingClears.get(target);
+    if (!target || !color) return;
+    this.pendingClears.delete(target);
+    this.target(target);
+    this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
+    getThreeRenderPerformance()?.add("three.clearPasses");
     this.renderer!.clear(true, false, false);
   }
   copy(source: THREE.RenderTarget, destination: THREE.RenderTarget, bounds?: Bounds): void {
@@ -374,6 +401,51 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     // hidden, so its range can have holes that a merged range would repaint.
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.batchLookup");
+    const { ordered, byProxy } = this.proxiesForRuns(runs);
+    profile?.endSection("three.batchLookup");
+    profile?.beginSection("three.batchGeometry");
+    const meshes: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
+    for (const proxy of ordered) {
+      proxy.mesh.material = proxy.source.material;
+      proxy.mesh.geometry = this.geometryForRuns(proxy, byProxy.get(proxy)!);
+      if (proxy.mesh.geometry instanceof THREE.InstancedBufferGeometry && proxy.mesh.geometry.instanceCount === 0) continue;
+      // Proxy meshes are private to the compositor, so an explicit order keeps
+      // source order without depending on the layer's own render order.
+      proxy.mesh.renderOrder = meshes.length;
+      if (proxy.run) profile?.add(`three.${proxy.run.kind}Draws`);
+      meshes.push(proxy.mesh);
+    }
+    profile?.endSection("three.batchGeometry");
+    this.drawMeshes(meshes, destination, shapeOnly);
+  }
+  /**
+   * A fill or analytic gradient fill whose material can scale its own alpha:
+   * each covers a pixel at most once, so its group chain's opacity and mask
+   * can apply to the paint itself (see `drawFolded`).
+   */
+  canFold(run: VectorDrawRun): boolean {
+    if (run.count !== 1 || (run.kind !== "fill" && run.kind !== "gradient-fill")) return false;
+    const { ordered } = this.proxiesForRuns([run]);
+    return ordered.length > 0 && ordered.every(proxy => canFoldThreePaint(proxy.source.material));
+  }
+  drawFolded(run: VectorDrawRun, destination: THREE.RenderTarget, opacity: number, mask: THREE.RenderTarget | undefined): void {
+    const profile = getThreeRenderPerformance();
+    profile?.add("three.foldedPaints");
+    const meshes: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
+    for (const proxy of this.proxiesForRuns([run]).ordered) {
+      const geometry = this.foldGeometry(proxy, run);
+      if (!geometry) continue;
+      proxy.mesh.material = proxy.source.material;
+      proxy.mesh.geometry = geometry;
+      proxy.mesh.renderOrder = meshes.length;
+      profile?.add(`three.${run.kind}Draws`);
+      meshes.push(proxy.mesh);
+    }
+    this.flushClear(mask);
+    this.drawMeshes(meshes, destination, false, { opacity, mask: mask?.texture ?? null });
+  }
+  /** The proxies holding these runs, in source order, each with the runs it holds. */
+  private proxiesForRuns(runs: readonly VectorDrawRun[]): { ordered: ProxyEntry[]; byProxy: Map<ProxyEntry, VectorDrawRun[]> } {
     const ordered: ProxyEntry[] = [];
     const byProxy = new Map<ProxyEntry, VectorDrawRun[]>();
     for (const run of runs) {
@@ -397,21 +469,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     if (ordered.some(proxy => proxy.source.userData.heprScheduled)) {
       ordered.sort((a, b) => a.source.renderOrder - b.source.renderOrder);
     }
-    profile?.endSection("three.batchLookup");
-    profile?.beginSection("three.batchGeometry");
-    const meshes: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
-    for (const proxy of ordered) {
-      proxy.mesh.material = proxy.source.material;
-      proxy.mesh.geometry = this.geometryForRuns(proxy, byProxy.get(proxy)!);
-      if (proxy.mesh.geometry instanceof THREE.InstancedBufferGeometry && proxy.mesh.geometry.instanceCount === 0) continue;
-      // Proxy meshes are private to the compositor, so an explicit order keeps
-      // source order without depending on the layer's own render order.
-      proxy.mesh.renderOrder = meshes.length;
-      if (proxy.run) profile?.add(`three.${proxy.run.kind}Draws`);
-      meshes.push(proxy.mesh);
-    }
-    profile?.endSection("three.batchGeometry");
-    this.drawMeshes(meshes, destination, shapeOnly);
+    return { ordered, byProxy };
   }
   pass(operation: PdfCompositeOperation<THREE.RenderTarget>, destination: THREE.RenderTarget): void {
     const rect = pdfCompositeScissorRect(operation.bounds, this.project, this.viewportWidth, this.viewportHeight,
@@ -419,6 +477,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     if (rect && (rect.width === 0 || rect.height === 0)) return;
     getThreeRenderPerformance()?.add("three.compositePasses");
     const sources = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
+    for (const source of sources) if (source !== destination) this.flushClear(source);
     for (let index = 0; index < sources.length; index++) {
       this.bindings[index].value = sources[index]?.texture ?? (index === MASK_BINDING ? this.one : this.zero);
     }
@@ -469,6 +528,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     profile?.beginSection("three.bindTarget");
     try { this.renderer!.setRenderTarget(target); }
     finally { profile?.endSection("three.bindTarget"); }
+    this.clearOnRender = this.pendingClears.get(target) ?? null;
+    this.pendingClears.delete(target);
     // WebGPURenderer reads the renderer's scissor-test flag even for targets;
     // WebGLRenderer restores the target flag on bind. Set both through public APIs.
     this.renderer!.setScissorTest(rect !== null);
@@ -486,6 +547,15 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     }
   }
   private hostRenderInternal(label: () => string): void {
+    // A deferred clear of this target happens as the render pass loads.
+    const clear = this.clearOnRender;
+    this.clearOnRender = null;
+    if (!clear) { this.hostRenderUnclearing(label); return; }
+    this.renderer!.setClearColor(new THREE.Color().setRGB(clear[0], clear[1], clear[2]), clear[3]);
+    this.renderer!.autoClear = true;
+    try { this.hostRenderUnclearing(label); } finally { this.renderer!.autoClear = false; }
+  }
+  private hostRenderUnclearing(label: () => string): void {
     const enabled = this.debugValidation ||
       (globalThis as { HEPR_DEBUG_COMPOSITOR_VALIDATION?: boolean }).HEPR_DEBUG_COMPOSITOR_VALIDATION === true;
     const device = enabled
@@ -502,11 +572,12 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     }
   }
   private drawMeshes(meshes: readonly THREE.Mesh<THREE.BufferGeometry, THREE.Material>[],
-    destination: THREE.RenderTarget, shapeOnly: boolean): void {
+    destination: THREE.RenderTarget, shapeOnly: boolean, fold: PaintFold | null = null): void {
     if (meshes.length === 0) return;
     // Clip clones share one shape input, so restore in reverse: the last
     // writer of a shared uniform must be the first to put it back.
     const restores = meshes.map(mesh => setThreePdfShapeOnly(mesh.material, shapeOnly));
+    if (fold) for (const mesh of meshes) restores.push(setThreePaintFold(mesh.material, fold.opacity, fold.mask));
     this.target(destination);
     for (const mesh of meshes) this.internalScene.add(mesh);
     try { this.hostRender(() => `draw ${meshes.length} mesh(es) -> ${surfaceLabel(destination)}`); }
@@ -658,13 +729,47 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     return partial;
   }
 
+  /**
+   * A folded paint's own one-instance geometry. A fill's instance data is the
+   * same every frame, so each folded paint builds it once, rather than
+   * rewriting the shared partial buffer once per fold within every frame. A
+   * mesh holding only this paint keeps its canonical buffers.
+   */
+  private foldGeometry(proxy: ProxyEntry, run: VectorDrawRun): THREE.BufferGeometry | null {
+    const geometry = proxy.source.geometry;
+    if (!proxy.attribute || !proxy.run) return geometry;
+    const ranges = proxy.ranges ?? [proxy.run];
+    if (ranges.every(range => range.first >= run.first && range.first + range.count <= run.first + run.count)) return geometry;
+    const cached = proxy.foldGeometries?.get(run.first);
+    if (cached) return cached;
+    const source = geometry.getAttribute(proxy.attribute);
+    const capacity = (geometry as THREE.InstancedBufferGeometry).instanceCount;
+    let item = -1;
+    for (let index = 0; index < capacity && item < 0; index++) {
+      const id = source.getX(index);
+      if ((proxy.origins?.[id] ?? id) === run.first) item = index;
+    }
+    if (item < 0) return null;
+    const folded = new THREE.InstancedBufferGeometry();
+    for (const [name, attribute] of Object.entries(geometry.attributes)) {
+      if (!(attribute instanceof THREE.InstancedBufferAttribute)) { folded.setAttribute(name, attribute); continue; }
+      const ArrayType = attribute.array.constructor as { new(length: number): typeof attribute.array };
+      const array = new ArrayType(attribute.itemSize);
+      for (let component = 0; component < attribute.itemSize; component++) array[component] = attribute.getComponent(item, component);
+      folded.setAttribute(name, new THREE.InstancedBufferAttribute(array, attribute.itemSize, attribute.normalized));
+    }
+    folded.setIndex(geometry.index);
+    folded.instanceCount = 1;
+    (proxy.foldGeometries ??= new Map()).set(run.first, folded);
+    return folded;
+  }
+
   private disposePartial(proxy: ProxyEntry): void {
+    for (const folded of proxy.foldGeometries?.values() ?? []) disposeOwnedInstances(folded);
+    proxy.foldGeometries = undefined;
     const geometry = proxy.partialGeometry;
     if (!geometry) return;
-    for (const [name, attribute] of Object.entries(geometry.attributes)) {
-      if (!(attribute instanceof THREE.InstancedBufferAttribute)) geometry.deleteAttribute(name);
-    }
-    geometry.setIndex(null); geometry.dispose();
+    disposeOwnedInstances(geometry);
     proxy.partialGeometry = undefined;
   }
 
@@ -700,4 +805,15 @@ export function projectThreePdfCompositeBounds(bounds: Bounds, matrix: THREE.Mat
     maxX = Math.max(maxX, px); maxY = Math.max(maxY, py);
   }
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+/**
+ * Disposes a subset geometry's own instance buffers. Its other attributes and
+ * index belong to the source mesh, so they are detached first and survive.
+ */
+function disposeOwnedInstances(geometry: THREE.BufferGeometry): void {
+  for (const [name, attribute] of Object.entries(geometry.attributes)) {
+    if (!(attribute instanceof THREE.InstancedBufferAttribute)) geometry.deleteAttribute(name);
+  }
+  geometry.setIndex(null); geometry.dispose();
 }

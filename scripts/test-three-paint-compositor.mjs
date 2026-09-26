@@ -367,6 +367,7 @@ try {
     for (const mesh of slotMeshes) { mesh.geometry.dispose(); mesh.material.dispose(); }
 
     testProxyReplacement(ThreePaintCompositor, backend);
+    await testFolding(ThreePaintCompositor, backend);
 
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
@@ -383,7 +384,7 @@ try {
   matrix.elements[3] = 4;
   assert.equal(projectThreePdfCompositeBounds({ minX: -1, minY: -1, maxX: 1, maxY: 1 }, matrix, 200, 100), null,
     "a rectangle crossing the perspective near plane conservatively keeps a full pass");
-  console.log("Three PDF compositor state, canonical subsets, shape coverage, pooling, and staged raster updates passed");
+  console.log("Three PDF compositor state, canonical subsets, shape coverage, folding, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
 
 function makeRenderer(backend = "webgpu") {
@@ -428,6 +429,87 @@ function makeRenderer(backend = "webgpu") {
     }
   };
 }
+// A Normal group holding one fill, with an opacity and a soft mask, folds onto
+// that fill: it draws straight onto the parent surface with the chain's
+// factors, and needs no surface, clear or composite pass of its own.
+async function testFolding(ThreePaintCompositor, backend) {
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { threePaintFoldState } = await import("../src/threePaintFold.ts");
+  const square = (x, y, size) => [[x, y], [x + size, y], [x + size, y + size], [x, y + size]];
+  const paths = [square(1, 1, 4), square(2, 2, 6)];
+  const a = [], b = [], metaA = [], metaB = [], metaC = [];
+  for (const points of paths) {
+    const start = a.length / 4;
+    points.forEach(([x0, y0], index) => { const [x1, y1] = points[(index + 1) % points.length];
+      a.push(x0, y0, x0, y0); b.push(x1, y1, 0, 0); });
+    const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+    metaA.push(start, points.length, Math.min(...xs), Math.min(...ys));
+    metaB.push(Math.max(...xs), Math.max(...ys), 1, 0);
+    metaC.push(0, 0, 0, 1);
+  }
+  const f = values => Float32Array.from(values);
+  const group = { kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
+    softMask: { subtype: "Alpha", children: [{ kind: "draw", runIndex: 1 }] }, children: [{ kind: "draw", runIndex: 0 }] };
+  const scene = Object.assign(createEmptyVectorScene(), {
+    pageRects: f([0, 0, 10, 10]), pageBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+    fillPathCount: 2, fillSegmentCount: a.length / 4, fillPathMetaA: f(metaA), fillPathMetaB: f(metaB),
+    fillPathMetaC: f(metaC), fillSegmentsA: f(a), fillSegmentsB: f(b),
+    drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
+    paintGraph: { roots: [group] }
+  });
+  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, vectorOverride: [0, 0, 0, 0] });
+  const compositor = new ThreePaintCompositor(backend);
+  const host = makeRenderer(backend);
+  const folds = [], clearingRenders = [];
+  const render = host.render.bind(host);
+  host.render = (renderScene, camera) => {
+    if (host.autoClear) clearingRenders.push(host.target);
+    for (const mesh of renderScene.children) {
+      const ids = mesh.geometry.getAttribute("aFillPathIndex");
+      if (ids) folds.push({ ids: Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
+        fold: threePaintFoldState(mesh.material) });
+    }
+    render(renderScene, camera);
+  };
+  const profiler = new RenderPerformanceProfiler();
+  profiler.start({ gpu: false, maxFrames: 1 });
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => compositor.render(host, scene, [fill.mesh], 32, 24, () => true));
+  profiler.endFrame();
+  const counters = profiler.getReport().counters;
+  profiler.dispose();
+  assert.equal(counters["three.foldedPaints"]?.total, 1, `${backend}: the masked group folds onto its fill`);
+  const masked = folds.find(draw => draw.fold?.masked);
+  assert.ok(masked, `${backend}: the folded fill draws with its mask`);
+  assert.deepEqual(masked.ids, [0], "only the folded paint draws, from its own one-instance geometry");
+  assert.equal(masked.fold.opacity, 0.5, "the fold carries the group's opacity");
+  assert.ok([...compositor.surfaces].some(target => target.texture === masked.fold.mask), "the mask is a compositor surface");
+  assert.deepEqual(folds.filter(draw => draw !== masked).map(draw => draw.fold),
+    folds.filter(draw => draw !== masked).map(() => ({ opacity: 1, masked: false, mask: null })),
+    "every other draw keeps the neutral fold");
+  assert.deepEqual(threePaintFoldState(fill.mesh.material), { opacity: 1, masked: false, mask: null },
+    "the fold is restored after drawing");
+  // Folding saves the group's surface, its clear and its composite. What is
+  // left is the backdrop copy and the soft mask, with its own content surface.
+  assert.equal(counters["three.compositePasses"]?.total, 2, `${backend}: only the copy and the soft mask need passes`);
+  assert.equal(counters["three.clears"]?.total, 2, `${backend}: only the backdrop and the mask content are cleared`);
+  // A WebGPU clear is a render pass and submission of its own, so it rides on
+  // the next render into its target. The backdrop is read (copied) before
+  // anything renders into it, so its clear alone is encoded by itself.
+  if (backend === "webgpu") {
+    assert.equal(host.clears.length, 1, "webgpu: only the backdrop, read first, clears on its own");
+    assert.equal(counters["three.clearPasses"]?.total, 1);
+    assert.equal(clearingRenders.length, 1, "webgpu: the mask content's clear happens as its draw loads");
+  } else {
+    assert.equal(host.clears.length, 2, "webgl: scissored clears stay separate calls");
+    assert.equal(clearingRenders.length, 0);
+  }
+  assert.equal(host.autoClear, true, "the host's own clear setting is restored");
+  compositor.dispose(); fill.dispose();
+}
+
 function snapshot(renderer) {
   return { target: renderer.target.uuid, viewport: renderer.viewport.toArray(), scissor: renderer.scissor.toArray(),
     scissorTest: renderer.scissorTest, color: renderer.clearColor.toArray(), alpha: renderer.clearAlpha,

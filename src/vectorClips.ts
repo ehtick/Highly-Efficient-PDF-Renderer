@@ -151,7 +151,7 @@ function clipCellTexels(cells: VectorPathCells): number {
 export interface PackVectorClipOptions {
   /**
    * Index polygons with cells instead of bands. Only shaders that read flag
-   * bit 2 may be given this layout: native WebGL's GLSL does.
+   * bit 2 may be given this layout: the clip GLSL and WGSL both do.
    */
   readonly cells?: boolean;
 }

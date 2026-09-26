@@ -410,3 +410,46 @@ fn heprCoverageMargin(pathToPixel: mat2x2<f32>) -> vec2<f32> {
   return vec2<f32>(length(pathToPixel[1]), length(pathToPixel[0])) * (${FILL_COVERAGE_MARGIN_PX.toFixed(1)} / det);
 }
 `;
+
+/**
+ * The quad a paint under a clip chain needs, as (low, high): the paint's
+ * bounds clamped to the chain's, then widened by the coverage margin. The
+ * clip's antialiasing reaches under a pixel past its bounds, which the same
+ * margin keeps; a paint and clip farther apart than that share no pixel and
+ * get low > high. The margin is the largest at any corner of the clamped
+ * rectangle, so the four vertices of a projected quad agree on it, and on
+ * whether the quad is empty. Unbounded clip bounds leave the paint's own.
+ * Needs FILL_COVERAGE_VERTEX_GLSL.
+ */
+export const CLIPPED_PAINT_QUAD_GLSL = `
+vec4 heprClippedPaintQuad(vec2 minBounds, vec2 maxBounds, vec4 clipBounds, float useLocalToClip,
+    mat4 localToClip, float zoom, vec2 viewport) {
+  vec2 low = max(minBounds, clipBounds.xy);
+  vec2 high = min(maxBounds, clipBounds.zw);
+  vec2 a = min(low, high);
+  vec2 b = max(low, high);
+  vec2 margin = max(
+    max(heprCoverageMargin(heprPathToPixel(a, useLocalToClip, localToClip, zoom, viewport)),
+      heprCoverageMargin(heprPathToPixel(b, useLocalToClip, localToClip, zoom, viewport))),
+    max(heprCoverageMargin(heprPathToPixel(vec2(a.x, b.y), useLocalToClip, localToClip, zoom, viewport)),
+      heprCoverageMargin(heprPathToPixel(vec2(b.x, a.y), useLocalToClip, localToClip, zoom, viewport))));
+  return vec4(low - margin, high + margin);
+}
+`;
+
+/** CLIPPED_PAINT_QUAD_GLSL in WGSL. Needs FILL_COVERAGE_VERTEX_WGSL. */
+export const CLIPPED_PAINT_QUAD_WGSL = /* wgsl */ `
+fn heprClippedPaintQuad(minBounds: vec2<f32>, maxBounds: vec2<f32>, clipBounds: vec4<f32>, useLocalToClip: f32,
+    localToClip: mat4x4<f32>, zoom: f32, viewport: vec2<f32>) -> vec4<f32> {
+  let low = max(minBounds, clipBounds.xy);
+  let high = min(maxBounds, clipBounds.zw);
+  let a = min(low, high);
+  let b = max(low, high);
+  let margin = max(
+    max(heprCoverageMargin(heprPathToPixel(a, useLocalToClip, localToClip, zoom, viewport)),
+      heprCoverageMargin(heprPathToPixel(b, useLocalToClip, localToClip, zoom, viewport))),
+    max(heprCoverageMargin(heprPathToPixel(vec2<f32>(a.x, b.y), useLocalToClip, localToClip, zoom, viewport)),
+      heprCoverageMargin(heprPathToPixel(vec2<f32>(b.x, a.y), useLocalToClip, localToClip, zoom, viewport))));
+  return vec4<f32>(low - margin, high + margin);
+}
+`;

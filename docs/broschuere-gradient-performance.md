@@ -1,5 +1,101 @@
 # Broschuere rendering performance investigation
 
+## Three and WebGPU: native WebGL's savings, and captures (September 26)
+
+The first three differences below are now fixed; no captures yet.
+
+- Three's gradient quads are clamped to their clip chain's bounds. Three always
+  projects through local-to-clip, so the margin is the largest at any of the
+  clamped rectangle's corners. On Broschuere this shades 0.26 M gradient pixels
+  instead of 1.87 M.
+- Three (WebGL and WebGPU) and native WebGPU fold single-paint group chains
+  holding a fill or an analytic gradient fill. All 29 folds on Broschuere are
+  such fills (21) and gradients (8), each with a soft mask. The compositor then
+  issues 55 clears, 61 passes, 12 copies and 75 spans plus 29 folded draws,
+  instead of 104 clears, 110 passes, 12 copies and 104 spans.
+- On WebGPU a clear waits for the next pass into its surface, which clears as
+  it loads. Native WebGPU then encodes 171 render passes for Broschuere instead
+  of about 320, and only 4 of them only clear. Three WebGPU does the same with
+  `autoClear`, saving each clear's pass and submission.
+- `heprPerf` captures native WebGPU, with CPU sections and GPU times from
+  timestamp queries on every render pass, and Three WebGPU through Three's
+  timestamps.
+
+## Three WebGL: what the first capture shows (September 26)
+
+At fit-all, Three WebGL frames arrive 8.4 ms apart at the median (120 FPS)
+and 10.5 ms on average. CPU time is 7.3 ms per frame, against 2.3–2.7 ms
+native. The GPU command span is 8.2 ms. Fills and gradient fills match native
+draw for draw (same instance counts), and so do their stores (579 cell-indexed
+fill paths), clip packing and shaders. Three frames the document smaller,
+though, at zoom 0.183 against native's 0.224; at that zoom the fill model
+predicts 2.08 ms for native, against 2.26 ms at 0.224.
+
+Four differences account for the gap:
+
+- Three's gradient quads cover the whole path, not its intersection with the
+  clip chain's bounds. That is 1.87 M pixels per frame against native's
+  0.26 M, and gradient fills take 2.14 ms against 1.01 ms.
+- Three does not fold single-paint group chains. The shared compositor then
+  issues 104 clears, 122 passes and copies, and 104 spans, where native WebGL
+  issues 55, 73, and 75 spans plus 29 folded draws. The capture's 105 clears
+  and 122 passes match the unfolded counts.
+- Each `renderer.render()` costs about 14 µs of CPU per mesh (native: about
+  6 µs per operation), and a frame makes 229 of them: 105 draw groups and
+  124 passes.
+- Fills take 3.56 ms, against the 2.08 ms the model predicts, with the same
+  program and data. The capture cannot tell why. One candidate is a GPU held
+  at lower clocks while a CPU-bound frame keeps it waiting. To be rechecked
+  once the CPU cost falls.
+
+Native WebGPU cannot be captured yet: `heprPerf` in the native viewer supports
+WebGL only, and Three WebGPU reports CPU sections without GPU times. Native
+WebGPU does not fold either, and there a clear, a span and a pass each begin
+their own render pass, about 340 per frame.
+
+## WebGPU and Three: the same indexes (September 26)
+
+Native WebGPU, Three WebGL and Three WebGPU now use the fill cells, gradient
+fill cells and cell-indexed clips that native WebGL uses. Clip antialiasing is
+also sample-only on all four. Three WebGL already ran native WebGL's GLSL, so it
+needed only the stores and the cell uniform. The WGSL cell coverage matches
+the GLSL on every test box to 1e-12. The WGSL clip was translated to C++ and
+compared with a brute-force point-in-polygon test over 9,919 points per layout
+(cells and bands): 0 mismatches in point tests and in 4×4 sample coverage.
+Each of ten deliberate errors in it was caught. No captures yet.
+
+The native WebGPU gradient mesh shader has not compiled since the band header
+joined the gradient fill's varyings (49ffc7a): both used location 9. The mesh
+color now has a location of its own.
+
+## Native WebGL: a draw's pieces come from memory (September 26)
+
+With one texel per line, frames arrive 5.5 ms apart on average at fit-all
+(181 FPS, up from 175) and 4.2 ms at the median. The GPU command span fell from
+5.1 to 4.8 ms p50. The capture now times every operation position
+(`byPosition`), and their medians attribute 3.8 ms of the frame. Fills take
+2.25 ms of that, gradient fills 1.03 ms, and everything else, including 55
+clears and 35 soft-mask passes, 0.5 ms. The logo draws fell as the model
+predicted: #303 from 0.21 to 0.13 ms, #60 from 0.10 to 0.06 ms. #354, whose
+densest path is 60% quadratics, stayed at 0.22 ms.
+
+Fitted over all 80 fill draws, a draw costs about 0.7 µs per dependent read
+step of its worst pixel, plus about 0.1 ms per million texel fetches
+(R² 0.74). A step of 0.4–0.8 µs is about one trip to GPU memory. A draw's
+pieces are rarely cached: the piece textures (39 MB) exceed the L2 cache, and
+each draw reads different paths. Coarser cells than half the footprint model
+20% worse; finer ones gain 1–10%, depending on where each path's cell sizes
+fall.
+
+Reading more pieces per step did not pay off. Line cells read eight texels
+per step and curve cells four pieces per step; the fitted model predicted
+fills falling from 2.26 to 1.56 ms, and the capture measured 2.25 against
+2.26 ms. The logo draw #303 fell from 0.131 to 0.114 ms, but the wide draws
+each grew by 5–8 µs, and #354 stayed at 0.22 ms. #354 is limited by curve
+arithmetic, not by fetches, and the step model overrates wider reads. The
+change was reverted. Native WebGL now runs at 240 FPS at the median while
+panning at fit-all, with about 4.7 ms of GPU time per frame.
+
 ## Native WebGL: fills fetch one texel per line (September 26)
 
 Captures at fit-all after sample-only clip antialiasing. Frames now arrive

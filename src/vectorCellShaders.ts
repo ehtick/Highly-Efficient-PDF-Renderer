@@ -100,3 +100,114 @@ float heprCellWinding(vec4 cells, vec2 origin, vec4 box, vec2 footprint) {
   return winding;
 }
 `;
+
+/**
+ * The same coverage in WGSL, for native WebGPU and Three's node materials.
+ * Textures are parameters, as TSL functions cannot name globals; A holds the
+ * segments, pieces and index records, B the pieces' control points.
+ */
+export const VECTOR_CELL_COVERAGE_WGSL = /* wgsl */ `
+fn heprCellWinding(cells: vec4<f32>, origin: vec2<f32>, box: vec4<f32>, footprint: vec2<f32>,
+    segmentsA: texture_2d<f32>, segmentsB: texture_2d<f32>) -> f32 {
+  let reach = 0.5 * max(footprint.x, footprint.y);
+  var level = clamp(ceil(log2(max(reach / cells.z, 1.0)) / cells.w), 0.0, cells.y - 1.0);
+  var size = cells.z * exp2(level * cells.w);
+  if (size < reach && level < cells.y - 1.0) {
+    level = level + 1.0;
+    size = cells.z * exp2(level * cells.w);
+  }
+  let grid = heprCellTexel(segmentsA, i32(cells.x + level));
+  let right = box.x + footprint.x;
+  let firstColumn = i32(clamp(floor((box.x - origin.x) / size), 0.0, grid.y - 1.0));
+  let lastColumn = i32(clamp(floor((right - origin.x) / size), 0.0, grid.y - 1.0));
+  let firstRow = i32(clamp(floor((box.y - origin.y) / size), 0.0, grid.z - 1.0));
+  let lastRow = i32(clamp(floor((box.y + footprint.y - origin.y) / size), 0.0, grid.z - 1.0));
+  let rowGrid = vec4<f32>(0.0, 0.0, origin.y, size);
+  var winding = 0.0;
+  // Reads run ahead of their use, as in the GLSL version.
+  for (var row = firstRow; row <= lastRow; row = row + 1) {
+    let rows = heprBandRows(rowGrid, row, i32(grid.z), box);
+    let rowBase = i32(grid.x + f32(row) * grid.y);
+    var nextCell = heprCellTexel(segmentsA, rowBase + firstColumn);
+    for (var column = firstColumn; column <= lastColumn; column = column + 1) {
+      let cell = nextCell;
+      nextCell = heprCellTexel(segmentsA, rowBase + min(column + 1, lastColumn));
+      // The outer columns reach past the grid: nothing lies beyond them.
+      var low = max(box.x, origin.x + f32(column) * size);
+      if (column == 0) {
+        low = box.x;
+      }
+      var high = min(right, origin.x + f32(column + 1) * size);
+      if (column == i32(grid.y) - 1) {
+        high = right;
+      }
+      if (high > low) {
+        let part = vec4<f32>(low, box.y, 1.0 / (high - low), box.w);
+        var cellWinding = 0.0;
+        let first = i32(cell.x);
+        let count = i32(abs(cell.y));
+        let last = first + count - 1;
+        if (cell.y > 0.0) {
+          // Lines only, one texel each. Reads past the end repeat the last
+          // line; an empty row range makes them add nothing.
+          for (var piece = 0; piece < count; piece = piece + 4) {
+            let l0 = heprCellTexel(segmentsA, first + piece);
+            let l1 = heprCellTexel(segmentsA, min(first + piece + 1, last));
+            let l2 = heprCellTexel(segmentsA, min(first + piece + 2, last));
+            let l3 = heprCellTexel(segmentsA, min(first + piece + 3, last));
+            cellWinding = cellWinding + heprCellLine(l0, part, rows.x, rows.y) +
+              heprCellLine(l1, part, rows.x, select(rows.x, rows.y, piece + 1 < count)) +
+              heprCellLine(l2, part, rows.x, select(rows.x, rows.y, piece + 2 < count)) +
+              heprCellLine(l3, part, rows.x, select(rows.x, rows.y, piece + 3 < count));
+          }
+        } else if (count > 0) {
+          var nextA = heprCellTexel(segmentsA, first);
+          var nextB = heprCellTexel(segmentsB, first);
+          for (var piece = 0; piece < count; piece = piece + 1) {
+            let a = nextA;
+            let b = nextB;
+            let following = min(first + piece + 1, last);
+            nextA = heprCellTexel(segmentsA, following);
+            nextB = heprCellTexel(segmentsB, following);
+            cellWinding = cellWinding + heprSegmentCoverage(vec2<f32>(a.x, a.y), vec2<f32>(b.x, b.y),
+              vec2<f32>(a.z, a.w), b.z >= 0.5, part, rows.x, rows.y);
+          }
+        }
+        let closures = i32(cell.z);
+        let closureCount = i32(cell.w);
+        for (var closure = 0; closure < closureCount; closure = closure + 2) {
+          let pair = heprCellTexel(segmentsA, closures + closure);
+          let pair2 = heprCellTexel(segmentsA, closures + min(closure + 1, closureCount - 1));
+          let more = select(0.0, 1.0, closure + 1 < closureCount);
+          cellWinding = cellWinding + pair.y * (clamp((pair.x - box.y) * box.w, rows.x, rows.y) - rows.y) +
+            pair.w * (clamp((pair.z - box.y) * box.w, rows.x, rows.y) - rows.y) +
+            more * pair2.y * (clamp((pair2.x - box.y) * box.w, rows.x, rows.y) - rows.y) +
+            more * pair2.w * (clamp((pair2.z - box.y) * box.w, rows.x, rows.y) - rows.y);
+        }
+        winding = winding + cellWinding * (high - low) / footprint.x;
+      }
+    }
+  }
+  return winding;
+}
+
+fn heprCellTexel(segments: texture_2d<f32>, index: i32) -> vec4<f32> {
+  let width = i32(textureDimensions(segments).x);
+  return textureLoad(segments, vec2<i32>(index % width, index / width), 0);
+}
+
+fn heprCellLine(line: vec4<f32>, part: vec4<f32>, low: f32, high: f32) -> f32 {
+  return heprSegmentCoverage(vec2<f32>(line.x, line.y), vec2<f32>(line.x, line.y), vec2<f32>(line.z, line.w), false,
+    part, low, high);
+}
+`;
+
+/** A path's cell header, from `headers` (the first header's texel plus one; zero means none). */
+export const VECTOR_FILL_CELL_INFO_WGSL = /* wgsl */ `
+fn heprFillCellInfo(pathIndex: f32, headers: f32, segments: texture_2d<f32>) -> vec4<f32> {
+  if (headers <= 0.0) { return vec4<f32>(0.0); }
+  let width = i32(textureDimensions(segments).x);
+  let index = i32(headers - 1.0 + pathIndex + 0.5);
+  return textureLoad(segments, vec2<i32>(index % width, index / width), 0);
+}
+`;

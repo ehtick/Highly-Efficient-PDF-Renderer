@@ -13,6 +13,33 @@ export interface RenderPerformanceOptions {
   gpuOperations?: boolean;
 }
 
+/**
+ * GPU timing an integration measures itself, such as WebGPU timestamp queries.
+ * The profiler asks it to time its sampled frames and collects whatever has
+ * completed, without waiting.
+ */
+export interface ExternalGpuFrameTimer {
+  /** Why frames cannot be timed; null when they can. */
+  readonly unavailableReason: string | null;
+  /** How to read its times, added to the report's notes. */
+  readonly note?: string;
+  /** Times the frame about to render, numbered `frame`; false when it cannot now. */
+  beginFrame(frame: number): boolean;
+  endFrame(): void;
+  /** Frames whose results arrived since the last call. */
+  takeResults(): readonly ExternalGpuFrameResult[];
+  /** Drops frames still in flight and returns how many. */
+  cancel(): number;
+}
+
+export interface ExternalGpuFrameResult {
+  frame: number;
+  /** The frame's GPU time, or null when its timestamps were unusable. */
+  ms: number | null;
+  /** Its timed operations, such as render passes, in submission order. */
+  operations?: readonly GpuOperationDetail[];
+}
+
 export interface RenderPerformanceFrameContext {
   cameraCenterX?: number | null;
   cameraCenterY?: number | null;
@@ -157,13 +184,20 @@ export class RenderPerformanceProfiler {
   private droppedGpuSamples = 0;
   private readonly describeProgram: ((program: WebGLProgram | null) => string | null) | undefined;
   private operations: GpuOperationTimer | null = null;
+  private readonly gpuTimer: ExternalGpuFrameTimer | undefined;
+  private externalOperations: GpuOperationStats | null = null;
+  private externalTiming = false;
 
-  /** `describeProgram` names programs in operation timings; it runs only in timed frames. */
+  /**
+   * `describeProgram` names programs in operation timings; it runs only in
+   * timed frames. `gpuTimer` measures GPU time for a host without WebGL.
+   */
   constructor(options: { gl?: WebGL2RenderingContext; now?: () => number;
-    describeProgram?: (program: WebGLProgram | null) => string | null } = {}) {
+    describeProgram?: (program: WebGLProgram | null) => string | null; gpuTimer?: ExternalGpuFrameTimer } = {}) {
     this.gl = options.gl;
     this.now = options.now ?? (() => performance.now());
     this.describeProgram = options.describeProgram;
+    this.gpuTimer = options.gpuTimer;
   }
 
   get enabled(): boolean { return this.active; }
@@ -190,6 +224,13 @@ export class RenderPerformanceProfiler {
     this.endedAt = this.startedAt;
     this.active = true;
     if (options.gpu === false) return;
+    if (this.gpuTimer) {
+      const reason = this.gpuTimer.unavailableReason;
+      this.gpuStatus = reason ? "unavailable" : "available";
+      this.gpuReason = reason;
+      if (!reason && options.gpuOperations) this.externalOperations = new GpuOperationStats();
+      return;
+    }
     if (!this.gl) {
       this.gpuStatus = "unavailable";
       this.gpuReason = "No WebGL2 context was provided.";
@@ -224,6 +265,14 @@ export class RenderPerformanceProfiler {
     this.frameContext = this.maxFrameRecords ? { frameGapMs: gap !== null && gap > 0 ? gap : null } : null;
     this.events = [];
     this.pollGpu();
+    if (this.gpuTimer) {
+      if (this.gpuStatus !== "available" || this.frameCpu.length % GPU_SAMPLE_EVERY !== 0) return;
+      const frame = this.frameCpu.length;
+      this.externalTiming = this.gpuTimer.beginFrame(frame);
+      if (!this.externalTiming) this.droppedGpuSamples++;
+      if (this.maxFrameRecords) this.frameGpuStates[frame] = this.externalTiming ? "pending" : "discarded";
+      return;
+    }
     // Operation frames never coincide with frame-span frames: one query at a time.
     if (this.gpuStatus === "available") this.operations?.beginFrame(this.frameCpu.length);
     if (this.gpuStatus !== "available" || this.frameCpu.length % GPU_SAMPLE_EVERY !== 0) return;
@@ -260,6 +309,7 @@ export class RenderPerformanceProfiler {
     this.frameStart = null;
     this.endedAt = now;
     this.operations?.endFrame();
+    if (this.externalTiming) { this.externalTiming = false; this.gpuTimer!.endFrame(); }
     this.finishGpuQuery();
     if (this.frameCpu.length >= this.maxFrames) this.finish();
   }
@@ -329,6 +379,8 @@ export class RenderPerformanceProfiler {
     this.frameGpuTimes.length = this.frameGpuStates.length = 0;
     this.cpuSections.clear(); this.counters.clear();
     this.operations = null;
+    this.externalOperations = null;
+    this.externalTiming = false;
     this.extension = null;
     this.gpuStatus = "disabled";
     this.gpuReason = null;
@@ -347,13 +399,19 @@ export class RenderPerformanceProfiler {
         pendingSamples: this.pendingQueries.length + (this.activeQuery ? 1 : 0),
         droppedSamples: this.droppedGpuSamples, sampleEvery: GPU_SAMPLE_EVERY,
         operations: this.operationReport() },
-      notes: [...NOTES]
+      notes: this.gpuTimer?.note ? [...NOTES, this.gpuTimer.note] : [...NOTES]
     };
   }
 
   dispose(): void { this.finish(); this.disposed = true; }
 
   private operationReport(): RenderPerformanceReport["gpu"]["operations"] {
+    if (this.externalOperations) {
+      const { frameMs, frameOperations, ...totals } = this.externalOperations.totals();
+      return { status: this.gpuStatus === "available" ? "available" : "unavailable", reason: this.gpuReason,
+        sampleEvery: GPU_SAMPLE_EVERY, droppedFrames: 0, ...totals,
+        frameMs: summarize(frameMs), operationsPerFrame: summarize(frameOperations) };
+    }
     if (!this.operations) return null;
     const { frameMs, frameOperations, ...totals } = this.operations.totals();
     return { ...totals, frameMs: summarize(frameMs), operationsPerFrame: summarize(frameOperations) };
@@ -434,6 +492,13 @@ export class RenderPerformanceProfiler {
     this.endedAt = this.now();
     this.finishGpuQuery();
     this.pollGpu();
+    if (this.gpuTimer) {
+      if (this.externalTiming) { this.externalTiming = false; this.gpuTimer.endFrame(); }
+      this.droppedGpuSamples += this.gpuTimer.cancel();
+      for (let frame = 0; frame < this.frameGpuStates.length; frame++) {
+        if (this.frameGpuStates[frame] === "pending") this.discardFrameGpu(frame);
+      }
+    }
     this.releaseQueries();
     this.operations?.dispose();
     this.active = false;
@@ -458,6 +523,20 @@ export class RenderPerformanceProfiler {
 
   private pollGpu(): void {
     if (this.gpuStatus !== "available") return;
+    if (this.gpuTimer) {
+      for (const result of this.gpuTimer.takeResults()) {
+        if (result.ms === null || !Number.isFinite(result.ms) || result.ms < 0) {
+          this.droppedGpuSamples++; this.discardFrameGpu(result.frame); continue;
+        }
+        this.gpuTimes.push(result.ms);
+        if (this.maxFrameRecords) {
+          this.frameGpuTimes[result.frame] = result.ms;
+          this.frameGpuStates[result.frame] = "available";
+        }
+        if (result.operations && this.externalOperations) this.externalOperations.addFrame(result.operations);
+      }
+      return;
+    }
     const gl = this.gl!;
     try {
       if (gl.getParameter(this.extension!.GPU_DISJOINT_EXT)) {
@@ -606,6 +685,72 @@ const TIMED = {
 } as const satisfies Record<string, (args: unknown[]) => unknown[]>;
 
 /**
+ * Aggregates timed operations frame by frame: per label, per position in the
+ * frame, and the slowest. Shared by every backend's operation timings.
+ */
+export class GpuOperationStats {
+  private readonly frameMs: number[] = [];
+  private readonly frameOperations: number[] = [];
+  private readonly labels = new Map<string, { calls: number; ms: number; maxMs: number; frameMs: number[] }>();
+  /** Keyed by position and label, so a frame whose sequence differs does not mix operations. */
+  private readonly positions = new Map<string, { detail: GpuOperationDetail; ms: number[] }>();
+  private slowest: GpuOperationDetail[] = [];
+
+  get frames(): number { return this.frameMs.length; }
+
+  /** One frame's operations, in submission order, each with its time. */
+  addFrame(operations: readonly GpuOperationDetail[]): void {
+    const frame = this.frameMs.length;
+    let total = 0;
+    for (const operation of operations) {
+      const ms = operation.ms;
+      total += ms;
+      let entry = this.labels.get(operation.label);
+      if (!entry) this.labels.set(operation.label, entry = { calls: 0, ms: 0, maxMs: 0, frameMs: [] });
+      entry.calls++; entry.ms += ms; entry.maxMs = Math.max(entry.maxMs, ms);
+      while (entry.frameMs.length <= frame) entry.frameMs.push(0);
+      entry.frameMs[frame] += ms;
+      const key = `${operation.order}:${operation.label}`;
+      const position = this.positions.get(key);
+      if (position) position.ms.push(ms);
+      else if (this.positions.size < MAX_OPERATIONS_PER_FRAME) this.positions.set(key, { detail: { ...operation }, ms: [ms] });
+      if (this.slowest.length < SLOWEST || ms > this.slowest[this.slowest.length - 1].ms) {
+        this.slowest.push({ ...operation });
+        this.slowest.sort((a, b) => b.ms - a.ms);
+        this.slowest.length = Math.min(this.slowest.length, SLOWEST);
+      }
+    }
+    this.frameMs.push(total);
+    this.frameOperations.push(operations.length);
+  }
+
+  totals(): Omit<GpuOperationTotals, "status" | "reason" | "sampleEvery" | "droppedFrames"> {
+    const frames = Math.max(1, this.frameMs.length);
+    const copy = <T extends GpuOperationDetail>(detail: T): T => ({ ...detail,
+      viewport: [...detail.viewport] as [number, number],
+      scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null });
+    // Frames without a label count as zero; positions reached by under half the
+    // frames are not typical of them.
+    const byLabel = [...this.labels].map(([label, entry]) => {
+      const perFrame = [...entry.frameMs];
+      while (perFrame.length < this.frameMs.length) perFrame.push(0);
+      return { label, operationsPerFrame: entry.calls / frames, msPerFrame: entry.ms / frames,
+        medianMsPerFrame: median(perFrame), maxMs: entry.maxMs };
+    }).sort((a, b) => b.medianMsPerFrame - a.medianMsPerFrame || b.msPerFrame - a.msPerFrame);
+    const usual = [...this.positions.values()].filter(position => position.ms.length * 2 >= this.frameMs.length);
+    const typical = usual
+      .map(position => ({ ...copy(position.detail), ms: median(position.ms), frames: position.ms.length }))
+      .sort((a, b) => b.ms - a.ms || a.order - b.order)
+      .slice(0, SLOWEST);
+    const byPosition = usual
+      .map(({ detail, ms }) => ({ order: detail.order, label: detail.label, instances: detail.instances, ms: median(ms) }))
+      .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+    return { frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
+      byLabel, slowest: this.slowest.map(copy), typical, byPosition };
+  }
+}
+
+/**
  * Opt-in GPU timing of individual draws, clears and blits. Every eighth frame
  * that has no frame-span query, each such call gets its own timer query, so a
  * report can say which operations take the GPU's time and whether their sum
@@ -626,12 +771,7 @@ class GpuOperationTimer {
   private scissorBox: [number, number, number, number] = [0, 0, 0, 0];
   private frame: PendingOperation[] = [];
   private readonly pending: PendingOperation[][] = [];
-  private readonly frameMs: number[] = [];
-  private readonly frameOperations: number[] = [];
-  private readonly labels = new Map<string, { calls: number; ms: number; maxMs: number; frameMs: number[] }>();
-  /** Keyed by position and label, so a frame whose sequence differs does not mix operations. */
-  private readonly positions = new Map<string, { detail: GpuOperationDetail; ms: number[] }>();
-  private slowest: GpuOperationDetail[] = [];
+  private readonly stats = new GpuOperationStats();
   private droppedFrames = 0;
   private status: GpuOperationTotals["status"] = "available";
   private reason: string | null = null;
@@ -679,7 +819,7 @@ class GpuOperationTimer {
         const operations = this.pending[0];
         if (!gl.getQueryParameter(operations[operations.length - 1].query, gl.QUERY_RESULT_AVAILABLE)) return;
         this.pending.shift();
-        let total = 0, valid = true;
+        let valid = true;
         const times = operations.map(operation => {
           const nanoseconds = Number(gl.getQueryParameter(operation.query, gl.QUERY_RESULT));
           gl.deleteQuery(operation.query);
@@ -687,28 +827,7 @@ class GpuOperationTimer {
           return nanoseconds / 1_000_000;
         });
         if (!valid) { this.droppedFrames++; continue; }
-        const frame = this.frameMs.length;
-        operations.forEach((operation, index) => {
-          const ms = times[index];
-          total += ms;
-          let entry = this.labels.get(operation.label);
-          if (!entry) this.labels.set(operation.label, entry = { calls: 0, ms: 0, maxMs: 0, frameMs: [] });
-          entry.calls++; entry.ms += ms; entry.maxMs = Math.max(entry.maxMs, ms);
-          while (entry.frameMs.length <= frame) entry.frameMs.push(0);
-          entry.frameMs[frame] += ms;
-          const { query: _query, ...detail } = operation;
-          const key = `${operation.order}:${operation.label}`;
-          const position = this.positions.get(key);
-          if (position) position.ms.push(ms);
-          else if (this.positions.size < MAX_OPERATIONS_PER_FRAME) this.positions.set(key, { detail: { ...detail, ms }, ms: [ms] });
-          if (this.slowest.length < SLOWEST || ms > this.slowest[this.slowest.length - 1].ms) {
-            this.slowest.push({ ...detail, ms });
-            this.slowest.sort((a, b) => b.ms - a.ms);
-            this.slowest.length = Math.min(this.slowest.length, SLOWEST);
-          }
-        });
-        this.frameMs.push(total);
-        this.frameOperations.push(operations.length);
+        this.stats.addFrame(operations.map(({ query: _query, ...detail }, index) => ({ ...detail, ms: times[index] })));
       }
     } catch { this.disable("WebGL timer-query results could not be read."); }
   }
@@ -722,31 +841,8 @@ class GpuOperationTimer {
   }
 
   totals(): GpuOperationTotals {
-    const frames = Math.max(1, this.frameMs.length);
-    const copy = <T extends GpuOperationDetail>(detail: T): T => ({ ...detail,
-      viewport: [...detail.viewport] as [number, number],
-      scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null });
-    // Frames without a label count as zero; positions reached by under half the
-    // frames are not typical of them.
-    const byLabel = [...this.labels].map(([label, entry]) => {
-      const perFrame = [...entry.frameMs];
-      while (perFrame.length < this.frameMs.length) perFrame.push(0);
-      return { label, operationsPerFrame: entry.calls / frames, msPerFrame: entry.ms / frames,
-        medianMsPerFrame: median(perFrame), maxMs: entry.maxMs };
-    }).sort((a, b) => b.medianMsPerFrame - a.medianMsPerFrame || b.msPerFrame - a.msPerFrame);
-    const usual = [...this.positions.values()].filter(position => position.ms.length * 2 >= this.frameMs.length);
-    const typical = usual
-      .map(position => ({ ...copy(position.detail), ms: median(position.ms), frames: position.ms.length }))
-      .sort((a, b) => b.ms - a.ms || a.order - b.order)
-      .slice(0, SLOWEST);
-    const byPosition = usual
-      .map(({ detail, ms }) => ({ order: detail.order, label: detail.label, instances: detail.instances, ms: median(ms) }))
-      .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
-    return {
-      status: this.status, reason: this.reason, sampleEvery: GPU_OPERATION_SAMPLE_EVERY,
-      droppedFrames: this.droppedFrames, frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
-      byLabel, slowest: this.slowest.map(copy), typical, byPosition
-    };
+    return { status: this.status, reason: this.reason, sampleEvery: GPU_OPERATION_SAMPLE_EVERY,
+      droppedFrames: this.droppedFrames, ...this.stats.totals() };
   }
 
   /** Restores the context's methods and frees queries; totals stay readable. */

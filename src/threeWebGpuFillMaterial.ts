@@ -1,5 +1,6 @@
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
+import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
@@ -32,6 +33,8 @@ interface ThreeWebGpuFillMaterialOptions {
   fillSegmentTextureWidth: number;
   fillBandBase?: number;
   fillBandEntries?: number;
+  /** The first cell header texel in segment texture A; -1 when there is none. */
+  fillCellBase?: number;
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
@@ -64,6 +67,8 @@ function varyingNode(node: unknown, flat = false): never {
 const fillBandInfoFn = TSL.wgslFn(VECTOR_FILL_BAND_INFO_WGSL);
 const fillCoverageFn = TSL.wgslFn(FILL_COVERAGE_WGSL);
 const fillCoverageVertexFn = TSL.wgslFn(FILL_COVERAGE_VERTEX_WGSL);
+const fillCellInfoFn = TSL.wgslFn(VECTOR_FILL_CELL_INFO_WGSL);
+const cellCoverageFn = TSL.wgslFn(VECTOR_CELL_COVERAGE_WGSL, [includeNode(fillCoverageFn)]);
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
@@ -139,6 +144,7 @@ fn heprFillFragment(
   segmentTexWidth: f32,
   bands: vec4<f32>,
   bandEntries: f32,
+  cells: vec4<f32>,
   fillAAScreenPx: f32,
   vectorOverride: vec4<f32>,
   shapeOnly: f32
@@ -155,11 +161,15 @@ fn heprFillFragment(
     discard;
   }
 
-  // Average the winding number over the footprint box. The bands spanning its
-  // rows hold every segment that can contribute; each integrates its own rows.
+  // Average the winding number over the footprint box. A path with a cell
+  // index reads only the cells under the box; otherwise the bands spanning
+  // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4<f32>(local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
   let safeWidth = max(i32(segmentTexWidth), 1);
+  if (cells.y > 0.0) {
+    winding = heprCellWinding(cells, metaA.zw, box, footprint, segmentTexA, segmentTexB);
+  } else {
 ${vectorFillBandLoopWgsl({
     bands: "bands",
     y: "local.y",
@@ -175,6 +185,7 @@ ${vectorFillBandLoopWgsl({
     winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
       primitiveB.z >= 1.0, box, rows.x, rows.y);`
   })}
+  }
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let baseColor = vec3<f32>(metaB.z, metaB.w, metaC.z);
   let color = baseColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
@@ -188,7 +199,7 @@ ${vectorFillBandLoopWgsl({
 
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
-`, [includeNode(fillCoverageFn)]);
+`, [includeNode(fillCoverageFn), includeNode(cellCoverageFn)]);
 
 export function createThreeWebGpuFillMaterial(
   options: ThreeWebGpuFillMaterialOptions
@@ -224,6 +235,10 @@ export function createThreeWebGpuFillMaterial(
     pathIndex: fillPathIndex, base: TSL.uniform(options.fillBandBase ?? -1),
     segments: TSL.textureLoad(options.fillSegmentTextureA)
   }), true);
+  const cells = varyingNode(callNode(fillCellInfoFn, {
+    pathIndex: fillPathIndex, headers: TSL.uniform((options.fillCellBase ?? -1) + 1),
+    segments: TSL.textureLoad(options.fillSegmentTextureA)
+  }), true);
   const viewportUniform = TSL.uniform(options.viewport);
   const localToClipUniform = TSL.uniform(options.localToClip);
   const vertexPack = varyingNode(callNode(fillVertexPackFn, {
@@ -256,6 +271,7 @@ export function createThreeWebGpuFillMaterial(
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: fillSegmentTextureWidthUniform,
     bands, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
+    cells,
     fillAAScreenPx: fillAAScreenPxUniform,
     vectorOverride: TSL.uniform(options.vectorOverride),
     shapeOnly: shapeOnlyUniform

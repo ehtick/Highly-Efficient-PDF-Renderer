@@ -357,15 +357,34 @@ await withFixture(optionalContentFixture(), {}, async ({ document, registry }) =
     defaultVisible: true
   });
 
+  // Broken layer references occur in otherwise usable documents, so an /OC
+  // membership that cannot be resolved keeps its paint visible with a warning
+  // instead of failing the page, and never borrows another layer's membership.
+  const optional = await registry.resolvePageProperties(
+    document.getPage(0).resources,
+    ["R62"],
+    undefined,
+    ["R62"]
+  );
+  assert.equal(optional.length, 1);
+  assert.equal(optional[0].membership, null, "an unresolved /OC membership borrows no layer");
+  assert.equal(optional[0].defaultVisible, true, "and its paint stays visible");
+  const unresolvedOptional = registry.getDiagnostics().filter((diagnostic) =>
+    diagnostic.code === NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.UnresolvedOptionalProperty
+  );
+  assert.equal(unresolvedOptional.length, 1, "an unresolved /OC membership is reported");
+  assert.equal(unresolvedOptional[0].severity, "warning");
+  assert.deepEqual(unresolvedOptional[0].details, {
+    propertyName: "R62",
+    reason: "resources-missing",
+    defaultVisible: true
+  });
+
+  // Direct callers that classify every property keep the historical strict behavior.
   await assert.rejects(
-    registry.resolvePageProperties(
-      document.getPage(0).resources,
-      ["R62"],
-      undefined,
-      ["R62"]
-    ),
+    registry.resolvePageProperties(document.getPage(0).resources, ["R62"]),
     hasPdfCode("invalid-object", /page has no resources/),
-    "an unresolved /OC membership remains a hard failure"
+    "the strict classifier still rejects a property without page resources"
   );
 });
 

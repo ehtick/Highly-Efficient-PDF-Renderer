@@ -533,17 +533,25 @@ async function testCidCffOutlinesAndPdfSelection() {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { createCanvas } = await import("@napi-rs/canvas");
-  for (const patterned of [false, true]) {
+  // Gray text; text in a pattern that is exactly one colour, an opaque fill of
+  // its whole gapless cell; and text in a pattern that is not, whose glyphs
+  // keep their shapes and positions in the fallback colour, with a warning.
+  const paints = [
+    { name: "gray", operator: "0 g", cell: "1 0 0 rg 0 0 2 2 re f", color: [0, 0, 0] },
+    { name: "solid pattern", operator: "/Pattern cs /P scn", cell: "1 0 0 rg 0 0 2 2 re f", color: [1, 0, 0] },
+    { name: "pattern", operator: "/Pattern cs /P scn", cell: "1 0 0 rg 0 0 1 1 re f", color: [0, 0, 0], approximated: true }
+  ];
+  for (const paint of paints) {
     const bytes = writeTinyPdf({ objects: [
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
       { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
       { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 30 20] /Resources << /Font << /F 5 0 R >> /Pattern << /P 9 0 R >> >> /Contents 4 0 R >>" },
-      { number: 4, body: tinyPdfStream("", `${patterned ? "/Pattern cs /P scn" : "0 g"} BT /F 100 Tf 1 0 0 1 2 2 Tm <002a> Tj ET`) },
+      { number: 4, body: tinyPdfStream("", `${paint.operator} BT /F 100 Tf 1 0 0 1 2 2 Tm <002a> Tj ET`) },
       { number: 5, body: "<< /Type /Font /Subtype /Type0 /BaseFont /SyntheticCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>" },
       { number: 6, body: "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /SyntheticCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /W [42 [700]] >>" },
       { number: 7, body: "<< /Type /FontDescriptor /FontName /SyntheticCID /Flags 4 /FontBBox [0 0 300 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile3 8 0 R >>" },
       { number: 8, body: tinyPdfStream("/Subtype /CIDFontType0C", buildCidCffFixture()) },
-      { number: 9, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 2 2] /XStep 2 /YStep 2 /Resources << >>", "1 0 0 rg 0 0 2 2 re f") },
+      { number: 9, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 2 2] /XStep 2 /YStep 2 /Resources << >>", paint.cell) },
       { number: 10, body: tinyPdfStream("", "1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <002a> <0041> endbfchar") }
     ] });
     const session = await openPdf({ kind: "bytes", bytes });
@@ -556,17 +564,15 @@ async function testCidCffOutlinesAndPdfSelection() {
           return { canvas, context: canvas.getContext("2d") };
         }
       });
-      assert.deepEqual([...rendered.surface.context.getImageData(5, 14, 1, 1).data], [0, 0, 0, 255],
-        "embedded CID outline paints at the correct position, including pattern-color fallback");
+      assert.deepEqual([...rendered.surface.context.getImageData(5, 14, 1, 1).data], [...paint.color.map(v => v * 255), 255],
+        `${paint.name}: the embedded CID outline paints at the correct position, in its colour or the pattern's fallback`);
       const scene = await session.compileVectorPage(0);
       assert.equal(scene.textIndex.pages[0].text, "A");
-      if (patterned) {
-        assert.ok(scene.rasterLayers.length > 0);
-        assert.equal(session.getDiagnostics().filter(d => d.code === "text-pattern-approximation").length, 1);
-      } else {
-        assert.equal(scene.textInstanceCount, 1, "ordinary CID CFF text retains vector geometry");
-        assert.equal(scene.rasterLayers.length, 0);
-      }
+      assert.equal(scene.textInstanceCount, 1, `${paint.name}: the CID CFF glyph keeps vector geometry`);
+      assert.deepEqual([...scene.textInstanceC.subarray(0, 3)], paint.color, `${paint.name}: in the colour it paints`);
+      assert.equal(session.getDiagnostics().filter(d => d.code === "text-pattern-approximation").length,
+        paint.approximated ? 1 : 0, `${paint.name}: only an unrepresentable pattern is reported as approximated`);
+      if (!paint.approximated) assert.equal(scene.rasterLayers.length, 0, `${paint.name}: nothing is rasterized`);
     } finally {
       await session.close();
     }

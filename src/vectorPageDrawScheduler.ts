@@ -63,8 +63,9 @@ export class VectorPageDrawScheduler {
    */
   static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array,
     segments: Uint32Array | null = null): VectorPageDrawScheduler | null {
-    const pages = scene.pageRects.length / 4;
-    // Bound setup work for arbitrary public scenes, including invalid layouts.
+    // Bound setup work for arbitrary public scenes, including invalid layouts
+    // and scenes that carry draw runs but no page rectangles.
+    const pages = (scene.pageRects?.length ?? 0) / 4;
     if (!scene.drawRuns || pages < 1 || pages > 512 || !Number.isInteger(pages) ||
         !scene.pageRects.every(Number.isFinite)) return null;
     if (segments && segments.length !== scene.drawRuns.length) return null;

@@ -80,6 +80,7 @@ const sourceSegmentsValue = document.querySelector<HTMLSpanElement>("#source-seg
 const visibleSegmentsValue = document.querySelector<HTMLSpanElement>("#visible-segments-value");
 const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
+const zoomValue = document.querySelector<HTMLSpanElement>("#zoom-value");
 const drawCallsValue = document.querySelector<HTMLSpanElement>("#draw-calls-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
@@ -126,6 +127,7 @@ if (
   !visibleSegmentsValue ||
   !timesValue ||
   !fpsValue ||
+  !zoomValue ||
   !drawCallsValue ||
   !drawStatsValue ||
   !lodStatsValue ||
@@ -168,6 +170,7 @@ const sourceSegmentsValueElement = sourceSegmentsValue;
 const visibleSegmentsValueElement = visibleSegmentsValue;
 const timesValueElement = timesValue;
 const fpsValueElement = fpsValue;
+const zoomValueElement = zoomValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
 const textLodStatsValueElement = textLodStatsValue;
@@ -494,6 +497,8 @@ function renderFrame(now: number = performance.now()): void {
     drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   profile?.endSection("render");
   drawCallMeter.update(drawCalls);
+  const zoomText = currentPdfObject ? `${currentPdfObject.getViewState().zoom.toFixed(2)}x` : "-";
+  if (zoomValueElement.textContent !== zoomText) zoomValueElement.textContent = zoomText;
   if (profile) recordCaptureCounters(profile, drawCalls);
   profile?.beginSection("overlays");
   drawingSelection.onFrame();

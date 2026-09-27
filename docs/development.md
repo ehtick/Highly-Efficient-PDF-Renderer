@@ -191,9 +191,18 @@ and remains preferred when it fits the tile budget.
 
 The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
 coarser levels up to a 5-pixel nominal overview tolerance, also past the first
-normal LOD threshold. There, exact geometry returns whenever it fits the tile
-budget, and is certain once no overview level fits the 5-pixel limit. Effect
-scenes have no overview levels and stay exact past the threshold. Visibility
+normal LOD threshold. Planar views first select within those limits and count
+the actual culled, deduplicated draw IDs. Only if that count exceeds the global
+soft budget (82,500 strokes) may tiles exceeding their share search coarser
+overview levels beyond that limit, stopping at the finest one that fits. If none
+fits, they use the smallest
+available representation. This prevents a zoom threshold from forcing a dense
+tile back to millions of strokes without thinning out affordable hatching just
+because it crosses multiple tiles. The initial counting pass stops at 82,501 IDs;
+only over-budget views need a second selection pass. Exact geometry returns
+whenever it fits the tile budget. Effect scenes have no overview levels and stay exact past the
+threshold; force-exact bypasses budget selection. Tilted views retain the
+5-pixel limit and the primitive-reach checks described below. Visibility
 cache keys include both the normal baseline and the pressure limit, including
 when discarded build levels leave gaps in the tolerance sequence. Active-level
 stats mark overview approximations for the HUD.

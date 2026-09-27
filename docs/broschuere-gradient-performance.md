@@ -956,3 +956,38 @@ and band-boundary rows and 20,128 Float32 winding comparisons, including both
 fill rules, transformed outlines, holes, self-intersections, nested rectangles,
 extreme coordinates, and storage-budget fallbacks. These checks do not replace
 compilation and visual inspection on actual WebGL/WebGPU drivers.
+
+## Compositor source layers and post-render statistics
+
+The Three compositor submits source paints through proxy meshes into its render
+targets, then presents the finished composite as one mesh in the host scene.
+The proxy meshes share source materials and, for complete batches, geometry;
+partial effect spans use their own instance selections. This does not draw the
+complete PDF twice. Shape and mask passes may legitimately replay paints.
+
+Previously the source layers remained attached to the PDF object and were hidden
+after compositing. That prevented duplicate drawing, but the outer scene still
+visited them during matrix updates. It also made the stroke/text statistics
+getters treat the composited layers as inactive: the example's HUD substituted
+zero for an unavailable stroke count.
+
+Composited source layers now remain detached from the host scene. Their visibility
+continues to describe the active layer selection, while only the presentation
+mesh is attached for composited color output. Switching to direct material
+rendering reattaches the layers and hides the composite.
+
+A bounded headless check loaded the existing Broschuere HEP at fit-all with exact
+stroke and text layers, without parsing the PDF or generating an archive. Both
+Three backends reported 2,897 strokes and 20,881 text instances after compositing.
+The compositor submitted 2,897 stroke instances, while the outer scene contained
+no source paint meshes. Detaching the layers removed 224 source objects from the
+outer scene's matrix traversal. Compositing still used 71 host render calls and
+236 mesh submissions in this configuration. These are submission counts from a
+mock host, not browser timings or GPU measurements, and do not establish the
+cause of the reported native/Three performance gap.
+
+Regression coverage checks scene-hook preparation, required knockout passes,
+post-render statistics, shared proxy materials, offscreen/back-in-view selection,
+source matrix traversal, and switching between composited and direct rendering
+in both backends. Browser checks should compare fit-all appearance and frame
+timings for the same PDF/HEP, viewport, DPR, and LOD settings.

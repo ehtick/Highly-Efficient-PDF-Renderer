@@ -1732,6 +1732,8 @@ export class HeprThreePdfObject extends THREE.Group {
       hostUsesMaterialBackend && this.hostSupportsRasterTextures(renderer);
     const cameraDrivenMaterialPipelineEnabled =
       this.hasCompleteMaterialLayers() && derivedView !== null && hostSupportsRasterTextures;
+    const usePaintCompositor = cameraDrivenMaterialPipelineEnabled &&
+      this.paintVisibility.requiresCompositing && !threeCompositorDisabled();
 
     profile?.endSection("three.camera");
     profile?.beginSection("three.pipeline");
@@ -1813,7 +1815,7 @@ export class HeprThreePdfObject extends THREE.Group {
     }
 
     if (cameraDrivenMaterialPipelineEnabled) {
-      this.configureThreeMaterialPipeline();
+      this.configureThreeMaterialPipeline(usePaintCompositor);
     } else {
       this.configureNativeTexturePipeline();
     }
@@ -1944,7 +1946,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.lastUploadedFrameSerial = presentedFrameSerial;
     }
     if (profile) {
-      // Read before the compositor hides these roots for presentation.
+      // Report the selected source geometry, including compositor-only layers.
       const strokes = this.getRenderedStrokeSegmentCount(), text = this.getTextInstanceStats();
       if (strokes !== null) profile.add("renderedSegments", strokes);
       if (text) profile.add("renderedTextInstances", text.rendered);
@@ -1956,8 +1958,7 @@ export class HeprThreePdfObject extends THREE.Group {
         profile.add("three.textSelectionUploads", textLod.selectionUploads);
       }
     }
-    if (cameraDrivenMaterialPipelineEnabled && this.paintVisibility.requiresCompositing &&
-      !threeCompositorDisabled()) {
+    if (usePaintCompositor) {
       if (!this.paintCompositor) {
         this.paintCompositor = new ThreePaintCompositor(this.rendererType);
         this.add(this.paintCompositor.mesh);
@@ -1971,7 +1972,6 @@ export class HeprThreePdfObject extends THREE.Group {
         condition => this.layerVisibility.isVisible(condition),
         bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType),
         this.clipFromDataMatrix);
-      for (const root of roots) root.visible = false;
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }
 
@@ -2234,7 +2234,7 @@ export class HeprThreePdfObject extends THREE.Group {
     }
   }
 
-  private configureThreeMaterialPipeline(): void {
+  private configureThreeMaterialPipeline(compositing: boolean): void {
     if (!this.hasCompleteMaterialLayers()) {
       this.configureNativeTexturePipeline();
       return;
@@ -2242,7 +2242,12 @@ export class HeprThreePdfObject extends THREE.Group {
 
     const wasMaterialPipelineActive = this.materialPipelineActive;
     this.materialPipelineActive = true;
-    this.attachThreeMaterialObjects();
+    // The compositor submits these layers through proxies sharing their GPU
+    // geometry and materials. Keep its sources out of the host scene so only
+    // the composite is presented, with no redundant matrix traversal. Their
+    // visibility still describes selection for updates and public statistics.
+    if (compositing) this.detachThreeMaterialObjects();
+    else this.attachThreeMaterialObjects();
 
     this.renderer.setRasterRenderingEnabled?.(false);
     this.renderer.setRasterTextureResidency?.(false);

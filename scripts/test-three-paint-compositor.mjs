@@ -381,6 +381,7 @@ try {
     testProxyReplacement(ThreePaintCompositor, backend);
     await testFolding(ThreePaintCompositor, backend);
     await testGradientMaskFolding(ThreePaintCompositor, backend);
+    await testCompositorOnlyLayers(scene, backend);
 
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
@@ -399,6 +400,94 @@ try {
     "a rectangle crossing the perspective near plane conservatively keeps a full pass");
   console.log("Three PDF compositor state, canonical subsets, shape coverage, folding, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
+
+async function testCompositorOnlyLayers(source, backend) {
+  const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
+  const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
+  const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
+  const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { ThreeMaterialTextLayer } = await import("../src/threeMaterialTextLayer.ts");
+  const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const viewport = { width: 320, height: 240 }, drawPlan = new ThreeVectorDrawPlan(source);
+  const options = { materialBackend: backend, colorCompositing: "display", drawPlan,
+    strokeCurveEnabled: true, textVectorOnly: true, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1] };
+  const stroke = new ThreeMaterialStrokeLayer(source, options);
+  let viewState = { cameraCenterX: 5, cameraCenterY: 5, zoom: 20 };
+  const native = new Proxy({ getViewState: () => viewState, hasUploadedScene: () => false,
+    setViewState: value => { viewState = value; }, getPresentedFrameSerial: () => 0,
+    renderExternalFrame: () => assert.fail("composited materials must not also render through native") },
+  { get: (target, key) => target[key] ?? (() => {}) });
+  const uv = new Float32Array(8);
+  const object = new HeprThreePdfObject({ sourceLabel: "composited-stats", sourceKind: "hep", scene: source }, backend,
+    native, { ...viewport }, null,
+    { vectorLodMode: "off", textLodMode: "off", strokeCurveEnabled: true, textVectorOnly: true,
+      threeColorCompositing: "display", pageBackground: [1, 1, 1, 1], vectorOverride: [0, 0, 0, 0] },
+    0, new ThreeMaterialRasterLayer(source, options), new ThreeMaterialGradientLayer(source, options),
+    new ThreeMaterialFillLayer(source, options), stroke, null, null, null, new ThreeMaterialTextLayer(source, options),
+    null, new THREE.Mesh(new THREE.PlaneGeometry(10, 10), new THREE.MeshBasicMaterial()),
+    uv, new THREE.BufferAttribute(uv, 2), drawPlan);
+  const outer = new THREE.Scene(); outer.add(object);
+  const host = Object.assign(makeRenderer(backend), {
+    isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
+    outputColorSpace: THREE.LinearSRGBColorSpace, capabilities: { maxTextureSize: 16384 },
+    getDrawingBufferSize: target => target.set(viewport.width, viewport.height), getPixelRatio: () => 1
+  });
+  const camera = new THREE.PerspectiveCamera(45, viewport.width / viewport.height, .1, 1000);
+  camera.position.z = 16;
+  const frame = () => {
+    camera.updateMatrixWorld(true); outer.updateMatrixWorld(true);
+    host.draws.length = 0;
+    // Match Three: prepare via the scene hook before gathering visible objects,
+    // then invoke the page callback, which must not prepare the PDF a second time.
+    outer.onBeforeRender(host, outer, camera, host.target);
+    object.handleBeforeRender(host, camera);
+  };
+  const previousDisable = globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR;
+  try {
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = false;
+    frame();
+    const roots = object.listThreeMaterialObjects();
+    assert(roots.every(root => root.parent === null), "compositor source layers stay outside the host scene");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2, "post-render HUD reports composited strokes");
+    assert.equal(object.getTextInstanceStats().rendered, 0, "composited text statistics remain available");
+    assert.equal(object.paintCompositor.mesh.visible, true);
+    // This knockout fixture needs a colour and a shape draw for each stroke.
+    // The source IDs must occur only in those required compositor submissions.
+    assert.deepEqual(host.draws.filter(draw => draw.ids).map(draw => draw.ids), [[0], [0], [1], [1]]);
+    const outerPaints = [];
+    outer.traverseVisible(mesh => { if (mesh.userData.heprDrawRun) outerPaints.push(mesh); });
+    assert.deepEqual(outerPaints, [], "outer presentation cannot submit the source paints again");
+    for (const proxy of object.paintCompositor.proxies.values()) {
+      for (const mesh of proxy.meshes) {
+        assert.equal(mesh.material, proxy.source.material, "compositor proxies reuse source materials");
+      }
+    }
+    let updates = 0;
+    const originalUpdates = roots.map(root => root.updateMatrixWorld);
+    roots.forEach(root => { root.updateMatrixWorld = () => { updates++; }; });
+    try { outer.updateMatrixWorld(true); }
+    finally { roots.forEach((root, i) => { root.updateMatrixWorld = originalUpdates[i]; }); }
+    assert.equal(updates, 0, "outer matrix updates never visit compositor-only layers");
+
+    camera.position.x = 100; frame();
+    assert.equal(object.getRenderedStrokeSegmentCount(), 0, "offscreen composited strokes report zero");
+    camera.position.x = 0; frame();
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2, "panning back restores the count");
+
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = true; frame();
+    assert(roots.every(root => root.parent === object), "direct rendering reattaches its sources");
+    assert.equal(object.paintCompositor.mesh.visible, false, "direct rendering hides the old composite");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2);
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = false; frame();
+    assert(roots.every(root => root.parent === null), "switching back detaches sources again");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2);
+  } finally {
+    if (previousDisable === undefined) delete globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR;
+    else globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = previousDisable;
+    outer.remove(object); object.dispose(); host.target.dispose();
+  }
+}
 
 function makeRenderer(backend = "webgpu") {
   return {

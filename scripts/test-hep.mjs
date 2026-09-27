@@ -357,6 +357,78 @@ function testSyntheticRadialGradientMath() {
   );
 }
 
+/** Draw runs in paint-graph order, with the groups (and soft masks) enclosing each one. */
+function scenePaintOrder(scene) {
+  const order = [];
+  const visit = (nodes, scopes) => {
+    for (const node of nodes) {
+      if (node.kind === "draw") {
+        order.push({ runIndex: node.runIndex, run: scene.drawRuns[node.runIndex], scopes });
+      } else if (node.kind === "group") {
+        if (node.softMask) visit(node.softMask.children, [...scopes, { mask: node }]);
+        visit(node.children, [...scopes, { group: node }]);
+      }
+    }
+  };
+  visit(scene.paintGraph?.roots ?? [], []);
+  return order;
+}
+
+function paintGroups(scene) {
+  const groups = [];
+  const visit = (nodes) => {
+    for (const node of nodes) {
+      if (node.kind !== "group") continue;
+      groups.push(node);
+      if (node.softMask) visit(node.softMask.children);
+      visit(node.children);
+    }
+  };
+  visit(scene.paintGraph?.roots ?? []);
+  return groups;
+}
+
+function gradientLutSamples(scene, gradientIndex) {
+  const samples = [];
+  for (let x = 0; x < 1024; x += 32) {
+    const offset = (gradientIndex * 1024 + x) * 4;
+    samples.push(Array.from(scene.gradientLut.subarray(offset, offset + 4)));
+  }
+  return samples;
+}
+
+function byteColor(...components) {
+  return components.map((component) => Math.round(component * 255)).join(",");
+}
+
+function orderIndexOf(order, predicate, context) {
+  const index = order.findIndex(predicate);
+  assert.notEqual(index, -1, context);
+  return index;
+}
+
+/** A vector page paints every draw run once, and HEP keeps its paint structure exactly. */
+function assertVectorPaintStructure(scene, roundTrip, context) {
+  const order = scenePaintOrder(scene);
+  assert.equal(new Set(order.map(({ runIndex }) => runIndex)).size, order.length,
+    `${context}: no draw run is painted twice`);
+  assert.equal(scene.rasterLayers.length, scene.imagePaintOpCount,
+    `${context}: only the page's own images stay raster`);
+  if (roundTrip) {
+    // Absent optional fields are omitted from HEP rather than stored as undefined.
+    const defined = (value) => Array.isArray(value) ? value.map(defined)
+      : value && typeof value === "object" && !ArrayBuffer.isView(value)
+        ? Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)
+          .map(([key, entry]) => [key, defined(entry)]))
+        : value;
+    assert.deepEqual(defined(roundTrip.drawRuns), defined(scene.drawRuns), `${context}: HEP keeps draw runs`);
+    assert.deepEqual(defined(roundTrip.paintGraph), defined(scene.paintGraph), `${context}: HEP keeps the paint graph`);
+    assert.deepEqual(defined(roundTrip.clipPaths), defined(scene.clipPaths), `${context}: HEP keeps vector clips`);
+    assertNativeGradientResourcesEqual(roundTrip, scene, `${context}: HEP gradient resources`);
+  }
+  return order;
+}
+
 function assertNativeGradientResourcesEqual(actual, expected, context) {
   for (const key of [
     "gradientCount",
@@ -408,13 +480,15 @@ async function run() {
       { loadPdfSceneFromSource },
       { listSceneRasterLayers, loadSceneFromHep },
       { composeVectorScenesInGrid },
-      { SCENE_RASTER_LAYERS_PATH, decodeRasterLayerTable, rasterAtlasFile, rasterLayerFile }
+      { SCENE_RASTER_LAYERS_PATH, decodeRasterLayerTable, rasterAtlasFile, rasterLayerFile },
+      { sceneRequiresPaintCompositing }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/index.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
       viteServer.ssrLoadModule("/src/hep.ts"),
       viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts"),
-      viteServer.ssrLoadModule("/src/hepRasterLayers.ts")
+      viteServer.ssrLoadModule("/src/hepRasterLayers.ts"),
+      viteServer.ssrLoadModule("/src/scenePaintVisibility.ts")
     ]);
     const readRasterLayerTable = async (zip) => decodeRasterLayerTable(
       await zip.file(SCENE_RASTER_LAYERS_PATH).async("uint8array"),
@@ -625,304 +699,158 @@ async function run() {
       "the optimized raster PDF must preserve raster layers"
     );
 
-    const parsedOrderedUnderlayPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "11"
-    });
-    const orderedUnderlayLayers = listSceneRasterLayers(parsedOrderedUnderlayPdf.scene);
-    assert.equal(orderedUnderlayLayers.length, 1, "the later page shading must remain a selective raster paint");
-    assert.equal(orderedUnderlayLayers[0].width, 1_663);
-    assert.equal(orderedUnderlayLayers[0].height, 250);
-    assert.equal(orderedUnderlayLayers[0].paintOrder, 501);
-    assert.equal(orderedUnderlayLayers[0].pageIndex, 0);
-    assert.equal(parsedOrderedUnderlayPdf.scene.gradientCount, 5, "ColorN strokes must retain five native gradients");
-    assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount, 13, "the complete visible circle prefix must retain ordered native runs");
-    assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeSegmentCount, 550);
-    const nativeCircleSourceRefs = [];
-    const nativeCirclePaintOrders = [];
-    const nativeCircleSegmentCounts = [];
-    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount; i += 1) {
-      const offset = i * 4;
-      nativeCircleSourceRefs.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 2]);
-      nativeCirclePaintOrders.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset]);
-      nativeCircleSegmentCounts.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 1]);
-      assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 3], -1);
-      assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset + 1], 0);
-      assert.ok(
-        parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset] < orderedUnderlayLayers[0].paintOrder,
-        "the decorative-circle prefix must remain below later raster paints"
-      );
+    // Brochure pages with shadings, soft masks and blend groups stay vector:
+    // native gradients, vector clips and paint-graph groups that the renderer
+    // composites. Their structure is checked here and must survive HEP exactly.
+    const loadBrochurePage = async (pages) =>
+      (await loadPdfSceneFromSource(optimizedRasterPdfBytes, { sourceKind: "pdf", pages })).scene;
+    const roundTripScene = async (scene, sourceLabel) => loadSceneFromHep(await (await buildHep(scene, {
+      sourceLabel, encodeRasterImages: false, compression: "store"
+    })).arrayBuffer());
+
+    // Page 11: ColorN circle strokes under a table.
+    const underlayScene = await loadBrochurePage("11");
+    const underlayOrder = assertVectorPaintStructure(underlayScene,
+      await roundTripScene(underlayScene, "native-circle-strokes.pdf"), "page 11");
+    assert.equal(underlayScene.rasterLayers.length, 0, "the circle shading no longer needs a raster composite");
+    assert.equal(underlayScene.gradientCount, 7, "ColorN circle strokes become native gradients");
+    for (let gradientIndex = 0; gradientIndex < underlayScene.gradientCount; gradientIndex += 1) {
+      assert.equal(underlayScene.gradientMetaA[gradientIndex * 4], 0, `circle gradient ${gradientIndex} is linear`);
+      assert.ok(new Set(gradientLutSamples(underlayScene, gradientIndex).map(String)).size > 4,
+        `native circle gradient ${gradientIndex} must retain color variation`);
     }
-    assert.deepEqual(nativeCircleSourceRefs, [0, 1, 2, 3, 4, -1, -1, -1, -1, -1, -1, -1, -1]);
-    assert.deepEqual(nativeCirclePaintOrders, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14]);
-    assert.deepEqual(nativeCircleSegmentCounts, [71, 71, 15, 40, 6, 84, 52, 37, 84, 8, 41, 39, 2]);
-    for (let gradientIndex = 0; gradientIndex < 5; gradientIndex += 1) {
-      const colors = new Set();
-      const rowOffset = gradientIndex * 1024 * 4;
-      for (let x = 0; x < 1024; x += 32) {
-        const offset = rowOffset + x * 4;
-        colors.add(Array.from(parsedOrderedUnderlayPdf.scene.gradientLut.subarray(offset, offset + 4)).join(","));
-      }
-      assert.ok(colors.size > 4, `native circle gradient ${gradientIndex} must retain color variation`);
-    }
-    assert.equal(parsedOrderedUnderlayPdf.scene.segmentCount, 2_322, "decorative circles must not remain in the ordinary stroke batch");
-    assert.equal(parsedOrderedUnderlayPdf.scene.fillPathCount, 156, "native circle extraction must preserve vector tables");
-    assert.equal(parsedOrderedUnderlayPdf.scene.textInstanceCount, 2_608, "native circle extraction must preserve vector text");
+    assert.deepEqual(underlayOrder.slice(0, 5).map(({ run }) => run.kind), Array(5).fill("gradient-fill"),
+      "the decorative-circle prefix paints first, below later page content");
+    assert.equal(underlayScene.textInstanceCount, 2_608, "native circle extraction must preserve vector text");
     let blackStrokeCount = 0;
     let burgundyStrokeCount = 0;
-    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.segmentCount; i += 1) {
-      const offset = i * 4;
-      const red = parsedOrderedUnderlayPdf.scene.styles[offset + 1];
-      const green = parsedOrderedUnderlayPdf.scene.styles[offset + 2];
-      const blue = parsedOrderedUnderlayPdf.scene.styles[offset + 3];
-      if (Math.abs(red) < 1e-4 && Math.abs(green) < 1e-4 && Math.abs(blue) < 1e-4) {
-        blackStrokeCount += 1;
-      }
-      if (
-        Math.abs(red - 80 / 255) < 1e-4 &&
-        Math.abs(green - 23 / 255) < 1e-4 &&
-        Math.abs(blue - 31 / 255) < 1e-4
-      ) {
-        burgundyStrokeCount += 1;
-      }
+    for (let i = 0; i < underlayScene.segmentCount; i += 1) {
+      const color = byteColor(...underlayScene.styles.subarray(i * 4 + 1, i * 4 + 4));
+      if (color === "0,0,0") blackStrokeCount += 1;
+      if (color === "80,23,31") burgundyStrokeCount += 1;
     }
     assert.equal(blackStrokeCount, 0, "ColorN pattern strokes must not fall back to black vectors");
-    assert.equal(burgundyStrokeCount, 0, "solid companion circles must stay in the ordered native prefix");
+    assert.equal(burgundyStrokeCount, 0, "solid companion circles must stay in the ordered gradient prefix");
     const tableOverlapX = 724.574;
     const tableOverlapY = 352.798;
-    let hasOpaqueCreamTableFill = false;
-    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.fillPathCount; i += 1) {
+    let creamTableFill = -1;
+    for (let i = 0; i < underlayScene.fillPathCount && creamTableFill < 0; i += 1) {
       const offset = i * 4;
-      const minX = parsedOrderedUnderlayPdf.scene.fillPathMetaA[offset + 2];
-      const minY = parsedOrderedUnderlayPdf.scene.fillPathMetaA[offset + 3];
-      const maxX = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset];
-      const maxY = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 1];
-      const red = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 2];
-      const green = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 3];
-      const blue = parsedOrderedUnderlayPdf.scene.fillPathMetaC[offset + 2];
-      const alpha = parsedOrderedUnderlayPdf.scene.fillPathMetaC[offset + 3];
-      if (
-        tableOverlapX >= minX && tableOverlapX <= maxX &&
-        tableOverlapY >= minY && tableOverlapY <= maxY &&
-        Math.abs(red - 251 / 255) < 1e-4 &&
-        Math.abs(green - 243 / 255) < 1e-4 &&
-        Math.abs(blue - 240 / 255) < 1e-4 &&
-        Math.abs(alpha - 1) < 1e-4
-      ) {
-        hasOpaqueCreamTableFill = true;
-        break;
-      }
+      const covers = tableOverlapX >= underlayScene.fillPathMetaA[offset + 2] &&
+        tableOverlapX <= underlayScene.fillPathMetaB[offset] &&
+        tableOverlapY >= underlayScene.fillPathMetaA[offset + 3] &&
+        tableOverlapY <= underlayScene.fillPathMetaB[offset + 1];
+      const color = byteColor(underlayScene.fillPathMetaB[offset + 2], underlayScene.fillPathMetaB[offset + 3],
+        underlayScene.fillPathMetaC[offset + 2], underlayScene.fillPathMetaC[offset + 3]);
+      if (covers && color === "251,243,240,255") creamTableFill = i;
     }
-    assert.ok(hasOpaqueCreamTableFill, "an opaque table fill must remain vector-rendered above the circle underlay");
+    assert.ok(creamTableFill >= 0, "an opaque cream table fill must remain vector-rendered");
+    assert.ok(orderIndexOf(underlayOrder, ({ run }) => run.kind === "fill" &&
+      creamTableFill >= run.first && creamTableFill < run.first + run.count, "the table fill is painted") > 4,
+    "the table fill paints above the circle underlay");
 
-    const nativeCircleZipBlob = await buildHep(parsedOrderedUnderlayPdf.scene, {
-      sourceLabel: "native-circle-strokes.pdf",
-      encodeRasterImages: false,
-      compression: "store"
-    });
-    const nativeCircleRoundTrip = await loadSceneFromHep(await nativeCircleZipBlob.arrayBuffer());
-    assertNativeGradientResourcesEqual(
-      nativeCircleRoundTrip,
-      parsedOrderedUnderlayPdf.scene,
-      "page 11 native gradient stroke round trip"
-    );
-    const roundTripCircleLayers = listSceneRasterLayers(nativeCircleRoundTrip);
-    assert.equal(roundTripCircleLayers.length, 1);
-    assert.equal(roundTripCircleLayers[0].paintOrder, 501);
-    assert.equal(roundTripCircleLayers[0].pageIndex, 0);
-
-    const parsedOrderedPatternPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "6"
-    });
-    const orderedPatternLayers = listSceneRasterLayers(parsedOrderedPatternPdf.scene);
-    assert.equal(orderedPatternLayers.length, 1, "interleaved ColorN strokes require one ordered graphics composite");
-    assert.ok(
-      orderedPatternLayers[0].width <= 1_800 && orderedPatternLayers[0].height <= 1_300,
-      "ordered vector-pattern capture must stay at the bounded shading scale"
-    );
-    assert.equal(parsedOrderedPatternPdf.scene.segmentCount, 0, "ordered pattern graphics must not be emitted twice");
-    assert.equal(parsedOrderedPatternPdf.scene.fillPathCount, 0, "ordered pattern fills must not be emitted twice");
-    assert.equal(parsedOrderedPatternPdf.scene.textInstanceCount, 1_461, "ordered graphics capture must preserve vector text");
-    const orderedPatternSamples = [
-      sampleRasterLayerAtWorld(orderedPatternLayers[0], 900, 236.543),
-      sampleRasterLayerAtWorld(orderedPatternLayers[0], 930, 252.274),
-      sampleRasterLayerAtWorld(orderedPatternLayers[0], 970, 228.581)
-    ];
-    assert.ok(
-      orderedPatternSamples.every((pixel) => pixel[0] > 245 && pixel[1] >= 70 && pixel[1] <= 190 && pixel[2] < 60 && pixel[3] > 250),
-      "interleaved ColorN strokes must retain their red/orange gradients and PDF paint order"
-    );
-
-    const parsedShadingAndDashPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "12"
-    });
-    const shadingLayers = listSceneRasterLayers(parsedShadingAndDashPdf.scene);
-    assert.equal(shadingLayers.length, 1, "shadingFill operators must produce a raster layer");
-    const sampledShadingColors = new Set();
-    for (let i = 0; i + 3 < shadingLayers[0].data.length; i += 388) {
-      if (shadingLayers[0].data[i + 3] > 0) {
-        sampledShadingColors.add(
-          `${shadingLayers[0].data[i]},${shadingLayers[0].data[i + 1]},${shadingLayers[0].data[i + 2]}`
-        );
-      }
+    // Page 6: ColorN strokes interleaved with images.
+    const orderedPatternScene = await loadBrochurePage("6");
+    const orderedPatternOrder = assertVectorPaintStructure(orderedPatternScene,
+      await roundTripScene(orderedPatternScene, "interleaved-pattern-strokes.pdf"), "page 6");
+    assert.equal(orderedPatternScene.textInstanceCount, 1_461, "vector text is preserved next to pattern strokes");
+    const redOrangeGradients = [];
+    for (let gradientIndex = 0; gradientIndex < orderedPatternScene.gradientCount; gradientIndex += 1) {
+      if (gradientLutSamples(orderedPatternScene, gradientIndex).every(([red, green, blue, alpha]) =>
+        red > 245 && green >= 70 && green <= 190 && blue < 60 && alpha > 250)) redOrangeGradients.push(gradientIndex);
     }
-    assert.ok(sampledShadingColors.size > 16, "captured shading content must retain gradient color variation");
-    const maskedCirclePixel = sampleRasterLayerAtWorld(shadingLayers[0], 500, 700);
-    assert.ok(
-      maskedCirclePixel[3] >= 40,
-      "soft-mask consumers must be composited with their luminosity-mask definitions"
-    );
-    const maskedCenterDotPixel = sampleRasterLayerAtWorld(shadingLayers[0], 800, 436.4);
-    assert.ok(
-      Math.abs(maskedCenterDotPixel[0] - 233) <= 2 &&
-        Math.abs(maskedCenterDotPixel[1] - 198) <= 2 &&
-        Math.abs(maskedCenterDotPixel[2] - 186) <= 2 &&
-        maskedCenterDotPixel[3] >= 253,
-      "soft-masked fill and dash consumers must be captured in PDF paint order"
-    );
-    let flatSalmonVectorFillCount = 0;
-    for (let i = 0; i < parsedShadingAndDashPdf.scene.fillPathCount; i += 1) {
+    assert.equal(redOrangeGradients.length, 2, "interleaved ColorN strokes must retain their red/orange gradients");
+    const lastImage = orderedPatternOrder.findLastIndex(({ run }) => run.kind === "raster");
+    for (const gradientIndex of redOrangeGradients) {
+      assert.ok(orderIndexOf(orderedPatternOrder, ({ run }) => run.kind === "gradient-fill" && run.first === gradientIndex,
+        `red/orange gradient ${gradientIndex} is painted`) > lastImage,
+      "interleaved ColorN strokes keep their PDF paint order above the images");
+    }
+
+    // Page 12: shadings, luminosity soft masks and dashes.
+    const shadingScene = await loadBrochurePage("12");
+    const shadingOrder = assertVectorPaintStructure(shadingScene,
+      await roundTripScene(shadingScene, "shading-and-dash.pdf"), "page 12");
+    assert.equal(shadingScene.rasterLayers.length, 0, "shadingFill operators become native gradients");
+    assert.equal(shadingScene.gradientCount, 7);
+    for (let gradientIndex = 0; gradientIndex < shadingScene.gradientCount; gradientIndex += 1) {
+      assert.ok(new Set(gradientLutSamples(shadingScene, gradientIndex).map(String)).size > 16,
+        `captured shading ${gradientIndex} must retain gradient color variation`);
+    }
+    const shadingMasks = paintGroups(shadingScene).filter((group) => group.softMask);
+    assert.equal(shadingMasks.length, 4, "soft-mask consumers keep their luminosity-mask groups");
+    for (const group of shadingMasks) {
+      assert.equal(group.softMask.subtype, "Luminosity");
+      assert.ok(shadingOrder.some(({ run, scopes }) => run.kind === "gradient-fill" && scopes.some((scope) => scope.mask === group)),
+        "each luminosity mask is defined by a native gradient");
+      assert.ok(shadingOrder.some(({ scopes }) => scopes.some((scope) => scope.group === group)),
+        "each soft mask has painted consumers");
+    }
+    let salmonConsumerCount = 0;
+    for (let i = 0; i < shadingScene.fillPathCount; i += 1) {
       const offset = i * 4;
-      const red = parsedShadingAndDashPdf.scene.fillPathMetaB[offset + 2];
-      const green = parsedShadingAndDashPdf.scene.fillPathMetaB[offset + 3];
-      const blue = parsedShadingAndDashPdf.scene.fillPathMetaC[offset + 2];
-      if (Math.abs(red - 1) < 1e-4 && Math.abs(green - 76 / 255) < 1e-4 && Math.abs(blue - 41 / 255) < 1e-4) {
-        flatSalmonVectorFillCount += 1;
-      }
+      if (byteColor(shadingScene.fillPathMetaB[offset + 2], shadingScene.fillPathMetaB[offset + 3],
+        shadingScene.fillPathMetaC[offset + 2]) !== "255,76,41") continue;
+      salmonConsumerCount += 1;
+      const painted = shadingOrder.filter(({ run }) => run.kind === "fill" && i >= run.first && i < run.first + run.count);
+      assert.equal(painted.length, 1, "each soft-mask consumer is painted once");
+      assert.ok(painted[0].scopes.some((scope) => scope.group?.softMask),
+        "soft-mask consumers must not be emitted as opaque vector fills outside their mask");
     }
-    assert.equal(flatSalmonVectorFillCount, 0, "soft-mask consumers must not be emitted again as opaque vector fills");
-    assert.ok(
-      parsedShadingAndDashPdf.scene.sourceSegmentCount > 1_000,
-      "setDash operators must expand stroked paths into painted dash spans"
-    );
-    assert.equal(parsedShadingAndDashPdf.scene.textInstanceCount, 1_764, "shading fallback must preserve vector text");
+    assert.ok(salmonConsumerCount > 0, "the salmon soft-mask consumers are present");
+    assert.equal(shadingScene.textInstanceCount, 1_764, "shadings must preserve vector text");
     let darkTableTextCount = 0;
-    for (let i = 0; i < parsedShadingAndDashPdf.scene.textInstanceCount; i += 1) {
-      const offset = i * 4;
-      const red = parsedShadingAndDashPdf.scene.textInstanceC[offset];
-      const green = parsedShadingAndDashPdf.scene.textInstanceC[offset + 1];
-      const blue = parsedShadingAndDashPdf.scene.textInstanceC[offset + 2];
-      const alpha = parsedShadingAndDashPdf.scene.textInstanceC[offset + 3];
-      if (
-        Math.abs(red - 44 / 255) < 1e-4 &&
-        Math.abs(green - 46 / 255) < 1e-4 &&
-        Math.abs(blue - 53 / 255) < 1e-4 &&
-        Math.abs(alpha - 1) < 1e-4
-      ) {
-        darkTableTextCount += 1;
-      }
+    for (let i = 0; i < shadingScene.textInstanceCount; i += 1) {
+      if (byteColor(...shadingScene.textInstanceC.subarray(i * 4, i * 4 + 4)) === "44,46,53,255") darkTableTextCount += 1;
     }
     assert.equal(darkTableTextCount, 1_649, "PDF display/sRGB text colors must survive extraction unchanged");
 
-    const shadingZipBlob = await buildHep(parsedShadingAndDashPdf.scene, {
-      sourceLabel: "shading-and-dash.pdf",
-      compression: "store"
-    });
-    const shadingZip = await readZip(shadingZipBlob);
-    const shadingTable = await readRasterLayerTable(shadingZip);
-    const encodedShading = shadingTable.layers[0];
-    assert.match(encodedShading.storage, /^(?:png|webp)$/, "large layers keep their own encoded section");
-    const encodedShadingBytes = await shadingZip.file(rasterPayloadFile(shadingTable, 0)).async("uint8array");
-    assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node HEP builds must compress raster layers");
-    const encodedShadingRoundTrip = await loadSceneFromHep(await shadingZipBlob.arrayBuffer());
-    const decodedShadingLayers = listSceneRasterLayers(encodedShadingRoundTrip);
-    assert.equal(decodedShadingLayers.length, 1, "Node HEP loads must decode encoded raster layers");
-    assert.equal(decodedShadingLayers[0].width, shadingLayers[0].width);
-    assert.equal(decodedShadingLayers[0].height, shadingLayers[0].height);
-    const decodedCenterDotPixel = sampleRasterLayerAtWorld(decodedShadingLayers[0], 800, 436.4);
-    assert.ok(
-      decodedCenterDotPixel[0] > 210 &&
-        decodedCenterDotPixel[1] > 170 &&
-        decodedCenterDotPixel[2] > 160 &&
-        decodedCenterDotPixel[3] > 245,
-      "encoded soft-mask composites must survive the Node HEP round trip"
-    );
+    // Page 3: shadings interleaved with two images.
+    const interleavedScene = await loadBrochurePage("3");
+    const interleavedOrder = assertVectorPaintStructure(interleavedScene,
+      await roundTripScene(interleavedScene, "interleaved-images.pdf"), "page 3");
+    const imagePositions = interleavedOrder.flatMap(({ run }, index) => run.kind === "raster" ? [index] : []);
+    assert.equal(imagePositions.length, 2, "page 3 paints two source images");
+    const gradientPositions = interleavedOrder.flatMap(({ run }, index) => run.kind === "gradient-fill" ? [index] : []);
+    assert.ok(gradientPositions.some((index) => index > imagePositions[0] && index < imagePositions[1]),
+      "the early gradient paints over the first image");
+    assert.ok(gradientPositions.some((index) => index > imagePositions[1]),
+      "the post-image shading remains after the intervening image");
 
-    const parsedInterleavedRasterPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "3"
-    });
-    const interleavedRasterLayers = listSceneRasterLayers(parsedInterleavedRasterPdf.scene);
-    assert.equal(
-      interleavedRasterLayers.length,
-      1,
-      "image-interleaved shadings must share one source-ordered raster composite"
-    );
-    assert.ok(
-      interleavedRasterLayers[0].width * interleavedRasterLayers[0].height < 4_500_000,
-      "the ordered raster composite must stay within the bounded page texture budget"
-    );
-    const interleavedOverlapPixel = sampleRasterLayerAtWorld(
-      interleavedRasterLayers[0],
-      372.6666667,
-      607.89
-    );
-    assert.ok(
-      interleavedOverlapPixel[0] >= 142 && interleavedOverlapPixel[0] <= 146 &&
-        interleavedOverlapPixel[1] >= 47 && interleavedOverlapPixel[1] <= 51 &&
-        interleavedOverlapPixel[2] >= 35 && interleavedOverlapPixel[2] <= 39 &&
-        interleavedOverlapPixel[3] >= 253,
-      "the early gradient must remain composited over the first image"
-    );
-    const lateShadingPixel = sampleRasterLayerAtWorld(
-      interleavedRasterLayers[0],
-      924.6666667,
-      232.5566667
-    );
-    assert.ok(
-      lateShadingPixel[0] >= 253 &&
-        lateShadingPixel[1] >= 72 && lateShadingPixel[1] <= 78 &&
-        lateShadingPixel[2] >= 40 && lateShadingPixel[2] <= 46 &&
-        lateShadingPixel[3] >= 69 && lateShadingPixel[3] <= 73,
-      "the post-image shading must remain after the intervening image"
-    );
-
-    const parsedPhotoOverlayPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "13"
-    });
-    const photoOverlayLayers = listSceneRasterLayers(parsedPhotoOverlayPdf.scene);
-    const photoOverlayScene = parsedPhotoOverlayPdf.scene;
+    // Page 13: a photo, a luminosity-masked circle and a signature.
+    const photoOverlayScene = await loadBrochurePage("13");
+    const photoOverlayLayers = listSceneRasterLayers(photoOverlayScene);
+    const photoOrder = assertVectorPaintStructure(photoOverlayScene, null, "page 13");
     assert.equal(photoOverlayLayers.length, 2, "page 13 must retain only its photo and signature raster paints");
-    assert.equal(parsedPhotoOverlayPdf.scene.segmentCount, 56, "page 13 strokes must remain vector-rendered");
-    assert.equal(parsedPhotoOverlayPdf.scene.fillPathCount, 16, "page 13 fills must remain vector-rendered");
-    assert.equal(parsedPhotoOverlayPdf.scene.textInstanceCount, 976, "page 13 text must remain vector-rendered");
+    assert.equal(photoOverlayScene.textInstanceCount, 976, "page 13 text must remain vector-rendered");
     assert.equal(photoOverlayScene.gradientCount, 1, "the soft-mask definition must become one native gradient");
-    assert.equal(photoOverlayScene.gradientFillPathCount, 1, "the salmon circle must become one native masked fill");
-    assert.equal(photoOverlayScene.gradientFillSegmentCount, 16);
-    assert.equal(photoOverlayScene.gradientStrokeRunCount, 0);
-    assert.equal(photoOverlayScene.gradientStrokeSegmentCount, 0);
-    assert.deepEqual(Array.from(photoOverlayScene.gradientFillPaintMeta), [-1, 0, 2, 0]);
     assert.ok(
       photoOverlayLayers.reduce((sum, layer) => sum + layer.width * layer.height, 0) < 3_000_000,
       "native mask extraction must not flatten page 13 into an additional full-page texture"
     );
-    assert.equal(photoOverlayLayers[0].width, 1_243);
-    assert.equal(photoOverlayLayers[0].height, 1_755);
-    assert.equal(photoOverlayLayers[0].paintOrder, 0, "the main photo must be the first ordered paint");
-    assert.equal(photoOverlayLayers[0].pageIndex, 0);
-    assert.equal(photoOverlayLayers[1].width, 732);
-    assert.equal(photoOverlayLayers[1].height, 137);
-    assert.equal(photoOverlayLayers[1].paintOrder, 25, "the signature must remain after the native gradient");
-    assert.equal(photoOverlayLayers[1].pageIndex, 0);
-    assert.ok(
-      photoOverlayLayers[0].paintOrder < photoOverlayScene.gradientFillPaintMeta[2] &&
-        photoOverlayScene.gradientFillPaintMeta[2] < photoOverlayLayers[1].paintOrder,
-      "paint order must remain photo -> native masked fill -> signature"
-    );
-    assert.ok(
-      photoOverlayLayers.every((layer) => !(layer.width >= 590 && layer.width <= 610 && layer.height >= 340 && layer.height <= 355)),
-      "the former soft-mask raster must not remain in the scene"
-    );
-    assertApprox(photoOverlayScene.gradientFillPathMetaB[2], 1, 1e-6, "native circle red");
-    assertApprox(photoOverlayScene.gradientFillPathMetaB[3], 76 / 255, 1e-6, "native circle green");
-    assertApprox(photoOverlayScene.gradientFillPathMetaC[2], 41 / 255, 1e-6, "native circle blue");
-    assertApprox(photoOverlayScene.gradientFillPathMetaC[3], 0.800003, 1e-5, "native circle group alpha");
+    const [photoMask] = paintGroups(photoOverlayScene).filter((group) => group.softMask);
+    assert.equal(photoMask?.softMask.subtype, "Luminosity", "the circle keeps its luminosity mask");
+    assert.ok(photoOrder.some(({ run, scopes }) => run.kind === "gradient-fill" && run.first === 0 &&
+      scopes.some((scope) => scope.mask === photoMask)), "the mask is the native gradient");
+    const photoPosition = orderIndexOf(photoOrder, ({ run }) => run.kind === "raster" && run.first === 0, "the photo is painted");
+    const circlePosition = orderIndexOf(photoOrder, ({ scopes }) => scopes.some((scope) => scope.group === photoMask),
+      "the masked circle is painted");
+    const signaturePosition = orderIndexOf(photoOrder, ({ run }) => run.kind === "raster" && run.first === 1,
+      "the signature is painted");
+    assert.ok(photoPosition < circlePosition && circlePosition < signaturePosition,
+      "paint order must remain photo -> masked circle -> signature");
+    const circle = photoOrder[circlePosition];
+    assert.equal(circle.run.kind, "fill");
+    const circleOffset = circle.run.first * 4;
+    assert.equal(byteColor(photoOverlayScene.fillPathMetaB[circleOffset + 2], photoOverlayScene.fillPathMetaB[circleOffset + 3],
+      photoOverlayScene.fillPathMetaC[circleOffset + 2], photoOverlayScene.fillPathMetaC[circleOffset + 3]), "255,76,41,255",
+    "the masked circle keeps its salmon paint");
+    const circleOpacity = circle.scopes.reduce((alpha, scope) => alpha * (scope.group?.alpha ?? 1), 1);
+    assertApprox(circleOpacity, 0.8, 1e-5, "native circle group alpha");
     assert.deepEqual(Array.from(photoOverlayScene.gradientMetaA.subarray(0, 4)), [0, 0, 0, 0]);
     assert.deepEqual(Array.from(photoOverlayScene.gradientLut.subarray(0, 4)), [255, 255, 255, 255]);
-    assert.deepEqual(Array.from(photoOverlayScene.gradientLut.subarray(1023 * 4, 1024 * 4)), [255, 255, 255, 0]);
+    assert.deepEqual(Array.from(photoOverlayScene.gradientLut.subarray(1023 * 4, 1024 * 4)), [0, 0, 0, 255],
+      "the luminosity mask runs from white (visible) to black (hidden)");
     const photoOverlapPixel = sampleRasterLayerAtWorld(photoOverlayLayers[0], 650, 100);
     assert.ok(
       Math.abs(photoOverlapPixel[0] - 146) <= 2 &&
@@ -938,48 +866,44 @@ async function run() {
       "page 13 native mask parameter"
     );
     const maskOverlapPixel = sampleSceneGradient(photoOverlayScene, 0, 650, 100);
-    assert.ok(
-      maskOverlapPixel.slice(0, 3).every((component) => component >= 254) &&
-        maskOverlapPixel[3] >= 166 && maskOverlapPixel[3] <= 170,
-      "the native luminosity mask must retain its white-to-transparent coverage"
-    );
-    const nativeGradientAlpha = photoOverlayScene.gradientFillPathMetaC[3] * maskOverlapPixel[3] / 255;
-    assertApprox(nativeGradientAlpha * 255, 134, 2, "native circle effective alpha");
-    const nativeGradientColor = [
-      photoOverlayScene.gradientFillPathMetaB[2] * 255,
-      photoOverlayScene.gradientFillPathMetaB[3] * 255,
-      photoOverlayScene.gradientFillPathMetaC[2] * 255
-    ];
-    const compositedOverlapPixel = nativeGradientColor.map((component, index) =>
-      Math.round(component * nativeGradientAlpha + photoOverlapPixel[index] * (1 - nativeGradientAlpha))
+    const maskCoverage = (0.2126 * maskOverlapPixel[0] + 0.7152 * maskOverlapPixel[1] + 0.0722 * maskOverlapPixel[2]) / 255;
+    assert.ok(maskCoverage * 255 >= 166 && maskCoverage * 255 <= 170,
+      "the native luminosity mask must retain its white-to-black coverage");
+    const nativeCircleAlpha = circleOpacity * maskCoverage;
+    assertApprox(nativeCircleAlpha * 255, 134, 2, "native circle effective alpha");
+    const compositedOverlapPixel = [255, 76, 41].map((component, index) =>
+      Math.round(component * nativeCircleAlpha + photoOverlapPixel[index] * (1 - nativeCircleAlpha))
     );
     assert.ok(
       Math.abs(compositedOverlapPixel[0] - 203) <= 2 &&
         Math.abs(compositedOverlapPixel[1] - 120) <= 2 &&
         Math.abs(compositedOverlapPixel[2] - 116) <= 2,
-      "native mask coverage must composite the gradient over the photo"
+      "native mask coverage must composite the circle over the photo"
     );
 
-    const composedGradientScene = composeVectorScenesInGrid(
-      [parsedOrderedUnderlayPdf.scene, photoOverlayScene],
-      2
-    );
-    const underlayGradientCount = parsedOrderedUnderlayPdf.scene.gradientCount;
+    const composedGradientScene = composeVectorScenesInGrid([underlayScene, photoOverlayScene], 2);
+    const underlayGradientCount = underlayScene.gradientCount;
     const translatedGradientIndex = underlayGradientCount;
     const translatedGradientOffset = translatedGradientIndex * 4;
-    const translatedFillIndex = parsedOrderedUnderlayPdf.scene.gradientFillPathCount;
-    const translatedFillOffset = translatedFillIndex * 4;
+    const translatedFillOffset = underlayScene.gradientFillPathCount * 4;
     const translatedPageRectOffset = 4;
     const translateX = composedGradientScene.pageRects[translatedPageRectOffset] - photoOverlayScene.pageRects[0];
     const translateY = composedGradientScene.pageRects[translatedPageRectOffset + 1] - photoOverlayScene.pageRects[1];
     assert.equal(composedGradientScene.pageCount, 2);
     assert.equal(composedGradientScene.gradientCount, underlayGradientCount + photoOverlayScene.gradientCount);
-    assert.equal(composedGradientScene.gradientStrokeRunCount, parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount);
-    assert.equal(composedGradientScene.gradientFillPathCount, 1);
-    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset], -1);
-    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 1], translatedGradientIndex);
-    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 2], 2);
-    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 3], 1);
+    assert.equal(composedGradientScene.gradientFillPathCount,
+      underlayScene.gradientFillPathCount + photoOverlayScene.gradientFillPathCount);
+    const [sourceGradient, maskGradient, sourcePaint, sourcePage] = photoOverlayScene.gradientFillPaintMeta.subarray(0, 4);
+    assert.deepEqual(
+      Array.from(composedGradientScene.gradientFillPaintMeta.subarray(translatedFillOffset, translatedFillOffset + 4)),
+      [
+        sourceGradient >= 0 ? sourceGradient + underlayGradientCount : -1,
+        maskGradient >= 0 ? maskGradient + underlayGradientCount : -1,
+        sourcePaint,
+        sourcePage + 1
+      ],
+      "grid composition remaps gradient and page references"
+    );
     const sourceGradientB = photoOverlayScene.gradientMetaB;
     const sourceGradientC = photoOverlayScene.gradientMetaC;
     assertApprox(
@@ -1035,7 +959,7 @@ async function run() {
       );
     }
 
-    const photoOverlayZipBlob = await buildHep(parsedPhotoOverlayPdf.scene, {
+    const photoOverlayZipBlob = await buildHep(photoOverlayScene, {
       sourceLabel: "photo-overlay.pdf",
       encodeRasterImages: false,
       compression: "store"
@@ -1044,8 +968,8 @@ async function run() {
     const photoOverlayManifest = JSON.parse(await photoOverlayZip.file("manifest.json").async("string"));
     assert.equal(photoOverlayManifest.formatVersion, 9);
     assert.equal(photoOverlayManifest.scene.gradientCount, 1);
-    assert.equal(photoOverlayManifest.scene.gradientFillPathCount, 1);
-    assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, 16);
+    assert.equal(photoOverlayManifest.scene.gradientFillPathCount, photoOverlayScene.gradientFillPathCount);
+    assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, photoOverlayScene.gradientFillSegmentCount);
     assert.deepEqual(
       photoOverlayManifest.gradientLut,
       {
@@ -1060,7 +984,7 @@ async function run() {
       4096
     );
     const photoOverlayRoundTrip = await loadSceneFromHep(await photoOverlayZipBlob.arrayBuffer());
-    assertNativeGradientResourcesEqual(photoOverlayRoundTrip, photoOverlayScene, "page 13 native gradient round trip");
+    assertVectorPaintStructure(photoOverlayScene, photoOverlayRoundTrip, "page 13");
     const roundTripPhotoOverlayLayers = listSceneRasterLayers(photoOverlayRoundTrip);
     assert.equal(roundTripPhotoOverlayLayers.length, photoOverlayLayers.length);
     for (let i = 0; i < photoOverlayLayers.length; i += 1) {
@@ -1073,6 +997,31 @@ async function run() {
       assert.equal(roundTripPhotoOverlayLayers[i].paintOrder, photoOverlayLayers[i].paintOrder);
       assert.equal(roundTripPhotoOverlayLayers[i].pageIndex, photoOverlayLayers[i].pageIndex);
     }
+
+    // Encoded raster sections: the page 13 photo is large enough for its own.
+    const encodedPhotoBlob = await buildHep(photoOverlayScene, {
+      sourceLabel: "photo-overlay-encoded.pdf",
+      compression: "store"
+    });
+    const encodedPhotoZip = await readZip(encodedPhotoBlob);
+    const encodedPhotoTable = await readRasterLayerTable(encodedPhotoZip);
+    assert.match(encodedPhotoTable.layers[0].storage, /^(?:png|webp)$/, "large layers keep their own encoded section");
+    const encodedPhotoBytes = await encodedPhotoZip.file(rasterPayloadFile(encodedPhotoTable, 0)).async("uint8array");
+    assert.ok(encodedPhotoBytes.length < photoOverlayLayers[0].data.length, "Node HEP builds must compress raster layers");
+    const decodedPhotoLayers = listSceneRasterLayers(await loadSceneFromHep(await encodedPhotoBlob.arrayBuffer()));
+    assert.equal(decodedPhotoLayers.length, photoOverlayLayers.length, "Node HEP loads must decode encoded raster layers");
+    assert.equal(decodedPhotoLayers[0].width, photoOverlayLayers[0].width);
+    assert.equal(decodedPhotoLayers[0].height, photoOverlayLayers[0].height);
+    // Photos may use lossy WebP: bound the whole layer's mean error, not one texel.
+    let photoError = 0;
+    for (let i = 0; i < photoOverlayLayers[0].data.length; i += 1) {
+      photoError += Math.abs(photoOverlayLayers[0].data[i] - decodedPhotoLayers[0].data[i]);
+    }
+    assert.ok(photoError / photoOverlayLayers[0].data.length < 3, "encoded raster layers must survive the Node HEP round trip");
+    const decodedPhotoPixel = sampleRasterLayerAtWorld(decodedPhotoLayers[0], 650, 100);
+    assert.ok(decodedPhotoPixel.every((component, index) => Math.abs(component - photoOverlapPixel[index]) <= 12),
+      "the decoded photo keeps its color at the circle overlap");
+
     const corruptGradientLutZip = await readZip(photoOverlayZipBlob);
     corruptGradientLutZip.remove(photoOverlayManifest.gradientLut.file);
     const corruptGradientLutBytes = await corruptGradientLutZip.generateAsync({
@@ -1193,27 +1142,21 @@ async function run() {
       "missing raster payload must be rejected"
     );
 
-    const parsedBackdropBlendPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
-      sourceKind: "pdf",
-      pages: "14"
-    });
-    const backdropBlendLayers = listSceneRasterLayers(parsedBackdropBlendPdf.scene);
-    assert.ok(parsedBackdropBlendPdf.scene.imagePaintOpCount > 0, "blend fixture must contain an image backdrop");
-    assert.equal(
-      backdropBlendLayers.length,
-      1,
-      "backdrop-dependent blend groups and their image backdrop must retain PDF paint order in one composite"
-    );
-    assert.equal(parsedBackdropBlendPdf.scene.segmentCount, 0, "composited blend paths must not be emitted twice");
-    assert.equal(
-      parsedBackdropBlendPdf.scene.sourceSegmentCount,
-      0,
-      "composited blend strokes must not remain in vector source data"
-    );
-    assert.equal(parsedBackdropBlendPdf.scene.fillPathCount, 0, "composited blend fills must not be emitted twice");
+    // Page 14: backdrop-dependent HardLight groups over an image.
+    const backdropBlendScene = await loadBrochurePage("14");
+    const backdropBlendOrder = assertVectorPaintStructure(backdropBlendScene,
+      await roundTripScene(backdropBlendScene, "backdrop-blend.pdf"), "page 14");
+    assert.ok(backdropBlendScene.imagePaintOpCount > 0, "blend fixture must contain an image backdrop");
+    const hardLightGroups = paintGroups(backdropBlendScene).filter((group) => group.blendMode === "HardLight");
+    assert.ok(hardLightGroups.length > 0, "backdrop-dependent blend groups keep their blend mode");
+    assert.equal(sceneRequiresPaintCompositing(backdropBlendScene), true);
+    const backdropPosition = orderIndexOf(backdropBlendOrder, ({ run }) => run.kind === "raster", "the backdrop image is painted");
+    assert.ok(backdropBlendOrder.some(({ scopes }, index) => index > backdropPosition &&
+      scopes.some((scope) => hardLightGroups.includes(scope.group))),
+    "a HardLight group composites over the image backdrop in PDF paint order");
     assert.ok(
-      parsedBackdropBlendPdf.scene.textInstanceCount > 1_000,
-      "backdrop-inclusive graphics capture must preserve searchable vector text"
+      backdropBlendScene.textInstanceCount > 1_000,
+      "blend groups must preserve searchable vector text"
     );
 
     await assert.rejects(

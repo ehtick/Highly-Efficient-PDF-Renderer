@@ -625,7 +625,7 @@ const fromScene = await buildHep(pdf.sceneData, {
 The result is an `application/x-hep` `Blob`; save or upload it with a `.hep`
 filename. Exporting a loaded scene reuses its parsed data, including original
 PDF layer defaults, hidden geometry, and retained fallback resources. The original
-PDF is not required to replay those resources after reopening a v7 archive.
+PDF is not required to replay those resources after reopening the HEP file.
 
 By default, `buildHep` uses DEFLATE compression and stores each raster as the
 smaller of WebP or PNG, with raw RGBA as a fallback when encoding is unavailable.
@@ -638,7 +638,7 @@ The builder accepts `signal` and `onProgress`, including raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP container v1 with scene schema v7. Earlier scene schemas
+The loader supports HEP container v1 with scene schema v9. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and

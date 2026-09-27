@@ -1,12 +1,10 @@
 # Highly Efficient PDF Renderer (HEPR)
 
-GPU rendering for large PDFs, technical drawings, and floorplans — in a standalone viewer or your three.js scene.
+GPU rendering for detailed floorplans, technical drawings, and entire books — in a standalone viewer or your three.js scene.
 
 HEPR brings PDF vector content, text, and embedded images to the GPU. WebGL and WebGPU backends, adaptive level of detail, and a reusable `.hep` document format help keep detailed documents practical to explore.
 
 **[Live demo](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/)** · **[Examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md)** · **[Manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md)** · **[API](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md)** · **[Documentation](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/README.md)**
-
-[![HEPR rendering and navigating a detailed PDF floorplan](demo/demo.gif)](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/)
 
 ## Try it
 
@@ -19,8 +17,29 @@ Open the [standalone viewer](https://soadzoor.github.io/Highly-Efficient-PDF-Ren
 - **Three.js integration:** add a `THREE.Group` to your scene and use your camera and controls.
 - **Multiple pages:** load a whole PDF or selected pages, arranged in a grid.
 - **Search and selection:** find text, highlight matches, and copy selections on desktop and touch devices.
+- **Drawing selection:** select drawing elements, inspect their geometry and layer membership, and temporarily recolor vectors.
 - **PDF layers:** toggle optional content in the main viewer, inspect layer dependencies when picking geometry, or use the shared library APIs.
 - **Reusable documents:** export `.hep` files with geometry, images, and a searchable text index to skip PDF parsing on subsequent loads.
+
+## See it in action
+
+### Toggle PDF layers
+
+Show or hide individual layers (PDF OCG) to focus on the parts of a drawing you need.
+
+![Toggling layer visibility in a PDF drawing](demo/layers.webp)
+
+### Zoom into every detail
+
+Vector graphics stay vector. Zoom deep into a detailed floorplan while lines and curves stay sharp and navigation stays smooth.
+
+![Zooming into a vector floorplan while preserving sharp detail](demo/floorplan.webp)
+
+### Explore whole books
+
+Load an entire book, then find, select, and copy text with crisp rendering and smooth navigation. Here, HEPR handles *War and Peace*.
+
+![Navigating War and Peace and finding and selecting text](demo/war-and-peace.webp)
 
 ## Quick start
 
@@ -30,9 +49,8 @@ Install the browser package alongside three.js:
 npm install @soadzoor/hepr three
 ```
 
-For browser apps built with Vite, import `@soadzoor/hepr/bundler`. This entry
-provides separate JavaScript modules and asset references that the application
-build can follow. Add these settings to your existing Vite configuration:
+For browser apps built with Vite, use `@soadzoor/hepr/bundler` throughout your
+application and add these settings to your existing Vite configuration:
 
 ```js
 import { defineConfig } from "vite";
@@ -43,21 +61,15 @@ export default defineConfig({
 });
 ```
 
-The exclusion keeps HEPR's asset and worker references available to Vite's
-development transforms. ES module workers allow lazy imports in production.
-No HEPR plugin or manual asset copying is required. Other bundlers need support
-for module workers and static `new URL("./asset", import.meta.url)` references;
-the package regression checks currently cover Vite.
-
-Use the bundler entry consistently throughout a browser application. The existing
-`@soadzoor/hepr` and `@soadzoor/hepr/three` entries retain the prebuilt `dist/lib`
-layout: serve that directory intact when using it in a browser; do not rebundle
-it or mix its modules with the bundler entry. Node usage is unchanged.
+No HEPR plugin or manual asset copying is required. See
+[package entry points](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md#package-entry-points)
+for other bundlers, prebuilt assets, and Node usage.
 
 Serve a PDF at `/document.pdf` and add this to your entry module:
 
 ```js
 import * as THREE from "three";
+import { MapControls } from "three/addons/controls/MapControls.js";
 import { pdfObjectGenerator } from "@soadzoor/hepr/bundler";
 
 const width = 800;
@@ -68,8 +80,14 @@ const camera = new THREE.OrthographicCamera(-aspect, aspect, 1, -1, 0.1, 100);
 camera.position.z = 10;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(width, height);
 document.body.appendChild(renderer.domElement);
+
+const controls = new MapControls(camera, renderer.domElement);
+controls.enableRotate = false;
+controls.screenSpacePanning = true;
+controls.update();
 
 const pdf = await pdfObjectGenerator("/document.pdf");
 
@@ -82,37 +100,20 @@ scene.add(pdf);
 renderer.setAnimationLoop(() => renderer.render(scene, camera));
 ```
 
+Drag to pan and scroll or pinch to zoom. The
+[responsive viewer example](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md#responsive-threejs-viewer)
+adds window resizing and complete viewer cleanup.
+
 The same loader accepts `.hep` files, `File`/`Blob` objects, bytes, and base64 data. Select PDF pages with `{ pages: "1-3, 5" }`; report loading progress with `{ onProgress: ({ stage, value }) => console.log(stage, value) }`.
 
-When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) for camera controls, resizing, search, selection, and cleanup.
+When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. When closing the viewer, also stop its animation loop and dispose its controls and renderer. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) to add search, text selection, and drawing selection.
 
 ## Render your own polylines
 
-Compile host geometry into a `VectorScene` and render it using HEPR's Three.js
-stroke batching and camera-driven LOD, without a PDF:
-
-```js
-import { buildStrokeScene, createThreePdfObject } from "@soadzoor/hepr/bundler";
-
-const geometry = buildStrokeScene([
-  { points: [[0, 0], [100, 0], [100, 60], [0, 60]], closed: true,
-    color: "#334155", width: 0.5 },
-  { points: new Float32Array([0, 30, 100, 30]), color: "#dc2626", width: 0.25 }
-]);
-const drawing = await createThreePdfObject(geometry, { vectorLod: "auto" });
-
-// HEPR centers the group. Restore the input XY origin for placement in a BIM scene.
-const b = geometry.pageBounds;
-drawing.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, 0);
-scene.add(drawing);
-// Your existing renderer.render(scene, camera) drives LOD automatically.
-// On removal: drawing.removeFromParent(); drawing.dispose();
-```
-
-Coordinates are Y-up and widths use the same units. The initial builder supports
-opaque solid strokes with round caps/joins; the page background is transparent
-by default. See the [geometry API](docs/api.md#buildstrokescenepolylines-defaults)
-for input validation, defaults, and placement details.
+Use `buildStrokeScene` and `createThreePdfObject` to render your own polylines
+with HEPR's stroke batching and camera-driven LOD, without a PDF. See the
+[polyline example](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md#render-your-own-polylines)
+for geometry, placement, and cleanup.
 
 ## Save a HEP file
 
@@ -128,7 +129,7 @@ const hepBlob = await buildHep("/document.pdf");
 
 HEP skips PDF extraction; loading still prepares LOD and GPU resources. See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md#hep-files) for browser export and Node conversion.
 
-HEP uses scene schema **v7 only**. Regenerate older archives from the original
+HEP uses scene schema **v9 only**. Regenerate older archives from the original
 PDFs. Exports retain hidden content and original layer defaults; temporary layer
 visibility and primitive colors remain per-view settings.
 

@@ -17,8 +17,17 @@ This page covers the main integration APIs. The package ships TypeScript declara
 | `@soadzoor/hepr/experimental/dense-pdf-worker` | Worker entry for the specialized dense-vector parser. |
 
 For bundled browser applications, consistently use the `/bundler` entry and the
-[Vite settings in the quick start](../README.md#quick-start). The main and
-`/three` entries retain the prebuilt layout for serving intact and for Node.
+[Vite settings in the quick start](../README.md#quick-start). This entry provides
+separate JavaScript modules and asset references that the application build can
+follow. Vite's dependency exclusion keeps those references available to its
+development transforms; ES module workers allow lazy imports in production.
+No HEPR plugin or manual asset copying is required. Other bundlers need support
+for module workers and static `new URL("./asset", import.meta.url)` references;
+the package regression checks currently cover Vite.
+
+The main and `/three` entries retain the prebuilt `dist/lib` layout: serve that
+directory intact when using it in a browser; do not rebundle it or mix its modules
+with the `/bundler` entry. Node usage is unchanged.
 
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 
@@ -426,7 +435,7 @@ earlier scenes; ordinary flat pages keep the existing rendering path. Effect
 graphs use temporary GPU surfaces at the viewing resolution, subject to memory
 budgets. Retained compatibility fallbacks may require asynchronous image replay
 on a layer change. These temporary surfaces are never serialized as canonical
-geometry. HEP schema v7 is required: regenerate older HEP files from their PDFs.
+geometry. HEP schema v9 is required: regenerate older HEP files from their PDFs.
 Replayable raster fallbacks use the retained PDF's original paints when computing
 their backdrop correction. Temporary vector recoloring or a global tint does not
 recolor that correction; layer-dependent backdrop changes are replayed.
@@ -449,7 +458,7 @@ compressed files requires `DecompressionStream("deflate")`.
 
 Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
 the PDF's original layer defaults, including initially hidden geometry, regardless
-of the viewer's current layer settings. V7 retains fallback commands and assets;
+of the viewer's current layer settings. HEP retains fallback commands and assets;
 it does not embed the original PDF for later image recovery.
 
 Node hosts can install the optional `@napi-rs/canvas` backend for PDF operations
@@ -468,7 +477,7 @@ and renderer-owned transient surfaces. Group opacity is applied to the group
 result, preserving overlap between its children.
 
 Malformed or unsupported effects and exhausted expansion budgets can still use
-diagnosed selective or whole-page image fallbacks. V7 retains the replayable
+diagnosed selective or whole-page image fallbacks. HEP retains the replayable
 program and assets beside these fallback slots so layer changes can regenerate
 their pixels without the original PDF. Print separations and exact overprint
 simulation remain outside scope.

@@ -15,7 +15,6 @@ const DEFAULT_PDF = fileURLToPath(
   new URL("../public/examples/pdfs/Livermore_L1.pdf", import.meta.url)
 );
 const LIVERMORE_COUNTS = Object.freeze({
-  operators: 6_209_850,
   sourceSegments: 6_187_497,
   mergedSegments: 6_187_497,
   visibleSegments: 887_355,
@@ -123,7 +122,6 @@ function fingerprintNativeOutput(result) {
       userUnit: structuralPage.userUnit,
       pageMatrix: geometry.pageMatrix,
       pageBounds: geometry.pageBounds,
-      operatorCount: compiled.operatorCount,
       sourceSegmentCount: compiled.sourceSegmentCount,
       mergedSegmentCount: compiled.mergedSegmentCount,
       segmentCount: compiled.segmentCount,
@@ -304,8 +302,7 @@ function printUsage(stream = process.stdout) {
 
 Measures the dependency-free native structure, geometry, and retained-text
 pipeline with peak-memory sampling and a deterministic semantic hash. The
-default Livermore input also checks its locked output counts. Differential
-rendering comparisons belong to the isolated oracle workspace.
+default Livermore input also checks its locked output counts.
 
 Options:
   --pages RANGE       One-based page selection, for example 1-5,8

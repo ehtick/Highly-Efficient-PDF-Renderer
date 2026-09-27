@@ -86,7 +86,7 @@ const EMPTY_IMAGE_REGISTRY = Object.freeze({
  * The returned one-page `VectorScene` is intentionally text-only and can be
  * passed through the same parity gate used by `mergeDenseGeometryWithText`.
  * This first direct boundary rejects every named non-font resource; callers
- * can fall back to the established mini-PDF/PDF.js path without risking a
+ * can fall back to the established mini-PDF text path without risking a
  * partial or visually different result.
  *
  * The caller retains ownership of `document` and its source. This function

@@ -176,8 +176,6 @@ interface ParsedDataSceneEntry {
   pageCount?: unknown;
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
-  operatorCount?: unknown;
-  operatorCountKind?: unknown;
   imageLayerSegmentCount?: unknown;
   imagePaintOpCount?: unknown;
   pathCount?: unknown;
@@ -409,8 +407,6 @@ export async function buildHepBlobForLayout(
       pageCount: scene.pageCount,
       pagesPerRow: scene.pagesPerRow,
       maxHalfWidth: scene.maxHalfWidth,
-      operatorCount: scene.operatorCount,
-      operatorCountKind: scene.operatorCountKind,
       drawRuns: drawRunsManifest,
       optionalContent: scene.optionalContent,
       retainedPages,
@@ -2063,9 +2059,6 @@ async function loadSceneFromHepInternal(
     pagesPerRow,
     maxHalfWidth,
     imagePaintOpCount: readNonNegativeInt(sceneMeta.imagePaintOpCount, 0),
-    operatorCount: readNonNegativeInt(sceneMeta.operatorCount, 0),
-    ...(sceneMeta.operatorCountKind === "native-estimate" || sceneMeta.operatorCountKind === "mixed"
-      ? { operatorCountKind: sceneMeta.operatorCountKind } : {}),
     ...(typeof sceneMeta.imageLayerSegmentCount === "number" &&
         Number.isSafeInteger(sceneMeta.imageLayerSegmentCount) && sceneMeta.imageLayerSegmentCount >= 0 &&
         [sceneMeta.discardedTransparentCount, sceneMeta.discardedDegenerateCount,

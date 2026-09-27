@@ -71,7 +71,17 @@ try {
       ["F1"],
       { missingFontResolver }
     );
-    assert.deepEqual(actual, expected);
+    // The mini-PDF reference uses the full parser's ordered paint output, which
+    // adds draw runs and vector clips. Dense text keeps the flat text pass, and
+    // mergeDenseGeometryWithText only takes its text fields. The page clip
+    // contains every glyph, so the flat scene loses nothing by omitting it.
+    const { drawRuns, clipPaths, ...expectedFlat } = expected;
+    assert.deepEqual(drawRuns, [
+      { kind: "text", first: 0, count: actual.textInstanceCount, clipIndex: 0 }
+    ]);
+    assert.equal(clipPaths.length, 1);
+    assertBoundsInsideEdges(actual.bounds, clipPaths[0].edges, "page clip");
+    assert.deepEqual(actual, expectedFlat);
     assert.equal(actual.pageCount, 1);
     assert.equal(actual.segmentCount, 0);
     assert.equal(actual.fillPathCount, 0);
@@ -287,4 +297,25 @@ function createEmbeddedMetricFixture(fontBytes, content) {
       { number: 7, body: tinyPdfStream("", fontBytes) }
     ]
   });
+}
+
+function assertBoundsInsideEdges(bounds, edges, label) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let offset = 0; offset < edges.length; offset += 2) {
+    minX = Math.min(minX, edges[offset]);
+    maxX = Math.max(maxX, edges[offset]);
+    minY = Math.min(minY, edges[offset + 1]);
+    maxY = Math.max(maxY, edges[offset + 1]);
+  }
+  assert.equal(edges.length, 16, `${label} must be a four-edge rectangle`);
+  for (let offset = 0; offset < edges.length; offset += 4) {
+    assert.ok(
+      edges[offset] === edges[offset + 2] || edges[offset + 1] === edges[offset + 3],
+      `${label} edges must be axis-aligned`
+    );
+  }
+  assert.ok(
+    bounds.minX >= minX && bounds.minY >= minY && bounds.maxX <= maxX && bounds.maxY <= maxY,
+    `${label} must contain every glyph`
+  );
 }

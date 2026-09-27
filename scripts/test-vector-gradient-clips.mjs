@@ -307,7 +307,8 @@ function buildNodeShader(mesh) {
     backend: { compatibilityMode: false, utils: { getTextureSampleData: () => ({ primarySamples: 1 }) },
       capabilities: { getUniformBufferLimit: () => 65536 } },
     hasFeature: () => false, hasCompatibility: () => false,
-    coordinateSystem: THREE.WebGPUCoordinateSystem
+    coordinateSystem: THREE.WebGPUCoordinateSystem,
+    debug: { diagnostics: { keywords: false } }
   };
   const builder = new WGSLNodeBuilder(mesh, renderer);
   builder.scene = new THREE.Scene();

@@ -98,7 +98,6 @@ try {
     ["ExtGState", "/MissingGS gs", "unsupported-content"],
     ["color space", "/MissingCS cs", "unsupported-color"],
     ["XObject", "/MissingImage Do", "unsupported-content"],
-    ["visibility property", "/OC /MissingProp BDC EMC", "invalid-object"],
     ["shading", "/MissingShading sh", "unsupported-content"]
   ]) {
     await assertDeterministicCompileFailure(
@@ -109,8 +108,26 @@ try {
     );
   }
 
-  // Non-visual /Span metadata may be absent with a diagnostic. /OC above is
-  // deliberately strict because an unresolved membership could hide paint.
+  // A missing /OC reference keeps its paint visible with a diagnostic rather
+  // than borrowing another scope's membership. A present but malformed
+  // property stays strict above.
+  {
+    const session = await openPdf({
+      kind: "bytes",
+      bytes: lazyResourceFixture("/OC /MissingProp BDC 0 0 10 10 re f EMC")
+    });
+    try {
+      const page = await session.compilePage(0, { optimization: "none" });
+      validateHeprPageData(page);
+      assert.equal(page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length, 1,
+        "paint under a missing layer reference remains visible");
+      assert.ok(session.getDiagnostics().some(({ code }) => code === "optional-content.unresolved-property"));
+    } finally {
+      await session.close();
+    }
+  }
+
+  // Non-visual /Span metadata may be absent or malformed with a diagnostic.
   for (const property of ["BadProp", "MissingProp"]) {
     const session = await openPdf({
       kind: "bytes",

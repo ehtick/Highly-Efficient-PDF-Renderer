@@ -4,13 +4,9 @@ import { registerHooks } from "node:module";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
-// Native outlines retain their source font units and use the bundled pinned
-// Liberation face, while PDF.js normalizes its equivalent Liberation face to
-// em units. Compare the rendered page-space result with a sub-pixel PDF-unit
-// tolerance instead of requiring identical local path topology/factorization.
+// Compare the rendered page-space result with a sub-pixel PDF-unit tolerance
+// instead of requiring identical local path topology/factorization.
 const WORLD_SPACE_GLYPH_TOLERANCE = 2e-3;
-
-installPdfJsNodePolyfills();
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -56,7 +52,7 @@ try {
   assert.equal(actual.length, expected.length);
   for (let pageIndex = 0; pageIndex < expected.length; pageIndex += 1) {
     assertTextOnlyScene(actual[pageIndex], `native page ${pageIndex + 1}`);
-    assertTextOnlyScene(expected[pageIndex], `PDF.js page ${pageIndex + 1}`);
+    assertTextOnlyScene(expected[pageIndex], `full native page ${pageIndex + 1}`);
     assertTextSemantics(actual[pageIndex], expected[pageIndex], pageIndex);
   }
 
@@ -126,7 +122,7 @@ function assertTextSemantics(actual, expected, pageIndex) {
     assert.equal(actual[field], expected[field], `${label}: ${field}`);
   }
   assert.equal(actual.textIndex?.pages.length, 1, `${label}: native text page count`);
-  assert.equal(expected.textIndex?.pages.length, 1, `${label}: PDF.js text page count`);
+  assert.equal(expected.textIndex?.pages.length, 1, `${label}: full native text page count`);
   const actualIndex = actual.textIndex.pages[0];
   const expectedIndex = expected.textIndex.pages[0];
   assert.equal(actualIndex.text, expectedIndex.text, `${label}: searchable text`);
@@ -146,7 +142,7 @@ function assertWorldSpaceGlyphGeometry(actual, expected, tolerance, label) {
   );
   for (let instanceIndex = 0; instanceIndex < actual.textInstanceCount; instanceIndex += 1) {
     const actualGlyph = readGlyphInstance(actual, instanceIndex, `${label}: native`);
-    const expectedGlyph = readGlyphInstance(expected, instanceIndex, `${label}: PDF.js`);
+    const expectedGlyph = readGlyphInstance(expected, instanceIndex, `${label}: full native`);
     assertPointNear(
       transformPoint(actualGlyph, 0, 0),
       transformPoint(expectedGlyph, 0, 0),
@@ -229,8 +225,8 @@ function assertCanonicalColorsNear(actual, expected, label) {
   for (let index = 0; index < actual.length; index += 1) {
     const actualByte = Math.round(Math.max(0, Math.min(1, actual[index])) * 255);
     const expectedByte = Math.round(Math.max(0, Math.min(1, expected[index])) * 255);
-    // PDF.js' display-color conversion may choose the adjacent byte at a
-    // half-quantum boundary (for example source 0.3 becomes 76 rather than 77).
+    // Allow the adjacent byte at a half-quantum boundary (for example source
+    // 0.3 may become 76 rather than 77).
     assert.ok(
       Math.abs(actualByte - expectedByte) <= 1,
       `${label}: normalized byte ${index} differs (${actualByte} versus ${expectedByte})`
@@ -250,23 +246,4 @@ function assertFloatArrayNear(actual, expected, tolerance, label) {
 
 function toArrayBuffer(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
-
-function installPdfJsNodePolyfills() {
-  if (typeof globalThis.DOMMatrix === "undefined") {
-    globalThis.DOMMatrix = class DOMMatrix {
-      constructor(init) {
-        const values = Array.isArray(init) || ArrayBuffer.isView(init)
-          ? Array.from(init)
-          : [1, 0, 0, 1, 0, 0];
-        [this.a, this.b, this.c, this.d, this.e, this.f] = values;
-      }
-    };
-  }
-  if (typeof globalThis.ImageData === "undefined") {
-    globalThis.ImageData = class ImageData {};
-  }
-  if (typeof globalThis.Path2D === "undefined") {
-    globalThis.Path2D = class Path2D {};
-  }
 }

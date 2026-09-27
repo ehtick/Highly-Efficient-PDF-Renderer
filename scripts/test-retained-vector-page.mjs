@@ -232,39 +232,90 @@ try {
   }
   {
     const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
-    // One glyph, three characters: the "ffi" ligature case. Each character must
-    // own a fallback quad, because the exported char map addresses quads by
-    // position and a reader drops the whole index when the counts disagree.
-    const toUnicode = tinyPdfStream("", [
-      "/CIDInit /ProcSet findresource begin 12 dict begin begincmap",
-      "1 begincodespacerange <00> <FF> endcodespacerange",
-      "1 beginbfchar <41> <006600660069> endbfchar",
-      "endcmap end end"
-    ].join("\n"));
+    // One glyph, three characters: the "ffi" ligature case. Painted characters
+    // share the glyph's instance. Invisible characters must each own a fallback
+    // quad, because the exported char map addresses quads by position and a
+    // reader drops the whole index when the counts disagree.
+    for (const renderingMode of [0, 3]) {
+      const toUnicode = tinyPdfStream("", [
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap",
+        "1 begincodespacerange <00> <FF> endcodespacerange",
+        "1 beginbfchar <41> <006600660069> endbfchar",
+        "endcmap end end"
+      ].join("\n"));
+      const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+        { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+        { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+        { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
+        { number: 4, body: tinyPdfStream("", `BT /F 24 Tf ${renderingMode} Tr 1 0 0 1 10 40 Tm (AB) Tj ET`) },
+        { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>" },
+        { number: 6, body: toUnicode }
+      ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-ligature-v1" }) });
+      try {
+        const page = await session.compilePage(0, {});
+        const shared = page.textIndex.charGlyphIndices;
+        assert.equal(page.textIndex.text, "ffiB", "the ToUnicode ligature expands to three characters");
+        assert.equal(shared[0], shared[1], "a ligature's characters share one glyph");
+        assert.equal(shared[1], shared[2], "a ligature's characters share one glyph");
+        const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+        const index = scene.textIndex.pages[0];
+        if (renderingMode === 0) {
+          assert.equal(index.text, "ffiB");
+          assert.ok(index.charInstance[0] >= 0, "a painted ligature references its vector instance");
+          assert.deepEqual([...index.charInstance.subarray(0, 3)], [index.charInstance[0], index.charInstance[0], index.charInstance[0]],
+            "the ligature's characters share one instance");
+          assert.ok(index.charInstance[3] >= 0 && index.charInstance[3] !== index.charInstance[0], "a different glyph has its own instance");
+          assert.equal(index.fallbackQuads.length, 0, "painted text needs no fallback quads");
+          continue;
+        }
+        const fallbacks = [...index.charInstance].filter(value => value <= -2);
+        assert.equal(fallbacks.length, index.fallbackQuads.length / 4,
+          "every fallback character owns exactly one quad");
+        const quadOf = i => [...index.fallbackQuads.subarray((-index.charInstance[i] - 2) * 4, (-index.charInstance[i] - 2) * 4 + 4)];
+        assert.notEqual(index.charInstance[0], index.charInstance[1], "each character gets its own slot");
+        assert.deepEqual(quadOf(0), quadOf(1), "the ligature's characters keep the same rectangle");
+        assert.deepEqual(quadOf(1), quadOf(2), "the ligature's characters keep the same rectangle");
+        assert.notDeepEqual(quadOf(0), quadOf(3), "a different glyph keeps its own rectangle");
+      } finally { await session.close(); }
+    }
+  }
+  {
+    const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
+    // B lies inside the triangle clip's bounding box but outside the triangle,
+    // so it paints nothing and must not be found by search.
     const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
       { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
-      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
-      { number: 4, body: tinyPdfStream("", "BT /F 24 Tf 1 0 0 1 10 40 Tm (AB) Tj ET") },
-      { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>" },
-      { number: 6, body: toUnicode }
-    ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-ligature-v1" }) });
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "q 0 0 m 100 0 l 0 100 l h W n BT /F 10 Tf 1 0 0 1 10 10 Tm (A) Tj 1 0 0 1 80 80 Tm (B) Tj ET Q") },
+      { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding >>" }
+    ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-clipped-index-v1" }) });
     try {
-      const page = await session.compilePage(0, {});
-      const shared = page.textIndex.charGlyphIndices;
-      assert.equal(page.textIndex.text, "ffiB", "the ToUnicode ligature expands to three characters");
-      assert.equal(shared[0], shared[1], "a ligature's characters share one glyph");
-      assert.equal(shared[1], shared[2], "a ligature's characters share one glyph");
-      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      const scene = await lowerRetainedPageToVectorScene(await session.compilePage(0, {}), { signal: new AbortController().signal });
       const index = scene.textIndex.pages[0];
-      const fallbacks = [...index.charInstance].filter(value => value <= -2);
-      assert.equal(fallbacks.length, index.fallbackQuads.length / 4,
-        "every fallback character owns exactly one quad");
-      const quadOf = i => [...index.fallbackQuads.subarray((-index.charInstance[i] - 2) * 4, (-index.charInstance[i] - 2) * 4 + 4)];
-      assert.notEqual(index.charInstance[0], index.charInstance[1], "each character gets its own slot");
-      assert.deepEqual(quadOf(0), quadOf(1), "the ligature's characters keep the same rectangle");
-      assert.deepEqual(quadOf(1), quadOf(2), "the ligature's characters keep the same rectangle");
-      assert.notDeepEqual(quadOf(0), quadOf(3), "a different glyph keeps its own rectangle");
+      assert.equal(index.text, "A", "fully clipped text leaves the search index");
+      assert.ok(index.charInstance[0] >= 0, "visible text references its vector instance");
+      assert.equal(index.fallbackQuads.length, 0);
+    } finally { await session.close(); }
+  }
+  {
+    const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
+    // Two runs repositioned with Tm carry no separator in the parser's raw
+    // index. A Screen blend forces the retained lowering, which must infer the
+    // word break from pen positions like every other vector page.
+    const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /ExtGState << /G << /BM /Screen >> >> /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "0 0 1 rg 0 0 200 100 re f /G gs 1 0 0 rg 20 20 60 60 re f BT /F 10 Tf 1 0 0 1 10 10 Tm (AB) Tj 1 0 0 1 60 10 Tm (AB) Tj ET") },
+      { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding >>" }
+    ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-word-break-v1" }) });
+    try {
+      assert.equal((await session.compilePage(0)).textIndex.text, "ABAB", "the raw index has no break between the runs");
+      const scene = await session.compileVectorPage(0);
+      assert.ok(scene.paintGraph, "the blend mode lowers the page through the retained program");
+      assert.equal(scene.textIndex.pages[0].text, "AB AB", "pen positions restore the word break");
+      assert.deepEqual([...scene.textIndex.pages[0].charInstance], [0, 1, -1, 2, 3]);
     } finally { await session.close(); }
   }
   {

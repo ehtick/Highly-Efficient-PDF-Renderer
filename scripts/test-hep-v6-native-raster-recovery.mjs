@@ -12,6 +12,6 @@ try {
   archive.file("manifest.json", JSON.stringify({ formatVersion: 6, sourcePdfFile: "source/source.pdf", scene: { imagePaintOpCount: 1 } }));
   archive.file("source/source.pdf", "%PDF-invalid-source-must-never-be-parsed");
   await assert.rejects(loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer" })),
-    /format v6 is not supported.*expected v7.*Re-export/);
+    /format v6 is not supported.*expected v\d+.*Re-export/);
   console.log("HEP v6 source-recovery archives are rejected without parsing their embedded PDF.");
 } finally { hooks.deregister(); }

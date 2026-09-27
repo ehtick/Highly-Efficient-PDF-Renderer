@@ -64,19 +64,34 @@ try {
     ["transparent tile paint", { state: "/ca 0.5" }],
     ["blended tile paint", { state: "/BM /Multiply" }],
     ["clipped tile paint", { cell: "0 g 0 0 5 12 re W n 0 0 10 12 re f" }],
-    ["singular pattern matrix", { matrix: "1 0 2 0 0 0" }],
     ["inherited cell color", { cell: "0 0 10 12 re f" }],
     ["uncolored pattern cell", { paintType: 2, cell: "0 0 10 12 re f" }]
   ]) {
+    // A nonuniform pattern stays vector: its fills and strokes expand into
+    // pattern cells, while pattern-colored text keeps its glyphs in a solid
+    // fallback color and says so.
     const session = await openPdf({ kind: "bytes", bytes: fixture(settings), label }, options);
     try {
-      await assert.rejects(
-        session.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" }),
-        error => error.code === "unsupported-content" && /pattern-colored text/.test(error.message),
-        `${label}: nonuniform patterns must not silently become a flat color`
-      );
+      const scene = await session.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" });
+      assert.equal(scene.rasterLayers.length, 0, `${label}: no raster fallback`);
+      assert.equal(scene.textInstanceCount, 3, `${label}: pattern-colored text keeps its glyphs`);
+      assert.equal(scene.textIndex.pages[0].text.replaceAll(/\s/g, ""), "AAB");
+      assert.deepEqual([...scene.textInstanceC.slice(8, 12)], [0, 0, 1, 1],
+        `${label}: text outside the pattern keeps its own color`);
+      assert(scene.fillPathCount > 1, `${label}: the pattern fill expands into vector cells`);
+      assert(session.getDiagnostics().some(({ code }) => code === "text-pattern-approximation"),
+        `${label}: nonuniform patterns must not silently become a flat color`);
     } finally { await session.close(); }
   }
+
+  const singular = await openPdf({ kind: "bytes", bytes: fixture({ matrix: "1 0 2 0 0 0" }) }, options);
+  try {
+    await assert.rejects(
+      singular.compileVectorPage(0, { preserveDrawingOrder: true, vectorFallback: "error" }),
+      error => error.code === "unsupported-content" && /singular pattern/.test(error.message),
+      "a singular pattern matrix is reported instead of guessed"
+    );
+  } finally { await singular.close(); }
 
   const constrained = await openPdf({ kind: "bytes", bytes: fixture() }, options);
   try {

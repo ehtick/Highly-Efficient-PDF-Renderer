@@ -264,7 +264,6 @@ export function buildNativeVectorPage(
     sourceSegmentCount: compiled.sourceSegmentCount + hairlineCount,
     mergedSegmentCount: compiled.mergedSegmentCount + hairlineCount,
     imageLayerSegmentCount: compiled.imageLayerSegmentCount ?? 0,
-    operatorCountKind: "native-estimate",
     sourceTextCount: text.sourceTextCount,
     textInstanceCount: text.instanceA.length / 4,
     textGlyphCount: text.glyphMetaA.length / 4,
@@ -291,7 +290,6 @@ export function buildNativeVectorPage(
     bounds: finalBounds(visualBounds),
     pageBounds: normalizedPageBounds,
     maxHalfWidth: compiled.maxHalfWidth,
-    operatorCount: compiled.operatorCount,
     imagePaintOpCount: rasterLayers.length,
     pathCount: compiled.pathCount + (hairlines?.glyphCount ?? 0),
     discardedTransparentCount: compiled.discardedTransparentCount,
@@ -1375,7 +1373,8 @@ function boundsFromQuad(quad: ArrayLike<number>): Bounds {
   };
 }
 
-class VectorPageTextIndexBuilder {
+/** Search text with separators inferred from page-space pen gaps, as for every vector page. */
+export class VectorPageTextIndexBuilder {
   private readonly chars: string[] = [];
 
   private readonly references: number[] = [];

@@ -111,9 +111,6 @@ export async function runNativeDenseBenchmark(
         measureDecodedContent(structuralPage.decodedContentChunks(), decodeTiming),
         {
           ...geometry,
-          fontDependencyKeys: new Map(structuralPage.fontDependencies.map(
-            ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
-          )),
           availableExtGStates: structuralPage.availableExtGStates,
           extGStates: structuralPage.extGStates,
           alwaysVisibleOptionalContentProperties:
@@ -196,7 +193,6 @@ export function summarizeNativeDenseCounts(result) {
   const pages = result.compiledPages;
   const scenes = result.textScenes;
   return {
-    operators: sumCompiled(pages, "operatorCount"),
     sourceSegments: sumCompiled(pages, "sourceSegmentCount"),
     mergedSegments: sumCompiled(pages, "mergedSegmentCount"),
     visibleSegments: sumCompiled(pages, "segmentCount"),

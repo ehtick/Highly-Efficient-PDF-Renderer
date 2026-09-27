@@ -27,14 +27,17 @@ try {
   });
   try {
     const scene = await tinySession.compileVectorPage(0);
-    assert.equal(scene.textInstanceCount, 1, "only B remains in the vector glyph store; A is clipped in its image layer");
+    assert.equal(scene.textInstanceCount, 2, "A stays a vector glyph behind its exact clip, alongside B");
+    assert.deepEqual(scene.drawRuns.map(({ kind }) => kind), ["raster", "text", "raster", "text"],
+      "the clipped label stays between both images in source order");
+    assert.ok(scene.drawRuns[1].clipIndex >= 0, "A references its vector clip");
     const matches = createSceneTextSearcher(scene).search("A");
     assert.equal(matches.length, 1);
     const indexed = scene.textIndex.pages[0];
-    assert(indexed.charInstance[matches[0].startChar] <= -2, "composited A keeps selection geometry");
+    assert(indexed.charInstance[matches[0].startChar] >= 0, "A remains a selectable vector glyph");
     checkSelection(scene, matches[0], "A");
     // The fixture's PDF coordinates are flipped into the viewer's page space.
-    const canvas = rasterPreview(scene);
+    const canvas = renderPreview(scene);
     const sample = (x, y) => [...canvas.getContext("2d").getImageData(x, 100 - y, 1, 1).data];
     assert.deepEqual(sample(11, 17), [0, 0, 255, 255], "the clipped-out half of A must not leak over the blue image");
     assert.deepEqual(sample(13, 11), [255, 0, 0, 255], "the retained label ink paints above the background image");
@@ -44,21 +47,21 @@ try {
     // Only this tiny in-memory fixture is exported, never the tracked brochure.
     const hep = await buildHep(scene, { encodeRasterImages: false, compression: "store" });
     const restored = await loadSceneFromHep(await hep.arrayBuffer());
-    assert.deepEqual(rasterPreview(restored).data(), canvas.data(), "HEP preserves overlap pixels");
+    assert.deepEqual(renderPreview(restored).data(), canvas.data(), "HEP preserves overlap pixels");
     checkSelection(restored, createSceneTextSearcher(restored).search("A")[0], "A");
   } finally {
     await tinySession.close();
   }
 
   // Physical PDF page 5 (source index 4), printed spread 8-9. Baseline comes
-  // exclusively from the accepted native appearance, never main or PDF.js.
+  // exclusively from the accepted native appearance.
   const bytes = new Uint8Array(await readFile(new URL(
     "../public/examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf", import.meta.url)));
   const session = await openPdf({ kind: "bytes", bytes });
   try {
     const scene = await session.compileVectorPage(4);
-    assert.equal(scene.textInstanceCount, 2469, "90 clipped labels must not be painted again as vector text");
-    assert.equal(scene.rasterLayers.length, 11);
+    assert.equal(scene.textInstanceCount, 2559, "each of the 90 clipped labels is one vector glyph run behind its clip");
+    assert.equal(scene.rasterLayers.length, 0, "the page lowers to vector paint without raster composites");
     const queries = ["SolvisLeo", "Wechselrichter", "Batteriespeicher", "Wärmepumpe", "Wallbox", "Photovoltaik"];
     const searcher = createSceneTextSearcher(scene);
     const diagramMatches = queries.map(query => {
@@ -92,13 +95,13 @@ try {
     const reference = {
       sourceSha256: sha(bytes), sourcePageIndex: 4,
       paintHash: sceneFingerprint(Object.fromEntries(Object.entries(scene).filter(([key]) =>
-        !["textIndex", "operatorCount", "operatorCountKind", "imageLayerSegmentCount", "sourceSegmentCount",
+        !["textIndex", "imageLayerSegmentCount", "sourceSegmentCount",
           "mergedSegmentCount", "discardedTransparentCount", "discardedDegenerateCount",
           "discardedDuplicateCount", "discardedContainedCount"].includes(key)))),
       // Exact CPU output provided to the unchanged GPU viewer: includes every
       // geometry/text store, clip, transform, image pixel and paint-order value.
       paintAndTextHash: sceneFingerprint(Object.fromEntries(Object.entries(scene).filter(([key]) =>
-        !["operatorCount", "operatorCountKind", "imageLayerSegmentCount", "sourceSegmentCount",
+        !["imageLayerSegmentCount", "sourceSegmentCount",
           "mergedSegmentCount", "discardedTransparentCount", "discardedDegenerateCount",
           "discardedDuplicateCount", "discardedContainedCount"].includes(key)))),
       textSha256: sha(scene.textIndex.pages[0].text),
@@ -173,17 +176,76 @@ try {
 
 function sha(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 
-function rasterPreview(scene) {
+/** CPU preview of ordered raster and vector-text runs, flipped into canvas space. */
+function renderPreview(scene) {
+  assert.ok(scene.drawRuns, "the preview follows ordered draw runs");
   const canvas = createCanvas(100, 100);
   const context = canvas.getContext("2d");
-  for (const layer of [...scene.rasterLayers].sort((a, b) => a.paintOrder - b.paintOrder)) {
-    const image = createCanvas(layer.width, layer.height);
-    image.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(layer.data), layer.width, layer.height), 0, 0);
-    const [a, b, c, d, e, f] = layer.matrix;
-    context.setTransform(a, -b, c, -d, e, 100 - f);
-    context.drawImage(image, 0, 0, 1, 1);
+  for (const run of scene.drawRuns) {
+    context.save();
+    context.setTransform(1, 0, 0, -1, 0, 100);
+    for (let index = run.clipIndex ?? -1; index >= 0; index = scene.clipPaths[index].parent) {
+      const clip = scene.clipPaths[index];
+      context.beginPath();
+      traceEdges(context, clip.edges);
+      context.clip(clip.fillRule ? "evenodd" : "nonzero");
+    }
+    for (let item = run.first; item < run.first + run.count; item++) {
+      if (run.kind === "raster") drawRasterLayer(context, scene.rasterLayers[item]);
+      else if (run.kind === "text") drawGlyphInstance(context, scene, item);
+      else assert.fail(`the preview does not draw ${run.kind} runs`);
+    }
+    context.restore();
   }
   return canvas;
+}
+
+function drawRasterLayer(context, layer) {
+  const image = createCanvas(layer.width, layer.height);
+  image.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(layer.data), layer.width, layer.height), 0, 0);
+  const [a, b, c, d, e, f] = layer.matrix;
+  context.setTransform(a, -b, c, -d, e, 100 - f);
+  context.drawImage(image, 0, 0, 1, 1);
+}
+
+function drawGlyphInstance(context, scene, instance) {
+  const offset = instance * 4;
+  context.save();
+  const clipOffset = (scene.textInstanceB[offset + 3] - 1) * 4;
+  if (clipOffset >= 0) {
+    const [x0, y0, x1, y1] = scene.textClipRects.subarray(clipOffset, clipOffset + 4);
+    context.beginPath(); context.rect(x0, y0, x1 - x0, y1 - y0); context.clip();
+  }
+  context.transform(...scene.textInstanceA.subarray(offset, offset + 4),
+    ...scene.textInstanceB.subarray(offset, offset + 2));
+  const [r, g, b, a] = scene.textInstanceC.subarray(offset, offset + 4);
+  context.fillStyle = `rgba(${r * 255}, ${g * 255}, ${b * 255}, ${a})`;
+  const glyph = scene.textInstanceB[offset + 2] * 4;
+  const first = scene.textGlyphMetaA[glyph];
+  const end = first + scene.textGlyphMetaA[glyph + 1];
+  context.beginPath();
+  let lastX, lastY;
+  for (let segment = first; segment < end; segment++) {
+    const [x0, y0, controlX, controlY] = scene.textGlyphSegmentsA.subarray(segment * 4, segment * 4 + 4);
+    const [x1, y1, curved] = scene.textGlyphSegmentsB.subarray(segment * 4, segment * 4 + 3);
+    if (x0 !== lastX || y0 !== lastY) context.moveTo(x0, y0);
+    if (curved >= 1) context.quadraticCurveTo(controlX, controlY, x1, y1);
+    else context.lineTo(x1, y1);
+    lastX = x1; lastY = y1;
+  }
+  context.fill("nonzero");
+  context.restore();
+}
+
+/** Directed [x0, y0, x1, y1] edges; each discontinuity starts a subpath. */
+function traceEdges(context, edges) {
+  let lastX, lastY;
+  for (let offset = 0; offset < edges.length; offset += 4) {
+    const [x0, y0, x1, y1] = edges.subarray(offset, offset + 4);
+    if (x0 !== lastX || y0 !== lastY) context.moveTo(x0, y0);
+    context.lineTo(x1, y1);
+    lastX = x1; lastY = y1;
+  }
 }
 
 function clippedOverlapFixture() {

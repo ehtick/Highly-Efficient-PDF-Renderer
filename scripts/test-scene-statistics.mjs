@@ -10,7 +10,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 } });
 
 try {
-  const { getSceneSegmentAccounting, formatSceneSegmentAccounting, describeSceneOperatorCount } =
+  const { getSceneSegmentAccounting, formatSceneSegmentAccounting } =
     await import("../src/sceneStatistics.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
@@ -19,17 +19,14 @@ try {
 
   const brochure = { sourceSegmentCount: 11257, mergedSegmentCount: 10028, segmentCount: 8834,
     discardedTransparentCount: 0, discardedDegenerateCount: 0, discardedDuplicateCount: 10,
-    discardedContainedCount: 24, imageLayerSegmentCount: 1160,
-    operatorCount: 33099, operatorCountKind: "native-estimate" };
+    discardedContainedCount: 24, imageLayerSegmentCount: 1160 };
   assert.deepEqual(getSceneSegmentAccounting(brochure), { mergedAway: 1229, culled: 34, imageLayers: 1160 });
   assert.match(formatSceneSegmentAccounting(brochure), /culled 34;/);
-  assert.match(describeSceneOperatorCount(brochure), /native estimate; engine-specific/);
   for (const imageLayerSegmentCount of [undefined, -1, 1.5, NaN, 1194]) {
     const unknown = { ...brochure, imageLayerSegmentCount };
     assert.equal(getSceneSegmentAccounting(unknown).culled, null);
     assert.match(formatSceneSegmentAccounting(unknown), /unavailable/);
   }
-  assert.match(describeSceneOperatorCount({ operatorCount: 20647 }), /legacy \/ unspecified/);
 
   const session = await openPdf({ kind: "bytes", bytes: strokeFixture() });
   try {
@@ -51,26 +48,23 @@ try {
       assert.deepEqual(getSceneSegmentAccounting(grid), {
         mergedAway: counts.mergedAway * 2, culled: counts.culled * 2, imageLayers: counts.imageLayers * 2
       });
-      assert.equal(grid.operatorCountKind, "native-estimate");
       const unknownGrid = composeVectorScenesInGrid([scene, { ...scene,
-        imageLayerSegmentCount: undefined, operatorCountKind: undefined }], 2);
+        imageLayerSegmentCount: undefined }], 2);
       assert.equal(getSceneSegmentAccounting(unknownGrid).culled, null);
-      assert.equal(unknownGrid.operatorCountKind, "mixed");
 
       // Tiny synthetic archive only; no tracked PDF / HEP regeneration.
       const hep = await buildHep(grid, { encodeRasterImages: false, compression: "store" });
       const bytes = await hep.arrayBuffer();
       const restored = await loadSceneFromHep(bytes);
       assert.deepEqual(getSceneSegmentAccounting(restored), getSceneSegmentAccounting(grid));
-      assert.equal(restored.operatorCountKind, "native-estimate");
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",
         "discardedDuplicateCount", "discardedContainedCount"]) assert.equal(restored[key], grid[key]);
 
       const archive = await HepArchive.loadAsync(bytes);
       const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
       assert.equal(manifest.formatVersion, 9, "statistics roundtrips use the current HEP format");
+      assert.equal("operatorCount" in manifest.scene, false, "HEP files carry no parser operator counter");
       delete manifest.scene.imageLayerSegmentCount;
-      delete manifest.scene.operatorCountKind;
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",
         "discardedDuplicateCount", "discardedContainedCount"]) delete manifest.scene[key];
       archive.file("manifest.json", JSON.stringify(manifest));
@@ -78,7 +72,6 @@ try {
       assert.equal(old.segmentCount, grid.segmentCount);
       assert.equal(old.imageLayerSegmentCount, undefined);
       assert.equal(getSceneSegmentAccounting(old).culled, null, "older v6 files cannot fabricate cull counts");
-      assert.match(describeSceneOperatorCount(old), /legacy \/ unspecified/);
       // An image-transfer field without all cull metadata is still incomplete.
       manifest.scene.imageLayerSegmentCount = 0;
       archive.file("manifest.json", JSON.stringify(manifest));

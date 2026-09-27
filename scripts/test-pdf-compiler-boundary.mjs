@@ -96,8 +96,6 @@ async function assertCompilerRuntimeBoundary() {
 
   const legacyResult = await legacyCompiler.compileDensePdfContent(content, options);
   assert.ok(legacyResult.retainedTextContent instanceof Uint8Array);
-  assert.equal(typeof legacyResult.dependencyOpCount, "number");
-  assert.ok(Array.isArray(legacyResult.dependencyKeys));
   assert.equal("paintRuns" in legacyResult, false);
 
   const nativeResult = await nativeCompiler.compileDensePdfContent(content, {
@@ -107,7 +105,6 @@ async function assertCompilerRuntimeBoundary() {
   assert.ok(nativeResult.paintRuns instanceof Uint32Array);
   assert.ok(Array.isArray(nativeResult.paintRunCompositeStates));
   assert.equal("retainedTextContent" in nativeResult, false);
-  assert.equal("dependencyKeys" in nativeResult, false);
   assert.equal(typeof nativeCompiler.DensePdfResourceLimitError, "function");
   assert.equal(legacyCompiler.DensePdfResourceLimitError, undefined);
 }

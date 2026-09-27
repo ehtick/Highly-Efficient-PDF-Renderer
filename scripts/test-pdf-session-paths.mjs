@@ -114,14 +114,14 @@ try {
   });
   try {
     const scene = await vectorClipSession.compileVectorPage(0, { optimization: "none" });
-    assert.equal(scene.fillPathCount, 0, "the exact clipped paint is not duplicated as a packed fill");
-    assert.equal(scene.rasterLayers.length, 1);
-    const [layer] = scene.rasterLayers;
-    assert.equal(layer.paintOrder, 0);
-    assert.ok(rasterAlphaAtPagePoint(layer, 40, 20) >= 250);
-    assert.ok(rasterAlphaAtPagePoint(layer, 40, 55) >= 250);
-    assert.equal(rasterAlphaAtPagePoint(layer, 12, 55), 0);
-    assert.equal(rasterAlphaAtPagePoint(layer, 68, 55), 0);
+    assert.equal(scene.fillPathCount, 1, "the exactly clipped fill stays vector");
+    assert.equal(scene.rasterLayers.length, 0, "no raster fallback layer");
+    assert.equal(scene.drawRuns?.length, 1);
+    assert.equal(scene.clipPaths[scene.drawRuns[0].clipIndex].fillRule, 1, "W* keeps even-odd clipping");
+    assert.ok(isFillPaintedAt(scene, 40, 20));
+    assert.ok(isFillPaintedAt(scene, 40, 55));
+    assert.equal(isFillPaintedAt(scene, 12, 55), false, "the irregular clip excludes its AABB-only corner");
+    assert.equal(isFillPaintedAt(scene, 68, 55), false);
   } finally {
     await vectorClipSession.close();
   }
@@ -176,16 +176,37 @@ function flattenCommands(page, commands, seen = new Set()) {
   return output;
 }
 
-function rasterAlphaAtPagePoint(layer, pageX, pageY) {
-  const [a, b, c, d, e, f] = layer.matrix;
-  const determinant = a * d - b * c;
-  assert.ok(Number.isFinite(determinant) && Math.abs(determinant) > 1e-12);
-  const unitX = (d * (pageX - e) - c * (pageY - f)) / determinant;
-  const unitY = (-b * (pageX - e) + a * (pageY - f)) / determinant;
-  if (unitX < 0 || unitX >= 1 || unitY < 0 || unitY >= 1) return 0;
-  const pixelX = Math.min(layer.width - 1, Math.floor(unitX * layer.width));
-  const pixelY = Math.min(layer.height - 1, Math.floor(unitY * layer.height));
-  return layer.data[(pixelY * layer.width + pixelX) * 4 + 3];
+/** Whether any clipped fill draw run covers a page-space point. */
+function isFillPaintedAt(scene, x, y) {
+  return scene.drawRuns.some((run) => {
+    if (run.kind !== "fill") return false;
+    for (let index = run.clipIndex ?? -1; index >= 0; index = scene.clipPaths[index].parent) {
+      const clip = scene.clipPaths[index];
+      if (!edgesContainPoint(clip.edges, clip.fillRule, x, y)) return false;
+    }
+    for (let path = run.first; path < run.first + run.count; path += 1) {
+      const first = scene.fillPathMetaA[path * 4];
+      const count = scene.fillPathMetaA[path * 4 + 1];
+      const edges = scene.fillSegmentsA.subarray(first * 4, (first + count) * 4);
+      if (edgesContainPoint(edges, scene.fillPathMetaC[path * 4], x, y)) return true;
+    }
+    return false;
+  });
+}
+
+/** Directed [x0, y0, x1, y1] line edges; fill rule 1 is even-odd, 0 is nonzero. */
+function edgesContainPoint(edges, fillRule, x, y) {
+  let winding = 0;
+  let crossings = 0;
+  for (let offset = 0; offset < edges.length; offset += 4) {
+    const [x0, y0, x1, y1] = edges.subarray(offset, offset + 4);
+    if ((y0 <= y) === (y1 <= y)) continue;
+    const crossingX = x0 + (y - y0) * (x1 - x0) / (y1 - y0);
+    if (crossingX <= x) continue;
+    crossings += 1;
+    winding += y1 > y0 ? 1 : -1;
+  }
+  return fillRule === 1 ? crossings % 2 === 1 : winding !== 0;
 }
 
 function pathFixture() {

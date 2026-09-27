@@ -72,7 +72,6 @@ const PAGE_OPTIMIZE_PROGRESS_END = 0.99;
 const MAX_FORM_RECURSION_DEPTH = 16;
 const MAX_CLASSIFIED_FORM_COUNT = 256;
 const MAX_DECODED_FORM_BYTES = 64 * 1024 * 1024;
-const MAX_RETAINED_FORM_TRACE_WORDS = 4_000_000;
 const denseWorkerMissingFontResolver = createBundledStandardFontResolver({
   loadAsset: loadDenseWorkerFontAsset
 });
@@ -90,7 +89,7 @@ workerScope?.addEventListener("message", (event) => {
   void handleCompileRequest(event.data);
 });
 
-/** Reproduce HEPR's PDF.js viewport-to-Y-up page transform without PDF.js. */
+/** Reproduce HEPR's PDF.js-compatible viewport-to-Y-up page transform. */
 export function computeDensePdfPageGeometry(input: DensePdfPageGeometryInput): {
   pageMatrix: DensePdfMatrix;
   pageBounds: DensePdfBounds;
@@ -296,7 +295,6 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       const compiled = await compileDensePdfContent(decodedChunks, {
         pageMatrix,
         pageBounds,
-        fontDependencyKeys: resourceDependencyMap(page.fontDependencies),
         availableExtGStates: page.availableExtGStates,
         extGStates: page.extGStates,
         alwaysVisibleOptionalContentProperties:
@@ -455,7 +453,6 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     // Dropping them avoids cloning/transferring a second text program.
     for (const page of compiledPages) {
       page.compiled.retainedTextContent = new Uint8Array(0);
-      page.compiled.dependencyKeys = [];
       page.compiled.referencedFonts = [];
       page.compiled.referencedProperties = [];
       page.compiled.referencedExtGStates = [];
@@ -559,8 +556,7 @@ export async function classifyDensePdfTextFormXObjects(
     active: new Set(),
     cache: new Map(),
     formCount: 0,
-    decodedBytes: 0,
-    retainedTraceWords: 0
+    decodedBytes: 0
   };
   const summaries = new Map<string, DensePdfTextFormSummary>();
   for (const form of page.formXObjects) {
@@ -578,7 +574,6 @@ interface DensePdfFormClassificationState {
   readonly cache: Map<string, Promise<DensePdfTextFormSummary>>;
   formCount: number;
   decodedBytes: number;
-  retainedTraceWords: number;
 }
 
 async function classifyDensePdfForm(
@@ -656,7 +651,6 @@ async function classifyDensePdfFormUncached(
     const compiled = await compileDensePdfContent(content, {
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: boxBounds(form.bbox),
-      fontDependencyKeys: resourceDependencyMap(form.fontDependencies),
       availableExtGStates: form.availableExtGStates,
       extGStates: form.extGStates,
       // The original Form is copied verbatim when retained, but the text mini
@@ -673,33 +667,10 @@ async function classifyDensePdfFormUncached(
       signal: options.signal,
       yieldIntervalMs: options.yieldIntervalMs ?? COMPILE_YIELD_INTERVAL_MS
     });
-    if (!compiled.operatorCountTrace) {
-      throw new DensePdfSyntaxError(
-        `Form XObject /${form.resourceName} did not produce an operator-count trace.`
-      );
-    }
-    const retainedTraceWords =
-      compiled.operatorCountTrace.genericRuns.length +
-      compiled.operatorCountTrace.semanticEvents.length +
-      compiled.operatorCountTrace.fontDependencyKeys.length;
-    if (
-      state.retainedTraceWords + retainedTraceWords >
-      MAX_RETAINED_FORM_TRACE_WORDS
-    ) {
-      throw new DensePdfUnsupportedError(
-        `Retained Form operator traces exceed the ${MAX_RETAINED_FORM_TRACE_WORDS}-word safety budget.`,
-        "Do"
-      );
-    }
-    state.retainedTraceWords += retainedTraceWords;
     return Object.freeze({
       dependencyKey: form.dependencyKey,
       bbox: boxBounds(form.bbox),
       matrix: [...form.matrix] as DensePdfMatrix,
-      operatorCount: compiled.operatorCount,
-      dependencyOpCount: compiled.dependencyOpCount,
-      dependencyKeys: Object.freeze([...compiled.dependencyKeys]),
-      operatorCountTrace: compiled.operatorCountTrace,
       textShowOpCount: compiled.textShowOpCount,
       hasNonTextPaint:
         compiled.pathCount > 0 ||
@@ -738,15 +709,6 @@ async function collectFormContent(
     offset += chunk.length;
   }
   return content;
-}
-
-function resourceDependencyMap(
-  dependencies: readonly { resourceName: string; dependencyKey: string }[]
-): ReadonlyMap<string, string> {
-  return new Map(dependencies.map(({ resourceName, dependencyKey }) => [
-    resourceName,
-    dependencyKey
-  ]));
 }
 
 class WorkerProgressEmitter {

@@ -219,7 +219,6 @@ function hashNativeDenseResult(result) {
       ...boxValues(structuralPage.cropBox),
       ...geometry.pageMatrix,
       ...boundsValues(geometry.pageBounds),
-      compiled.operatorCount,
       compiled.pathCount,
       compiled.sourceSegmentCount,
       compiled.mergedSegmentCount,
@@ -320,8 +319,7 @@ function printRunReport(report) {
     `text ${formatMilliseconds(report.timing.nativeTextMs)}`
   );
   console.log(
-    `    counts            ${formatInteger(report.counts.operators)} operators, ` +
-    `${formatInteger(report.counts.visibleSegments)} visible segments, ` +
+    `    counts            ${formatInteger(report.counts.visibleSegments)} visible segments, ` +
     `${formatInteger(report.counts.textInstances)} text instances`
   );
   console.log(`    semantic hash     ${report.semanticHash}`);

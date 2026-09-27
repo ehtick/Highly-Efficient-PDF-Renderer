@@ -4,7 +4,7 @@
  * PDF leaves DeviceCMYK interpretation device-dependent when no calibrated
  * replacement or output profile is present. This polynomial is the stable
  * fallback used by PDF.js, retained here so native parsing and HEP rendering
- * agree with the migration oracle. Inputs and outputs are normalized.
+ * keep matching its output. Inputs and outputs are normalized.
  * An optional caller-owned output tuple avoids allocation in image loops.
  *
  * Adapted from PDF.js DeviceCmykCS (Apache-2.0).

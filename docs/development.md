@@ -148,10 +148,8 @@ synthetic suites deliberately do not regenerate them or convert real-PDF corpora
 ### Rendering performance
 
 The [parser benchmark guide](parser-benchmark.md) describes production parser
-measurements and their scope. The optional [oracle harness](../oracle/README.md)
-has a separate dependency installation for rendering comparisons. Run corpus
-benchmarks and baseline generation manually; the default tests do not establish
-full-corpus visual fidelity or browser performance.
+measurements and their scope. Run corpus benchmarks manually; the default tests
+do not establish full-corpus visual fidelity or browser performance.
 
 Adjacent strokes, fills, or text share instanced draws even when their clip roots
 differ. Spatially independent

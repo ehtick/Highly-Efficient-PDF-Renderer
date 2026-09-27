@@ -57,10 +57,19 @@ async function assertHiddenFormStaysLazy(openPdf) {
     label: "hidden-poisoned-form.pdf"
   });
   try {
+    const defaultView = await session.compileVectorPage(0, { optimization: "none", retainOptionalContent: false });
+    assert.equal(defaultView.segmentCount, 0);
+    assert.equal(session.getDiagnostics().some(({ code }) => code === "optional-content.default-view-fallback"), false,
+      "the default view never decodes the hidden Form");
+    // Toggleable layers must compile the hidden Form. Its unusable stream
+    // degrades to the default view instead of refusing the page.
     const scene = await session.compileVectorPage(0, { optimization: "none" });
     assert.equal(scene.segmentCount, 0);
     assert.equal(scene.fillPathCount, 0);
     assert.equal(scene.imagePaintOpCount, 0);
+    assert.equal(scene.optionalContent, undefined, "layer controls are withdrawn, not half-populated");
+    const fallback = session.getDiagnostics().find(({ code }) => code === "optional-content.default-view-fallback");
+    assert.equal(fallback?.details?.code, "unsupported-filter");
   } finally {
     await session.close();
   }

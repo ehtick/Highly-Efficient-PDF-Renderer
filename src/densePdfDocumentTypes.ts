@@ -40,21 +40,15 @@ export interface DensePdfExtGState {
   readonly strokeAlpha?: number;
   /** Present only when the dictionary explicitly sets nonstroking opacity (`/ca`). */
   readonly fillAlpha?: number;
-  /** Whether PDF.js emits a `setGState` op for this dictionary. */
-  readonly emitsPdfJsOperator: boolean;
-}
-
-/** Stable identity for a named resource whose PDF.js dependency op is deduplicated. */
-export interface DensePdfResourceDependency {
-  readonly resourceName: string;
-  readonly dependencyKey: string;
+  /** Sets paint state (opacity, blend mode, alpha source, soft mask) that retained text must replay. */
+  readonly changesPaintState: boolean;
 }
 
 /** A conservatively validated `/Subtype /Form` XObject. */
 export interface DensePdfFormXObject {
   /** Decoded PDF resource name, without its leading slash. */
   readonly resourceName: string;
-  /** Stable source-object identity used to deduplicate PDF.js dependencies. */
+  /** Stable source-object identity; aliases of one Form share it. */
   readonly dependencyKey: string;
   readonly bbox: DensePdfPageBox;
   /** The form's `/Matrix`, defaulting to the identity matrix. */
@@ -66,8 +60,6 @@ export interface DensePdfFormXObject {
   readonly extGStates: readonly DensePdfExtGState[];
   /** `/Properties` names whose direct OCG is visible in the default configuration. */
   readonly alwaysVisibleOptionalContentProperties: readonly string[];
-  /** Stable identities for this Form's local font resources. */
-  readonly fontDependencies: readonly DensePdfResourceDependency[];
 
   /** Resolve a Form-local XObject only when its `Do` operator is actually used. */
   resolveFormXObject(resourceName: string): DensePdfFormXObject | null;
@@ -102,8 +94,6 @@ export interface DensePdfSelectedPage {
   readonly extGStates: readonly DensePdfExtGState[];
   /** `/Properties` names whose direct OCG is visible in the default configuration. */
   readonly alwaysVisibleOptionalContentProperties: readonly string[];
-  /** Stable identities for page font resources. */
-  readonly fontDependencies: readonly DensePdfResourceDependency[];
   /** Plain Form XObjects in the page resource scope that may be invoked by `Do`. */
   readonly formXObjects: readonly DensePdfFormXObject[];
   readonly decodeTiming: DensePdfDecodeTiming;

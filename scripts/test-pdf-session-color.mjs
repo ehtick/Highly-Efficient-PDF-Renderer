@@ -98,7 +98,7 @@ try {
     const rgbs = root.commands.map((command) => paintRgb(page, command.paintIndex));
     assertRgb(rgbs[0], [0, 0, 0]);
     assertRgb(rgbs[1], [1, 0, 0]);
-    // Frozen uncalibrated DeviceCMYK oracle value, also covered by the color
+    // Frozen PDF.js-compatible DeviceCMYK fallback value, also covered by the color
     // registry tests. DeviceCMYK red is not the same color as DeviceRGB red.
     assertRgb(rgbs[2], [1, 0.17998620773545304, 0.0891440862243233]);
     assert(rgbs[3][0] > 0 && rgbs[3][0] < 1, "CalGray conversion must remain tonal");

@@ -131,11 +131,26 @@ function assertBrochureOverlapCoverage(scene) {
   const instanceIndex = page.charInstance[wordStart + 3];
   assert.ok(instanceIndex >= 0, "the first e in zuverlässig must have vector geometry");
   const glyphIndex = Math.trunc(scene.textInstanceB[instanceIndex * 4 + 2]);
-  const probe = 1e-5;
+  // Probes are in the e's font units (2048 per em): the crossbar's internal
+  // edge lies at y=582 and two contours' lower edges coincide at y=393. Outline
+  // stores keep either font units or the glyph's baked 2x2, so map points
+  // through the outline bounds instead of assuming one scale.
+  const unitBounds = [66, -25, 997, 1012];
+  const glyphMeta = glyphIndex * 4;
+  const outlineBounds = [
+    scene.textGlyphMetaA[glyphMeta + 2], scene.textGlyphMetaA[glyphMeta + 3],
+    scene.textGlyphMetaB[glyphMeta], scene.textGlyphMetaB[glyphMeta + 1]
+  ];
+  const scaleX = (outlineBounds[2] - outlineBounds[0]) / (unitBounds[2] - unitBounds[0]);
+  const scaleY = (outlineBounds[3] - outlineBounds[1]) / (unitBounds[3] - unitBounds[1]);
+  assert.ok(Math.abs(scaleX / scaleY - 1) < 1e-4, "the brochure e is upright and uniformly scaled");
+  const windingAt = (x, y) => textGlyphWindingAt(scene, glyphIndex,
+    outlineBounds[0] + (x - unitBounds[0]) * scaleX, outlineBounds[1] + (y - unitBounds[1]) * scaleY);
+  const probe = 0.02;
 
   const internalEdgeWindings = [
-    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.291015625 + probe),
-    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.291015625 - probe)
+    windingAt(800, 582 + probe),
+    windingAt(800, 582 - probe)
   ];
   assert.ok(
     internalEdgeWindings.every((winding) => winding !== 0),
@@ -148,8 +163,8 @@ function assertBrochureOverlapCoverage(scene) {
   );
 
   const coincidentExteriorWindings = [
-    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.196533203 + probe),
-    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.196533203 - probe)
+    windingAt(800, 393 + probe),
+    windingAt(800, 393 - probe)
   ];
   assert.ok(
     coincidentExteriorWindings.includes(0) &&
@@ -607,7 +622,7 @@ async function run() {
     assert.ok(parsedOptimizedRasterPdf.scene.imagePaintOpCount > 0);
     assert.ok(
       listSceneRasterLayers(parsedOptimizedRasterPdf.scene).length > 0,
-      "optimized PDF.js render lists must preserve raster layers"
+      "the optimized raster PDF must preserve raster layers"
     );
 
     const parsedOrderedUnderlayPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {

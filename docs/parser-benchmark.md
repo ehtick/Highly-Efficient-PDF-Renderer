@@ -8,14 +8,14 @@ Use the production-bundle benchmark for parser cutover decisions. The older
 `benchmark:native-vector-page` script intentionally calls the TypeScript
 session directly, so it omits worker startup and transfer costs. Likewise,
 `benchmark:native-dense-cutover` is a useful dense-pipeline microbenchmark but
-does not exercise tier routing or detect a PDF.js fallback.
+does not exercise tier routing.
 
 Build each checkout first, then run the same benchmark driver against each
 build directory. For example, from the current checkout:
 
 ```sh
 npm run build:lib
-npm run benchmark:production-parser -- "public/examples/pdfs/Level 1.pdf" --runs 5 --json /tmp/hepr-current.json --fail-on-pdfjs-fallback
+npm run benchmark:production-parser -- "public/examples/pdfs/Level 1.pdf" --runs 5 --json /tmp/hepr-current.json
 node --max-old-space-size=12288 --expose-gc scripts/benchmark-production-parser.mjs "public/examples/pdfs/Level 1.pdf" --package-root /path/to/main-worktree --runs 5 --json /tmp/hepr-main.json
 ```
 
@@ -23,9 +23,7 @@ The input file is read before timing. Package import is reported separately.
 Each measured run gets a fresh process and a cold production worker. The
 `parser engine boundary` is the number to compare; the script stops at the
 first vector-LOD event, before LOD generation, upload, renderer construction,
-or viewer work. `main-thread-fallback` is reported explicitly as a PDF.js
-fallback. On the old `main` dense path, PDF.js text processing is part of the
-dense route and therefore correctly remains inside its parser time.
+or viewer work.
 
 For the browser check, build production assets in separate worktrees and serve
 both `dist` directories with the same static server. Use the same browser and
@@ -33,8 +31,8 @@ PDF, reload between runs to clear the in-memory page-scene cache, discard one
 warm-up, and record five `[Page grid] ... parsed ... ms` lines. That log starts
 after source bytes are loaded and ends before vector LOD and GPU upload. Do not
 compare the later `total` line as parser time. Also record the preceding HEPR
-route line and reject a current-build run that reports a native or PDF.js
-fallback unexpectedly.
+route line and reject a current-build run that reports an unexpected native
+fallback.
 
 ## Local validation snapshot — 2026-09-07
 
@@ -73,14 +71,10 @@ Any reuse must remain operation-scoped and preserve resource limits, color
 spaces, masks, cancellation, and returned-pixel ownership. Lowering image
 resolution or changing the viewer is not an acceptable speed optimization.
 
-The temporary PDF.js oracle is an isolated opt-in installation, not a root
-workspace or published runtime dependency. The package test checks root
-dependencies, emitted JavaScript/declarations, worker paths, and native Node
-worker startup. Runtime attribution in `THIRD_PARTY_NOTICES` is intentionally
-retained even though neither PDF library ships as a dependency.
+The package test checks emitted JavaScript/declarations, worker paths, and
+native Node worker startup.
 
-The all-pages routing audit blocks both PDF libraries in the host and parser
-workers and fails on any unsuccessful document:
+The all-pages routing audit fails on any unsuccessful document:
 
 ```sh
 node --max-old-space-size=12288 --experimental-strip-types scripts/audit-native-corpus-routing.mjs --timeout-ms 120000
@@ -231,7 +225,7 @@ The page-7 exact scene fingerprint also matches the pre-change artifact.
 All 15 brochure pages match byte-for-byte with cache/bounded work enabled and
 disabled, including image pixels, text, geometry, and paint order. Image
 surfaces materialized across those passes fell from 35 to 25. This is output
-preservation against the accepted native path, not a new visual-oracle result.
+preservation against the accepted native path, not a new visual-fidelity result.
 
 Reproduce the internal diagnostic comparison without changing public options:
 
@@ -349,8 +343,8 @@ Reproduce using separately built packages and the production driver described
 at the start of this document:
 
 ```sh
-npm run benchmark:production-parser -- public/examples/pdfs/WarAndPeace.pdf --runs 3 --fail-on-pdfjs-fallback
-npm run benchmark:production-parser -- public/examples/pdfs/optimizing_cpp.pdf --runs 3 --fail-on-pdfjs-fallback
+npm run benchmark:production-parser -- public/examples/pdfs/WarAndPeace.pdf --runs 3
+npm run benchmark:production-parser -- public/examples/pdfs/optimizing_cpp.pdf --runs 3
 ```
 
 Validation passed: `npm run build`, `npm run build:lib`, `git diff --check`, and

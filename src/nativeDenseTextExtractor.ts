@@ -35,8 +35,8 @@ export async function extractDenseTextMiniPdfWithNative(
     repair: "safe",
     signal: options.signal,
     // Production dense-text extraction intentionally has no implicit font
-    // substitution. A mini-PDF with a nonembedded font falls back to PDF.js
-    // until the bundled substitute metrics/outlines are oracle-equivalent.
+    // substitution: a mini-PDF with a nonembedded font is rejected below
+    // unless the caller supplies a missing-font resolver.
     missingFontResolver: options.missingFontResolver,
     onDiagnostic: options.onDiagnostic
   };
@@ -70,7 +70,7 @@ export async function extractDenseTextMiniPdfWithNative(
     if (blockingDiagnostic) {
       throw new Error(
         `Native dense-text extraction emitted ${blockingDiagnostic.code}; ` +
-        "the established PDF.js text pass is required for this mini-PDF."
+        "this mini-PDF is not supported."
       );
     }
     return scenes;

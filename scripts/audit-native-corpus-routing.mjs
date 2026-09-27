@@ -128,7 +128,6 @@ async function runOne(inputPath, pages, timeoutMs) {
 
 async function runChild(inputPath, pages, resultPath) {
   installNodeRuntimeCompatibility();
-  let pdfJsResolveAttempts = 0;
   const logs = [];
   const originalInfo = console.info;
   console.info = (...values) => {
@@ -136,10 +135,6 @@ async function runChild(inputPath, pages, resultPath) {
   };
   const hooks = registerHooks({
     resolve(specifier, context, nextResolve) {
-      if (/^(?:pdfjs-dist|pdf-lib)(?:\/|$)/.test(specifier)) {
-        pdfJsResolveAttempts += 1;
-        throw new Error("HEPR routing audit stopped at the PDF.js import boundary.");
-      }
       if (
         context.parentURL?.includes("/src/") &&
         /^\.\.?\//.test(specifier) &&
@@ -191,18 +186,15 @@ async function runChild(inputPath, pages, resultPath) {
     sourcePageIndex: error.pageIndex ?? lastProgress?.sourcePageIndex,
     details: error.details
   } : parseNativeFailure(nativeFallback, lastProgress);
-  const route = pdfJsResolveAttempts > 0
-    ? "pdfjs-fallback"
-    : pageCount !== undefined
-      ? denseSuccess ? "dense" : "native-full"
-      : "failed-before-pdfjs";
+  const route = pageCount !== undefined
+    ? denseSuccess ? "dense" : "native-full"
+    : "failed";
 
   await writeFile(resultPath, JSON.stringify({
     inputPath,
     route,
     elapsedMs: performance.now() - startedAt,
     pageCount,
-    pdfJsResolveAttempts,
     denseFallback: stripHeprPrefix(denseFallback),
     nativeFailure,
     lastProgress,
@@ -247,7 +239,6 @@ function childExecArguments() {
   if (!arguments_.includes("--experimental-strip-types")) {
     arguments_.push("--experimental-strip-types");
   }
-  arguments_.push("--import", new URL("./lib/blockPdfDependencies.mjs", import.meta.url).href);
   return arguments_;
 }
 

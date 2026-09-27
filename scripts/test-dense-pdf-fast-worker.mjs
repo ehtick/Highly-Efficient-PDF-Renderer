@@ -15,9 +15,8 @@ Uint8Array.prototype.toBase64 ??= function toBase64() {
 Uint8Array.fromHex ??= (value) => new Uint8Array(Buffer.from(value, "hex"));
 Uint8Array.fromBase64 ??= (value) => new Uint8Array(Buffer.from(value, "base64"));
 
-// Frozen from the pinned PDF.js 6.1.200 differential oracle before removing
-// the runtime test dependency. These values intentionally describe PDF.js's
-// public page view/viewport semantics and first-page operator/text output.
+// Frozen from PDF.js 6.1.200 output. These values intentionally describe
+// PDF.js's public page view/viewport semantics and first-page text output.
 const PDFJS_GEOMETRY_GOLDENS = Object.freeze([
   { pageMatrix: [2, 0, 0, 2, -60, -40], pageBounds: [0, 0, 340, 140] },
   { pageMatrix: [0, -2, 2, 0, -40, 400], pageBounds: [0, 0, 140, 340] },
@@ -29,10 +28,7 @@ const PDFJS_GEOMETRY_GOLDENS = Object.freeze([
 const PDFJS_FIRST_PAGE_GOLDENS = Object.freeze({
   lkOffice: Object.freeze({
     sourceSha256: "c56147fee1b5b51e37edc0326d287006ff7d3413169e6b58c0744ec9d7eb5cd7",
-    operatorCount: 1_131,
-    setGStateCount: 0,
     textShowCount: 3,
-    imagePaintCount: 0,
     textItemCount: 3,
     textItems: Object.freeze([
       "*SR.min",
@@ -44,50 +40,35 @@ const PDFJS_FIRST_PAGE_GOLDENS = Object.freeze({
   }),
   recursiveUnusedImage: Object.freeze({
     sourceSha256: "e0844f1d9a3b94e9a6adb87e576d1222d18ca140286fa5d9f139d7bba2c5b311",
-    operatorCount: 6,
-    setGStateCount: 0,
     textShowCount: 0,
-    imagePaintCount: 0,
     textItemCount: 0,
     normalizedTextLength: 0,
     normalizedTextSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }),
   chino: Object.freeze({
     sourceSha256: "65793154111994307c7f8a3454d1ae151c9d1f78578a2b43da37d79793f2a2ad",
-    operatorCount: 155_096,
-    setGStateCount: 0,
     textShowCount: 287,
-    imagePaintCount: 0,
     textItemCount: 298,
     normalizedTextLength: 2_264,
     normalizedTextSha256: "66f2cff99420c4e27c76905a78a8499ba32023a5dbc9b30c28d66debe84e9b4c"
   }),
   dublin: Object.freeze({
     sourceSha256: "d27e385b3b627f9ffacb852ab1a9a7ac9283c93809070eed21976163164c9386",
-    operatorCount: 494_823,
-    setGStateCount: 38,
     textShowCount: 3_304,
-    imagePaintCount: 0,
     textItemCount: 3_371,
     normalizedTextLength: 17_759,
     normalizedTextSha256: "c37f8fd93108116a305070a24c3474a76aa4c69bdfbe62f0f589aec24362a962"
   }),
   simi: Object.freeze({
     sourceSha256: "b31a733fe3cdc66b26447fa24a73eeabcd98503af7698e29f117672272e7f646",
-    operatorCount: 77_154,
-    setGStateCount: 48,
     textShowCount: 399,
-    imagePaintCount: 0,
     textItemCount: 403,
     normalizedTextLength: 2_839,
     normalizedTextSha256: "9341b48a70b2689d575fef5d30c952515061d3447bb8d34cbbe677aed7b1f1e3"
   }),
   baldwin: Object.freeze({
     sourceSha256: "5c4fb6ddda7e22c59df5d84bf803d25e27548065802ed3748e10bc40f7f8c1a9",
-    operatorCount: 1_396_700,
-    setGStateCount: 0,
     textShowCount: 7_687,
-    imagePaintCount: 0,
     textItemCount: 1_313,
     normalizedTextLength: 7_006,
     normalizedTextSha256: "4fc531afdba681ea2c100ff9cf583c0e09e5ac22c7d1ae85f3a378b4c2b8ed13"
@@ -99,13 +80,6 @@ const originalWorkerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Wo
 const originalProcessDescriptor = Object.getOwnPropertyDescriptor(globalThis, "process");
 const moduleHooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (
-      specifier === "pdf-lib" ||
-      specifier === "pdfjs-dist" ||
-      specifier.startsWith("pdfjs-dist/")
-    ) {
-      throw new Error(`Dense worker regression test imported forbidden dependency ${specifier}.`);
-    }
     if (
       context.parentURL?.includes("/src/") &&
       /^\.\.?\//.test(specifier) &&
@@ -378,7 +352,6 @@ async function testLkOfficeTextForm(workerHarness) {
   assert.equal(result.structureBackend, "hepr-native");
   assert.equal(result.pages.length, 1);
   assert.equal(result.pages[0].compiled.textShowOpCount, sourceGolden.textShowCount);
-  assert.equal(result.pages[0].compiled.operatorCount, sourceGolden.operatorCount);
   assert.equal(result.textMiniPdfBytes.length, 0);
   assert.equal(result.timing.textMiniPdfMs, 0);
   assert.ok(result.timing.nativeTextMs > 0);
@@ -398,7 +371,7 @@ async function testLkOfficeTextForm(workerHarness) {
   const { extractPdfPageScenes } = await import(
     new URL("../src/pdfVectorExtractor.ts?native-text-form-parity", import.meta.url)
   );
-  const [oracleTextScene] = await extractPdfPageScenes(
+  const [fullNativeTextScene] = await extractPdfPageScenes(
     sourceBytes.buffer.slice(
       sourceBytes.byteOffset,
       sourceBytes.byteOffset + sourceBytes.byteLength
@@ -407,7 +380,7 @@ async function testLkOfficeTextForm(workerHarness) {
   );
   assertTextWorldGeometryClose(
     nativeTextScene,
-    oracleTextScene,
+    fullNativeTextScene,
     "LK Office native/Form text"
   );
   assertMonotonicProgress(workerHarness.messages);
@@ -427,7 +400,6 @@ async function testRecursiveFormWithUnusedImage(workerHarness) {
     result.kind === "success" ? undefined : `${result.reason}: ${result.message}`
   );
   assert.equal(result.structureBackend, "hepr-native");
-  assert.equal(result.pages[0].compiled.operatorCount, sourceGolden.operatorCount);
   assert.equal(result.pages[0].compiled.textShowOpCount, sourceGolden.textShowCount);
   assert.deepEqual(result.pages[0].compiled.referencedXObjects, ["Outer"]);
   assert.equal(result.textMiniPdfBytes.length, 0);
@@ -578,8 +550,6 @@ async function testBaldwinRecursiveForms(workerHarness) {
   );
   const compiled = result.pages[0].compiled;
   assert.equal(result.structureBackend, "hepr-native");
-  assert.equal(compiled.operatorCount, sourceGolden.operatorCount);
-  assert.equal(compiled.dependencyOpCount, 48);
   assert.equal(compiled.textShowOpCount, sourceGolden.textShowCount);
   assert.ok(
     compiled.referencedXObjects.length > 0,
@@ -615,7 +585,6 @@ async function testRealDenseFile(
   );
   assert.equal(result.pages.length, 1);
   assert.equal(result.structureBackend, "hepr-native");
-  assert.equal(result.pages[0].compiled.operatorCount, sourceGolden.operatorCount);
   assert.equal(result.pages[0].compiled.textShowOpCount, sourceGolden.textShowCount);
   assert.ok(compiledPageHasAlpha(result.pages[0].compiled, expectedAlpha));
   assert.equal(result.textMiniPdfBytes.length, 0);
@@ -655,7 +624,7 @@ function assertPdfSourceGolden(sourceBytes, golden, label) {
   assert.equal(
     sha256(sourceBytes),
     golden.sourceSha256,
-    `${label} changed; regenerate its pinned-oracle facts intentionally`
+    `${label} changed; its frozen PDF.js facts no longer apply`
   );
 }
 
@@ -847,6 +816,7 @@ async function testClient(compileDensePdfInWorker) {
   assert.deepEqual(successWorker.transfer, [successWorker.request.pdfBytes.buffer]);
   assert.deepEqual(successWorker.request.options, {
     pages: "1",
+    retainOptionalContent: false,
     enableSegmentMerge: true,
     enableInvisibleCull: true
   });
@@ -965,10 +935,9 @@ function assertTextWorldGeometryClose(actual, expected, label) {
       `${label} instance ${instance} primitive count`
     );
 
-    // PDF.js normalizes TrueType outlines to em units and may pack their path
-    // coordinates as Float16. The native path retains integer font units. A
-    // PDF.js path point may therefore differ by at most half a native font
-    // unit after applying the instance transform.
+    // The two paths may quantize glyph outline coordinates differently. A
+    // path point may therefore differ by at most half a native font unit
+    // after applying the instance transform.
     const pathPointTolerance = 1e-4 + 0.5001 * Math.max(
       Math.abs(actualMatrix[0]) + Math.abs(actualMatrix[2]),
       Math.abs(actualMatrix[1]) + Math.abs(actualMatrix[3])

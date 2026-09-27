@@ -30,43 +30,6 @@ await Promise.all([
   access(resolve(libDir, "pdf-worker.js")),
   access(resolve(rootDir, "dist/types/nodePdfSource.d.ts"))
 ]);
-for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
-  for (const dependency of ["pdf-lib", "pdfjs-dist"]) {
-    assert.equal(
-      packageManifest[field]?.[dependency],
-      undefined,
-      `${dependency} must not be present in package.json ${field}`
-    );
-  }
-}
-const listFilesRecursively = async (directory) => {
-  const files = [];
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const path = resolve(directory, entry.name);
-    if (entry.isDirectory()) files.push(...await listFilesRecursively(path));
-    else files.push(path);
-  }
-  return files;
-};
-const packagedFiles = [
-  ...await listFilesRecursively(libDir),
-  ...await listFilesRecursively(resolve(rootDir, "dist/types"))
-];
-for (const path of packagedFiles) {
-  const packagedPath = relative(libDir, path);
-  assert.doesNotMatch(
-    packagedPath,
-    /pdfjs|pdf-lib/i,
-    `published artifact name must not reference PDF.js or pdf-lib: ${packagedPath}`
-  );
-  if (!/\.(?:js|mjs|cjs|d\.ts)$/.test(path)) continue;
-  const source = await readFile(path, "utf8");
-  assert.doesNotMatch(
-    source,
-    /pdfjs-dist|(?:@pdf-lib\/|["']pdf-lib(?:\/|["']))|pdfJsRuntime|GlobalWorkerOptions|__w_pdfjs_require__/,
-    `published artifact must not contain a PDF.js/pdf-lib runtime reference: ${packagedPath}`
-  );
-}
 // Shared code can move out of index.js when optional features are split into chunks.
 // Follow only static imports/re-exports so an unrelated lazy chunk cannot satisfy this check.
 const pendingModulePaths = [entryPath];

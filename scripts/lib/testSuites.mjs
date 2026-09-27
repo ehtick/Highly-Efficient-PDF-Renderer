@@ -153,7 +153,7 @@ export const explicitSuites = {
 
 const integrationPatterns = [
   /^pdf-(?:session(?:-|$)|optional-content-session$|node-worker-runtime$|to-hep-node-dense-worker$)/,
-  /^native-(?:composite-|resource-reuse$|vector-(?:forms|differential|lazy-eligibility)$|parser-boundary$|dense-dependency-boundary$|dense-text-extractor$|retained-text-compiler$|text-clip-index$|jpeg-codec$)/,
+  /^native-(?:composite-|resource-reuse$|vector-(?:forms|differential|lazy-eligibility)$|parser-boundary$|dense-text-extractor$|retained-text-compiler$|text-clip-index$|jpeg-codec$)/,
   /^dense-pdf-(?:document|integration)$/,
   /^(?:bundled-standard-fonts|hepr-canvas2d-renderer|optional-node-canvas|room-overlay-page-matrix|public-load-cancellation|scene-statistics|retained-vector-page|retained-layer-programs)$/
 ];

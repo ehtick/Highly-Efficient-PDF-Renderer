@@ -78,7 +78,6 @@
     "test:conversion": "node scripts/run-tests.mjs conversion",
     "test:corpus": "node scripts/run-tests.mjs corpus",
     "test:file": "node scripts/run-tests.mjs file",
-    "test:oracle": "npm --prefix oracle test",
     "dev": "vite",
     "build": "tsc && npm run test:file -- scripts/test-persistent-viewer-contract.mjs && vite build",
     "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run build:bundler && npm run test:package",
@@ -100,11 +99,7 @@
     "audit:rooms": "node scripts/audit-room-topology.mjs",
     "gold:rooms": "node scripts/room-gold-set.mjs",
     "prepublishOnly": "npm test && npm run build:all",
-    "clean:lib": "node scripts/clean-lib-output.mjs",
-    "oracle:validate": "npm --prefix oracle run validate",
-    "oracle:compare": "npm --prefix oracle run compare --",
-    "oracle:compare:hepr": "npm --prefix oracle run compare:hepr --",
-    "oracle:write": "npm --prefix oracle run write --"
+    "clean:lib": "node scripts/clean-lib-output.mjs"
   },
   "dependencies": {},
   "devDependencies": {

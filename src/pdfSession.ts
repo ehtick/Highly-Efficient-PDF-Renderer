@@ -1,6 +1,6 @@
 import { rectangleVectorClip } from "./pdf/nativeVectorClips";
 import { buildNativeRasterPage, buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
-import { lowerRetainedPageToVectorScene } from "./retainedVectorPage";
+import { lowerRetainedPageToVectorScene, type RetainedTextPositions } from "./retainedVectorPage";
 import { attachRetainedTextOptionalContent } from "./retainedOptionalContentText";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
@@ -487,12 +487,49 @@ class NativePdfSession implements NativeVectorPdfSession {
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
-      return await this.compileVectorPageUnlocked(sourcePageIndex, options, signal);
+      return await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
     } catch (error) {
       throw normalizeAbortError(error, signal);
     } finally {
       operation.abort(new PdfError("aborted", "The PDF vector-page operation ended."));
       release?.();
+    }
+  }
+
+  /**
+   * Toggleable layers also compile content that is hidden by default. When only
+   * that content is unusable, open the page in its default view without layer
+   * controls instead of refusing it, and say why.
+   */
+  private async compileVectorPageWithLayerFallback(
+    sourcePageIndex: number,
+    options: NativeVectorCompileOptions,
+    signal: AbortSignal
+  ): Promise<VectorScene> {
+    try {
+      return await this.compileVectorPageUnlocked(sourcePageIndex, options, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (options.retainOptionalContent === false || this.optionalContent.groupCount === 0 ||
+          !(error instanceof PdfError) || error.code === "resource-limit" || error.code === "aborted") {
+        throw error;
+      }
+      // When the default view fails as well, its error is why the page cannot
+      // open at all.
+      const scene = await this.compileVectorPageUnlocked(
+        sourcePageIndex,
+        { ...options, retainOptionalContent: false },
+        signal
+      );
+      this.appendDiagnostics([{
+        code: "optional-content.default-view-fallback",
+        severity: "warning",
+        pageIndex: sourcePageIndex,
+        message: "PDF layers are unavailable on this page because content hidden by default " +
+          "could not be compiled; the page shows its default view.",
+        details: { code: error.code, reason: error.message }
+      }]);
+      return scene;
     }
   }
 
@@ -778,19 +815,20 @@ class NativePdfSession implements NativeVectorPdfSession {
         optionalContent: buildOptionalContentStore(this.optionalContent),
         limits: densePathCompileLimits(this.document, options)
       });
-      const pageData = text
-        ? {
-            ...densePageData,
-            textIndex: buildInvocationOrderedTextIndex(
-              compiled,
-              compositingPrograms.forms,
-              accumulatedText,
-              allFontResources,
-              maxGlyphs,
-              signal
-            )
-          }
+      const invocationText = text
+        ? buildInvocationOrderedTextIndex(
+            compiled,
+            compositingPrograms.forms,
+            accumulatedText,
+            allFontResources,
+            maxGlyphs,
+            signal
+          )
+        : undefined;
+      const pageData = invocationText
+        ? { ...densePageData, textIndex: invocationText.textIndex }
         : densePageData;
+      if (invocationText?.positions) retainedTextPositions.set(pageData.textIndex, invocationText.positions);
       const commandCount = pageData.displayProgram.groups.reduce(
         (sum, group) => sum + group.commands.length,
         0
@@ -856,6 +894,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       try {
         return await lowerRetainedPageToVectorScene(page, {
           optionalContent: options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined,
+          textPositions: retainedTextPositions.get(page.textIndex),
           signal,
           onDiagnostic: diagnostic => this.appendDiagnostics([diagnostic]),
           maxPrimitives: options.limits?.maxPathsPerPage ?? this.document.limits.maxPathsPerPage,
@@ -1098,7 +1137,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private async buildRetainedRasterScene(page: HeprPageData, options: NativeVectorCompileOptions,
     signal: AbortSignal, reason: Error): Promise<VectorScene> {
     const commandCount = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
-    if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal });
+    if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal, textPositions: retainedTextPositions.get(page.textIndex) });
     const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal,
       { ...this.document.limits, ...options.limits });
     if (!layer) throw new PdfError("invalid-object", "A retained page replay produced no structural raster slot.");
@@ -5399,6 +5438,9 @@ function extendType3GlyphBindings(
  * their direct store references; reusable occurrences use page-space fallback
  * quads so repeated invocations never alias selection geometry.
  */
+/** Pen geometry captured with a compiled page's text index, for the retained vector lowering. */
+const retainedTextPositions = new WeakMap<HeprTextIndex, RetainedTextPositions>();
+
 function buildInvocationOrderedTextIndex(
   root: DensePdfCompiledPage,
   forms: DensePdfFormPageData,
@@ -5406,10 +5448,13 @@ function buildInvocationOrderedTextIndex(
   fontResources: readonly NativeTextFontResource[],
   maxGlyphOccurrences: number,
   signal: AbortSignal
-): HeprTextIndex {
+): { textIndex: HeprTextIndex; positions: RetainedTextPositions | undefined } {
   const textParts: string[] = [];
   const references: number[] = [];
   const fallbackQuads: number[] = [];
+  const charOccurrences: number[] = [];
+  const pens: number[] = [];
+  const gapBefore: number[] = [];
   const activePrograms = new Set<number>();
   const compilation = accumulated.compilation;
   const maxTextCodeUnits = Math.min(
@@ -5420,7 +5465,28 @@ function buildInvocationOrderedTextIndex(
   let occurrenceCount = 0;
   let boundaryPending = false;
 
-  const appendCodeUnits = (text: string, reference: number): void => {
+  const glyphCount = compilation.glyphs.glyphIds.length;
+  const widthEms = compilation.glyphWidthEms?.length === glyphCount ? compilation.glyphWidthEms : undefined;
+  const gaps = compilation.glyphGapBefore?.length === glyphCount ? compilation.glyphGapBefore : undefined;
+
+  // The same pen geometry an ordinary vector page derives its word breaks from.
+  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix): number => {
+    const occurrence = gapBefore.length;
+    const offset = compilation.glyphs.transformIndices[glyphIndex] * 6, values = compilation.transforms.values;
+    const matrix = multiplyPdfMatrices(outerTransform, [values[offset], values[offset + 1], values[offset + 2],
+      values[offset + 3], values[offset + 4], values[offset + 5]]);
+    const units = fontResources[compilation.glyphs.fontIndices[glyphIndex]]?.font.unitsPerEm ?? 1000;
+    const vertical = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Vertical) !== 0;
+    const advance = (widthEms?.[glyphIndex] ?? 0) * units;
+    pens.push(matrix[4], matrix[5],
+      matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
+      matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
+      Math.hypot(matrix[2] * units, matrix[3] * units));
+    gapBefore.push(gaps?.[glyphIndex] ?? 0);
+    return occurrence;
+  };
+
+  const appendCodeUnits = (text: string, reference: number, occurrence = -1): void => {
     if (text.length === 0) return;
     if (textLength > maxTextCodeUnits - text.length) {
       throw new PdfError("resource-limit", "Expanded reusable text exceeds the Unicode limit.", {
@@ -5429,7 +5495,10 @@ function buildInvocationOrderedTextIndex(
     }
     textParts.push(text);
     textLength += text.length;
-    for (let index = 0; index < text.length; index += 1) references.push(reference);
+    for (let index = 0; index < text.length; index += 1) {
+      references.push(reference);
+      charOccurrences.push(occurrence);
+    }
   };
 
   const appendBoundaryIfNeeded = (prefix: string, text: string): void => {
@@ -5461,8 +5530,9 @@ function buildInvocationOrderedTextIndex(
       });
     }
     const invisible = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Invisible) !== 0;
+    const occurrence = appendPen(glyphIndex, outerTransform);
     if (directReference && !invisible) {
-      appendCodeUnits(text, glyphIndex);
+      appendCodeUnits(text, glyphIndex, occurrence);
       return true;
     }
     const fallbackIndex = fallbackQuads.length / 4;
@@ -5477,7 +5547,7 @@ function buildInvocationOrderedTextIndex(
       fontResources,
       outerTransform
     ));
-    appendCodeUnits(text, -fallbackIndex - 2);
+    appendCodeUnits(text, -fallbackIndex - 2, occurrence);
     return true;
   };
 
@@ -5573,10 +5643,17 @@ function buildInvocationOrderedTextIndex(
     boundaryPending = appended ? true : previousBoundary;
   }
   return {
-    version: 1,
-    text: textParts.join(""),
-    charGlyphIndices: Int32Array.from(references),
-    fallbackQuads: Float32Array.from(fallbackQuads)
+    textIndex: {
+      version: 1,
+      text: textParts.join(""),
+      charGlyphIndices: Int32Array.from(references),
+      fallbackQuads: Float32Array.from(fallbackQuads)
+    },
+    positions: widthEms ? {
+      charOccurrences: Int32Array.from(charOccurrences),
+      pens: Float32Array.from(pens),
+      gapBefore: Uint8Array.from(gapBefore)
+    } : undefined
   };
 }
 

@@ -791,14 +791,7 @@ async function testTextAndMarkedContentSemantics() {
   assert.deepEqual(scene.referencedFonts, ["F1"]);
   assert.deepEqual(scene.referencedProperties, []);
   assert.equal(scene.textShowOpCount, 4);
-  for (const removedField of [
-    "retainedTextContent",
-    "dependencyOpCount",
-    "dependencyKeys",
-    "operatorCountTrace"
-  ]) {
-    assert.equal(removedField in scene, false, removedField);
-  }
+  assert.equal("retainedTextContent" in scene, false);
 
   const nextLineShow = await compile("(a) '", { textOperatorSink: NOOP_TEXT_SINK });
   assert.equal(nextLineShow.operatorCount, 1);

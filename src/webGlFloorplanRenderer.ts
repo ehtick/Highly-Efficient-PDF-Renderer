@@ -77,7 +77,7 @@ import {
 
 const GLSL_OUTPUT_COLOR_HELPERS = `
 vec4 heprThreeEncodeOutputColor(vec4 color) {
-  // PDF.js supplies display/sRGB components already. The canvas framebuffer is
+  // Scene colors are display/sRGB components already. The canvas framebuffer is
   // unorm, so encoding them again would wash dark colors toward gray.
   return color;
 }

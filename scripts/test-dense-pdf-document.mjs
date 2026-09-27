@@ -129,15 +129,11 @@ async function testEligibleDocumentContract({
       resourceName: "Alpha",
       strokeAlpha: 0.4,
       fillAlpha: 0.2,
-      emitsPdfJsOperator: true
+      changesPaintState: true
     },
-    { resourceName: "GSFalse", emitsPdfJsOperator: false },
-    { resourceName: "R10", emitsPdfJsOperator: false }
+    { resourceName: "GSFalse", changesPaintState: false },
+    { resourceName: "R10", changesPaintState: false }
   ]);
-  assert.deepEqual(page.fontDependencies, [{
-    resourceName: "F1",
-    dependencyKey: "5 0 R"
-  }]);
 
   assert.deepEqual(await collectChunks(page.decodedContentChunks()), content);
   assert.equal(page.decodeTiming.completed, true);
@@ -409,11 +405,7 @@ async function testFormResources({
     resourceName: "Alpha",
     strokeAlpha: 0.5,
     fillAlpha: 0.5,
-    emitsPdfJsOperator: true
-  }]);
-  assert.deepEqual(selected.fontDependencies, [{
-    resourceName: "FLocal",
-    dependencyKey: "8 0 R"
+    changesPaintState: true
   }]);
   assert.equal(selected.resolveFormXObject("Im0"), null);
   assert.equal(selected.resolveFormXObject("/Im0"), null);
@@ -455,26 +447,26 @@ async function testExtGStateEligibility({
   preflightNativeDensePdfDocument
 }) {
   for (const [entries, resourceName, expected] of [
-    ["/Type /ExtGState /OPM 1", "R10", { resourceName: "R10", emitsPdfJsOperator: false }],
-    ["/OPM 0 /OP false /op false", "GSOff", { resourceName: "GSOff", emitsPdfJsOperator: false }],
+    ["/Type /ExtGState /OPM 1", "R10", { resourceName: "R10", changesPaintState: false }],
+    ["/OPM 0 /OP false /op false", "GSOff", { resourceName: "GSOff", changesPaintState: false }],
     ["/SA false /SM 0.5", "GSStrokeDefaults", {
       resourceName: "GSStrokeDefaults",
-      emitsPdfJsOperator: false
+      changesPaintState: false
     }],
     ["/Type /ExtGState /SA true", "StrokeAdjustment", {
       resourceName: "StrokeAdjustment",
-      emitsPdfJsOperator: false
+      changesPaintState: false
     }],
     ["/Type /ExtGState /SMask /None", "NoSoftMask", {
       resourceName: "NoSoftMask",
       softMaskIndex: null,
-      emitsPdfJsOperator: true
+      changesPaintState: true
     }],
     ["/Type /ExtGState /BM /Normal /CA 0.4 /ca 0.2", "Alpha", {
       resourceName: "Alpha",
       strokeAlpha: 0.4,
       fillAlpha: 0.2,
-      emitsPdfJsOperator: true
+      changesPaintState: true
     }]
   ]) {
     const document = await expectEligible(

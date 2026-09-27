@@ -27,7 +27,7 @@ HEP → scene loader ─────────────┘
 The native PDF engine handles document structure, fonts, graphics state, and
 content streams. A specialized streaming compiler handles compatible dense vector
 pages; other pages use the full native session compiler. Both produce the same
-scene representation. PDF parsing has no PDF.js or pdf-lib runtime dependency.
+scene representation. PDF parsing has no third-party runtime dependencies.
 
 Analytic shaders render vector strokes, fills, and glyph outlines. Embedded images
 and PDF operations that need compositing use raster layers. Vector LOD selects

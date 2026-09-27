@@ -92,9 +92,6 @@ try {
     );
     const compiled = await compileDensePdfContent(selectedPage.decodedContentChunks(), {
       ...geometry,
-      fontDependencyKeys: new Map(selectedPage.fontDependencies.map(
-        ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
-      )),
       availableExtGStates: selectedPage.availableExtGStates,
       extGStates: selectedPage.extGStates,
       alwaysVisibleOptionalContentProperties:
@@ -329,9 +326,6 @@ async function testRawStateDifferentials({
         const page = preflight.document.pages[index];
         const compiled = await compileDensePdfContent(page.decodedContentChunks(), {
           ...computeDensePdfPageGeometry(page),
-          fontDependencyKeys: new Map(page.fontDependencies.map(
-            ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
-          )),
           availableExtGStates: page.availableExtGStates,
           extGStates: page.extGStates,
           alwaysVisibleOptionalContentProperties:
@@ -365,8 +359,8 @@ async function testRawStateDifferentials({
       enableInvisibleCull ? 0.5 : 10,
       "simple degenerate paths must contribute PDF.js-compatible no-cull width metadata"
     );
-    assertExactTriangleClipRaster(forced[4]);
-    assertExactRectangleHoleRaster(forced[5]);
+    assertExactTriangleClip(forced[4]);
+    assertExactRectangleHoleClip(forced[5]);
     assert.ok(
       Math.abs(forced[6].primitiveMeta[3] - 0.4) < 1e-6,
       "Normal-blend stroking opacity must survive packed geometry"
@@ -408,54 +402,67 @@ function assertSelectiveClipReplacement(compiled, scene, label) {
     assert.equal(compiled[key], scene[key], `${label} ${key}`);
   }
   assert.equal(compiled.fillPathCount, 1, `${label}: compact reference fill`);
-  assert.equal(scene.fillPathCount, 0, `${label}: exact fill leaves packed vector stores`);
-  assert.equal(scene.fillSegmentCount, 0, `${label}: no stale packed fill segments`);
-  assert.equal(scene.rasterLayers.length, 1, `${label}: one source-ordered exact clip layer`);
-  assert.equal(scene.rasterLayers[0].paintOrder, 0, `${label}: source paint order`);
-  assert.ok(countVisibleRasterPixels(scene.rasterLayers[0]) > 0, `${label}: visible paint retained`);
+  assert.equal(scene.fillPathCount, 1, `${label}: exact clip keeps the fill vector`);
+  assert.equal(scene.rasterLayers.length, 0, `${label}: no raster fallback layer`);
+  assert.equal(scene.drawRuns?.length, 1, `${label}: one source-ordered draw run`);
+  const [run] = scene.drawRuns;
+  assert.equal(run.kind, "fill", `${label}: fill draw run`);
+  assert.ok(run.clipIndex >= 0, `${label}: fill references its vector clip`);
+  assert.equal(scene.clipPaths[run.clipIndex].fillRule, 1, `${label}: W* keeps even-odd clipping`);
 }
 
-function assertExactTriangleClipRaster(scene) {
-  const layer = scene.rasterLayers[0];
-  assert.ok(rasterAlphaAtPagePoint(layer, 40, 20) >= 250, "triangle interior must be painted");
-  assert.ok(rasterAlphaAtPagePoint(layer, 40, 55) >= 250, "triangle apex interior must be painted");
+function assertExactTriangleClip(scene) {
+  assert.ok(isFillPaintedAt(scene, 40, 20), "triangle interior must be painted");
+  assert.ok(isFillPaintedAt(scene, 40, 55), "triangle apex interior must be painted");
   assert.equal(
-    rasterAlphaAtPagePoint(layer, 12, 55),
-    0,
+    isFillPaintedAt(scene, 12, 55),
+    false,
     "the irregular W* clip must exclude its AABB-only corner"
   );
-  assert.equal(rasterAlphaAtPagePoint(layer, 68, 55), 0);
+  assert.equal(isFillPaintedAt(scene, 68, 55), false);
 }
 
-function assertExactRectangleHoleRaster(scene) {
-  const layer = scene.rasterLayers[0];
-  assert.ok(rasterAlphaAtPagePoint(layer, 15, 15) >= 250, "outer clip region must be painted");
+function assertExactRectangleHoleClip(scene) {
+  assert.ok(isFillPaintedAt(scene, 15, 15), "outer clip region must be painted");
   assert.equal(
-    rasterAlphaAtPagePoint(layer, 30, 25),
-    0,
+    isFillPaintedAt(scene, 30, 25),
+    false,
     "the even-odd rectangle exclusion must remain transparent"
   );
-  assert.equal(rasterAlphaAtPagePoint(layer, 5, 5), 0);
+  assert.equal(isFillPaintedAt(scene, 5, 5), false);
 }
 
-function countVisibleRasterPixels(layer) {
-  let count = 0;
-  for (let offset = 3; offset < layer.data.length; offset += 4) {
-    if (layer.data[offset] !== 0) count += 1;
+/** Whether any clipped fill draw run covers a page-space point. */
+function isFillPaintedAt(scene, x, y) {
+  return scene.drawRuns.some((run) => {
+    if (run.kind !== "fill") return false;
+    for (let index = run.clipIndex ?? -1; index >= 0; index = scene.clipPaths[index].parent) {
+      const clip = scene.clipPaths[index];
+      if (!edgesContainPoint(clip.edges, clip.fillRule, x, y)) return false;
+    }
+    for (let path = run.first; path < run.first + run.count; path += 1) {
+      const first = scene.fillPathMetaA[path * 4];
+      const count = scene.fillPathMetaA[path * 4 + 1];
+      const edges = scene.fillSegmentsA.subarray(first * 4, (first + count) * 4);
+      if (edgesContainPoint(edges, scene.fillPathMetaC[path * 4], x, y)) return true;
+    }
+    return false;
+  });
+}
+
+/** Directed [x0, y0, x1, y1] line edges; fill rule 1 is even-odd, 0 is nonzero. */
+function edgesContainPoint(edges, fillRule, x, y) {
+  let winding = 0;
+  let crossings = 0;
+  for (let offset = 0; offset < edges.length; offset += 4) {
+    const [x0, y0, x1, y1] = edges.subarray(offset, offset + 4);
+    if ((y0 <= y) === (y1 <= y)) continue;
+    const crossingX = x0 + (y - y0) * (x1 - x0) / (y1 - y0);
+    if (crossingX <= x) continue;
+    crossings += 1;
+    winding += y1 > y0 ? 1 : -1;
   }
-  return count;
-}
-
-function rasterAlphaAtPagePoint(layer, pageX, pageY) {
-  const [a, b, c, d, e, f] = layer.matrix;
-  const determinant = a * d - b * c;
-  assert.ok(Number.isFinite(determinant) && Math.abs(determinant) > 1e-12);
-  const unitX = (d * (pageX - e) - c * (pageY - f)) / determinant;
-  const unitY = (-b * (pageX - e) + a * (pageY - f)) / determinant;
-  if (unitX < 0 || unitX >= 1 || unitY < 0 || unitY >= 1) return 0;
-  const pixelX = Math.min(layer.width - 1, Math.floor(unitX * layer.width));
-  const pixelY = Math.min(layer.height - 1, Math.floor(unitY * layer.height));
-  return layer.data[(pixelY * layer.width + pixelX) * 4 + 3];
+  return fillRule === 1 ? crossings % 2 === 1 : winding !== 0;
 }
 
 function assertPackedGeometryParity(compiled, forced, label) {

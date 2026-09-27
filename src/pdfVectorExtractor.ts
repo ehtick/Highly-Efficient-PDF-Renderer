@@ -24,6 +24,7 @@ import type { SceneRetainedPage } from "./retainedPageData";
 import { composePagePaintGraph } from "./scenePaintGraphComposition";
 import { validateScenePaintGraph, type ScenePaintGraph } from "./scenePaintGraph";
 import { composeOptionalContent } from "./optionalContentComposition";
+import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -189,9 +190,6 @@ export interface VectorScene {
   bounds: Bounds;
   pageBounds: Bounds;
   maxHalfWidth: number;
-  operatorCount: number;
-  /** Engine-specific diagnostic units, not raw PDF operators or GPU draw calls. */
-  operatorCountKind?: "native-estimate" | "mixed";
   imagePaintOpCount: number;
   pathCount: number;
   discardedTransparentCount: number;
@@ -306,6 +304,7 @@ export async function extractPdfPageScenes(
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   validateIccEngine(options.iccEngine);
+  assertPdfSourceBytes(pdfData);
   const progress = createLoadProgressReporter(options.onProgress);
   if (options.pdfFastPath === "off") {
     return extractPdfPageScenesWithNativeTier(
@@ -957,7 +956,6 @@ function createDenseGeometryScene(page: DensePdfFastCompiledPage): VectorScene {
     sourceSegmentCount: compiled.sourceSegmentCount,
     mergedSegmentCount: compiled.mergedSegmentCount,
     imageLayerSegmentCount: 0,
-    operatorCountKind: "native-estimate",
     endpoints: compiled.endpoints,
     primitiveMeta: compiled.primitiveMeta,
     primitiveBounds: compiled.primitiveBounds,
@@ -965,7 +963,6 @@ function createDenseGeometryScene(page: DensePdfFastCompiledPage): VectorScene {
     bounds: { ...compiled.bounds },
     pageBounds,
     maxHalfWidth: compiled.maxHalfWidth,
-    operatorCount: compiled.operatorCount,
     imagePaintOpCount: 0,
     pathCount: compiled.pathCount,
     discardedTransparentCount: compiled.discardedTransparentCount,
@@ -1011,6 +1008,11 @@ function mergeDenseGeometryWithText(
   };
 }
 
+/** Name an HTML fallback page or other non-PDF source before any parser work. */
+function assertPdfSourceBytes(pdfData: ArrayBuffer): void {
+  assertPdfBytes(new Uint8Array(pdfData, 0, Math.min(pdfData.byteLength, PDF_HEADER_SCAN_BYTES)));
+}
+
 export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
   return composeScenesInGrid(pageScenes, requestedPagesPerRow);
 }
@@ -1030,6 +1032,7 @@ export async function extractPdfRasterPageScenes(
   options: VectorExtractOptions = {},
   signal?: AbortSignal
 ): Promise<VectorScene[]> {
+  assertPdfSourceBytes(pdfData);
   const pageScenes = await extractPdfPageScenesWithNative(pdfData, {
     ...options,
     // Embedded-source recovery needs only the image paints. Avoid retaining a
@@ -1101,8 +1104,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
       primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     bounds: combineBounds(pageBounds, rasterBounds) ?? pageBounds,
     pageBounds,
-    imagePaintOpCount: scene.imagePaintOpCount,
-    operatorCount: scene.operatorCount
+    imagePaintOpCount: scene.imagePaintOpCount
   };
 }
 
@@ -1145,7 +1147,6 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalTextClipRectCount = 0;
   let totalTextInPageCount = 0;
   let totalTextOutOfPageCount = 0;
-  let totalOperatorCount = 0;
   let totalImagePaintOpCount = 0;
   let totalPathCount = 0;
   let totalDiscardedTransparentCount = 0;
@@ -1175,7 +1176,6 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     totalTextClipRectCount += Math.floor((scene.textClipRects?.length ?? 0) / 4);
     totalTextInPageCount += scene.textInPageCount;
     totalTextOutOfPageCount += scene.textOutOfPageCount;
-    totalOperatorCount += scene.operatorCount;
     totalImagePaintOpCount += scene.imagePaintOpCount;
     totalPathCount += scene.pathCount;
     totalDiscardedTransparentCount += scene.discardedTransparentCount;
@@ -1630,10 +1630,6 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     ...(pageScenes.every((scene) => scene.imageLayerSegmentCount !== undefined)
       ? { imageLayerSegmentCount: pageScenes.reduce((sum, scene) => sum + scene.imageLayerSegmentCount!, 0) }
       : {}),
-    ...(pageScenes.every((scene) => scene.operatorCountKind === "native-estimate")
-      ? { operatorCountKind: "native-estimate" as const }
-      : pageScenes.some((scene) => scene.operatorCountKind !== undefined)
-        ? { operatorCountKind: "mixed" as const } : {}),
     sourceTextCount: totalSourceTextCount,
     textInstanceCount: totalTextInstanceCount,
     textGlyphCount: totalTextGlyphCount,
@@ -1661,7 +1657,6 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     pageBounds: combinedPageBounds ?? combinedBounds ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     maxHalfWidth,
     imagePaintOpCount: totalImagePaintOpCount,
-    operatorCount: totalOperatorCount,
     pathCount: totalPathCount,
     discardedTransparentCount: totalDiscardedTransparentCount,
     discardedDegenerateCount: totalDiscardedDegenerateCount,

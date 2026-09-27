@@ -77,10 +77,8 @@ try {
     fillAlpha: 0.2,
     alphaIsShape: true,
     softMaskIndex: null,
-    emitsPdfJsOperator: true
+    changesPaintState: true
   }]);
-  assert.equal(nativePage.fontDependencies.length, 1);
-  assert.equal(nativePage.fontDependencies[0].resourceName, "F1");
 
   const nativeDecoded = await collect(nativePage.decodedContentChunks());
   assert.deepEqual(nativeDecoded, content);

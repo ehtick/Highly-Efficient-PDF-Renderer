@@ -230,7 +230,6 @@ async function runIteration({
 function summarizeScene(scene) {
   return Object.freeze({
     pages: scene.pageCount,
-    operators: scene.operatorCount,
     paths: scene.pathCount,
     sourceSegments: scene.sourceSegmentCount,
     mergedSegments: scene.mergedSegmentCount,

@@ -4,7 +4,7 @@
  * The caller is responsible for resolving and decoding page content streams. This
  * module deliberately understands only the PDF graphics subset that HEPR can map
  * directly to its native stroke/fill representation. Unsupported content throws a
- * typed error so the caller can atomically fall back to PDF.js.
+ * typed error so the caller can atomically fall back to the full native parser.
  */
 
 export type DensePdfMatrix = [number, number, number, number, number, number];
@@ -14,21 +14,6 @@ export interface DensePdfBounds {
   minY: number;
   maxX: number;
   maxY: number;
-}
-
-/**
- * Compact semantic trace used to replay PDF.js operator-list batching when a
- * Form is inserted into its caller's live operator list.
- *
- * Each semantic event is preceded by the generic-operator run at the same
- * index; the final run follows the last event. Event code 0 is a Q/ET
- * early-flush checkpoint, while positive codes index `fontDependencyKeys`
- * plus one and represent a conditional dependency followed by `Tf`.
- */
-export interface DensePdfOperatorCountTrace {
-  readonly genericRuns: Uint32Array;
-  readonly semanticEvents: Uint32Array;
-  readonly fontDependencyKeys: readonly string[];
 }
 
 export type DensePdfContentSource =
@@ -49,6 +34,7 @@ export interface DensePdfCompileProgress {
   phase: "scanning" | "finalizing";
   processedBytes: number;
   totalBytes?: number;
+  /** Content-stream operators executed so far. */
   operatorCount: number;
   sourceSegmentCount: number;
   /** Present while final packed geometry is copied, culled, or bounded. */
@@ -66,12 +52,6 @@ export interface DensePdfTextFormSummary {
   dependencyKey: string;
   bbox: DensePdfBounds;
   matrix: DensePdfMatrix;
-  operatorCount: number;
-  dependencyOpCount: number;
-  /** Stable source-object identities for PDF.js font dependency ops. */
-  dependencyKeys: readonly string[];
-  /** Batch-aware semantic operator trace for insertion into a caller. */
-  operatorCountTrace: DensePdfOperatorCountTrace;
   textShowOpCount: number;
   /** True when this Form or a referenced nested Form paints non-text geometry. */
   hasNonTextPaint: boolean;
@@ -86,7 +66,8 @@ export interface DensePdfExtGStateDefinition {
   resourceName: string;
   strokeAlpha?: number;
   fillAlpha?: number;
-  emitsPdfJsOperator: boolean;
+  /** Sets paint state (opacity, blend mode, alpha source, soft mask) that retained text must replay. */
+  changesPaintState: boolean;
 }
 
 export interface DensePdfContentCompileOptions {
@@ -100,8 +81,6 @@ export interface DensePdfContentCompileOptions {
   alwaysVisibleOptionalContentProperties?: readonly string[];
   /** Recursively classified Form XObjects available for retention or BBox culling. */
   availableTextFormXObjects?: ReadonlyMap<string, DensePdfTextFormSummary>;
-  /** Stable source identities for font names in the active resource scope. */
-  fontDependencyKeys?: ReadonlyMap<string, string>;
   /** Classification-only mode: account for painted nested Forms without retaining them. */
   allowPaintedFormXObjects?: boolean;
   /** Used while preflighting text-only forms; clipping/end-path operations remain valid. */
@@ -117,11 +96,6 @@ export interface DensePdfContentCompileOptions {
 }
 
 export interface DensePdfCompiledPage {
-  operatorCount: number;
-  dependencyOpCount: number;
-  dependencyKeys: string[];
-  /** Present only for classification-only Form compiles. */
-  operatorCountTrace?: DensePdfOperatorCountTrace;
   pathCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
@@ -212,7 +186,6 @@ const DEFAULT_YIELD_INTERVAL_MS = 50;
 const MAX_OPERAND_COUNT = 1_000_000;
 const MAX_PAINT_PATH_FLOATS = 65_536;
 const MAX_COVERAGE_GROUP_SIZE = 8_192;
-const MAX_OPERATOR_TRACE_SEMANTIC_EVENTS = 1_000_000;
 const UTF8_ENCODER = new TextEncoder();
 
 interface PdfNameValue {
@@ -317,7 +290,7 @@ function emptyStrokeFinalizeResult(): StrokeFinalizeResult {
   };
 }
 
-/** Compile already-decoded page content without materializing a PDF.js operator list. */
+/** Compile already-decoded page content in one streaming pass. */
 export async function compileDensePdfContent(
   source: DensePdfContentSource,
   options: DensePdfContentCompileOptions
@@ -390,7 +363,7 @@ export async function compileDensePdfContent(
     phase: "finalizing",
     processedBytes,
     totalBytes: options.totalBytes ?? processedBytes,
-    operatorCount: result.operatorCount,
+    operatorCount: compiler.operatorCount,
     sourceSegmentCount: result.sourceSegmentCount,
     finalization: { stage: "complete", completed: 1, total: 1 }
   });
@@ -419,7 +392,7 @@ function normalizeExtGStateDefinitions(
     }
     definitions.set(resourceName, {
       resourceName,
-      emitsPdfJsOperator: false
+      changesPaintState: false
     });
   }
   for (const definition of options.extGStates ?? []) {
@@ -427,7 +400,7 @@ function normalizeExtGStateDefinitions(
       !definition ||
       typeof definition.resourceName !== "string" ||
       definition.resourceName.length === 0 ||
-      typeof definition.emitsPdfJsOperator !== "boolean" ||
+      typeof definition.changesPaintState !== "boolean" ||
       !isOptionalUnitInterval(definition.strokeAlpha) ||
       !isOptionalUnitInterval(definition.fillAlpha)
     ) {
@@ -477,13 +450,9 @@ class DenseContentCompiler {
 
   readonly stateStack: GraphicsState[] = [];
 
-  readonly operatorTracker: PdfJsOperatorCountTracker;
-
   readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
 
   readonly alwaysVisibleOptionalContentProperties: ReadonlySet<string>;
-
-  readonly fontDependencyKeys: ReadonlyMap<string, string>;
 
   private state: GraphicsState;
 
@@ -503,16 +472,14 @@ class DenseContentCompiler {
 
   textShowOpCount = 0;
 
+  operatorCount = 0;
+
   constructor(options: DensePdfContentCompileOptions) {
     this.options = options;
-    this.operatorTracker = new PdfJsOperatorCountTracker(
-      options.classificationOnly === true
-    );
     this.extGStates = normalizeExtGStateDefinitions(options);
     this.alwaysVisibleOptionalContentProperties = new Set(
       options.alwaysVisibleOptionalContentProperties ?? []
     );
-    this.fontDependencyKeys = options.fontDependencyKeys ?? new Map();
     this.state = {
       matrix: [...options.pageMatrix],
       matrixScale: matrixScale(options.pageMatrix),
@@ -542,10 +509,6 @@ class DenseContentCompiler {
     this.fillPathMetaC = collectGeometry ? new Float4Builder(2_048) : null;
     this.fillSegmentsA = collectGeometry ? new Float4Builder(16_384) : null;
     this.fillSegmentsB = collectGeometry ? new Float4Builder(16_384) : null;
-  }
-
-  get operatorCount(): number {
-    return this.operatorTracker.operatorCount;
   }
 
   get sourceSegmentCount(): number {
@@ -596,6 +559,7 @@ class DenseContentCompiler {
     }
 
     this.executeOperator(token.value, this.operands);
+    this.operatorCount += 1;
     this.operandCount = 0;
   }
 
@@ -615,15 +579,9 @@ class DenseContentCompiler {
     if (this.path.length > 0 || this.pendingClipRule !== null) {
       throw new DensePdfSyntaxError("Unpainted path at the end of PDF content.");
     }
-    if (this.stateStack.length > 0) {
-      // PDF.js implicitly closes missing restores at EOF. Mirror its normalized
-      // operator count; geometry already retains the innermost state at EOF.
-      while (this.stateStack.length > 0) {
-        this.operatorTracker.addOperator("Q");
-        this.stateStack.pop();
-        if ((this.stateStack.length & 0x1fff) === 0) await checkpoint();
-      }
-    }
+    // Missing restores at EOF close implicitly; geometry already retains the
+    // innermost state.
+    this.stateStack.length = 0;
 
     const strokeResult = this.strokes
       ? await this.strokes.finalize(checkpoint)
@@ -636,12 +594,7 @@ class DenseContentCompiler {
     const combinedBounds = combineBounds(strokeResult.bounds, this.fillBounds) ?? {
       ...this.options.pageBounds
     };
-    const operatorCountTrace = this.operatorTracker.finishTrace();
     return {
-      operatorCount: this.operatorTracker.operatorCount,
-      dependencyOpCount: this.operatorTracker.dependencyOpCount,
-      dependencyKeys: [...this.operatorTracker.dependencyKeys],
-      ...(operatorCountTrace ? { operatorCountTrace } : {}),
       pathCount: this.pathCount,
       sourceSegmentCount: this.strokes?.sourceSegmentCount ?? 0,
       mergedSegmentCount: this.strokes?.mergedSegmentCount ?? 0,
@@ -767,7 +720,6 @@ class DenseContentCompiler {
           operator,
           this.operandCount
         );
-        this.operatorTracker.addOperator(operator);
         return;
       case "S":
       case "s":
@@ -792,7 +744,7 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 0);
         this.rejectTransformChangeInsidePath(operator);
         this.stateStack.push(cloneState(this.state));
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "Q": {
         this.requireArgs(operator, args, 0);
@@ -802,7 +754,7 @@ class DenseContentCompiler {
           throw new DensePdfSyntaxError("Unbalanced Q operator in PDF content.");
         }
         this.state = restored;
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       }
       case "cm":
@@ -810,17 +762,17 @@ class DenseContentCompiler {
         this.rejectTransformChangeInsidePath(operator);
         this.state.matrix = multiplyMatrices(this.state.matrix, matrixFromArgs(args));
         this.state.matrixScale = matrixScale(this.state.matrix);
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "w":
         this.requireArgs(operator, args, 1);
         this.state.lineWidth = Math.abs(numberArg(args, 0));
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "J":
         this.requireArgs(operator, args, 1);
         this.state.lineCap = clampInt(Math.trunc(numberArg(args, 0)), 0, 2);
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "j":
       case "M":
@@ -829,7 +781,7 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 1);
         if (operator !== "ri") numberArg(args, 0);
         else nameArg(args, 0);
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "d": {
         this.requireArgs(operator, args, 2);
@@ -839,7 +791,7 @@ class DenseContentCompiler {
         }
         this.state.lineDash = normalizeDashPattern(dash);
         this.state.dashPhase = numberArg(args, 1);
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       }
       case "gs": {
@@ -858,25 +810,25 @@ class DenseContentCompiler {
         if (definition.fillAlpha !== undefined) {
           this.state.fillAlpha = definition.fillAlpha;
         }
-        if (definition.emitsPdfJsOperator) {
+        // A dictionary that changes no paint state (OPM, disabled overprint,
+        // SA, SM) has nothing for retained text to replay.
+        if (definition.changesPaintState) {
           this.referencedExtGStates.add(resourceName);
-          this.trackAndRetainState(args, operator);
+          this.retainStatement(args, operator);
         }
-        // PDF.js omits OPM-only/overprint-disabled dictionaries from its
-        // operator list. Those definitions are consumed without counting.
         return;
       }
       case "G":
         this.requireArgs(operator, args, 1);
         this.state.strokeColorSpace = "DeviceGray";
         [this.state.strokeR, this.state.strokeG, this.state.strokeB] = normalizeGray(numberArg(args, 0));
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "g":
         this.requireArgs(operator, args, 1);
         this.state.fillColorSpace = "DeviceGray";
         [this.state.fillR, this.state.fillG, this.state.fillB] = normalizeGray(numberArg(args, 0));
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "RG":
         this.requireArgs(operator, args, 3);
@@ -884,7 +836,7 @@ class DenseContentCompiler {
         [this.state.strokeR, this.state.strokeG, this.state.strokeB] = normalizeRgb(
           numberArg(args, 0), numberArg(args, 1), numberArg(args, 2)
         );
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "rg":
         this.requireArgs(operator, args, 3);
@@ -892,7 +844,7 @@ class DenseContentCompiler {
         [this.state.fillR, this.state.fillG, this.state.fillB] = normalizeRgb(
           numberArg(args, 0), numberArg(args, 1), numberArg(args, 2)
         );
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "K":
         this.requireArgs(operator, args, 4);
@@ -900,7 +852,7 @@ class DenseContentCompiler {
         [this.state.strokeR, this.state.strokeG, this.state.strokeB] = normalizeCmyk(
           numberArg(args, 0), numberArg(args, 1), numberArg(args, 2), numberArg(args, 3)
         );
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "k":
         this.requireArgs(operator, args, 4);
@@ -908,7 +860,7 @@ class DenseContentCompiler {
         [this.state.fillR, this.state.fillG, this.state.fillB] = normalizeCmyk(
           numberArg(args, 0), numberArg(args, 1), numberArg(args, 2), numberArg(args, 3)
         );
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       case "CS":
       case "cs": {
@@ -916,8 +868,6 @@ class DenseContentCompiler {
         const colorSpace = parseDeviceColorSpace(nameArg(args, 0), operator);
         if (operator === "CS") this.state.strokeColorSpace = colorSpace;
         else this.state.fillColorSpace = colorSpace;
-        // PDF.js consumes device color-space selection as evaluator state. It
-        // retains only the subsequent color-setting operator in its op list.
         this.retainStatement(args, operator);
         return;
       }
@@ -938,7 +888,7 @@ class DenseContentCompiler {
         } else {
           [this.state.fillR, this.state.fillG, this.state.fillB] = color;
         }
-        this.trackAndRetainState(args, operator);
+        this.retainStatement(args, operator);
         return;
       }
       case "Do": {
@@ -953,7 +903,6 @@ class DenseContentCompiler {
           );
         }
         assertValidTextFormSummary(summary, resourceName);
-        this.operatorTracker.addTextFormXObject(resourceName, summary);
         this.textShowOpCount += summary.textShowOpCount;
         const formBounds = transformRectangleBounds(
           summary.bbox,
@@ -962,8 +911,8 @@ class DenseContentCompiler {
         const visible = boundsIntersectNullable(formBounds, this.state.clipBounds);
         if (!visible) {
           // The Form BBox is an implicit clip. Retaining an off-clip Form that
-          // contains text preserves PDF.js's source-text/font accounting while
-          // its vector paint remains provably unable to reach the page.
+          // contains text keeps its source text searchable while its vector
+          // paint remains provably unable to reach the page.
           if (summary.textShowOpCount > 0) {
             this.referencedXObjects.add(resourceName);
             this.retainStatement(args, operator);
@@ -987,7 +936,6 @@ class DenseContentCompiler {
       case "ET":
       case "T*":
         this.requireArgs(operator, args, 0);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       case "Tc":
@@ -997,7 +945,6 @@ class DenseContentCompiler {
       case "Ts":
         this.requireArgs(operator, args, 1);
         numberArg(args, 0);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       case "Tr": {
@@ -1009,11 +956,10 @@ class DenseContentCompiler {
         }
         if (mode >= 4) {
           throw new DensePdfUnsupportedError(
-            "Glyph clipping text modes require PDF.js to clip later vector geometry.",
+            "Glyph clipping text modes are not supported by dense-vector compilation.",
             operator
           );
         }
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       }
@@ -1022,13 +968,11 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 2);
         numberArg(args, 0);
         numberArg(args, 1);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       case "Tm":
         this.requireArgs(operator, args, 6);
         matrixFromArgs(args);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       case "Tf": {
@@ -1036,32 +980,24 @@ class DenseContentCompiler {
         const font = nameArg(args, 0);
         numberArg(args, 1);
         this.referencedFonts.add(font);
-        this.operatorTracker.addFontOperator(
-          this.fontDependencyKeys.get(font) ?? font
-        );
         this.retainStatement(args, operator);
         return;
       }
       case "Tj":
         this.requireArgs(operator, args, 1);
         stringArg(args, 0);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         this.textShowOpCount += 1;
         return;
       case "TJ":
         this.requireArgs(operator, args, 1);
         validateTextArray(arrayArg(args, 0));
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         this.textShowOpCount += 1;
         return;
       case "'":
         this.requireArgs(operator, args, 1);
         stringArg(args, 0);
-        // PDF.js expands ' into nextLine followed by showText.
-        this.operatorTracker.addOperator("T*");
-        this.operatorTracker.addOperator("Tj");
         this.retainStatement(args, operator);
         this.textShowOpCount += 1;
         return;
@@ -1070,11 +1006,6 @@ class DenseContentCompiler {
         numberArg(args, 0);
         numberArg(args, 1);
         stringArg(args, 2);
-        // PDF.js expands " into nextLine, word/character spacing, and showText.
-        this.operatorTracker.addOperator("T*");
-        this.operatorTracker.addOperator("Tw");
-        this.operatorTracker.addOperator("Tc");
-        this.operatorTracker.addOperator("Tj");
         this.retainStatement(args, operator);
         this.textShowOpCount += 1;
         return;
@@ -1082,9 +1013,11 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 1);
         const tag = nameArg(args, 0);
         if (tag === "OC") {
-          throw new DensePdfUnsupportedError("Optional-content marked content requires PDF.js.", operator);
+          throw new DensePdfUnsupportedError(
+            "Optional-content marked content is not supported by dense-vector compilation.",
+            operator
+          );
         }
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       }
@@ -1104,8 +1037,7 @@ class DenseContentCompiler {
           }
           // HEP captures the default all-visible view rather than preserving
           // interactive layer controls. A plain marked-content wrapper keeps
-          // PDF.js operator counts and text scoping without copying OCG state.
-          this.operatorTracker.addOperator(operator);
+          // text scoping without copying OCG state.
           this.textProgram.pushBytes(UTF8_ENCODER.encode("/Span BMC\n"));
           return;
         }
@@ -1116,31 +1048,31 @@ class DenseContentCompiler {
           throw new DensePdfSyntaxError("BDC property operand must be a name or dictionary.");
         } else if (dictionaryContainsOptionalContent(property)) {
           throw new DensePdfUnsupportedError(
-            "Optional-content properties require PDF.js.",
+            "Optional-content properties are not supported by dense-vector compilation.",
             operator
           );
         }
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       }
       case "EMC":
         this.requireArgs(operator, args, 0);
-        this.operatorTracker.addOperator(operator);
         this.retainStatement(args, operator);
         return;
       case "MP":
         this.requireArgs(operator, args, 1);
         nameArg(args, 0);
-        // Point marked-content operators are retained for the text mini-PDF,
-        // but PDF.js does not expose them in its operator list.
+        // Point marked-content operators are retained for the text mini-PDF.
         this.retainStatement(args, operator);
         return;
       case "DP": {
         this.requireArgs(operator, args, 2);
         const tag = nameArg(args, 0);
         if (tag === "OC") {
-          throw new DensePdfUnsupportedError("Optional-content marked content requires PDF.js.", operator);
+          throw new DensePdfUnsupportedError(
+            "Optional-content marked content is not supported by dense-vector compilation.",
+            operator
+          );
         }
         const property = args[1];
         if (isPdfName(property)) {
@@ -1148,9 +1080,11 @@ class DenseContentCompiler {
         } else if (!isPdfDictionary(property)) {
           throw new DensePdfSyntaxError("DP property operand must be a name or dictionary.");
         } else if (dictionaryContainsOptionalContent(property)) {
-          throw new DensePdfUnsupportedError("Optional-content properties require PDF.js.", operator);
+          throw new DensePdfUnsupportedError(
+            "Optional-content properties are not supported by dense-vector compilation.",
+            operator
+          );
         }
-        // As with MP, PDF.js consumes DP without emitting an operator-list op.
         this.retainStatement(args, operator);
         return;
       }
@@ -1215,7 +1149,6 @@ class DenseContentCompiler {
       operator === "B" || operator === "B*" || operator === "b" || operator === "b*";
     const isEndPath = operator === "n";
 
-    this.operatorTracker.addOperator("constructPath");
     const pathVisible = pathData.length > 0 && boundsIntersectNullable(this.state.clipBounds, pathBounds);
     if (!isEndPath && pathVisible) {
       this.pathCount += 1;
@@ -1230,7 +1163,7 @@ class DenseContentCompiler {
       countPathMoveOps(pathData) >= 100
     ) {
       throw new DensePdfUnsupportedError(
-        "Large disconnected nonzero fills require HEPR's PDF.js subpath splitter.",
+        "Large disconnected nonzero fills require source-ordered exact path compilation.",
         operator
       );
     }
@@ -1256,10 +1189,10 @@ class DenseContentCompiler {
     if (pathVisible && strokePaint) {
       const isHairline = this.state.lineWidth <= 0;
       const halfWidth = isHairline ? 0 : this.state.lineWidth * this.state.matrixScale * 0.5;
-      // The PDF.js path records the width once for a path whose aggregate
-      // bounds intersect the clip, even when every primitive of that path is
-      // later rejected by primitive-level clipping. Preserve that no-cull
-      // metadata boundary independently from primitive emission.
+      // The former PDF.js path recorded the width once for a path whose
+      // aggregate bounds intersect the clip, even when every primitive of that
+      // path is later rejected by primitive-level clipping. Preserve that
+      // no-cull metadata boundary independently from primitive emission.
       strokes.recordPathHalfWidth(halfWidth);
       let flags = isHairline ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0;
       if (this.state.lineCap === 1) {
@@ -1320,7 +1253,6 @@ class DenseContentCompiler {
     if (!strokes) {
       throw new DensePdfSyntaxError("Dense PDF stroke builder is unavailable.");
     }
-    this.operatorTracker.addOperator("constructPath");
     const data = this.path.rawData();
     const matrix = this.state.matrix;
     const x0 = matrix[0] * data[1] + matrix[2] * data[2] + matrix[4];
@@ -1400,11 +1332,6 @@ class DenseContentCompiler {
     this.textProgram.pushBytes(this.pendingTextClipPath);
     this.textProgram.pushBytes(this.pendingTextClipStatement);
     this.textProgram.pushStatement([], "n");
-  }
-
-  private trackAndRetainState(args: PdfValue[], operator: string): void {
-    this.operatorTracker.addOperator(operator);
-    this.retainStatement(args, operator);
   }
 
   private retainStatement(args: PdfValue[], operator: string): void {
@@ -1951,164 +1878,6 @@ class PdfProgramBuilder {
   }
 }
 
-class PdfJsOperatorCountTracker {
-  operatorCount = 0;
-
-  dependencyOpCount = 0;
-
-  readonly dependencyKeys: string[] = [];
-
-  private weight = 0;
-
-  private readonly fontDependencies = new Set<string>();
-
-  private readonly traceBuilder: PdfJsOperatorCountTraceBuilder | null;
-
-  constructor(recordTrace = false) {
-    this.traceBuilder = recordTrace ? new PdfJsOperatorCountTraceBuilder() : null;
-  }
-
-  addFontOperator(dependencyKey: string): void {
-    this.traceBuilder?.addFontDependency(dependencyKey);
-    if (!this.fontDependencies.has(dependencyKey)) {
-      this.fontDependencies.add(dependencyKey);
-      this.dependencyOpCount += 1;
-      this.dependencyKeys.push(dependencyKey);
-      this.addOperatorWithoutTrace("dependency");
-    }
-    this.addOperatorWithoutTrace("Tf");
-  }
-
-  addTextFormXObject(
-    _resourceName: string,
-    summary: DensePdfTextFormSummary
-  ): void {
-    // PDF.js surrounds a Form's evaluated operator list with begin/end ops.
-    // Replaying the inner semantic trace against the caller's current weight
-    // is necessary because a 1000-op (or Q/ET near-1000) flush can land at a
-    // different position than it did when the Form was classified in isolation.
-    this.addGenericOperatorRun(1);
-    this.replayTrace(summary.operatorCountTrace);
-    this.addGenericOperatorRun(1);
-  }
-
-  addOperator(operator: string): void {
-    if (operator === "Q" || operator === "ET") {
-      this.traceBuilder?.addEarlyFlushOperator();
-    } else {
-      this.traceBuilder?.addGenericOperators(1);
-    }
-    this.addOperatorWithoutTrace(operator);
-  }
-
-  finishTrace(): DensePdfOperatorCountTrace | undefined {
-    return this.traceBuilder?.finish();
-  }
-
-  private replayTrace(trace: DensePdfOperatorCountTrace): void {
-    const { genericRuns, semanticEvents, fontDependencyKeys } = trace;
-    for (let index = 0; index < semanticEvents.length; index += 1) {
-      this.addGenericOperatorRun(genericRuns[index]);
-      const event = semanticEvents[index];
-      if (event === 0) {
-        // Q and ET have identical OperatorList early-flush behavior.
-        this.addOperator("Q");
-      } else {
-        this.addFontOperator(fontDependencyKeys[event - 1]);
-      }
-    }
-    this.addGenericOperatorRun(genericRuns[semanticEvents.length]);
-  }
-
-  private addGenericOperatorRun(count: number): void {
-    if (count === 0) return;
-    this.traceBuilder?.addGenericOperators(count);
-    this.operatorCount += count;
-    const combinedWeight = this.weight + count;
-    if (combinedWeight >= 1_000) {
-      this.weight = combinedWeight % 1_000;
-      this.fontDependencies.clear();
-    } else {
-      this.weight = combinedWeight;
-    }
-  }
-
-  private addOperatorWithoutTrace(operator: string): void {
-    this.operatorCount += 1;
-    this.weight += 1;
-    if (
-      this.weight >= 1_000 ||
-      (this.weight >= 995 && (operator === "Q" || operator === "ET"))
-    ) {
-      this.weight = 0;
-      this.fontDependencies.clear();
-    }
-  }
-}
-
-class PdfJsOperatorCountTraceBuilder {
-  private readonly genericRuns: number[] = [0];
-
-  private readonly semanticEvents: number[] = [];
-
-  private readonly fontDependencyKeys: string[] = [];
-
-  private readonly fontDependencyIndices = new Map<string, number>();
-
-  private finishedTrace: DensePdfOperatorCountTrace | null = null;
-
-  addGenericOperators(count: number): void {
-    if (!Number.isSafeInteger(count) || count < 0) {
-      throw new DensePdfSyntaxError("Operator trace received an invalid generic run length.");
-    }
-    const index = this.genericRuns.length - 1;
-    const combined = this.genericRuns[index] + count;
-    if (combined > 0xffff_ffff) {
-      throw new DensePdfUnsupportedError(
-        "A Form XObject operator run exceeds the dense compiler's trace limit."
-      );
-    }
-    this.genericRuns[index] = combined;
-  }
-
-  addEarlyFlushOperator(): void {
-    this.reserveSemanticEvent();
-    this.semanticEvents.push(0);
-    this.genericRuns.push(0);
-  }
-
-  addFontDependency(dependencyKey: string): void {
-    this.reserveSemanticEvent();
-    let index = this.fontDependencyIndices.get(dependencyKey);
-    if (index === undefined) {
-      index = this.fontDependencyKeys.length;
-      this.fontDependencyKeys.push(dependencyKey);
-      this.fontDependencyIndices.set(dependencyKey, index);
-    }
-    this.semanticEvents.push(index + 1);
-    this.genericRuns.push(0);
-  }
-
-  finish(): DensePdfOperatorCountTrace {
-    if (!this.finishedTrace) {
-      this.finishedTrace = Object.freeze({
-        genericRuns: Uint32Array.from(this.genericRuns),
-        semanticEvents: Uint32Array.from(this.semanticEvents),
-        fontDependencyKeys: Object.freeze([...this.fontDependencyKeys])
-      });
-    }
-    return this.finishedTrace;
-  }
-
-  private reserveSemanticEvent(): void {
-    if (this.semanticEvents.length >= MAX_OPERATOR_TRACE_SEMANTIC_EVENTS) {
-      throw new DensePdfUnsupportedError(
-        `A Form XObject operator trace exceeds the ${MAX_OPERATOR_TRACE_SEMANTIC_EVENTS.toLocaleString()}-event safety limit.`
-      );
-    }
-  }
-}
-
 function assertValidTextFormSummary(
   summary: DensePdfTextFormSummary,
   resourceName: string
@@ -2118,64 +1887,17 @@ function assertValidTextFormSummary(
       `Form XObject /${resourceName} has an invalid dependencyKey.`
     );
   }
-  for (const [label, value] of [
-    ["operatorCount", summary.operatorCount],
-    ["dependencyOpCount", summary.dependencyOpCount],
-    ["textShowOpCount", summary.textShowOpCount]
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new DensePdfSyntaxError(
-        `Form XObject /${resourceName} has an invalid ${label}.`
-      );
-    }
-  }
-  if (summary.dependencyOpCount > summary.operatorCount) {
+  if (!Number.isSafeInteger(summary.textShowOpCount) || summary.textShowOpCount < 0) {
     throw new DensePdfSyntaxError(
-      `Form XObject /${resourceName} has more dependencies than operators.`
+      `Form XObject /${resourceName} has an invalid textShowOpCount.`
     );
   }
-  if (
-    !Array.isArray(summary.dependencyKeys) ||
-    summary.dependencyKeys.some((key) => typeof key !== "string" || key.length === 0) ||
-    summary.dependencyKeys.length !== summary.dependencyOpCount
-  ) {
-    throw new DensePdfSyntaxError(
-      `Form XObject /${resourceName} has invalid dependency identities.`
-    );
-  }
-  assertValidOperatorCountTrace(summary.operatorCountTrace, resourceName);
   assertValidBounds(summary.bbox, `Form XObject /${resourceName} BBox`);
   assertFiniteMatrix(summary.matrix);
   if (typeof summary.hasNonTextPaint !== "boolean") {
     throw new DensePdfSyntaxError(
       `Form XObject /${resourceName} has an invalid paint classification.`
     );
-  }
-}
-
-function assertValidOperatorCountTrace(
-  trace: DensePdfOperatorCountTrace,
-  resourceName: string
-): void {
-  if (
-    !trace ||
-    !(trace.genericRuns instanceof Uint32Array) ||
-    !(trace.semanticEvents instanceof Uint32Array) ||
-    trace.semanticEvents.length > MAX_OPERATOR_TRACE_SEMANTIC_EVENTS ||
-    trace.genericRuns.length !== trace.semanticEvents.length + 1 ||
-    !Array.isArray(trace.fontDependencyKeys) ||
-    trace.fontDependencyKeys.some((key) => typeof key !== "string" || key.length === 0)
-  ) {
-    throw new DensePdfSyntaxError(
-      `Form XObject /${resourceName} has an invalid operator-count trace.`
-    );
-  }
-  for (const event of trace.semanticEvents) {
-    if (event > trace.fontDependencyKeys.length) {
-      throw new DensePdfSyntaxError(
-        `Form XObject /${resourceName} has an invalid operator-count trace event.`
-      );
-    }
   }
 }
 
@@ -4329,9 +4051,9 @@ interface RectangleClipSubpath {
 }
 
 /**
- * Mirrors the one non-AABB W* case handled by the generic PDF.js extractor.
- * Every other even-odd path is reduced there to its transformed bounds, which
- * is also the representation used by the dense compiler.
+ * Recognizes the one non-AABB W* case the former PDF.js extractor handled.
+ * Every other even-odd clip path is reduced to its transformed bounds, as it
+ * was there.
  */
 function extractSimpleEvenOddRectangleClipMask(
   pathData: Float32Array,

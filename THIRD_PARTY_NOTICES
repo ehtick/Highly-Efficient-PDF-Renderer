@@ -1,9 +1,8 @@
 HEPR third-party notices
 ========================
 
-This file covers third-party material shipped in the published package. The
-private differential oracle and development-only dependencies are not part of
-the package.
+This file covers third-party material shipped in the published package.
+Development-only dependencies are not part of the package.
 
 PDF.js DeviceCMYK fallback
 --------------------------

@@ -9,7 +9,6 @@ import type {
   DensePdfPreflightOptions,
   DensePdfPreflightResult,
   DensePdfPreflightTiming,
-  DensePdfResourceDependency,
   DensePdfSelectedPage
 } from "./densePdfDocumentTypes";
 import {
@@ -116,7 +115,6 @@ interface NativeDenseFormNode {
   readonly availableExtGStates: readonly string[];
   readonly extGStates: readonly DensePdfExtGState[];
   readonly alwaysVisibleOptionalContentProperties: readonly string[];
-  readonly fontDependencies: readonly DensePdfResourceDependency[];
   readonly nestedXObjects: Map<string, NativeDenseNestedFormResolution>;
   decodeActive: boolean;
 }
@@ -182,8 +180,7 @@ const nativeDensePagesBySource = new WeakMap<NativePdfDocument, readonly NativeD
  * It covers the hot CAD pages that use fonts, marked-content properties, and
  * simple ExtGStates while preserving the exact public DensePdfDocument
  * contract.
- * Unsupported documents remain eligible for the established backend until
- * the native adapter has passed its differential and timing gates.
+ * Unsupported documents fall back to the established backend.
  *
  * @internal
  */
@@ -354,6 +351,7 @@ async function inspectSelectedPage(
     : await document.resolveDictionary(sourcePage.resources);
   await validatePageResources(document, resources, sourcePageIndex);
   const fonts = await resolveResourceDictionary(document, resources, "Font", sourcePageIndex);
+  await assertFontResourceDictionaries(document, fonts, sourcePageIndex);
   const properties = await resolveResourceDictionary(
     document,
     resources,
@@ -431,7 +429,6 @@ async function inspectSelectedPage(
     availableExtGStates: Object.freeze(sortedResourceNames(extGStateDictionary)),
     extGStates,
     alwaysVisibleOptionalContentProperties,
-    fontDependencies: await readResourceDependencies(document, fonts, sourcePageIndex),
     formXObjects: Object.freeze(forms.map(({ publicForm }) => publicForm)),
     get decodeTiming(): DensePdfDecodeTiming {
       return { ...decodeTiming };
@@ -703,6 +700,7 @@ async function inspectFormNode(
     "Font",
     sourcePageIndex
   );
+  await assertFontResourceDictionaries(document, fonts, sourcePageIndex);
   const properties = await resolveResourceDictionary(
     document,
     resources,
@@ -743,12 +741,6 @@ async function inspectFormNode(
     availableExtGStates: Object.freeze(sortedResourceNames(extGStateDictionary)),
     extGStates,
     alwaysVisibleOptionalContentProperties,
-    fontDependencies: await readResourceDependencies(
-      document,
-      fonts,
-      sourcePageIndex,
-      `direct-form-resource:${sourcePageIndex}:${resourceName}`
-    ),
     nestedXObjects: new Map(),
     decodeActive: false
   };
@@ -807,7 +799,6 @@ function createPrivateForm(
     availableExtGStates: node.availableExtGStates,
     extGStates: node.extGStates,
     alwaysVisibleOptionalContentProperties: node.alwaysVisibleOptionalContentProperties,
-    fontDependencies: node.fontDependencies,
     resolveFormXObject(rawResourceName: string): DensePdfFormXObject | null {
       return resolveNestedForm(rawResourceName)?.publicForm ?? null;
     },
@@ -1137,7 +1128,7 @@ async function inspectSupportedExtGStates(
     let fillAlpha: number | undefined;
     let alphaIsShape: boolean | undefined;
     let softMaskIndex: null | undefined;
-    let emitsPdfJsOperator = false;
+    let changesPaintState = false;
     for (const [key, rawValue] of state) {
       const value = await document.resolveValue(rawValue);
       if (key === "Type") {
@@ -1157,9 +1148,9 @@ async function inspectSupportedExtGStates(
         );
       }
       if (key === "SA") {
-        // Match the pinned PDF.js oracle: automatic stroke adjustment is not
-        // applied by the legacy VectorScene path, but malformed values remain
-        // a structural error rather than being silently coerced.
+        // Like PDF.js and the legacy VectorScene path, automatic stroke
+        // adjustment is not applied, but malformed values remain a
+        // structural error rather than being silently coerced.
         if (typeof value === "boolean") continue;
         throw unsupportedExtGState(sourcePageIndex, resourceName, "has an invalid /SA value");
       }
@@ -1175,7 +1166,7 @@ async function inspectSupportedExtGStates(
       }
       if (key === "BM") {
         if (isPdfName(value, "Normal")) {
-          emitsPdfJsOperator = true;
+          changesPaintState = true;
           continue;
         }
         throw unsupportedExtGState(sourcePageIndex, resourceName, "uses a blend mode other than /Normal");
@@ -1190,7 +1181,7 @@ async function inspectSupportedExtGStates(
         }
         if (key === "CA") strokeAlpha = value;
         else fillAlpha = value;
-        emitsPdfJsOperator = true;
+        changesPaintState = true;
         continue;
       }
       if (key === "AIS") {
@@ -1202,13 +1193,13 @@ async function inspectSupportedExtGStates(
           );
         }
         alphaIsShape = value;
-        emitsPdfJsOperator = true;
+        changesPaintState = true;
         continue;
       }
       if (key === "SMask") {
         if (isPdfName(value, "None")) {
           softMaskIndex = null;
-          emitsPdfJsOperator = true;
+          changesPaintState = true;
           continue;
         }
         throw unsupportedExtGState(
@@ -1225,7 +1216,7 @@ async function inspectSupportedExtGStates(
       ...(fillAlpha === undefined ? {} : { fillAlpha }),
       ...(alphaIsShape === undefined ? {} : { alphaIsShape }),
       ...(softMaskIndex === undefined ? {} : { softMaskIndex }),
-      emitsPdfJsOperator
+      changesPaintState
     }));
   }
   supported.sort((left, right) => left.resourceName.localeCompare(right.resourceName));
@@ -1461,31 +1452,19 @@ function validateSingleDecodeParameters(
   }
 }
 
-async function readResourceDependencies(
+async function assertFontResourceDictionaries(
   document: NativePdfDocument,
   dictionary: PdfDictionary | null,
-  sourcePageIndex: number,
-  directIdentityPrefix = `direct-resource:${sourcePageIndex}`
-): Promise<readonly DensePdfResourceDependency[]> {
-  const dependencies: DensePdfResourceDependency[] = [];
-  let directIndex = 0;
+  sourcePageIndex: number
+): Promise<void> {
   for (const [resourceName, rawValue] of dictionary ?? []) {
-    const resolved = await document.resolveValue(rawValue);
-    if (!isPdfDictionary(resolved)) {
+    if (!isPdfDictionary(await document.resolveValue(rawValue))) {
       throw invalidPageStructure(
         sourcePageIndex,
         `Font resource /${resourceName} has an invalid value.`
       );
     }
-    dependencies.push(Object.freeze({
-      resourceName,
-      dependencyKey: isPdfRef(rawValue)
-        ? `${rawValue.objectNumber} ${rawValue.generation} R`
-        : `${directIdentityPrefix}:${resourceName}:${directIndex++}`
-    }));
   }
-  dependencies.sort((left, right) => left.resourceName.localeCompare(right.resourceName));
-  return Object.freeze(dependencies);
 }
 
 function readPageBox(

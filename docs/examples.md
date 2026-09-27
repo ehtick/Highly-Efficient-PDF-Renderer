@@ -341,4 +341,4 @@ try {
 }
 ```
 
-`pageIndexes` contains zero-based positions in the composed scene. Polygons and areas use scene coordinates and squared scene units, so real-world measurements require a drawing scale. Browser detection requires Web Workers; pass `signal` to cancel it. HEP inputs use their searchable text index for labels. This detector does not require training the separate [ML project](../ml/room-detection/README.md).
+`pageIndexes` contains zero-based positions in the composed scene. Polygons and areas use scene coordinates and squared scene units, so real-world measurements require a drawing scale. Browser detection requires Web Workers; pass `signal` to cancel it. HEP inputs use their searchable text index for labels. This deterministic detector requires no trained models or machine-learning runtime.

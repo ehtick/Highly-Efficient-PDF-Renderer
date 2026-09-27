@@ -21,18 +21,8 @@ package-lock.json
 /pdf-tsv/
 /public/pdf-tsv/
 
-# Keep room-detection source, tests, model manifest, and browser runtime assets
-# trackable; ignore local training byproducts and generated dataset manifests.
-/ml/*
-!/ml/
-!/ml/room-detection/
-!/ml/room-detection/**
-/ml/room-detection/.venv/
-/ml/room-detection/runs/
-/ml/room-detection/data/
-/ml/room-detection/*splits.json
-/ml/room-detection/**/__pycache__/
-/ml/room-detection/**/*.pyc
+# Retired ML experiment artifacts and cached room-evaluation inputs stay local.
+/ml/
 
 # Room-detection eval/debug outputs stay local.
 /.eval/

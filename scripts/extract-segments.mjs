@@ -1,7 +1,7 @@
-// Headless segment dump for the vector-native room-detection pipeline.
+// Headless segment dump for deterministic room-detector evaluation.
 //
 // Walks the pdf-tsv corpus, runs src/pdfVectorExtractor.ts on page 1 of every PDF
-// (same code path the browser demo uses, so training data matches inference exactly)
+// (same code path the browser demo uses, so cached geometry matches live extraction)
 // and writes one gzipped JSON per PDF with stroke segments, fill-outline segments and
 // the PDF-user-space -> scene-space matrix needed to map TSV ground truth.
 //

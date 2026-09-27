@@ -95,6 +95,16 @@ Local artifacts from this review:
 
 ## Regression checks
 
+The detector and its Node.js evaluation tools require no trained models or Python
+environment. The former ML training/export project and browser ONNX runtime assets
+have been removed. `scripts/extract-segments.mjs`, `scripts/eval-rooms.mjs`, and
+`scripts/score-rooms.mjs` retain the historical cache location
+`ml/room-detection/data/vector-segments` so existing local dumps remain usable.
+Optional text-label sidecars remain under `ml/room-detection/data/text-labels`;
+`--split` filtering uses an existing local `ml/room-detection/vector-splits.json`.
+These ignored data files are not shipped. Standalone `--pdf` and `--hep` evaluation
+does not require these caches or split manifests.
+
 The fast suite now includes focused Node-only checks for exact contour area and
 pixel ownership, rotated and oblique geometry, supported corners, shared-frontier
 cleanup, preservation of small rooms, annotation ownership, rotated text, and

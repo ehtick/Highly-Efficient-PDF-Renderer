@@ -177,10 +177,13 @@ interface PaintResult<Surface> {
  * contributes nothing to any composite channel. `selected`, when given, is the
  * caller's per-run-index view culling: it drops those paints exactly as the
  * non-compositing path already does. Retained raster nodes carry no run index
- * and are always kept.
+ * and are always kept. `reuseBackdrop` permits painting into a private scratch
+ * backdrop: the caller still owns it on failure, and the returned surface may
+ * alias it on success. Other callers retain the non-mutating copy behavior.
  */
 export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>,
-  backdrop: Surface, visible: (condition?: number) => boolean, selected: Uint8Array | null = null): Surface {
+  backdrop: Surface, visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
+  reuseBackdrop = false): Surface {
   const stats = (globalThis as { HEPR_DEBUG_COMPOSITE_STATS?: boolean }).HEPR_DEBUG_COMPOSITE_STATS === true
     ? { clears: 0, copies: 0, passes: 0, spans: 0, runs: 0, folds: 0, live: 0, peak: 0 } : null;
   if (stats) adapter = compositeStatsAdapter(adapter, stats);
@@ -532,7 +535,9 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     // knocks out, so its paints land on the backdrop exactly as compositing the
     // whole root as one layer would. Accumulating straight into a copy of the
     // backdrop saves a surface, a clear and two full-surface passes per span.
-    const result = accumulate(normalizeScenePaintGraph(scene), copy(backdrop), 0);
+    // Backend-owned scratch backdrops can be painted in place. The caller
+    // retains ownership on failure and must release an aliased result only once.
+    const result = accumulate(normalizeScenePaintGraph(scene), reuseBackdrop ? backdrop : copy(backdrop), 0);
     // Transfer only the result's ownership to the caller.
     owned.delete(result);
     return result;

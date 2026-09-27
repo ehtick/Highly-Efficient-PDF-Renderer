@@ -31,7 +31,7 @@ try {
   render.foldedContent = 0;
   render.maskPaints = false;
   render.maskPaintFolds = 0;
-  function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null) {
+  function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null, reuseBackdrop = false) {
     const alive = new Set(); let draws=0;
     render.spans=[]; render.passes=0; render.surfaces=0; render.folds=0;
     const zero = [0,0,0,0], one = [1,1,1,1];
@@ -91,10 +91,17 @@ try {
       } : {})
     };
     const scene={paintGraph:{roots},drawRuns:paints.map((p,i)=>({kind:"fill",first:i,count:1,blendMode:p.blendMode,optionalContent:p.condition}))};
+    const initial = { pixel: [...backdrop] };
+    if (reuseBackdrop) alive.add(initial);
     try {
-      const result=compositeScenePaintGraph(scene,adapter,{pixel:backdrop},visible,selected);
+      const result=compositeScenePaintGraph(scene,adapter,initial,visible,selected,reuseBackdrop);
+      if (reuseBackdrop) assert.equal(result, initial, "the root returns its borrowed scratch backdrop");
+      else close(initial.pixel, backdrop, 0.000000001);
       const pixel=[...result.pixel]; adapter.release(result); assert.equal(alive.size,0); return pixel;
-    } catch(error) { assert.equal(alive.size,0,"failed frame releases transient resources"); throw error; }
+    } catch(error) {
+      if (reuseBackdrop) adapter.release(initial);
+      assert.equal(alive.size,0,"failed frame releases transient resources"); throw error;
+    }
   }
   const d=i=>({kind:"draw",runIndex:i});
   const g=(children,extra={})=>({kind:"group",children,alpha:1,isolated:true,knockout:false,blendMode:"Normal",...extra});
@@ -302,14 +309,18 @@ try {
     const visible = random() < 0.2 ? id => id !== 0 : () => true;
     render.blending = random() < 0.5;
     const expected = render(roots, paints, backdrop, visible);
+    close(render(roots, paints, backdrop, visible, -1, null, true), expected, 1e-9);
     render.folding = true;
     close(render(roots, paints, backdrop, visible), expected, 1e-9);
     folded += render.folds;
     render.maskPaints = true;
     close(render(roots, paints, backdrop, visible), expected, 1e-9);
+    close(render(roots, paints, backdrop, visible, -1, null, true), expected, 1e-9);
     render.maskPaints = false;
     render.folding = false;
   }
+  assert.throws(() => render([g([d(0), d(1)], { knockout: true })], [red, blue],
+    [1, 1, 1, 1], () => true, 1, null, true), /synthetic GPU failure/);
   assert(folded > 300, `randomized graphs exercise folding (${folded} folded paints)`);
   assert(render.foldedContent > 50, `and folds converting their mask's content (${render.foldedContent})`);
   assert(render.maskPaintFolds > 50, `and folds computing a one-paint mask (${render.maskPaintFolds})`);

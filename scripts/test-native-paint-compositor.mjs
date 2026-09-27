@@ -10,6 +10,7 @@ try {
   const { WebGpuPaintCompositor, beginPdfManagedRenderPass } = await import("../src/webGpuPaintCompositor.ts");
   const { WebGpuPaintFolds } = await import("../src/webGpuPaintFold.ts");
   const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
+  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
   const { pdfShapeCoverageWgsl } = await import("../src/pdfShapeCoverage.ts");
@@ -145,6 +146,91 @@ try {
       "before the mask pass reads it");
   }
 
+  // Consecutive writes share an attachment, but copies and pooled texture
+  // clears finish the pass first. A bounded composite cannot clip the next span.
+  {
+    const batch = new WebGpuPaintCompositor(device, "rgba8unorm"), log = makeEncoder();
+    Object.assign(batch, { encoder: log, width: 6, height: 6, viewportWidth: 6, viewportHeight: 6,
+      project: box => ({ x: box.minX, y: box.minY, width: box.maxX - box.minX, height: box.maxY - box.minY }),
+      drawSpan: (_runs, pass) => pass.draw(3), folding: { draw: (_run, pass) => pass.draw(3) } });
+    const destination = batch.acquire(), source = batch.acquire(), copied = batch.acquire();
+    batch.clear(source); batch.draw(scene.drawRuns, source, false);
+    batch.clear(destination); batch.draw(scene.drawRuns, destination, false);
+    batch.drawFolded(scene.drawRuns[0], destination, 0.5, undefined);
+    batch.pass({ operation: 6, source, blend: true, bounds: { minX: 1, minY: 2, maxX: 3, maxY: 4 } }, destination);
+    batch.draw(scene.drawRuns, destination, false);
+    assert.equal(log.passes.length, 2, "four consecutive destination operations share one pass");
+    assert.deepEqual(log.passes[1].scissors, [[0, 0, 6, 6], [0, 0, 6, 6], [0, 0, 5, 6], [0, 0, 6, 6]],
+      "the span following a bounded composite resets the scissor");
+    batch.copy(destination, copied);
+    batch.draw(scene.drawRuns, destination, false);
+    assert.equal(log.passes.length, 3, "a copy breaks the batch");
+    batch.clear(source); // It was sampled by an earlier pass and may now be reused.
+    batch.draw(scene.drawRuns, source, false);
+    batch.endPass(); log.finish(); batch.dispose();
+  }
+
+  // A gradient soft mask can be computed by the folded paint itself. Transfer
+  // functions, curved boundaries and renderer overrides keep the surface path.
+  {
+    const f = values => Float32Array.from(values);
+    const analytic = { ...masked,
+      drawRuns: [scene.drawRuns[0], { kind: "gradient-fill", first: 0, count: 1 }],
+      gradientCount: 1, gradientMetaA: f([0, 0, 3, 0]), gradientMetaB: f([1, 0, 0, 1]),
+      gradientMetaC: f([0, 0, 0, 0]), gradientMetaD: f([6, 0, 0, 0]), gradientMetaE: f([0, 0, 6, 6]),
+      gradientFillPathMetaA: f([0, 4, 0, 0]), gradientFillPathMetaC: f([0, 0, 0, 1]),
+      gradientFillPaintMeta: f([0, -1, 0, 0]),
+      gradientFillSegmentsA: f([0, 0, 0, 0, 6, 0, 6, 0, 6, 6, 6, 6, 0, 6, 0, 6]),
+      gradientFillSegmentsB: f([6, 0, 0, 0, 6, 6, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0]),
+      paintGraph: { roots: [{ ...masked.paintGraph.roots[0],
+        softMask: { subtype: "Alpha", children: [{ kind: "draw", runIndex: 1 }] } }] } };
+    const project = box => ({ x: box.minX, y: box.minY, width: box.maxX - box.minX, height: box.maxY - box.minY });
+    for (const mode of ["computed", "override", "transfer", "curved"]) {
+      const graph = mode === "transfer" ? { ...analytic, paintGraph: { roots: [{ ...analytic.paintGraph.roots[0],
+        softMask: { ...analytic.paintGraph.roots[0].softMask, transfer } }] } }
+        : mode === "curved" ? { ...analytic, gradientFillSegmentsB: analytic.gradientFillSegmentsB.slice() } : analytic;
+      if (mode === "curved") graph.gradientFillSegmentsB[2] = 1;
+      const log = makeEncoder(), parentPass = beginPdfManagedRenderPass(log,
+        { colorAttachments: [{ view: target.createView(), loadOp: "load", storeOp: "store" }] });
+      draws.length = 0;
+      let actual;
+      compositor.render(graph, parentPass, 6, 6, draw, () => true, null, project, {
+        canFold: run => run.kind === "fill", canFoldMaskPaint: () => mode !== "override",
+        draw(run, pass, opacity, mask, content, gradient) { actual = { mask, gradient }; pass.draw(3); }
+      });
+      assert.equal(!!actual.gradient, mode === "computed", mode);
+      assert.equal(actual.mask === null, mode === "computed", mode);
+      assert.equal(draws.length, mode === "computed" ? 0 : 1, `${mode}: mask paint submissions`);
+      assert.equal(new Set(compositor.pool).size, compositor.pool.length, "backdrop/result aliases return to the pool once");
+      parentPass.end(); log.finish();
+      // Both adapters use the same eligibility, with backend-specific Y direction.
+      const gl = Object.create(WebGlPaintCompositor.prototype);
+      Object.assign(gl, { scene: graph, folding: { canFoldMaskPaint: () => mode !== "override" }, project,
+        width: 6, height: 6, viewportWidth: 6, viewportHeight: 6 });
+      if (mode !== "transfer") assert.equal(gl.canFoldMaskPaint(graph.drawRuns[0], graph.drawRuns[1]), mode === "computed");
+    }
+  }
+
+  // Native GL binds the LUT and gradient parameters only for the computed
+  // mask, then restores neutral opacity when the next ordinary paint draws.
+  {
+    const values = new Map(), textures = [];
+    const renderer = Object.create(WebGlFloorplanRenderer.prototype);
+    Object.assign(renderer, { paintFoldUnit: 27, paintFoldUniforms: new Map(), gl: {
+      TEXTURE0: 0, TEXTURE_2D: 1, activeTexture() {}, bindTexture(_kind, texture) { textures.push(texture); },
+      getUniformLocation(_program, name) { return name; },
+      uniform4f(name, ...value) { values.set(name, value); }, uniform4fv(name, value) { values.set(name, [...value]); }
+    } });
+    const program = {}, lut = {}, gradient = Float32Array.from({ length: 60 }, (_, i) => i);
+    renderer.paintFold = { opacity: 0.5, mask: lut, gradient, weights: [0.3, 0.59, 0.11, -1, 1] };
+    renderer.bindPaintFold(program);
+    assert.equal(textures.at(-1), lut);
+    assert.deepEqual(values.get("uPaintFold"), [0.5, 2, 1, 0]);
+    assert.deepEqual(values.get("uPaintMaskGradient"), [...gradient]);
+    renderer.paintFold = null; renderer.bindPaintFold(program);
+    assert.deepEqual(values.get("uPaintFold"), [1, 0, 0, 0], "later paints do not inherit the mask");
+  }
+
   // Fold slots: the neutral fold sits at offset 0, each fold of a frame takes a
   // slot of its own, and an outgrown buffer lives until the next frame.
   {
@@ -154,19 +240,24 @@ try {
     folds.beginFrame();
     folds.bind(pass, 2);
     assert.deepEqual(bound.at(-1).offsets, [0], "unfolded draws bind the neutral slot");
-    assert.deepEqual([...writes.find(write => write.values.length === 8).values], [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert.deepEqual([...writes.find(write => write.values.length === 68).values.slice(0, 8)], [1, 0, 0, 0, 0, 0, 0, 0]);
     const maskView = { texture: {} };
     folds.begin(0.25, maskView); folds.bind(pass, 3); folds.end();
     assert.equal(bound.at(-1).index, 3);
-    assert.deepEqual(bound.at(-1).offsets, [256], "the first fold takes slot 1");
+    assert.deepEqual(bound.at(-1).offsets, [512], "the first fold takes slot 1");
     assert.equal(bound.at(-1).group.entries[1].resource, maskView, "the fold binds its mask");
-    assert.equal(bound.at(-1).group.entries[0].resource.size, 32, "each fold binds its opacity and mask weights");
-    assert.deepEqual([...writes.at(-1).values], [0.25, 1, 0, 0, 1, 0, 0, 0], "a converted mask is read from red");
+    assert.equal(bound.at(-1).group.entries[0].resource.size, 272, "each fold binds its opacity and mask weights");
+    assert.deepEqual([...writes.at(-1).values.slice(0, 8)], [0.25, 1, 0, 0, 1, 0, 0, 0], "a converted mask is read from red");
     // Unconverted luminosity content over a white backdrop: lum(rgb) - a + 1.
     folds.begin(0.5, maskView, { subtype: "Luminosity", backdrop: [1, 1, 1], children: [] }); folds.end();
-    assert.deepEqual([...writes.at(-1).values], [...Float32Array.of(0.5, 1, 1, 0, 0.3, 0.59, 0.11, -1)]);
+    assert.deepEqual([...writes.at(-1).values.slice(0, 8)], [...Float32Array.of(0.5, 1, 1, 0, 0.3, 0.59, 0.11, -1)]);
     folds.bind(pass, 2);
     assert.deepEqual(bound.at(-1).offsets, [0], "a fold ends with its draw");
+    const gradient = Float32Array.from({ length: 60 }, (_, index) => index / 60);
+    folds.begin(0.75, maskView, { subtype: "Alpha", children: [] }, gradient); folds.bind(pass, 2); folds.end();
+    assert.equal(writes.at(-1).values[1], 2, "gradient masks select the analytic shader branch");
+    assert.deepEqual(writes.at(-1).values.slice(8), gradient, "mask vectors travel with this fold's uniform slot");
+    assert.equal(bound.at(-1).offsets[0] % 256, 0, "the larger fold stays aligned");
     const first = bound.at(-1).group.entries[0].resource.buffer;
     for (let fold = 0; fold < 64; fold++) { folds.begin(1, null); folds.end(); }
     folds.bind(pass, 2);
@@ -212,16 +303,18 @@ try {
 
 function makeEncoder() {
   let active = false;
-  const resources = new Set();
+  const resources = new Set(), passes = [];
   return {
+    passes,
     beginRenderPass(descriptor) {
       assert.equal(active, false, "render passes cannot overlap"); active = true;
       for (const attachment of descriptor.colorAttachments) resources.add(attachment.view.texture);
-      let ended = false;
+      const entry = { descriptor, scissors: [] }; passes.push(entry);
+      let scissor = null, ended = false;
       return {
-        setPipeline() {},
+        setPipeline() {}, setScissorRect(...rect) { scissor = rect; },
         setBindGroup(_index, group) { for (const entry of group.entries) if (entry.resource.texture) resources.add(entry.resource.texture); },
-        draw() { assert(!ended); },
+        draw() { assert(!ended); entry.scissors.push(scissor); },
         end() { assert(!ended); ended = true; active = false; }
       };
     },

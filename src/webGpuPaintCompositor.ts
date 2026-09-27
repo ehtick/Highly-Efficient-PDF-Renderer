@@ -1,3 +1,4 @@
+import { nativeGradientMaskVectors } from "./gradientMaskFold";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
@@ -16,11 +17,13 @@ interface ManagedPass { encoder: any; descriptor: any; pause(): void; resume(): 
  */
 export interface WebGpuPaintFolding {
   canFold(run: VectorDrawRun): boolean;
+  canFoldMaskPaint?(run: VectorDrawRun, maskRun: VectorDrawRun): boolean;
   /**
    * `mask` is the mask surface's view, or null. `content` is the soft mask
    * whose rendered content that surface holds, when it was not converted first.
+   * With `gradient`, compute the mask using these vectors and the renderer's LUT.
    */
-  draw(run: VectorDrawRun, pass: any, opacity: number, mask: any, content?: ScenePaintMask): void;
+  draw(run: VectorDrawRun, pass: any, opacity: number, mask: any, content?: ScenePaintMask, gradient?: Float32Array): void;
 }
 const managedPasses = new WeakMap<object, ManagedPass>();
 
@@ -62,7 +65,10 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   private height = 0;
   private approximationReported = false;
   private encoder: any;
+  private activePass: { target: Surface; pass: any } | null = null;
   private drawSpan: ((runs: readonly VectorDrawRun[], pass: any, shapeOnly: boolean) => void) | null = null;
+  private scene: VectorScene | null = null;
+  private gradientMask: Float32Array | null = null;
   private folding: WebGpuPaintFolding | null = null;
   /**
    * Clears not yet encoded. A clear is its own render pass only when a surface
@@ -128,6 +134,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     }
     this.width = size.width; this.height = size.height;
     this.encoder = info.encoder; this.drawSpan = draw; this.folding = folding;
+    this.scene = scene;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     info.pause();
     let backdrop: Surface | null = null, result: Surface | null = null;
@@ -135,19 +142,21 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     try {
       backdrop = this.acquire();
       this.pass({ operation: 5, source: { view: info.descriptor.colorAttachments[0].view, texture: null } }, backdrop);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
+      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true);
       this.flushClears([result]);
+      this.endPass();
       const pass = info.resume();
       resumed = true;
       this.encode({ operation: 5, source: result }, pass, width, height);
     } catch (error) {
+      this.endPass();
       if (!resumed) info.resume();
       throw error;
     } finally {
-      if (result) this.release(result); if (backdrop) this.release(backdrop);
+      if (result) this.release(result); if (backdrop && backdrop !== result) this.release(backdrop);
       // Nothing reads an unused surface's content, and the next lease clears it.
       this.pendingClears.clear();
-      this.drawSpan = null; this.folding = null; this.encoder = null; this.project = null;
+      this.drawSpan = null; this.folding = null; this.scene = null; this.gradientMask = null; this.encoder = null; this.project = null;
     }
   }
   acquire(): Surface {
@@ -161,9 +170,12 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   }
   release(surface: Surface): void { this.pendingClears.delete(surface); this.pool.push(surface); }
   clear(surface: Surface, color: readonly [number, number, number, number] = [0, 0, 0, 0]): void {
+    // A new lease can reuse a texture read or written by the open pass.
+    this.endPass();
     this.pendingClears.set(surface, { r: color[0], g: color[1], b: color[2], a: color[3] });
   }
   copy(source: Surface, destination: Surface, bounds?: Bounds): void {
+    this.endPass();
     const rect = this.scissor(bounds);
     this.flushClears([source]);
     // A whole-surface copy replaces a pending clear; a partial one keeps the
@@ -191,33 +203,33 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void {
     if (runs.length === 0) return;
     // A whole span shares one render pass; source order is the call order.
-    const pass = this.encoder.beginRenderPass({ label: "span", colorAttachments: [this.attachment(destination)] });
-    try { this.drawSpan!(runs, pass, shapeOnly); } finally { pass.end(); }
+    const pass = this.renderPass(destination, "span");
+    this.drawSpan!(runs, pass, shapeOnly);
   }
   canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
+  canFoldMaskPaint(run: VectorDrawRun, maskRun: VectorDrawRun): boolean {
+    this.gradientMask = null;
+    if (!this.scene || !this.folding?.canFoldMaskPaint?.(run, maskRun)) return false;
+    this.gradientMask = nativeGradientMaskVectors(this.scene, maskRun, run.clipIndex, this.project,
+      this.width, this.height, this.viewportWidth, this.viewportHeight, true);
+    return this.gradientMask !== null;
+  }
   drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined,
-    content?: ScenePaintMask): void {
+    content?: ScenePaintMask, maskRun?: VectorDrawRun): void {
     if (mask) this.flushClears([mask]);
-    const pass = this.encoder.beginRenderPass({ label: "fold", colorAttachments: [this.attachment(destination)] });
-    try { this.folding!.draw(run, pass, opacity, mask?.view ?? null, content); } finally { pass.end(); }
+    const pass = this.renderPass(destination, "fold");
+    this.folding!.draw(run, pass, opacity, mask?.view ?? null, content, maskRun ? this.gradientMask! : undefined);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const rect = this.scissor(operation.bounds);
     if (rect && (rect.width === 0 || rect.height === 0)) return;
     this.flushClears([operation.source, operation.shape, operation.current, operation.stats, operation.initial,
       operation.mask].filter(surface => surface !== undefined && surface !== destination) as Surface[]);
-    // Loading rather than clearing keeps everything outside the rectangle, which
-    // the operation has established is already correct in the destination. A
-    // whole-surface pass that does not blend replaces it, pending clear or not.
-    const pending = this.pendingClears.get(destination);
-    this.pendingClears.delete(destination);
-    const pass = this.encoder.beginRenderPass({ label: `composite:${PASS_NAMES[operation.operation]}`,
-      colorAttachments: [{ view: destination.view, loadOp: pending || !(rect || operation.blend) ? "clear" : "load", storeOp: "store",
-      clearValue: pending ?? [0, 0, 0, 0] }] });
-    try {
-      if (rect) pass.setScissorRect(rect.x, this.height - rect.y - rect.height, rect.width, rect.height);
-      this.encode(operation, pass);
-    } finally { pass.end(); }
+    // Preserve pixels outside a bounded operation. A pending clear is consumed
+    // when the attachment opens; full-surface replacement draws need no new clear.
+    const pass = this.renderPass(destination, `composite:${PASS_NAMES[operation.operation]}`);
+    if (rect) pass.setScissorRect(rect.x, this.height - rect.y - rect.height, rect.width, rect.height);
+    this.encode(operation, pass);
   }
   dispose(): void {
     this.releaseSurfaces(); this.zero.texture.destroy(); this.one.texture.destroy();
@@ -231,11 +243,28 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     this.pendingClears.delete(destination);
     return { view: destination.view, loadOp: "clear", storeOp: "store", clearValue: pending };
   }
+  /** Only consecutive writes to one attachment share a pass. Copies, clears,
+   * target changes and presentation finish it before dependent work begins. */
+  private renderPass(target: Surface, label: string): any {
+    if (this.activePass?.target !== target) this.endPass();
+    if (!this.activePass) this.activePass = { target,
+      pass: this.encoder.beginRenderPass({ label, colorAttachments: [this.attachment(target)] }) };
+    const pass = this.activePass.pass;
+    // Composite operations may have left a bounded scissor on the same pass.
+    pass.setScissorRect(0, 0, this.width, this.height);
+    return pass;
+  }
+  private endPass(): void {
+    const active = this.activePass;
+    this.activePass = null;
+    active?.pass.end();
+  }
   /** Encodes the pending clears of surfaces about to be read. */
   private flushClears(surfaces: readonly Surface[]): void {
     for (const surface of surfaces) {
       const pending = this.pendingClears.get(surface);
       if (!pending) continue;
+      this.endPass();
       this.pendingClears.delete(surface);
       this.encoder.beginRenderPass({ label: "clear", colorAttachments: [{ view: surface.view, loadOp: "clear",
         storeOp: "store", clearValue: pending }] }).end();

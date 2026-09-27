@@ -174,7 +174,7 @@ try {
     assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
       "the span costs one host render, and without a knockout it renders no shape at all");
     // Normal groups blend directly, and their effects touch only their projected
-    // rectangle. A root copy is still needed, but there is no per-group copy.
+    // rectangle. The root reuses its private backdrop without a copy.
     spanHost.draws.length = 0;
     const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
       width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
@@ -189,7 +189,7 @@ try {
         "small effects do not clear the full framebuffer");
     } else assert.equal(boundedClears.length, 0, "WebGPU keeps its whole-attachment fast clear");
     const effects = spanHost.draws.filter(draw => !draw.ids);
-    assert.equal(effects.length, 2, "one root copy and one direct source-over pass");
+    assert.equal(effects.length, 1, "only the direct source-over pass remains");
     const blended = effects.find(draw => draw.blending === THREE.CustomBlending);
     assert.ok(blended, "group opacity uses the hardware blending pass");
     assert.equal(blended.blendSrc, THREE.OneFactor, "effect output is premultiplied on both backends");
@@ -201,12 +201,12 @@ try {
     assert.ok(maxX - minX < 30 / 160 && maxY - minY < 30 / 120, "a small effect does not shade the full target");
     assert.ok(minY < 0 && maxY < 0, "clip space counts the shared bottom-left rectangle upwards on both backends");
     assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
-    assert.ok(effects.some(draw => draw.rect.join() === "-1,-1,1,1"), "the root copy covers the whole target");
+    assert.ok(effects.every(draw => draw.rect.join() !== "-1,-1,1,1"), "no full-target root copy remains");
     spanHost.draws.length = 0;
     spanHost.clears.length = 0;
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
       bounds => ({ ...boundedProject(bounds), x: 10000 }));
-    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 1, "offscreen effects skip their composite pass");
+    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 0, "offscreen effects skip their composite pass");
     assert.equal(spanHost.clears.length, 1, "offscreen effects skip clears, keeping only the backdrop clear");
     assert.equal(spanHost.clears[0].scissorTest, false, "a pooled scissor cannot restrict the backdrop clear");
 
@@ -604,16 +604,16 @@ async function testFolding(ThreePaintCompositor, backend) {
   assert.deepEqual(threePaintFoldState(fill.mesh.material), neutral, "the fold is restored after drawing");
   // Folding saves the group's surface, its clear and its composite, and the
   // folded draw converts the mask's content, which saves the mask's pass. What
-  // is left is the backdrop copy and the mask content's own surface.
-  assert.equal(counters["three.compositePasses"]?.total, 1, `${backend}: only the copy needs a pass`);
+  // is left is the mask content's own surface; the backdrop is painted in place.
+  assert.equal(counters["three.compositePasses"]?.total ?? 0, 0, `${backend}: neither root nor mask needs a copy pass`);
   assert.equal(counters["three.clears"]?.total, 2, `${backend}: only the backdrop and the mask content are cleared`);
   // A WebGPU clear is a render pass and submission of its own, so it rides on
-  // the next render into its target. The backdrop is read (copied) before
-  // anything renders into it, so its clear alone is encoded by itself.
+  // the next render into its target. Both backdrop and mask now clear as
+  // their paints load, with no standalone clear submission.
   if (backend === "webgpu") {
-    assert.equal(host.clears.length, 1, "webgpu: only the backdrop, read first, clears on its own");
-    assert.equal(counters["three.clearPasses"]?.total, 1);
-    assert.equal(clearingRenders.length, 1, "webgpu: the mask content's clear happens as its draw loads");
+    assert.equal(host.clears.length, 0, "webgpu: no standalone clear remains");
+    assert.equal(counters["three.clearPasses"]?.total ?? 0, 0);
+    assert.equal(clearingRenders.length, 2, "webgpu: both surfaces clear as their draws load");
   } else {
     assert.equal(host.clears.length, 2, "webgl: scissored clears stay separate calls");
     assert.equal(clearingRenders.length, 0);
@@ -629,7 +629,7 @@ async function testFolding(ThreePaintCompositor, backend) {
 
 // Broschuere's fades: a luminosity mask made of one gradient fill over the
 // page. Given the projection, the folded fill computes that mask itself, so the
-// gradient never renders, no mask surface is taken, and the root copy and the
+// gradient never renders, no mask surface is taken, and the backdrop and the
 // folded draw share one host render.
 async function testGradientMaskFolding(ThreePaintCompositor, backend) {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
@@ -691,7 +691,7 @@ async function testGradientMaskFolding(ThreePaintCompositor, backend) {
   assert.ok(folds[0].mask?.image?.width === 1024 && folds[0].mask.image.data[4] === lut[4],
     "the fold reads the gradient's colour table in place of a mask surface");
   assert.ok(folds[0].gradient?.length === 60, "the fold carries the gradient mask's description");
-  assert.equal(host.call, 1, `${backend}: the root copy and the folded draw share one host render`);
+  assert.equal(host.call, 1, `${backend}: the folded draw needs only one host render`);
   assert.equal(counters["three.hostRenders"]?.total, 1);
   assert.equal(threePaintFoldState(fill.mesh.material).masked, false, "the fold is restored after drawing");
   // Without the projection, the mask renders into a surface as before.

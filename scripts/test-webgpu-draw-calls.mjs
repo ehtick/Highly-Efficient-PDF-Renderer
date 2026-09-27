@@ -122,14 +122,15 @@ try {
     assert.equal(frame(), 1, "culled runs issue no commands");
   }
 
-  {
+  for (const blendMode of ["Normal", "Multiply"]) {
     const { renderer, device, frame } = create();
     renderer.scene.drawRuns = [{ kind: "fill", first: 0, count: 5 }];
     renderer.scene.paintGraph = { roots: [{ kind: "group", isolated: true, knockout: false,
-      alpha: 0.5, blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }] }] };
+      alpha: 0.5, blendMode, children: [{ kind: "draw", runIndex: 0 }] }] };
     const count = frame();
     assert(count > 3, "transparency adds intermediate compositor commands beyond the background and fill");
-    assert(device.copies > 0, "exercise copies which are excluded from the draw-call count");
+    assert.equal(device.copies > 0, blendMode === "Multiply",
+      "only Multiply needs a backdrop snapshot; copies remain excluded from the draw-call count");
     assert.equal(frame(), count, "reusing the compositor still reports a fresh frame total");
   }
 
@@ -189,7 +190,7 @@ function makeDevice() {
     createBuffer: () => ({ destroy() {} }),
     createTexture: () => ({ createView() { return { texture: this }; }, destroy() {} }),
     createCommandEncoder: () => ({
-      beginRenderPass: () => ({ setPipeline() {}, setBindGroup() {}, setVertexBuffer() {},
+      beginRenderPass: () => ({ setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, setScissorRect() {},
         draw() { device.draws++; }, end() {} }),
       copyTextureToTexture() { device.copies++; }, finish() { return {}; }
     })

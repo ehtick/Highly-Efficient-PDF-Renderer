@@ -1215,6 +1215,7 @@ export class WebGpuFloorplanRenderer {
   private gradientMetaTextures: any[] = [];
 
   private gradientLutTexture: any = null;
+  private gradientLutView: any = null;
 
   private gradientFillTextures: any[] = [];
 
@@ -3798,9 +3799,12 @@ export class WebGpuFloorplanRenderer {
             // straight onto the surface, scaled by its opacity and soft mask.
             canFold: run => run.count === 1 && this.fillRenderingEnabled && (run.kind === "fill" ||
               (run.kind === "gradient-fill" && !(this.gradientMeshRanges?.[run.first * 2 + 1] ?? 0))),
-            draw: (run, target, opacity, mask, content) => {
+            canFoldMaskPaint: (_run, maskRun) => this.fillRenderingEnabled && this.vectorOverrideOpacity === 0 &&
+              !this.primitiveColors?.gradient("gradient-fill", maskRun.first),
+            draw: (run, target, opacity, mask, content, gradient) => {
               this.performanceProfiler?.add("foldedPaints");
-              this.paintFolds?.begin(opacity, mask, content);
+              if (gradient) this.performanceProfiler?.add("computedMasks");
+              this.paintFolds?.begin(opacity, gradient ? this.gradientLutView : mask, content, gradient);
               pass = target;
               try { draw(run); } finally { this.paintFolds?.end(); }
             }
@@ -4473,6 +4477,7 @@ export class WebGpuFloorplanRenderer {
       this.gradientLutTexture = this.createRgba8DataTexture(1, 1, new Uint8Array(4));
     }
 
+    this.gradientLutView = this.gradientLutTexture.createView();
     this.gradientFillTextures = [
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaA),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaB),
@@ -5067,7 +5072,7 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureB = null;
     this.textRasterAtlasTexture = null;
     this.gradientMetaTextures = [];
-    this.gradientLutTexture = null;
+    this.gradientLutTexture = null; this.gradientLutView = null;
     this.gradientFillTextures = [];
     this.gradientStrokeTextures = [];
     this.gradientData = null;

@@ -991,3 +991,63 @@ post-render statistics, shared proxy materials, offscreen/back-in-view selection
 source matrix traversal, and switching between composited and direct rendering
 in both backends. Browser checks should compare fit-all appearance and frame
 timings for the same PDF/HEP, viewport, DPR, and LOD settings.
+
+## Native mask folding, pass batching, and backdrop reuse (September 27)
+
+Native WebGL and WebGPU now compute eligible single-gradient soft masks inside
+the folded paint shader, using the same eligibility, projection, coverage and
+gradient sampling code as Three. Curved/non-convex boundaries, unsupported clip
+chains, transfer functions, and color overrides retain the rendered-mask path.
+Native projected views without an axis-aligned projector also keep that path.
+The gradient LUT uses the existing mask binding; WebGPU fold uniforms retain a
+distinct aligned slot for every draw, including the gradient parameters.
+
+Native WebGPU keeps consecutive spans, folded paints and composite draws in one
+render pass when they write the same attachment. Target changes, texture copies,
+clears and presentation close the pass. Each operation resets the scissor before
+applying its own bounds, so a small composite cannot clip the following paint.
+
+All three compositor adapters now paint into their private initial backdrop
+instead of copying it into another root texture. The shared executor still
+supports callers that require an unchanged backdrop. Result/backdrop aliases
+are released once, and Three retains the presented texture until its replacement
+is ready. Native's initial framebuffer capture and final presentation remain.
+
+A bounded headless comparison against the previous source loaded the existing
+`20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep`, with all paints
+selected, a 1920×945 viewport, and an orthographic fit-all view at 90% coverage:
+
+| Native WebGPU compositor work | Before | After |
+| --- | ---: | ---: |
+| Encoded render passes, including parent start/resume | 142 | 64 |
+| Texture copies | 12 | 11 |
+| Paint span callbacks | 75 | 48 |
+| Folded paints | 29 | 29 |
+| Masks computed inside folded paints | 0 | 27 |
+| Allocated pooled surfaces | 10 | 9 |
+| Submitted stroke instances | 2,897 | 2,897 |
+
+These are mock-device command counts, not GPU timings or FPS measurements.
+No PDF conversion or browser session was run.
+
+Implementation files: `gradientMaskFold.ts`, `nativePaintFold.ts`,
+`scenePaintCompositor.ts`, `threePaintFold.ts`, `threePaintCompositor.ts`,
+`webGlFloorplanRenderer.ts`, `webGlPaintCompositor.ts`,
+`webGpuFloorplanRenderer.ts`, `webGpuPaintCompositor.ts`, and `webGpuPaintFold.ts`.
+Regression changes are in `test-native-paint-compositor.mjs`,
+`test-pdf-compositing.mjs`, `test-three-gradient-mask-fold.mjs`,
+`test-three-paint-compositor.mjs`, and `test-webgpu-draw-calls.mjs`.
+
+Validation covers native mask bindings and fallback, native/Three projection
+parity at full and reduced surface resolution, merged passes and scissor resets,
+per-draw uniform isolation, pooled surface ownership, failure cleanup, and
+backdrop-reuse equivalence across 1,500 randomized compositing graphs. Type
+checking and affected tests pass. The fast suite still has the existing
+`test-pdf-session-render-fallback.mjs` blue glyph-stroke assertion failure,
+reproduced with the modified source modules loaded from HEAD instead.
+
+Manual verification: compare Broschuere at fit-all and while zooming/panning in
+native WebGL/WebGPU and Three WebGL/WebGPU, with matching viewport, DPR and LOD.
+Check soft-mask edges and opacity groups (including page 14), move the document
+outside the frustum and back, resize the viewport, and inspect GPU validation
+errors. Capture frame timings to determine the actual FPS improvement.

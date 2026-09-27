@@ -14,12 +14,6 @@ export type RendererBackend = "webgl" | "webgpu";
 
 /** Options for setting HEPR native view state. */
 export interface ViewStateUpdateOptions {
-  /** Keep the native pan cache when possible. */
-  preservePanCache?: boolean;
-
-  /** Mark the update as part of an active pointer interaction. */
-  interacting?: boolean;
-
   /**
    * Whether the renderer should schedule a frame of its own. Hosts that drive
    * the camera but present through their own pipeline set this to false: the

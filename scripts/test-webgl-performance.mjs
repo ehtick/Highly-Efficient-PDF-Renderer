@@ -26,7 +26,7 @@ try {
     gl: { bindFramebuffer() {}, viewport() {}, clearColor() {}, clear() {}, bindBuffer() {},
       bufferData() { uploads++; now += 0.25; } },
     updateCameraWithDamping() { now += 0.5; return false; }, updatePanReleaseVelocitySample() {},
-    ensureRenderState() { now += 0.5; }, shouldUsePanCache() { return false; },
+    ensureRenderState() { now += 0.5; },
     shouldUseVectorMinifyPath() { return false; }, updateVisibleSet() { now += 2; },
     drawVisibleSegments(_w, _h, _x, _y, _z, range) { now += 3; return range.count; },
     drawFilledPaths() { now += 2; }, drawTextInstances() { now += 1; },

@@ -29,7 +29,7 @@ try {
       needsVisibleSetUpdate: false,
       requestFrame() {}, updateStrokeVisibleSet() {},
       resolveClientToPixelScale: () => ({ x: 1, y: 1 }),
-      shouldUsePanCache: () => false, shouldUseVectorMinifyPath: () => false
+      shouldUseVectorMinifyPath: () => false
     });
     let report;
     renderer.setFrameListener(stats => { report = stats; });
@@ -97,12 +97,10 @@ try {
     assert.equal(frame(), 9, "instanced primitive, selection and search highlights each count once");
     renderer.shouldUseVectorMinifyPath = () => true;
     assert.equal(frame(), 10, "offscreen vector draws and final minify composite belong to the same frame");
-    renderer.shouldUsePanCache = () => true;
-    assert.equal(frame(), 10, "pan-cache refresh includes scene draws, blit and live highlights");
-    assert.equal(frame(), 5, "cache reuse counts only the blit and live highlights");
+    renderer.shouldUseVectorMinifyPath = () => false;
     renderer.setPrimitiveHighlights(null);
     renderer.highlightSelectionCount = renderer.highlightOthersCount = renderer.highlightCurrentCount = 0;
-    assert.equal(frame(), 1, "a cached frame with no highlights has one draw call");
+    assert.equal(frame(), 5, "direct rendering without highlights submits the scene each frame");
     renderer.rasterRenderingEnabled = renderer.fillRenderingEnabled =
       renderer.strokeRenderingEnabled = renderer.textRenderingEnabled = false;
     assert.equal(frame(), 0, "disabled rendering clears the previous count");
@@ -165,12 +163,9 @@ try {
     renderer.shouldUseVectorMinifyPath = () => true;
     renderer.render(1);
     assert.equal(report.paintOrderApproximated, true, "including a minified composite");
-    renderer.shouldUsePanCache = () => true;
-    renderer.render(1);
-    assert.equal(report.paintOrderApproximated, true, "and a cached frame");
   }
 
-  console.log("WebGPU draw calls: direct, ordered, culled, multiply, raster strips, gradients, LOD, minify, pan cache, highlights, compositing and empty frames passed.");
+  console.log("WebGPU draw calls: direct, ordered, culled, multiply, raster strips, gradients, LOD, minify, highlights, compositing and empty frames passed.");
 } finally {
   for (const [key, value] of Object.entries(globals)) {
     if (value === undefined) delete globalThis[key]; else globalThis[key] = value;

@@ -5,8 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   isNativeTextHeavyStrokeFreeScene,
-  NATIVE_VECTOR_MINIFY_ENABLED,
-  shouldUseNativePanCacheForFrame
+  NATIVE_VECTOR_MINIFY_ENABLED
 } from "../src/nativeRenderPolicy.ts";
 import { buildSingleChannelUint8MipChain } from "../src/singleChannelMipChain.ts";
 import { TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE } from "../src/textRasterAtlas.ts";
@@ -42,7 +41,7 @@ assert.equal(NATIVE_VECTOR_MINIFY_ENABLED, false, "native vector minification mu
 assert.equal(
   isNativeTextHeavyStrokeFreeScene(100_001, 0),
   true,
-  "stroke-free books above the threshold must qualify for the pan cache"
+  "stroke-free books above the threshold must skip legacy vector minification"
 );
 assert.equal(
   isNativeTextHeavyStrokeFreeScene(100_000, 0),
@@ -53,47 +52,6 @@ assert.equal(
   isNativeTextHeavyStrokeFreeScene(100_001, 1),
   false,
   "any stroke content must exclude the text-heavy special case"
-);
-
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, true, true),
-  false,
-  "damped zoom must render directly so text LOD follows every camera frame"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, true, true, true),
-  false,
-  "combined pinch-pan and zoom must not display a stale scaled cache"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, true),
-  false,
-  "a zoom-changing frame must remain direct even without another camera animation flag"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, true, false, false),
-  true,
-  "translation-only pointer dragging may reuse the pan cache"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, true, false),
-  true,
-  "translation-only inertial animation may reuse the pan cache"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, false),
-  false,
-  "a stationary camera must render the settled direct frame"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(false, true, true, false),
-  false,
-  "an ineligible scene must not allocate or use the pan cache"
-);
-assert.equal(
-  shouldUseNativePanCacheForFrame(true, true, true, false),
-  true,
-  "translation remains cacheable independently of the stroke representation"
 );
 
 for (const [name, source] of [["WebGL", webGl], ["WebGPU", webGpu]]) {
@@ -107,54 +65,6 @@ for (const [name, source] of [["WebGL", webGl], ["WebGPU", webGpu]]) {
     source,
     /isNativeTextHeavyStrokeFreeScene\(this\.textInstanceCount, this\.segmentCount\)/,
     `${name} must use the shared text-heavy render policy`
-  );
-  const panCachePolicy = source.slice(
-    source.indexOf("private shouldUsePanCache("),
-    source.indexOf("private renderDirectToScreen()")
-  );
-  assert.match(
-    panCachePolicy,
-    /shouldUseNativePanCacheForFrame\(/,
-    `${name} must use the shared native pan-cache motion policy`
-  );
-  assert.match(
-    panCachePolicy,
-    /this\.segmentCount >= PAN_CACHE_MIN_SEGMENTS \|\| this\.isTextHeavyStrokeFreeScene\(\)/,
-    `${name} must share stroke-heavy and text-heavy pan-cache eligibility`
-  );
-  assert.match(
-    panCachePolicy,
-    /Math\.abs\(this\.targetZoom - this\.zoom\) > CAMERA_DAMPING_ZOOM_EPSILON/,
-    `${name} must bypass its cache throughout damped zoom`
-  );
-  const zoomAtClientPoint = source.slice(
-    source.indexOf("zoomAtClientPoint("),
-    source.indexOf("requestFrame()", source.indexOf("zoomAtClientPoint("))
-  );
-  assert.match(
-    zoomAtClientPoint,
-    /if \(zoomTargetChanged\) \{[\s\S]*?this\.panCacheValid = false;/,
-    `${name} must invalidate history-dependent cached LOD pixels when zoom changes`
-  );
-  const renderWithPanCacheStart = source.indexOf("private renderWithPanCache()");
-  const renderWithPanCacheEnd = source.indexOf(
-    name === "WebGL" ? "private drawOrderedGradientPaint(" : "private drawSceneIntoPass(",
-    renderWithPanCacheStart
-  );
-  assert.ok(
-    renderWithPanCacheStart >= 0 && renderWithPanCacheEnd > renderWithPanCacheStart,
-    `${name} pan-cache regression checks must be scoped to the cache renderer`
-  );
-  const renderWithPanCache = source.slice(renderWithPanCacheStart, renderWithPanCacheEnd);
-  assert.match(
-    renderWithPanCache,
-    /const needsSharpRefresh = zoomSettled && Math\.abs\(this\.panCacheZoom - this\.zoom\) > PAN_CACHE_ZOOM_EPSILON;/,
-    `${name} must rebuild a stale pre-zoom cache before a later pan`
-  );
-  assert.match(
-    renderWithPanCache,
-    /const needsCacheRefresh = [^;]*\|\| needsSharpRefresh;/,
-    `${name} must include sharpness mismatch in its cache-refresh decision`
   );
   assert.match(
     source,

@@ -19,7 +19,7 @@ try {
       gl: { getParameter: () => 128, bindTexture() {}, texParameteri() {}, texImage2D() {}, generateMipmap() {}, deleteTexture(t) { t.destroy(); } },
       mustCreateTexture: texture, maxTextureSize: () => 128, createRgba8Texture: texture,
       createRasterLayerResource: (_matrix, tex) => ({ texture: tex, uniformBuffer: { destroy() {} } }),
-      destroyVectorMinifyResources() {}, requestFrame() { frames++; }, panCacheValid: true
+      destroyVectorMinifyResources() {}, requestFrame() { frames++; }
     });
     const replacement = layer(20), input = new Map([[0, replacement]]);
     const staged = instance.prepareRasterLayerUpdates(input);
@@ -27,7 +27,7 @@ try {
     input.clear(); staged.commit(); staged.dispose();
     assert.equal(instance.getRasterLayerUpdates().get(0), replacement, "batch contents captured before commit");
     assert.equal(source.rasterLayers[0].data[0], 10, "source pixels unchanged");
-    assert.equal(instance.panCacheValid, false); assert.equal(frames, 1);
+    assert.equal(frames, 1);
     const beforeInvalid = allocations;
     assert.throws(() => instance.prepareRasterLayerUpdates(new Map([[0, layer(30)], [9, layer(30)]])), RangeError);
     assert.equal(allocations, beforeInvalid, "whole batch validated before allocating resources");

@@ -460,13 +460,9 @@ scheduling/LOD, resource uploads, shader/program queries, or another submission
 phase. A browser Performance trace may still be needed for browser-internal
 work such as garbage collection.
 
-Native WebGL also reports `panCacheRefreshes` and `panCacheReuses`. A refresh
-renders the ordered scene into the bounded cache; a reuse frame translates that
-image and draws live highlights without resubmitting the scene paints. Heavy
-source-ordered PDFs can use this path during panning; zooming and settled frames
-render directly. `panCacheFrames` counts attempts to use the cache, including
-frames that fall back to direct rendering when a suitable cache cannot fit.
-Compare refreshes and reuse frames separately when interpreting frame costs.
+Native panning, inertia, zooming and settled frames all render directly using
+the current camera and viewport. Vector LOD and visibility selection remain
+active during movement; no previous pan image is reused.
 
 Native WebGL captures include `gradientFillSubmission` and
 `gradientStrokeSubmission` CPU sections. These sum gradient setup and draw

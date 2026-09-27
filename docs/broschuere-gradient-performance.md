@@ -1,5 +1,10 @@
 # Broschuere rendering performance investigation
 
+> Current status: native pan-cache has been removed in favor of direct rendering
+> during all camera motion. Cache measurements and implementation notes below
+> describe the historical implementation, not the current rendering policy.
+
+
 ## Half the Three render calls, and WebGPU frame pacing (September 26)
 
 Captures at fit-all, with mask-content folding and lighting off in Three:

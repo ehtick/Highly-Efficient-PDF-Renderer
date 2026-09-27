@@ -6,7 +6,7 @@ Goal: render HEPR pages as true Three.js objects using Three materials/shaders, 
 - Reuse core shader logic and data encoding where possible.
 - Keep page nodes transformable (`position/rotation/scale`) like regular Three objects.
 - Avoid HTML-canvas texture bridging for the WebGL path.
-- Maintain feature parity: strokes, fills, text, raster layers, culling, pan cache/vector-minify behavior.
+- Maintain feature parity: strokes, fills, text, raster layers, culling, and vector LOD.
 
 ## Milestones
 1. Extract shared GPU contracts from core WebGL renderer:
@@ -19,7 +19,7 @@ Goal: render HEPR pages as true Three.js objects using Three materials/shaders, 
    - text mesh
    - raster layer mesh
 3. Port culling and visibility update logic into a renderer-agnostic module.
-4. Recreate pan-cache/vector-minify behavior using Three render targets.
+4. Render from the live camera throughout panning and zooming, with shared vector LOD and no pan-image cache.
 5. Add benchmark harness against native WebGL/WebGPU outputs and frame times.
 6. Make material adapter the default Three path once parity thresholds are met.
 

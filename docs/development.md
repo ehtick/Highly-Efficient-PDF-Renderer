@@ -212,8 +212,7 @@ may use a level only while everything that level lists in it stays within the
 5-pixel limit wherever visible; these per-level tile bounds are built on first
 tilted use. The HUD reports the nearest tile's baseline and the mean tile target.
 Tilted selections are recomputed every frame.
-Canonical PDF/HEP geometry is unchanged. Native translation-only pan caching
-also supports active LOD: refresh selects vectors for the complete cache bounds
-at the current zoom. Zooming still renders directly, and scene/style/layer
-changes invalidate cached pixels. The Draw counter reports selected vector
-representatives, including those represented by a reused native pan cache.
+Canonical PDF/HEP geometry is unchanged. Native panning, inertia, zooming and
+settled frames render directly at the current camera and viewport, with vector
+LOD and visibility selection active throughout. The Draw counter reports the
+vector representatives submitted for that frame.

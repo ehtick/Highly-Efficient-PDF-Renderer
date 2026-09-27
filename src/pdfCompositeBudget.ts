@@ -41,7 +41,7 @@ export function choosePdfCompositeResolution(scene: VectorScene, width: number, 
       return maximum;
     };
     // The normalized graph is immutable and already cached per scene. Count its
-    // actual nesting once, including when pan-cache sizing checks the budget.
+    // actual nesting once.
     estimatedSurfaces = 8 * (depth(normalizeScenePaintGraph(scene), 0) + 1) + 8;
     surfaceEstimates.set(scene, estimatedSurfaces);
   }

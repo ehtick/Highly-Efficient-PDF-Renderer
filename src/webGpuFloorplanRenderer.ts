@@ -91,6 +91,12 @@ interface WebGpuRasterLayerResource {
   pageIndex: number;
 }
 
+interface WebGpuPageBackgroundResource {
+  count: number;
+  instanceBuffer: any;
+  bindGroup: any;
+}
+
 interface WebGpuRasterStripResource {
   first: number;
   count: number;
@@ -843,7 +849,11 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 }
 `;
 
-const RASTER_SHADER_SOURCE = /* wgsl */ `
+const RASTER_SHADER_SOURCE = createRasterShaderSource(false);
+
+/** Ordinary images and instanced page backgrounds share projection, clipping and color. */
+function createRasterShaderSource(pageBackgrounds: boolean): string {
+  return /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
   cameraCenter : vec2f,
@@ -866,7 +876,9 @@ struct RasterUniforms {
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
-@group(0) @binding(1) var<uniform> uRaster : RasterUniforms;
+@group(0) @binding(1) ${pageBackgrounds
+  ? "var<storage, read> uPageRects : array<vec4f>;"
+  : "var<uniform> uRaster : RasterUniforms;"}
 @group(0) @binding(2) var uRasterSampler : sampler;
 @group(0) @binding(3) var uRasterTex : texture_2d<f32>;
 
@@ -894,10 +906,14 @@ fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
 }
 
 @vertex
-fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
+fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
   let localTopDown = vec2f(corner01.x, 1.0 - corner01.y);
 
+${pageBackgrounds ? `
+  let rect = uPageRects[instanceIndex];
+  let world = rect.xy + rect.zw * localTopDown;
+` : `
   let a = uRaster.matrixA.x;
   let b = uRaster.matrixA.y;
   let c = uRaster.matrixA.z;
@@ -909,6 +925,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
     a * localTopDown.x + c * localTopDown.y + e,
     b * localTopDown.x + d * localTopDown.y + f
   );
+`}
 
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
@@ -926,13 +943,14 @@ ${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  let color = textureSample(uRasterTex, uRasterSampler, inData.uv) * uRaster.matrixB.z;
+  let color = textureSample(uRasterTex, uRasterSampler, inData.uv) * ${pageBackgrounds ? "1.0" : "uRaster.matrixB.z"};
   if (color.a <= 0.001) {
     discard;
   }
   return color * heprVectorClip(inData.world, uVectorClip.x, uVectorClipTex);
 }
 `;
+}
 
 const HIGHLIGHT_SHADER_SOURCE = /* wgsl */ `
 struct HighlightCamera {
@@ -1095,6 +1113,7 @@ export class WebGpuFloorplanRenderer {
   private readonly textPipeline: any;
 
   private readonly rasterPipeline: any;
+  private pageBackgroundPipeline: any = null;
   private rasterStripPipeline: any = null;
 
   private readonly vectorCompositePipeline: any;
@@ -1198,7 +1217,7 @@ export class WebGpuFloorplanRenderer {
   private rasterLayerResources: WebGpuRasterLayerResource[] = [];
   private readonly rasterStripResources = new Map<number, WebGpuRasterStripResource>();
   private rasterTextureResidency = true;
-  private pageBackgroundResources: WebGpuRasterLayerResource[] = [];
+  private pageBackgroundResources: WebGpuPageBackgroundResource[] = [];
 
   private textGlyphMetaTextureA: any = null;
 
@@ -3533,12 +3552,16 @@ export class WebGpuFloorplanRenderer {
     if (!this.rasterRenderingEnabled || this.pageBackgroundResources.length === 0) {
       return;
     }
-    pass.setPipeline(this.rasterPipeline);
+    pass.setPipeline(this.pageBackgroundPipeline);
     this.bindVectorClip(pass);
-    for (const layer of this.pageBackgroundResources) {
-      pass.setBindGroup(0, layer.bindGroup);
-      pass.draw(4, 1, 0, 0);
+    for (const batch of this.pageBackgroundResources) {
+      pass.setBindGroup(0, batch.bindGroup);
+      pass.draw(4, batch.count, 0, 0);
       this.frameDrawCalls += 1;
+      if (this.performanceProfiler?.enabled) {
+        this.performanceProfiler.add("pageBackgroundBatches");
+        this.performanceProfiler.add("pageBackgroundInstances", batch.count);
+      }
     }
   }
 
@@ -4572,20 +4595,69 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
+    this.ensurePageBackgroundPipeline();
     const rects = normalizePageRects(scene);
-    for (let i = 0; i + 3 < rects.length; i += 4) {
-      const minX = rects[i];
-      const minY = rects[i + 1];
-      const maxX = rects[i + 2];
-      const maxY = rects[i + 3];
-      if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
-        continue;
+    // Usually one buffer for the whole document; keep extreme page counts
+    // within both the storage binding and allocation limits of this device.
+    const maxPages = Math.floor(Math.min(this.gpuDevice.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024,
+      this.gpuDevice.limits.maxBufferSize ?? 256 * 1024 * 1024) / 16);
+    if (maxPages < 1) throw new Error("WebGPU buffer limits cannot hold a page background rectangle.");
+    const instances = new Float32Array(Math.min(rects.length / 4, maxPages) * 4);
+    let count = 0;
+    try {
+      for (let i = 0; i + 3 < rects.length; i += 4) {
+        const minX = rects[i], minY = rects[i + 1], maxX = rects[i + 2], maxY = rects[i + 3];
+        if (![minX, minY, maxX, maxY].every(Number.isFinite)) continue;
+        instances[count * 4] = minX;
+        instances[count * 4 + 1] = minY;
+        instances[count * 4 + 2] = Math.max(maxX - minX, 1e-6);
+        instances[count * 4 + 3] = Math.max(maxY - minY, 1e-6);
+        if (++count === maxPages) {
+          this.pageBackgroundResources.push(this.createPageBackgroundResource(instances));
+          count = 0;
+        }
       }
+      if (count) this.pageBackgroundResources.push(this.createPageBackgroundResource(instances.subarray(0, count * 4)));
+    } catch (error) {
+      this.destroyPageBackgroundResources();
+      throw error;
+    }
+  }
 
-      const width = Math.max(maxX - minX, 1e-6);
-      const height = Math.max(maxY - minY, 1e-6);
-      const matrix = new Float32Array([width, 0, 0, height, minX, minY]);
-      this.pageBackgroundResources.push(this.createRasterLayerResource(matrix, this.pageBackgroundTexture));
+  private ensurePageBackgroundPipeline(): void {
+    if (this.pageBackgroundPipeline) return;
+    const stage = (globalThis as any).GPUShaderStage;
+    const bindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: stage.VERTEX,
+        buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES } },
+      { binding: 1, visibility: stage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: stage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 3, visibility: stage.FRAGMENT, texture: { sampleType: "float" } }
+    ] });
+    const layout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [bindGroupLayout, this.vectorClipBindGroupLayout]
+    });
+    this.pageBackgroundPipeline = this.createPipeline(createRasterShaderSource(true), "vsMain", "fsMain", layout, true);
+  }
+
+  private createPageBackgroundResource(instances: Float32Array): WebGpuPageBackgroundResource {
+    const usage = (globalThis as any).GPUBufferUsage;
+    const instanceBuffer = this.gpuDevice.createBuffer({ size: instances.byteLength, usage: usage.STORAGE | usage.COPY_DST });
+    try {
+      this.gpuDevice.queue.writeBuffer(instanceBuffer, 0, instances);
+      const bindGroup = this.gpuDevice.createBindGroup({
+        layout: this.pageBackgroundPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES } },
+          { binding: 1, resource: { buffer: instanceBuffer } },
+          { binding: 2, resource: this.rasterLayerSampler },
+          { binding: 3, resource: this.pageBackgroundTexture.createView() }
+        ]
+      });
+      return { count: instances.length / 4, instanceBuffer, bindGroup };
+    } catch (error) {
+      instanceBuffer.destroy();
+      throw error;
     }
   }
 
@@ -4721,11 +4793,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private destroyPageBackgroundResources(): void {
-    for (const layer of this.pageBackgroundResources) {
-      if (layer.uniformBuffer) {
-        layer.uniformBuffer.destroy();
-      }
-    }
+    for (const batch of this.pageBackgroundResources) batch.instanceBuffer.destroy();
     this.pageBackgroundResources = [];
   }
 

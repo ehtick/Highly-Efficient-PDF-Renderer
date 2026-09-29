@@ -183,6 +183,24 @@ The object supports normal Three.js transforms. `sceneData` contains its parsed
 `VectorScene`; treat it as read-only. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
 
+Transforms apply to the **whole loaded object**, including all pages, backgrounds
+and content:
+
+```ts
+pdf.position.set(x, y, z);
+pdf.rotation.set(rx, ry, rz);
+pdf.scale.set(sx, sy, sz);
+```
+
+There is currently no `setPagePosition` / `setPageTransform` method or public
+per-page `Object3D` accessor for a composed document. For independently movable
+PDF pages today, load each selected page as a separate object using, for example,
+`pdfObjectGenerator(pdfBytes, { pages: "2" })`, then transform that object.
+`pages` is one-based and only filters PDF inputs; it does not filter HEP inputs.
+Separate objects incur separate loading/rendering resources and draw calls.
+Do not mutate `sceneData.pageRects` or internal background attributes to move a
+page: those changes would not update its content, culling or interaction.
+
 | Member | Purpose |
 | --- | --- |
 | `hasSearchableText` | Whether the scene has searchable indexed text. |

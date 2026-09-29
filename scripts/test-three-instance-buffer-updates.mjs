@@ -75,8 +75,11 @@ try {
       "all page backgrounds must share one mesh and one draw call"
     );
     const pageBackgroundMesh = rasterLayer.group.children[0];
-    assert.equal(pageBackgroundMesh.geometry.getAttribute("aCorner").count, 12);
-    assert.equal(pageBackgroundMesh.geometry.getIndex()?.count, 18);
+    assert.equal(pageBackgroundMesh.geometry.isInstancedBufferGeometry, true);
+    assert.equal(pageBackgroundMesh.geometry.instanceCount, 3);
+    assert.equal(pageBackgroundMesh.geometry.getAttribute("aCorner").count, 4);
+    assert.equal(pageBackgroundMesh.geometry.getAttribute("aPageRect").count, 3);
+    assert.equal(pageBackgroundMesh.geometry.getIndex()?.count, 6);
 
     const textVersion = textAttribute.version;
     assert.equal(textLayer.setSelectedTextInstanceIds(new Uint32Array([0])), true);

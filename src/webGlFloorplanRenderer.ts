@@ -881,8 +881,12 @@ precision highp float;
 
 layout(location = 0) in vec2 aCorner;
 
+#ifdef INSTANCED_PAGE_BACKGROUNDS
+layout(location = 1) in vec4 aPageRect;
+#else
 uniform vec4 uRasterMatrixABCD;
 uniform vec2 uRasterMatrixEF;
+#endif
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -896,6 +900,9 @@ void main() {
   vec2 corner01 = aCorner * 0.5 + 0.5;
   vec2 localTopDown = vec2(corner01.x, 1.0 - corner01.y);
 
+#ifdef INSTANCED_PAGE_BACKGROUNDS
+  vec2 world = aPageRect.xy + aPageRect.zw * localTopDown;
+#else
   float a = uRasterMatrixABCD.x;
   float b = uRasterMatrixABCD.y;
   float c = uRasterMatrixABCD.z;
@@ -907,6 +914,7 @@ void main() {
     a * localTopDown.x + c * localTopDown.y + e,
     b * localTopDown.x + d * localTopDown.y + f
   );
+#endif
 
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
@@ -1231,6 +1239,11 @@ export class WebGlFloorplanRenderer {
   private readonly vectorCompositeProgram: WebGLProgram;
 
   private readonly rasterProgram: WebGLProgram;
+
+  private readonly pageBackgroundProgram: WebGLProgram;
+  private readonly pageBackgroundUniforms: Readonly<Record<string, WebGLUniformLocation>>;
+  private readonly pageBackgroundVao: WebGLVertexArrayObject;
+  private readonly pageBackgroundBuffer: WebGLBuffer;
 
   private readonly highlightProgram: WebGLProgram;
 
@@ -1625,6 +1638,10 @@ export class WebGlFloorplanRenderer {
   private visiblePageRectIndices: Uint32Array<ArrayBufferLike> = new Uint32Array(0);
 
   private visiblePageRectCount = 0;
+  private pageBackgroundSourceRects: Float32Array<ArrayBufferLike> | null = null;
+  private pageBackgroundPageIndices = new Uint32Array(0);
+  private pageBackgroundInstanceRects = new Float32Array(0);
+  private pageBackgroundInstanceCount = 0;
 
   private visibleTextRanges: InstanceRange[] = [];
 
@@ -1792,6 +1809,12 @@ export class WebGlFloorplanRenderer {
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, foldable(RASTER_FRAGMENT_SHADER_SOURCE, true));
+    this.pageBackgroundProgram = this.createProgram(
+      RASTER_VERTEX_SHADER_SOURCE.replace("#version 300 es", "#version 300 es\n#define INSTANCED_PAGE_BACKGROUNDS"),
+      foldable(RASTER_FRAGMENT_SHADER_SOURCE, true));
+    this.pageBackgroundUniforms = this.mustGetUniformMap(this.pageBackgroundProgram, [
+      "uRasterTex", "uRasterOpacity", "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip"
+    ]);
     this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
@@ -1799,11 +1822,13 @@ export class WebGlFloorplanRenderer {
     this.gradientPaintVao = this.createVertexArray();
     this.textVao = this.createVertexArray();
     this.blitVao = this.createVertexArray();
+    this.pageBackgroundVao = this.createVertexArray();
     this.highlightOthersVao = this.createVertexArray();
     this.highlightCurrentVao = this.createVertexArray();
     this.highlightSelectionVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
+    this.pageBackgroundBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
     this.allFillPathIdBuffer = this.mustCreateBuffer();
@@ -2001,7 +2026,7 @@ export class WebGlFloorplanRenderer {
       [this.segmentProgram, "stroke"], [this.fillProgram, "fill"], [this.gradientFillProgram, "gradientFill"],
       [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
       [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
-      [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
+      [this.pageBackgroundProgram, "pageBackground"], [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
     return names.find(([candidate]) => candidate === program)?.[1] ?? null;
   }
 
@@ -2507,6 +2532,7 @@ export class WebGlFloorplanRenderer {
     this.fillPathCount = scene.fillPathCount;
     this.textInstanceCount = scene.textInstanceCount;
     this.pageRects = normalizePageRects(scene);
+    this.pageBackgroundSourceRects = null;
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
     this.textLodRuntime?.dispose();
     const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
@@ -2847,6 +2873,7 @@ export class WebGlFloorplanRenderer {
 
     const buffers: WebGLBuffer[] = [
       this.cornerBuffer,
+      this.pageBackgroundBuffer,
       this.allSegmentIdBuffer,
       this.visibleSegmentIdBuffer,
       this.allFillPathIdBuffer,
@@ -2866,6 +2893,7 @@ export class WebGlFloorplanRenderer {
       this.gradientPaintVao,
       this.textVao,
       this.blitVao,
+      this.pageBackgroundVao,
       this.highlightOthersVao,
       this.highlightCurrentVao,
       this.highlightSelectionVao
@@ -2882,6 +2910,7 @@ export class WebGlFloorplanRenderer {
       this.textProgram,
       this.vectorCompositeProgram,
       this.rasterProgram,
+      this.pageBackgroundProgram,
       this.highlightProgram
     ];
     for (const program of programs) {
@@ -2905,6 +2934,10 @@ export class WebGlFloorplanRenderer {
     this.grid = null;
     this.sceneStats = null;
     this.pageRects = new Float32Array(0);
+    this.pageBackgroundSourceRects = null;
+    this.pageBackgroundPageIndices = new Uint32Array(0);
+    this.pageBackgroundInstanceRects = new Float32Array(0);
+    this.pageBackgroundInstanceCount = 0;
     this.pageTextRanges = new Uint32Array(0);
     this.visiblePageRectIndices = new Uint32Array(0);
     this.visibleTextRanges = [];
@@ -3706,20 +3739,47 @@ export class WebGlFloorplanRenderer {
       return;
     }
     const gl = this.gl;
-    this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+    this.updatePageBackgroundInstances();
+    const program = this.pageBackgroundProgram, uniforms = this.pageBackgroundUniforms;
+    gl.useProgram(program);
+    this.bindVectorClip(program);
+    this.bindPaintFold(program);
+    gl.bindVertexArray(this.pageBackgroundVao);
     this.bindOrderedTexture(12, this.pageBackgroundTexture);
-    gl.uniform1f(this.uRasterOpacity, 1);
-    for (let i = 0; i < this.visiblePageRectCount; i += 1) {
-      const rectOffset = this.visiblePageRectIndices[i] * 4;
-      const minX = this.pageRects[rectOffset];
-      const minY = this.pageRects[rectOffset + 1];
-      const width = Math.max(this.pageRects[rectOffset + 2] - minX, 1e-6);
-      const height = Math.max(this.pageRects[rectOffset + 3] - minY, 1e-6);
-      gl.uniform4f(this.uRasterMatrixABCD, width, 0, 0, height);
-      gl.uniform2f(this.uRasterMatrixEF, minX, minY);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      this.frameDrawCalls++;
+    this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+    gl.uniform1i(uniforms.uRasterTex, 12);
+    gl.uniform1f(uniforms.uRasterOpacity, 1);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.visiblePageRectCount);
+    this.frameDrawCalls++;
+    if (this.performanceProfiler?.enabled) {
+      this.performanceProfiler.add("pageBackgroundBatches");
+      this.performanceProfiler.add("pageBackgroundInstances", this.visiblePageRectCount);
     }
+  }
+
+  /** Camera motion reuses page geometry until the visible page IDs change. */
+  private updatePageBackgroundInstances(): void {
+    const count = this.visiblePageRectCount, indices = this.visiblePageRectIndices;
+    let changed = this.pageBackgroundSourceRects !== this.pageRects || this.pageBackgroundInstanceCount !== count;
+    for (let i = 0; !changed && i < count; i++) changed = this.pageBackgroundPageIndices[i] !== indices[i];
+    if (!changed) return;
+    if (this.pageBackgroundPageIndices.length < count) {
+      this.pageBackgroundPageIndices = new Uint32Array(count);
+      this.pageBackgroundInstanceRects = new Float32Array(count * 4);
+    }
+    const rects = this.pageBackgroundInstanceRects;
+    for (let i = 0; i < count; i++) {
+      const source = indices[i] * 4, target = i * 4;
+      this.pageBackgroundPageIndices[i] = indices[i];
+      rects[target] = this.pageRects[source];
+      rects[target + 1] = this.pageRects[source + 1];
+      rects[target + 2] = Math.max(this.pageRects[source + 2] - this.pageRects[source], 1e-6);
+      rects[target + 3] = Math.max(this.pageRects[source + 3] - this.pageRects[source + 1], 1e-6);
+    }
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.pageBackgroundBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, rects.subarray(0, count * 4), this.gl.DYNAMIC_DRAW);
+    this.pageBackgroundSourceRects = this.pageRects;
+    this.pageBackgroundInstanceCount = count;
   }
 
   private setMultiplyBlend(): void {
@@ -3966,7 +4026,7 @@ export class WebGlFloorplanRenderer {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, Uint8Array.of(255, 255, 255, 255));
     gl.activeTexture(gl.TEXTURE0);
     this.paintFoldNeutralTexture = texture;
-    for (const program of [this.fillProgram, this.gradientFillProgram, this.rasterProgram]) {
+    for (const program of [this.fillProgram, this.gradientFillProgram, this.rasterProgram, this.pageBackgroundProgram]) {
       gl.useProgram(program);
       gl.uniform4f(this.paintFoldLocations(program)[0], 1, 0, 0, 0);
       gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
@@ -5898,6 +5958,7 @@ export class WebGlFloorplanRenderer {
     gl.vertexAttribDivisor(0, 0);
 
     for (const [vao, rectBuffer] of [
+      [this.pageBackgroundVao, this.pageBackgroundBuffer],
       [this.highlightOthersVao, this.highlightOthersBuffer],
       [this.highlightCurrentVao, this.highlightCurrentBuffer],
       [this.highlightSelectionVao, this.highlightSelectionBuffer]

@@ -151,6 +151,27 @@ The [parser benchmark guide](parser-benchmark.md) describes production parser
 measurements and their scope. Run corpus benchmarks manually; the default tests
 do not establish full-corpus visual fidelity or browser performance.
 
+All four backends batch page backgrounds before page content. Native WebGL
+instances the visible page rectangles; native WebGPU instances the document's
+rectangles and lets the GPU clip offscreen pages. WebGPU splits unusually large
+page sets only when needed to respect device buffer limits. Both Three backends
+use one indexed quad with `InstancedBufferGeometry`: each page has one packed
+`(x, y, width, height)` instance (16 bytes), in `scene.pageRects` order. Camera,
+document/ancestor transforms and background-color changes reuse the geometry in
+all four paths. Both Three shaders apply the same document-to-clip matrix used
+by content after reconstructing each background corner.
+Native captures report `pageBackgroundBatches` and `pageBackgroundInstances`
+separately from content batches. The viewer's draw-call total includes both,
+plus any compositing and overlay draws. The `webgl-page-background-batching`,
+`webgpu-draw-calls` and `three-page-background-batching` tests cover 396 pages,
+upload reuse, color and cleanup. WebGL also tests visibility changes; WebGPU
+checks bounded allocations; Three verifies both materials, document/ancestor
+translation, tilt, nonuniform scale and reflection, and generates WGSL without
+a GPU. Browser draw counts and visual checks remain manual. In each Three
+backend, check the CS-MAP overview, zoom into individual pages, then translate,
+rotate and scale the PDF group under a transformed parent; backgrounds must
+stay aligned with content and contribute one draw call.
+
 Adjacent strokes, fills, or text share instanced draws even when their clip roots
 differ. Spatially independent
 pages also share draws: their paint streams are interleaved by type while keeping

@@ -197,10 +197,13 @@ and remains preferred when it fits the tile budget.
 Native and Three WebGL/WebGPU apply text LOD to source-ordered scenes. Coarse
 text runs stop at each PDF paint boundary and retain its clip and layer. Selected
 IDs are grouped back into canonical paint order; unchanged selections reuse the
-instance buffer during panning. Coarse text keeps its original clips and bypasses
-paint reordering based on exact geometry. Text with Multiply blending and scenes
-requiring effect composition stay exact. Readable text and primitive color
-overrides also retain exact glyphs. This keeps direct rendering practical for
+instance buffer during panning. Coarse text keeps its original clips. Native
+paint scheduling includes both exact glyph bounds and all coarse replacement
+bounds, so Auto retains safe batching across disjoint or equal-color paints.
+Adding coarse bounds invalidates cached dependencies even at an unchanged zoom;
+subsequent exact/coarse selection changes reuse those conservative dependencies.
+Text with Multiply blending and scenes requiring effect composition stay exact.
+Readable text and primitive color overrides also retain exact glyphs. This keeps direct rendering practical for
 large books without changing HEP data. Three batches consume selected exact or
 coarse IDs directly, without scanning the full glyph store. Its shared paint plan
 keeps canonical order while text LOD is active. The synthetic

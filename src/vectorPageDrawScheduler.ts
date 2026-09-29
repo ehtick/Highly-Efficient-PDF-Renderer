@@ -1,4 +1,5 @@
 import type { VectorScene } from "./pdfVectorExtractor";
+import type { TextLodBuildData } from "./textGreekLod";
 import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 const kinds = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
@@ -55,6 +56,7 @@ export class VectorPageDrawScheduler {
   private padding = NaN;
   private enabled = false;
   private colorCommutationEnabled = true;
+  private textLodData: TextLodBuildData | null = null;
 
   /**
    * `segments` restricts reordering to paints that share a compositor span; see
@@ -115,6 +117,16 @@ export class VectorPageDrawScheduler {
       // actual paint bounds below, including content outside the page rect.
       this.pageForRun[index] = nearest;
     });
+  }
+
+  /** Include dormant coarse coverage so exact/coarse switches share a safe schedule. */
+  includeTextLod(data: TextLodBuildData): void {
+    if (this.textLodData === data) return;
+    this.textLodData = data;
+    this.bounds.includeTextLod(data);
+    // updateScale must refresh paint/page bounds even in the same AA bucket.
+    this.padding = NaN;
+    this.scheduleDirty = true;
   }
 
   /** Temporary primitive colors can invalidate source-color equivalence. */

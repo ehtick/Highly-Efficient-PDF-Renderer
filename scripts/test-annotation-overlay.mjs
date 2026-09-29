@@ -12,6 +12,7 @@ class Element extends EventTarget {
   constructor(document) { super(); this.ownerDocument = document; }
   set innerHTML(_) { throw new Error("PDF strings must never become HTML"); }
   setAttribute(k, v) { this.attributes.set(k, v); }
+  removeAttribute(k) { this.attributes.delete(k); }
   appendChild(child) { child.parent = this; this.children.push(child); }
   replaceChildren(...children) { this.children = children; }
   contains(child) { return this === child || this.children.some(c => c.contains(child)); }
@@ -99,6 +100,10 @@ try {
 
   const overlay = createAnnotationOverlay({ getCanvas: () => canvas, adapter });
   const panel = document.body.children[0];
+  const hasPointerCursor = (element = canvas) => element.attributes.has("data-hepr-annotation-hover");
+  canvas.style.cursor = "text";
+  assert(panel.children.some(child => child.textContent.includes("cursor: pointer !important")),
+    "annotation hover takes precedence over the text selection cursor");
   const event = (type, x = 20, y = 20, extra = {}, target = canvas) => {
     const e = new Event(type, { cancelable: true });
     Object.defineProperty(e, "target", { value: target });
@@ -109,35 +114,69 @@ try {
   event("pointermove"); window.frame();
   assert.equal(panel.hidden, false); assert(text(panel).includes("<img src=x onerror=bad()>"));
   assert.equal(document.body.children.length, 1, "only one bubble element");
-  const down = event("pointerdown"); event("pointerup");
+  assert.equal(hasPointerCursor(), true);
+  assert.equal(canvas.style.cursor, "text", "the underlying text cursor is preserved");
+  event("pointermove", 200, 100); window.frame();
+  assert.equal(hasPointerCursor(), false, "empty page regions retain the host cursor");
+  event("pointermove"); window.frame();
+  event("pointerout", 20, 20, { relatedTarget: document.body });
+  assert.equal(hasPointerCursor(), false, "leaving the canvas releases the hover cursor");
+  event("pointermove"); window.frame();
+  const down = event("pointerdown");
+  assert.equal(hasPointerCursor(), false, "pointerdown releases the cursor for pan/selection gestures");
+  event("pointerup"); window.frame();
+  assert.equal(hasPointerCursor(), true, "idle cursor returns after a click");
   assert.equal(down.defaultPrevented, false, "camera and selection retain their pointer events");
   event("pointermove", 50, 65); window.frame();
   assert(text(panel).includes("<img"), "hover cannot replace a pinned bubble");
+  assert.equal(hasPointerCursor(), true, "other clickable annotations retain pointer feedback while a bubble is pinned");
+  event("pointermove", 200, 100); window.frame();
+  assert.equal(hasPointerCursor(), false, "pinning a bubble does not pin the cursor");
+  assert(text(panel).includes("<img"));
   event("pointerdown", 50, 65); event("pointerup", 50, 65);
   assert(text(panel).includes("Comment 3"), "click replaces the pinned annotation");
   const oldLeft = panel.style.left;
-  shift = 10; overlay.onFrame();
+  shift = 10; overlay.onFrame(); window.frame();
   assert.notEqual(panel.style.left, oldLeft, "pin follows view projection");
-  canvas = new Element(document); overlay.sceneChanged(); overlay.onFrame();
+  shift = 300; overlay.onFrame(); window.frame();
+  assert.equal(hasPointerCursor(), false, "camera changes refresh cursor hit testing");
+  shift = 10; event("pointermove", 60, 65); window.frame();
+  assert.equal(hasPointerCursor(), true);
+  const previousCanvas = canvas;
+  canvas = new Element(document); overlay.sceneChanged(); overlay.onFrame(); window.frame();
   assert.equal(panel.hidden, false, "backend canvas changes preserve the same scene's pin");
+  assert.equal(hasPointerCursor(previousCanvas), false, "backend replacement releases the previous canvas");
+  assert.equal(hasPointerCursor(), true);
   event("keydown", 0, 0, { key: "Escape" }); window.frame();
   assert.equal(panel.hidden, true);
   event("pointerdown", 30, 20); event("pointermove", 80, 30, { buttons: 1 }); event("pointerup", 80, 30);
   assert.equal(panel.hidden, true, "dragging never pins");
+  assert.equal(hasPointerCursor(), false, "dragging does not leave a pointer cursor");
   event("pointerdown", 30, 20); event("pointerdown", 30, 20, { pointerId: 2 });
   event("pointerup", 30, 20, { pointerId: 2 }); event("pointerup", 30, 20);
   assert.equal(panel.hidden, true, "multitouch gestures never pin");
   overlay.show(annotations[6]); assert.equal(panel.hidden, true);
   visibility = { revision: 1, layers: [], conditions: Uint8Array.of(1) };
   overlay.show(annotations[6]); assert.equal(panel.hidden, false);
-  visibility = { revision: 2, layers: [], conditions: Uint8Array.of(0) }; overlay.onFrame();
+  event("pointermove", 230, 60); window.frame(); assert.equal(hasPointerCursor(), true);
+  visibility = { revision: 2, layers: [], conditions: Uint8Array.of(0) }; overlay.onFrame(); window.frame();
   assert.equal(panel.hidden, true, "hidden layer dismisses its pin");
-  suppressed = true; event("pointermove", 30, 20); window.frame(); assert.equal(panel.hidden, true);
+  assert.equal(hasPointerCursor(), false, "hidden annotations have no pointer cursor");
+  event("pointermove", 30, 20); window.frame(); assert.equal(hasPointerCursor(), true);
+  canvas.style.cursor = "crosshair";
+  suppressed = true; overlay.onFrame(); window.frame(); assert.equal(panel.hidden, true);
+  assert.equal(hasPointerCursor(), false, "drawing selection takes precedence");
+  assert.equal(canvas.style.cursor, "crosshair", "releasing annotation hover preserves a newer host cursor");
   suppressed = false; overlay.show(annotations[1]); assert.equal(panel.hidden, false);
+  event("pointermove", 30, 20); window.frame(); assert.equal(hasPointerCursor(), true);
   overlay.disable(); assert.equal(panel.hidden, true); assert.equal(overlay.isEnabled(), false);
+  assert.equal(hasPointerCursor(), false, "disabling annotation bubbles releases the cursor");
   overlay.enable(); overlay.show(annotations[1]);
   scene = { ...scene }; overlay.sceneChanged(); assert.equal(panel.hidden, true, "new document dismisses pin");
+  assert.equal(hasPointerCursor(), false);
+  event("pointermove", 30, 20); window.frame(); assert.equal(hasPointerCursor(), true);
   overlay.dispose(); overlay.dispose(); assert.equal(document.body.children.length, 0);
+  assert.equal(hasPointerCursor(), false, "disposal restores the host cursor");
   event("pointermove"); window.frame(); assert.equal(document.body.children.length, 0);
-  console.log("Annotation overlay: precise picking, safe HTML text, pinning, gestures, visibility, projection and lifecycle passed.");
+  console.log("Annotation overlay: precise picking, safe HTML text, pinning, cursor ownership, gestures, visibility, projection and lifecycle passed.");
 } finally { hooks.deregister(); }

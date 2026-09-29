@@ -157,20 +157,34 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   close.type = "button"; close.textContent = "×"; close.setAttribute("aria-label", "Close annotation");
   close.style.cssText = "position:absolute;top:4px;right:5px;border:0;background:transparent;color:inherit;font:22px system-ui;cursor:pointer;";
   const content = document.createElement("div");
-  panel.appendChild(close); panel.appendChild(content); document.body.appendChild(panel);
+  // Keep host cursors (text selection, grab/grabbing) intact underneath this
+  // temporary override, including inline cursor updates from other controls.
+  const cursorAttribute = "data-hepr-annotation-hover";
+  const cursorStyle = document.createElement("style");
+  cursorStyle.textContent = `canvas[${cursorAttribute}] { cursor: pointer !important; }`;
+  panel.appendChild(close); panel.appendChild(content); panel.appendChild(cursorStyle); document.body.appendChild(panel);
   const lifetime = new AbortController();
   const eventOptions = { capture: true, signal: lifetime.signal };
   let enabled = options.enabled !== false, disposed = false;
   let scene = adapter.getScene(), active: SceneAnnotation | null = null, pinned = false;
   let pointer: AnnotationPoint | null = null;
+  let cursorCanvas: HTMLCanvasElement | null = null;
   let gesture: { id: number; start: AnnotationPoint; time: number; moved: boolean; multiple: boolean } | null = null;
   const pointers = new Set<number>();
   let frame = 0;
 
+  function setPointerCursor(overAnnotation: boolean): void {
+    const canvas = overAnnotation ? options.getCanvas() : null;
+    if (cursorCanvas === canvas) return;
+    cursorCanvas?.removeAttribute(cursorAttribute);
+    cursorCanvas = canvas;
+    cursorCanvas?.setAttribute(cursorAttribute, "");
+  }
+  function clearPointer(): void { pointer = null; setPointerCursor(false); }
   function hide(): void { active = null; pinned = false; panel.hidden = true; }
   function sceneChanged(): void {
     const next = adapter.getScene();
-    if (scene !== next) { hide(); pointer = null; gesture = null; pointers.clear(); scene = next; }
+    if (scene !== next) { hide(); clearPointer(); gesture = null; pointers.clear(); scene = next; }
   }
   function suppressed(): boolean { return !enabled || disposed || !!adapter.isInteractionSuppressed?.(); }
   function position(): void {
@@ -200,19 +214,27 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   }
   function updateHover(): void {
     frame = 0; sceneChanged();
-    if (suppressed()) { hide(); return; }
-    if (pinned || gesture || !pointer || !scene) return;
+    if (suppressed()) { setPointerCursor(false); hide(); return; }
+    if (gesture || !pointer || !scene) { setPointerCursor(false); return; }
     const annotation = pickSceneAnnotation(scene, pointer.x, pointer.y, adapter);
+    setPointerCursor(annotation !== null);
+    if (pinned) return;
     if (annotation) display(annotation, false); else hide();
   }
   function scheduleHover(): void { if (!frame) frame = window.requestAnimationFrame(updateHover); }
-  function onFrame(): void { sceneChanged(); if (active) position(); if (!pinned && pointer && !gesture) scheduleHover(); }
+  function onFrame(): void {
+    sceneChanged();
+    if (active) position();
+    if (suppressed() || !pointer || gesture || !scene) setPointerCursor(false);
+    else scheduleHover();
+  }
   function insidePanel(event: Event): boolean { return !!event.target && panel.contains(event.target as Node); }
 
   window.addEventListener("pointerdown", event => {
     sceneChanged();
+    clearPointer();
     if (insidePanel(event)) { pinned = true; return; }
-    if (event.target !== options.getCanvas()) { pointer = null; hide(); return; }
+    if (event.target !== options.getCanvas()) { hide(); return; }
     pointers.add(event.pointerId);
     if (gesture) { gesture.multiple = true; return; }
     if (event.button !== 0 || suppressed()) return;
@@ -225,38 +247,46 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
       if (event.pointerId === gesture.id && Math.hypot(event.clientX - gesture.start.x, event.clientY - gesture.start.y) > 5) gesture.moved = true;
       return;
     }
-    if (insidePanel(event)) return;
+    if (insidePanel(event)) { clearPointer(); return; }
     if (event.target !== options.getCanvas() || event.buttons !== 0 || event.pointerType === "touch") {
-      pointer = null; if (!pinned) hide(); return;
+      clearPointer(); if (!pinned) hide(); return;
     }
     pointer = { x: event.clientX, y: event.clientY }; scheduleHover();
+  }, eventOptions);
+  window.addEventListener("pointerout", event => {
+    if (event.target !== options.getCanvas()) return;
+    clearPointer();
+    if (!pinned && !panel.contains(event.relatedTarget as Node | null)) hide();
   }, eventOptions);
   window.addEventListener("pointerup", event => {
     pointers.delete(event.pointerId);
     if (!gesture || gesture.id !== event.pointerId) return;
     const ended = gesture; gesture = null;
+    if (event.pointerType !== "touch" && event.target === options.getCanvas()) {
+      pointer = { x: event.clientX, y: event.clientY }; scheduleHover();
+    }
     if (ended.moved || ended.multiple || performance.now() - ended.time > 450 || suppressed()) return;
     sceneChanged();
     if (!scene) return;
     const annotation = pickSceneAnnotation(scene, event.clientX, event.clientY, adapter);
     if (annotation) display(annotation, true); else hide();
   }, eventOptions);
-  window.addEventListener("pointercancel", () => { gesture = null; pointers.clear(); pointer = null; if (!pinned) hide(); }, eventOptions);
+  window.addEventListener("pointercancel", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, eventOptions);
   window.addEventListener("keydown", event => {
-    if (event.key === "Escape" && active) { const focused = panel.contains(document.activeElement); pointer = null; hide(); if (focused) options.getCanvas()?.focus(); }
+    if (event.key === "Escape" && active) { const focused = panel.contains(document.activeElement); clearPointer(); hide(); if (focused) options.getCanvas()?.focus(); }
     else if (event.key === "Enter" && event.target === options.getCanvas() && active) { pinned = true; close.focus(); }
   }, eventOptions);
-  window.addEventListener("blur", () => { gesture = null; pointers.clear(); pointer = null; if (!pinned) hide(); }, { signal: lifetime.signal });
+  window.addEventListener("blur", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, { signal: lifetime.signal });
   window.addEventListener("resize", onFrame, { signal: lifetime.signal });
   window.addEventListener("scroll", onFrame, eventOptions);
   panel.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });
-  close.addEventListener("click", () => { pointer = null; hide(); options.getCanvas()?.focus(); }, { signal: lifetime.signal });
+  close.addEventListener("click", () => { clearPointer(); hide(); options.getCanvas()?.focus(); }, { signal: lifetime.signal });
   return {
     enable() { if (!disposed) enabled = true; },
-    disable() { enabled = false; hide(); },
+    disable() { enabled = false; setPointerCursor(false); hide(); },
     isEnabled: () => enabled && !disposed,
     show(annotation) { sceneChanged(); if (!suppressed() && scene?.annotations?.includes(annotation)) display(annotation, true); },
-    hide() { pointer = null; hide(); }, onFrame, sceneChanged,
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); if (frame) window.cancelAnimationFrame(frame); panel.remove(); active = null; }
+    hide() { clearPointer(); hide(); }, onFrame, sceneChanged,
+    dispose() { if (disposed) return; disposed = true; clearPointer(); lifetime.abort(); if (frame) window.cancelAnimationFrame(frame); panel.remove(); active = null; }
   };
 }

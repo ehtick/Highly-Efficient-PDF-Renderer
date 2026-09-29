@@ -124,6 +124,8 @@ void main() {
   // Reach pixels whose footprint touches a path narrower than a pixel.
   vec2 margin = heprCoverageMargin(heprPathToPixel(mix(metaA.zw, metaB.xy, corner01),
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  margin = heprBoundCoverageMargin(mix(max(metaA.zw, uClipBounds.xy), min(metaB.xy, uClipBounds.zw), corner01),
+    margin, mat2(1.0), uUseLocalToClip, uLocalToClip, uViewport);
   // A page-sized gradient under a small clip would otherwise shade the whole
   // page. The clip's antialiasing reaches under a pixel past its bounds, so
   // the same one-pixel margin keeps every covered fragment; a path and clip

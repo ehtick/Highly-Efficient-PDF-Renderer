@@ -1,4 +1,5 @@
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
+import { placeSceneAnnotation, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import {
   createLoadProgressReporter,
@@ -102,6 +103,10 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Annotation geometry in composed scene coordinates; absent in older HEP files. */
+  annotations?: readonly SceneAnnotation[];
+  /** Source page identities and PDF-to-scene transforms; absent in older HEP files. */
+  pdfPages?: readonly ScenePdfPage[];
   /** Self-contained replay sources for layer-aware composite fallback islands. */
   retainedPages?: SceneRetainedPage[];
   /** Ordered compositing boundaries. Absent scenes use the ordinary flat fast path. */
@@ -773,6 +778,8 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
   const primaryRasterLayer = rasterLayers[0] ?? null;
   return {
     ...base,
+    pdfPages: scene.pdfPages,
+    annotations: scene.annotations?.map(a => { const { optionalContent: _condition, ...rest } = a; return { ...rest, pageIndex: 0 }; }),
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([
@@ -941,6 +948,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const rasterLayers: RasterLayer[] = [];
   const mergedTextIndexPages: PageTextIndex[] = [];
   const combinedTextContent: SceneTextItem[] = [];
+  const annotations: SceneAnnotation[] = [];
+  const pdfPages: ScenePdfPage[] = [];
   let hasTextContent = false;
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
@@ -950,6 +959,13 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
+    for (const page of scene.pdfPages ?? []) {
+      const [a, b, c, d, e, f] = page.pdfToScene;
+      pdfPages.push({ ...page, pageIndex: pageRectBase + page.pageIndex, pdfToScene: [a, b, c, d, e + tx, f + ty] });
+    }
+    for (const annotation of scene.annotations ?? []) {
+      annotations.push(placeSceneAnnotation(annotation, pageRectBase + annotation.pageIndex, tx, ty, layers.offsets[pageIndex]));
+    }
     const clipBase = clipPaths.length;
     const retainedPageBase = retainedPages.length;
     for (const resource of scene.retainedPages ?? []) {
@@ -1269,6 +1285,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
   const composedScene: VectorScene = {
+    annotations,
+    pdfPages,
     ...(paintGraph ? { paintGraph } : {}),
     ...(retainedPages.length ? { retainedPages } : {}),
     ...(layers.data ? { optionalContent: layers.data } : {}),

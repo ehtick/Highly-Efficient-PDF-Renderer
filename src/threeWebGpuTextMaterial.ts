@@ -112,8 +112,10 @@ fn heprTextVertexPack(
   // than a pixel reach every pixel their footprint touches.
   let glyphToWorld = mat2x2<f32>(instanceA.x, instanceA.y, instanceA.z, instanceA.w);
   let cornerWorld = glyphToWorld * (minBounds + (maxBounds - minBounds) * corner01) + instanceB.xy;
-  let margin = heprCoverageMargin(heprPathToPixel(cornerWorld, useLocalToClip, localToClip, zoom,
+  let rawMargin = heprCoverageMargin(heprPathToPixel(cornerWorld, useLocalToClip, localToClip, zoom,
     max(viewport, vec2<f32>(1.0))) * glyphToWorld);
+  let margin = heprBoundCoverageMargin(cornerWorld, rawMargin, glyphToWorld, useLocalToClip, localToClip,
+    max(viewport, vec2<f32>(1.0)));
   let local = minBounds - margin + (maxBounds - minBounds + 2.0 * margin) * corner01;
   let world = vec2<f32>(
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,

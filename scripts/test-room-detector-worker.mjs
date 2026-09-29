@@ -164,6 +164,7 @@ async function testDemoLifetime() {
         dispose() { assert.equal(layerDetachments, 1); pdfDisposed = true; } },
       drawCallMeter: { reset() {} },
       drawingSelection: { sceneChanged() {} },
+      annotationOverlay: { sceneChanged() {} },
       layerControls: { objectChanged() {
         assert.equal(context.currentPdfObject, null);
         assert.equal(pdfDisposed, false, "detach layer subscriptions before releasing the PDF");

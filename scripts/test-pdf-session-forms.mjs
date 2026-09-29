@@ -124,7 +124,7 @@ try {
   await testSynthesizedLinks(openPdf, validateHeprPageData);
   await testSynthesizedSquares(openPdf, validateHeprPageData);
   await testSynthesizedSquareUnderlines(openPdf, validateHeprPageData);
-  await testFailClosed(openPdf);
+  await testSynthesizedNote(openPdf);
   console.log("PDF session Form/annotation display-program tests passed");
 } finally {
   hooks.deregister();
@@ -209,7 +209,7 @@ function formFixture() {
   });
 }
 
-async function testFailClosed(openPdf) {
+async function testSynthesizedNote(openPdf) {
   const bytes = writeTinyPdf({
     objects: [
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
@@ -224,11 +224,11 @@ async function testFailClosed(openPdf) {
   });
   const session = await openPdf({ kind: "bytes", bytes });
   try {
-    await assert.rejects(
-      session.compilePage(0),
-      (error) => error?.code === "unsupported-content" &&
-        error?.details?.reason === "appearance-synthesis-not-implemented"
-    );
+    const page = await session.compilePage(0);
+    assert.equal(page.annotations[0].subtype, "Text");
+    assert.equal(page.displayProgram.programs.length, 1);
+    assert.equal(page.textIndex.text, "");
+    assert(session.getDiagnostics().some(d => d.code === "annotation.appearance-synthesized"));
   } finally {
     await session.close();
   }

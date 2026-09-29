@@ -167,6 +167,9 @@ import {
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
 
+import { placeSceneAnnotation, type PdfAnnotation } from "./annotationData";
+import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
+
 export const computePageGeometry = computeNativePdfPageGeometry;
 
 export interface OpenPdfOptions extends PdfIccOptions {
@@ -189,6 +192,7 @@ export interface ParsePdfOptions extends OpenPdfOptions {
 
 export interface PdfSession {
   readonly info: Readonly<PdfDocumentInfo>;
+  getPageAnnotations(sourcePageIndex: number, options?: { signal?: AbortSignal }): Promise<readonly PdfAnnotation[]>;
   compilePage(sourcePageIndex: number, options?: PdfCompileOptions): Promise<HeprPageData>;
   compilePages(options?: PdfCompilePagesOptions): AsyncIterable<HeprPageData>;
   getDiagnostics(): readonly PdfDiagnostic[];
@@ -417,6 +421,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private readonly diagnosticKeys = new Set<string>();
   private readonly document: NativePdfDocument;
   private readonly formRegistry: NativePdfFormAppearanceRegistry;
+  private readonly annotationMetadata: NativePdfAnnotationMetadataRegistry;
   private readonly appearanceSynthesizer: NativePdfAppearanceSynthesizer;
   private readonly optionalContent: NativeOptionalContentRegistry;
   private readonly defaultProgress?: PdfCompileOptions["onProgress"];
@@ -446,6 +451,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     }
     this.optionalContent = optionalContent;
     this.formRegistry = new NativePdfFormAppearanceRegistry(document, { optionalContent });
+    this.annotationMetadata = new NativePdfAnnotationMetadataRegistry(document, this.formRegistry, optionalContent,
+      diagnostic => this.appendDiagnostics([diagnostic]));
     this.appearanceSynthesizer = new NativePdfAppearanceSynthesizer(document, {
       missingFontResolver,
       optionalContent
@@ -462,6 +469,16 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.imageCodecResolver = imageCodecResolver;
     this.iccTransformResolver = iccTransformResolver;
     this.iccEngine = validateIccEngine(iccEngine);
+  }
+
+  async getPageAnnotations(sourcePageIndex: number, options: { signal?: AbortSignal } = {}): Promise<readonly PdfAnnotation[]> {
+    const signal = combineSignals(this.lifetime.signal, options.signal);
+    let release: (() => void) | null = null;
+    try {
+      release = await this.acquireOperation(signal);
+      return structuredClone(await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal));
+    } catch (error) { throw normalizeAbortError(error, signal); }
+    finally { release?.(); }
   }
 
   async compilePage(
@@ -676,6 +693,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.assertOpen();
     signal.throwIfAborted();
     try {
+      const annotations = await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal);
       const initialFonts = reuse?.prepared?.fontRegistry.resources.length ?? 0;
       const initialImages = reuse?.prepared?.imageResources.registry.size ?? 0;
       const {
@@ -832,6 +850,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       const pageData = invocationText
         ? { ...densePageData, textIndex: invocationText.textIndex }
         : densePageData;
+      pageData.annotations = annotations;
       if (invocationText?.positions) retainedTextPositions.set(pageData.textIndex, invocationText.positions);
       const commandCount = pageData.displayProgram.groups.reduce(
         (sum, group) => sum + group.commands.length,
@@ -842,7 +861,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       );
       const maxCommands = options.limits?.maxCommandsPerPage ??
         this.document.limits.maxCommandsPerPage;
-      if (commandCount > maxCommands) {
+      if (commandCount > maxCommands || annotations.length > maxCommands) {
         throw new PdfError("resource-limit", "The compiled display program exceeds the command limit.", {
           pageIndex: sourcePageIndex,
           details: { reason: "display-command-count", commandCount, maxCommands }
@@ -878,6 +897,27 @@ class NativePdfSession implements NativeVectorPdfSession {
   }
 
   private async compileVectorPageUnlocked(
+    sourcePageIndex: number, options: NativeVectorCompileOptions, signal: AbortSignal,
+    timings?: NativeVectorCompileTimings, reusePageResources = true, reuseCompositeSurfaces = true,
+    boundCompositeWork = true
+  ): Promise<VectorScene> {
+    const annotations = await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal);
+    const scene = await this.compileVectorPageContentUnlocked(sourcePageIndex, options, signal,
+      timings, reusePageResources, reuseCompositeSurfaces, boundCompositeWork);
+    if (annotations.length > (options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage)) {
+      throw new PdfError("resource-limit", "Annotations exceed the page command limit.", { pageIndex: sourcePageIndex });
+    }
+    scene.pdfPages = [{ sourcePageIndex, pageIndex: 0,
+      pdfToScene: computePageGeometry(this.document.getPage(sourcePageIndex)).pageMatrix }];
+    scene.annotations = annotations.map(annotation => {
+      const result = placeSceneAnnotation(annotation, 0);
+      if (!scene.optionalContent) delete result.optionalContent;
+      return result;
+    });
+    return scene;
+  }
+
+  private async compileVectorPageContentUnlocked(
     sourcePageIndex: number,
     options: NativeVectorCompileOptions,
     signal: AbortSignal,
@@ -1143,7 +1183,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     const commandCount = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
     if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal, textPositions: retainedTextPositions.get(page.textIndex) });
     const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal,
-      { ...this.document.limits, ...options.limits });
+      { ...this.document.limits, ...options.limits }, diagnostic => this.appendDiagnostics([diagnostic]));
     if (!layer) throw new PdfError("invalid-object", "A retained page replay produced no structural raster slot.");
     const scene = buildNativeRasterPage(page, { rgba: new Uint8ClampedArray(layer.data), width: layer.width,
       height: layer.height, scale: layer.width / layer.matrix[0] }, signal);
@@ -3792,7 +3832,8 @@ async function renderNativeSelectiveCompositeLayers(
 /** Internal replay entry point; the supplied retained page needs no source PDF or parser session. */
 export async function renderNativeRetainedCommandSpan(
   page: HeprPageData, firstCommand: number, count: number, signal: AbortSignal,
-  limits?: Readonly<PdfResourceLimits>
+  limits?: Readonly<PdfResourceLimits>,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void
 ): Promise<NativeSelectiveRasterLayer | null> {
   signal.throwIfAborted();
   const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex]?.commands;
@@ -3805,7 +3846,7 @@ export async function renderNativeRetainedCommandSpan(
   try {
     return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
       firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
-      { imageSurfaces, boundSoftMasks: true }, true, limits);
+      { imageSurfaces, boundSoftMasks: true, onDiagnostic }, true, limits);
   } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
 }
 
@@ -3813,7 +3854,9 @@ async function renderNativeCompositeCommandSpan(
   page: HeprPageData, first: number, last: number, paintOrder: number, signal: AbortSignal,
   surfaceFactory: Awaited<ReturnType<typeof createNativeCompositeSurfaceFactory>>,
   renderHeprPageToCanvas2d: NativeCompositeRenderer,
-  renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals,
+  renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals & {
+    readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  },
   boundCompositeWork: boolean,
   limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer | null> {
@@ -4137,8 +4180,25 @@ async function renderNativeCompositePixels(
   } = {}
 ) {
   try {
-    const { surface, width, height, scale } = await render(page, {
-      ...options, onDiagnostic: options.onDiagnostic ?? internal.onDiagnostic
+    // A stored raster has no live camera transform. Approximate view-dependent
+    // annotation flags only for raster capture; retain the original program.
+    const hasViewFlags = (command: HeprDisplayCommand) =>
+      command.kind === "invoke-program" && command.viewTransformFlags !== 0;
+    const approximatedViewFlags = page.displayProgram.groups.some(group => group.commands.some(hasViewFlags)) ||
+      page.displayProgram.programs.some(program => program.commands.some(hasViewFlags));
+    const captureCommands = (commands: readonly HeprDisplayCommand[]) => commands.map(command =>
+      hasViewFlags(command) ? { ...command, viewTransformFlags: 0 } : command);
+    const displayProgram = approximatedViewFlags ? { ...page.displayProgram,
+      groups: page.displayProgram.groups.map(group => ({ ...group, commands: captureCommands(group.commands) })),
+      programs: page.displayProgram.programs.map(program => ({ ...program, commands: captureCommands(program.commands) }))
+    } : page.displayProgram;
+    const onDiagnostic = options.onDiagnostic ?? internal.onDiagnostic;
+    if (approximatedViewFlags) onDiagnostic?.({
+      code: "annotation.view-transform-approximated", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+      message: "Rasterized NoZoom/NoRotate annotations use page geometry and scale with the page."
+    });
+    const { surface, width, height, scale } = await render(approximatedViewFlags ? { ...page, displayProgram } : page, {
+      ...options, onDiagnostic
     }, internal);
     options.signal?.throwIfAborted();
     // getImageData owns its pixels. Release scratch surfaces after extraction;

@@ -67,7 +67,10 @@ async function assertCompilerRuntimeBoundary() {
 
 async function assertDirectVectorBoundary() {
   const sessionSource = await readFile(path.join(sourceRoot, "pdfSession.ts"), "utf8");
-  const body = readMethodBody(sessionSource, "compileVectorPageUnlocked");
+  const wrapper = readMethodBody(sessionSource, "compileVectorPageUnlocked");
+  assert.match(wrapper, /this\.compileVectorPageContentUnlocked\(/,
+    "annotation metadata wraps the existing direct vector compilation path");
+  const body = readMethodBody(sessionSource, "compileVectorPageContentUnlocked");
   assert.match(
     body,
     /preparePageCompilation\([\s\S]*?"vector-scene"[\s\S]*?\)/,

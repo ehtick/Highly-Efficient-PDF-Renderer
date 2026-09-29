@@ -1,3 +1,5 @@
+import { createViewerLinkNavigation } from "./viewerLinkNavigation";
+import { createAnnotationOverlay } from "./annotationOverlay";
 import "./style.css";
 import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
@@ -213,6 +215,7 @@ const vectorColorInputElement = vectorColorInput;
 const vectorOpacitySliderElement = vectorOpacitySlider;
 const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
+let lastParsedScene: VectorScene | null = null;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
@@ -266,6 +269,7 @@ function applyTextSearchScene(scene: VectorScene): void {
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
   drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
@@ -316,6 +320,41 @@ const drawingSelection = createDrawingSelectionControls({
   }
 });
 
+const annotationBubblesCheckbox = document.querySelector<HTMLInputElement>("#annotation-bubbles-checkbox")!;
+const linkNavigation = createViewerLinkNavigation({
+  getCanvas: () => canvasElement,
+  getScene: () => lastParsedScene,
+  getIdentity: () => renderer,
+  getSourceUrl: () => lastDownloadablePdf?.url,
+  beforeNavigate: () => canvasInteractionController.cancelActiveGesture(),
+  getView: () => {
+    if (!renderer) return null;
+    const view = renderer.getViewState();
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    return { centerX: view.cameraCenterX, centerY: view.cameraCenterY, zoom: view.zoom / ratio };
+  },
+  setView: view => {
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    renderer.setViewState({ cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio });
+  }
+});
+const annotationOverlay = createAnnotationOverlay({
+  getCanvas: () => canvasElement,
+  adapter: {
+    getScene: () => lastParsedScene,
+    getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
+    clientToScenePoint: (x, y) => renderer.clientToScenePoint?.(x, y) ?? null,
+    sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
+  },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
+  enabled: annotationBubblesCheckbox.checked
+});
+annotationBubblesCheckbox.addEventListener("change", () => {
+  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+});
+
 const layerVisibility = createLayerVisibilityController({
   getScene: () => lastParsedScene,
   getRenderer: () => renderer,
@@ -324,6 +363,7 @@ const layerVisibility = createLayerVisibilityController({
     textSearchController.refreshVisibility();
     textSelection.clearSelection();
     drawingSelection.onFrame();
+    annotationOverlay.onFrame();
   }
 });
 const pdfLayerControls = createPdfLayerControls({
@@ -337,6 +377,7 @@ function onRendererFrame(stats: DrawStats): void {
   drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
   drawingSelection.onFrame();
+  annotationOverlay.onFrame();
 
   // Camera/interaction work stays per frame; formatting and replacing the HUD
   // text hundreds of times per second adds unnecessary browser work.
@@ -409,7 +450,6 @@ interface LoadedSource {
 }
 
 let lastLoadedSource: LoadedSource | null = null;
-let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
@@ -583,6 +623,8 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 window.addEventListener("beforeunload", () => {
   drawCallMeter.dispose();
   drawingSelection.dispose();
+  annotationOverlay.dispose();
+  linkNavigation.dispose();
   pdfLayerControls.dispose();
   layerVisibility.dispose();
   activeHepExportController?.abort();
@@ -807,7 +849,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     if (selection.kind === "pdf") {
       await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
         source: { kind: "pdf", bytes, label: selection.sourceName },
-        downloadablePdf: { label: selection.sourceName, bytes },
+        downloadablePdf: { label: selection.sourceName, bytes, url: selection.pdfPath },
         signal,
         preserveView: false
       });

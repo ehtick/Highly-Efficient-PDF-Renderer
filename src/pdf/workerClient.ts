@@ -1,3 +1,4 @@
+import type { PdfAnnotation } from "../annotationData";
 import type {
   HeprPageData,
   PdfCompileOptions,
@@ -311,6 +312,15 @@ class WorkerPdfSession implements NativeVectorPdfSession {
     }
   }
 
+  async getPageAnnotations(sourcePageIndex: number, options: { signal?: AbortSignal } = {}): Promise<readonly PdfAnnotation[]> {
+    const signal = combineSignals(this.lifetime.signal, options.signal);
+    let release: (() => void) | null = null;
+    try {
+      release = await this.acquireOperation(signal);
+      return await this.connection.getPageAnnotations(sourcePageIndex, signal);
+    } finally { release?.(); }
+  }
+
   async compilePage(
     sourcePageIndex: number,
     options: PdfCompileOptions = {}
@@ -534,6 +544,13 @@ class PdfWorkerConnection {
     signal?: AbortSignal
   ): Promise<OpenSuccess> {
     return this.request({ operation: "open", source, options }, transfer, signal) as Promise<OpenSuccess>;
+  }
+
+  async getPageAnnotations(sourcePageIndex: number, signal?: AbortSignal): Promise<readonly PdfAnnotation[]> {
+    const response = await this.request({ operation: "get-page-annotations", sourcePageIndex }, [], signal) as
+      Extract<PdfWorkerSuccess, { operation: "get-page-annotations" }>;
+    this.replaceDiagnostics(response.diagnostics);
+    return response.annotations;
   }
 
   compilePage(
@@ -980,6 +997,8 @@ class PdfWorkerConnection {
 }
 
 type RequestBody =
+  | Omit<Extract<PdfWorkerRequest, { operation: "get-page-annotations" }>,
+      "type" | "protocolVersion" | "requestId">
   | Omit<Extract<PdfWorkerRequest, { operation: "open" }>,
       "type" | "protocolVersion" | "requestId">
   | Omit<Extract<PdfWorkerRequest, { operation: "compile-page" }>,

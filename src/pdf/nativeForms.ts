@@ -186,6 +186,7 @@ export class NativePdfFormAppearanceRegistry {
   private readonly decodedContentCache = new WeakMap<NativePdfForm, Promise<Uint8Array>>();
   private readonly pageResourceCache = new Map<number, PdfDictionary>();
   private readonly annotationCache = new Map<number, readonly NativePdfAnnotationAppearance[]>();
+  private readonly annotationRecordCache = new Map<number, readonly NativePdfAnnotationAppearance[]>();
   private readonly annotationPrivate = new WeakMap<NativePdfAnnotationAppearance, PrivateAnnotation>();
   private readonly inferredStateDiagnostics = new WeakSet<NativePdfAnnotationAppearance>();
   private acroFormCache: NativePdfAcroFormMetadata | null | undefined;
@@ -369,17 +370,19 @@ export class NativePdfFormAppearanceRegistry {
   /** Discover page annotations and field metadata without decoding appearances. */
   async listPageAnnotations(
     pageIndex: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    metadataOnly = false
   ): Promise<readonly NativePdfAnnotationAppearance[]> {
     throwIfAborted(signal);
-    const cached = this.annotationCache.get(pageIndex);
+    const cache = metadataOnly ? this.annotationRecordCache : this.annotationCache;
+    const cached = cache.get(pageIndex);
     if (cached) return cached;
     const page = this.document.getPage(pageIndex);
     const pageResources = await this.getPageResources(pageIndex, signal);
     const resolved = await this.document.resolveValue(page.annotations, signal);
     if (resolved === undefined || resolved === null) {
       const empty = Object.freeze([]) as readonly NativePdfAnnotationAppearance[];
-      this.annotationCache.set(pageIndex, empty);
+      cache.set(pageIndex, empty);
       return empty;
     }
     if (!Array.isArray(resolved)) {
@@ -429,7 +432,7 @@ export class NativePdfFormAppearanceRegistry {
         `annotation ${annotationIndex} /F`,
         signal
       );
-      const appearanceStateValue = await this.document.resolveValue(dictionary.get("AS"), signal);
+      const appearanceStateValue = metadataOnly ? undefined : await this.document.resolveValue(dictionary.get("AS"), signal);
       if (
         appearanceStateValue !== undefined && appearanceStateValue !== null &&
         !isPdfName(appearanceStateValue)
@@ -439,11 +442,11 @@ export class NativePdfFormAppearanceRegistry {
           details: { annotationIndex }
         });
       }
-      const widget = subtypeValue.value === "Widget"
+      const widget = !metadataOnly && subtypeValue.value === "Widget"
         ? await this.readWidgetMetadata(rawValue, pageIndex, annotationIndex, signal)
         : undefined;
       const annotation: NativePdfAnnotationAppearance = Object.freeze({
-        id: this.sourceIdentity(rawValue, dictionary),
+        id: isPdfRef(rawValue) ? `ref:${pdfRefKey(rawValue)}` : `page:${pageIndex}:annotation:${annotationIndex}`,
         pageIndex,
         annotationIndex,
         ref: isPdfRef(rawValue) ? rawValue : null,
@@ -469,7 +472,7 @@ export class NativePdfFormAppearanceRegistry {
       annotations.push(annotation);
     }
     const result = Object.freeze(annotations);
-    this.annotationCache.set(pageIndex, result);
+    cache.set(pageIndex, result);
     return result;
   }
 
@@ -487,7 +490,7 @@ export class NativePdfFormAppearanceRegistry {
     if (!privateAnnotation) {
       throw new TypeError("The annotation was not created by this registry.");
     }
-    if (!annotation.visibleInDefaultView) return null;
+    if (!annotation.visibleInDefaultView || annotation.subtype === "Popup") return null;
     let optionalContentIndex = -1;
     if (annotation.optionalContent !== undefined && annotation.optionalContent !== null) {
       if (!this.optionalContent) {
@@ -1405,7 +1408,7 @@ function fieldStructureError(
   });
 }
 
-function decodePdfString(
+export function decodePdfString(
   value: PdfString,
   pageIndex: number,
   annotationIndex: number

@@ -112,6 +112,10 @@ EMC
     const page = await session.compilePage(0);
     validateHeprPageData(page);
 
+    assert.equal(page.annotations.length, 2);
+    assert.equal(page.annotations[0].visibleInDefaultView, false);
+    assert.equal(page.annotations[0].optionalContent, 1);
+    assert.equal(page.annotations[1].optionalContent, 0);
     assert.deepEqual(page.stores.optionalContent.names, ["Visible Layer", "Hidden Layer"]);
     assert.deepEqual([...page.stores.optionalContent.defaultVisible], [1, 0]);
     assert.ok(

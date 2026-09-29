@@ -708,6 +708,8 @@ const GRADIENT_FILL_VERTEX_SHADER_SOURCE = replaceShaderSource(replaceShaderSour
   "void main() {", `uniform vec4 uClipBounds;\n${CLIPPED_PAINT_QUAD_GLSL}\nvoid main() {`),
   `  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
+    uUseLocalToClip, uLocalToClip, uViewport);
   vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);`,
   `  vec4 quad = heprClippedPaintQuad(minBounds, maxBounds, uClipBounds, uUseLocalToClip, uLocalToClip, uZoom, uViewport);
   if (any(greaterThan(quad.xy, quad.zw))) {

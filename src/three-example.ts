@@ -1,3 +1,5 @@
+import { createThreeLinkNavigation } from "./threeLinkNavigation";
+import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
 import { WebGPURenderer } from "three/webgpu";
@@ -305,6 +307,32 @@ const drawingSelection = createDrawingSelectionControls({
     else textSelection.enable();
   }
 });
+const annotationBubblesCheckbox = document.querySelector<HTMLInputElement>("#annotation-bubbles-checkbox")!;
+const linkNavigation = createThreeLinkNavigation({
+  getCanvas: () => canvasElement,
+  getPdfObject: () => currentPdfObject,
+  camera,
+  getControls: () => controls,
+  getSourceUrl: () => lastDownloadablePdf?.url,
+  onCameraChange: () => { updateCameraClipping(true); requestRender(); }
+});
+const annotationOverlay = createAnnotationOverlay({
+  getCanvas: () => canvasElement,
+  adapter: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
+    clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvasElement) ?? null,
+    sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement) ?? null,
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
+  },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
+  enabled: annotationBubblesCheckbox.checked
+});
+annotationBubblesCheckbox.addEventListener("change", () => {
+  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+});
+
 const layerControls = createThreePdfLayerControls({
   container: pdfLayersContainer,
   getPdfObject: () => currentPdfObject,
@@ -314,6 +342,7 @@ const layerControls = createThreePdfLayerControls({
     refreshSearchAvailability();
     runSearch(textSearchInputElement.value, false);
     drawingSelection.onFrame();
+    annotationOverlay.onFrame();
   }
 });
 
@@ -502,6 +531,7 @@ function renderFrame(now: number = performance.now()): void {
   if (profile) recordCaptureCounters(profile, drawCalls, controlsChanged);
   profile?.beginSection("overlays");
   drawingSelection.onFrame();
+  annotationOverlay.onFrame();
   textSelection.updateOverlay();
   profile?.endSection("overlays");
   // Writing the readouts every frame costs a style recalc, layout and paint per
@@ -1031,6 +1061,8 @@ function disposeExample(): void {
   captureProfiler = null;
   layerControls.dispose();
   drawingSelection.dispose();
+  annotationOverlay.dispose();
+  linkNavigation.dispose();
   textSelection.dispose();
   controls.dispose();
   disposeCurrentObject();
@@ -1316,6 +1348,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
     try { drawingSelection.rendererChanged(); }
     finally { releasePdfObject(previousObject!); }
   } else drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   updateDrawStatsMeter();
   setDownloadDataButtonState(true);
   refreshSearchAvailability();
@@ -1342,6 +1375,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   currentPdfObject = null;
   layerControls.objectChanged();
   drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {

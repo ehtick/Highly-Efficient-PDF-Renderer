@@ -1,3 +1,5 @@
+import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
+import { placeSceneAnnotation } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import { HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
@@ -735,6 +737,13 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.imagePaintOpCount = scene.rasterLayers.length;
   const image = scene.rasterLayers[0];
   if (image) { scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerData = image.data; scene.rasterLayerMatrix = image.matrix; }
+  scene.pdfPages = [{ pageIndex: 0, sourcePageIndex: source.pageInfo.sourcePageIndex,
+    pdfToScene: computeNativePdfPageGeometry(source.pageInfo).pageMatrix }];
+  scene.annotations = source.annotations?.map(annotation => {
+    const result = placeSceneAnnotation(annotation, 0);
+    if (!scene.optionalContent) delete result.optionalContent;
+    return result;
+  });
   return scene;
 }
 

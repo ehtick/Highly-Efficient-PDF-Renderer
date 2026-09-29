@@ -224,6 +224,143 @@ pdf.dispose();
 fallback viewport. In an ordinary Three.js integration, use your application's
 camera and controls. Full method contracts: [HeprThreePdfObject](../src/threePdfObject.ts).
 
+### PDF annotations and HTML bubbles
+
+Read `pdf.sceneData.annotations ?? []` for clone-safe `SceneAnnotation` records.
+HEPR extracts metadata independently of bubble rendering. Native appearances
+remain page content; missing highlights, underlines, ink and note icons receive
+vector appearances. Unknown missing appearances use a diagnosed outline. Popup
+annotations carry relationships only, without a separate drawable or hotspot.
+Comment text never enters the page's searchable text index.
+
+Records preserve source `/Annots` order, including hidden annotations. Their
+`id` is stable within the source document; `sourcePageIndex` and
+`annotationIndex` are zero-based source indexes. `pageIndex` is the composed
+scene page slot, so selected or reordered pages keep their source identity.
+`bounds`, `quadPoints`, `line`, `vertices` and `inkList` use composed Y-up
+scene coordinates. `pdfGeometry` retains the original PDF coordinates before
+crop offsets, rotation, UserUnit and page placement. An annotation can extend
+beyond its page crop; hosts should clip interaction to `scene.pageRects`.
+
+`scene.pdfPages ?? []` contains `ScenePdfPage` mappings for displayed pages,
+including pages without annotations. Each mapping has `pageIndex` (scene slot),
+`sourcePageIndex` (PDF page), and a six-number `pdfToScene` matrix. Transform a
+PDF destination `(x, y)` with `[a, b, c, d, e, f]` as
+`(a*x + c*y + e, b*x + d*y + f)`. These mappings include crop, rotation,
+UserUnit and grid placement. Do not assume a source page index is a scene slot;
+a selected-page scene may omit the target page.
+
+Decoded fields include `contents` (`/Contents`), `tooltip` (`/TU`),
+`author` (`/T` for comments), subject, name, original PDF date strings, icon,
+open state, color, opacity and border. Widgets use `field.name` for the
+qualified field name, plus type, flags and decoded values; their `/TU` is the
+field's alternate UI name and is resolved through the field ancestry.
+`popupId`, `parentId` and `replyToId` link records without recursive objects.
+
+`action` and `destination` are inert descriptions. URI, GoTo, GoToR and Named
+actions include bounded `next` chains; local destinations resolve to source page
+indexes where possible. Destination parameters stay in the target page's
+original PDF coordinates. Unresolved names and unsupported action types are
+retained. Parsing and loading never execute actions or follow links. The
+package does not edit comments or interact with fields. Hosts can opt into
+link navigation through the overlay's activation callback.
+
+The optional HTML helper uses your existing projection and layer APIs:
+
+```ts
+import { createAnnotationOverlay } from "@soadzoor/hepr";
+
+const bubbles = createAnnotationOverlay({
+  getCanvas: () => renderer.domElement,
+  adapter: {
+    getScene: () => pdf.sceneData,
+    getOptionalContentVisibility: () => pdf.getOptionalContentVisibility(),
+    clientToScenePoint: (x, y) =>
+      pdf.clientToScenePoint(camera, x, y, renderer.domElement),
+    sceneToClientPoint: (x, y) =>
+      pdf.sceneToClientPoint(camera, x, y, renderer.domElement),
+    isInteractionSuppressed: () => drawingSelectionEnabled
+  },
+  // Optional: replace the bubble body while keeping its lifecycle and controls.
+  renderContent(annotation, container) {
+    const text = container.ownerDocument.createElement("p");
+    text.textContent = annotation.contents ?? annotation.tooltip ?? annotation.subtype;
+    container.appendChild(text); // Treat all PDF strings as text.
+  }
+});
+
+// Call after camera/layer changes or in your existing frame loop.
+bubbles.onFrame();
+// After replacing the document or rendering backend:
+bubbles.sceneChanged();
+// During teardown:
+bubbles.dispose();
+```
+
+Omit `renderContent` to use selectable plain text with tooltip/comment,
+author/date and informational link details. Hover previews one bubble; clicking
+or tapping a comment pins it. A pinned comment survives hover and backend
+replacement for the same scene object. Another click, the close button, Escape,
+hiding its layer or replacing its scene dismisses it. Dragging and multi-touch
+never pin a bubble.
+
+Link previews follow the pointer with an offset, flipping near viewport edges.
+They have no close or action buttons and pass pointer events through to the
+canvas. Links never pin, including unresolved links or links without an
+activation handler; leaving the link dismisses its preview. Click or tap the
+link itself, or press Enter while it is hovered, to activate it. Programmatic
+`show(link)` only previews a link that is currently hovered.
+
+Call `enable()` / `disable()` for a toggle, or `show(annotation)` /
+`hide()` for an accessible host-provided annotation list. Call `onFrame()`
+after visibility changes even when the camera is idle. Use
+`isInteractionSuppressed` to give drawing or active text selection precedence.
+
+Supply `onActivate(annotation)` to handle a click, tap or Enter on the canvas.
+Return `true` when handled to dismiss the bubble; return `false` to keep the
+normal pinning behavior for comments. Links dismiss after activation even if
+unhandled. The callback runs synchronously in the input event,
+so a host can call `window.open(url, "_blank", "noopener,noreferrer")` after
+validating the URL. Optionally supply `getActivationLabel(annotation)` to show
+an accessible action button in a comment bubble (return `null` for no button).
+Link previews always omit this button.
+The helper itself does not interpret or execute PDF actions.
+
+The native viewer uses its renderer's `clientToScenePoint` and
+`sceneToClientPoint` methods with the same helper. Native, three-example and
+room-detection enable **Annotation bubbles** by default, with no permanent
+hotspot markers. `pickSceneAnnotation` is also exported for custom UIs; it tests
+individual markup quads, ink proximity and other annotation bounds.
+
+All three examples opt into opening HTTP(S) links in a new tab and navigating
+local `/GoTo` or `/Dest` links with a distance-aware camera animation: nearby
+jumps have a subtle zoom arc, while longer jumps pull back as they move and
+zoom in on arrival. Travel takes 450–1200 ms with a smooth departure and
+ease-out arrival, preserving the destination's final position and zoom. The
+preview follows the mouse while the canvas shows a pointer over interactive
+annotations. Clicking the link activates it directly. Camera jumps respect
+reduced-motion preferences and stop on user input, document replacement or
+backend replacement. Dragging and active selection take precedence. The
+**Annotation bubbles** toggle also enables/disables these link interactions.
+Relative URLs resolve against the PDF's `/URI /Base` or its source URL when
+available. Remote-file, Named, JavaScript and chained `/Next` actions remain
+informational; unresolved destinations also retain their preview.
+
+Navigation handles XYZ, Fit, FitB, FitH, FitBH, FitV, FitBV and FitR destinations.
+Point destinations are centered for visibility; an unspecified zoom retains a
+closer zoom or fits the destination page when leaving an overview. FitB variants
+use the page crop because separate visible-content bounds are not available.
+Destinations outside the selected pages remain informational.
+
+HEP files preserve these records in an optional JSON section. Supported HEP
+files written without that section load with an empty annotation collection.
+Recovering their metadata requires reconversion from the original PDF. The
+optional page mappings live in the same version-1 section; no HEP format version
+changes. Files with older annotation sections still open: URLs work, and an
+internal target can fit its page if another annotation identifies that page's
+source index. Exact positions and targets on pages without annotations require
+reconversion to include `pdfPages`.
+
 ### Drawing primitives
 
 `pick({ camera, element, clientX, clientY, tolerancePx?, kinds?, signal? })`
@@ -625,6 +762,29 @@ for lazy bundled font loading. Close worker sessions with `await session.close()
 close a file source yourself if it is never handed to a session. Session options
 and methods are defined in [workerClient.ts](../src/pdf/workerClient.ts) and
 [nativeTypes.ts](../src/pdf/nativeTypes.ts).
+
+Both direct `PdfSession` and worker sessions expose
+`await session.getPageAnnotations(sourcePageIndex, { signal })`. This reads
+metadata without compiling page content or decoding appearance streams. It
+returns detached `PdfAnnotation` records with page-native Y-up geometry,
+including crop, rotation and UserUnit, before scene placement. Newly compiled
+`HeprPageData.annotations` and `VectorScene.annotations` are arrays, including
+an empty array for pages without annotations. Optional malformed fields emit
+`annotation.metadata-invalid` diagnostics while preserving usable fields;
+cancellation and resource limits remain enforced.
+
+```ts
+import { createNodeFilePdfSource, openPdfInNodeWorker } from "@soadzoor/hepr/node";
+
+const session = await openPdfInNodeWorker(await createNodeFilePdfSource("drawing.pdf"));
+try {
+  const annotations = await session.getPageAnnotations(0);
+  console.log(annotations.map(({ id, bounds, contents, tooltip }) =>
+    ({ id, bounds, contents, tooltip })));
+} finally {
+  await session.close();
+}
+```
 
 The standalone native viewer is a repository application. Its renderer classes
 are source modules, not named exports from the npm entry point. Use

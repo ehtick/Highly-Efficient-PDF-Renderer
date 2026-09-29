@@ -101,8 +101,10 @@ fn heprFillVertexPack(
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
   // Pixels whose footprint reaches the path need fragments even when the path
   // is thinner than a pixel and falls between pixel centres.
-  let margin = heprCoverageMargin(heprPathToPixel(minBounds + (maxBounds - minBounds) * corner01,
+  let rawMargin = heprCoverageMargin(heprPathToPixel(minBounds + (maxBounds - minBounds) * corner01,
     useLocalToClip, localToClip, zoom, max(viewport, vec2<f32>(1.0))));
+  let margin = heprBoundCoverageMargin(minBounds + (maxBounds - minBounds) * corner01, rawMargin,
+    mat2x2<f32>(1.0, 0.0, 0.0, 1.0), useLocalToClip, localToClip, max(viewport, vec2<f32>(1.0)));
   let world = minBounds - margin + (maxBounds - minBounds + 2.0 * margin) * corner01;
   return vec4<f32>(world, 1.0, 0.0);
 }

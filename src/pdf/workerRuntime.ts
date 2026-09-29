@@ -211,6 +211,13 @@ export function attachPdfWorkerRuntime(
 
       const activeSession = session;
       if (!activeSession) throw new PdfError("closed", "The PDF worker session is not open.");
+      if (request.operation === "get-page-annotations") {
+        const annotations = await activeSession.getPageAnnotations(request.sourcePageIndex, { signal: controller.signal });
+        endpoint.postMessage({ type: "hepr-pdf-result", protocolVersion: PDF_WORKER_PROTOCOL_VERSION,
+          requestId: request.requestId, ok: true, operation: "get-page-annotations",
+          annotations, diagnostics: activeSession.getDiagnostics() });
+        return;
+      }
       const compileOptions: NativeVectorCompileOptions = {
         ...request.options,
         signal: controller.signal,

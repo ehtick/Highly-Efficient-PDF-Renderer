@@ -367,6 +367,7 @@ async function testThreeBackendReplacement() {
 function demoHost() {
   return {
     performance, AbortController, waitForLoad,
+    annotationOverlay: { sceneChanged: noop },
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
     drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },

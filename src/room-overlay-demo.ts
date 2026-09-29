@@ -1,3 +1,5 @@
+import { createThreeLinkNavigation } from "./threeLinkNavigation";
+import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
 import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
@@ -167,6 +169,7 @@ const tempRoomLabelWorldPosition = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 let currentPdfObject: HeprThreePdfObject | null = null;
+let currentPdfSourceUrl: string | undefined;
 let currentRoomOverlay: RoomOverlay | null = null;
 let currentParsedTsv: ParsedRoomTsv | null = null;
 let currentGeneratedTsv: GeneratedRoomTsv | null = null;
@@ -193,11 +196,37 @@ const drawingSelection = createDrawingSelectionControls({
   })
 });
 
+const annotationBubblesCheckbox = requireElement<HTMLInputElement>("#annotation-bubbles-checkbox");
+const linkNavigation = createThreeLinkNavigation({
+  getCanvas: () => canvas,
+  getPdfObject: () => currentPdfObject,
+  camera,
+  getControls: () => controls,
+  getSourceUrl: () => currentPdfSourceUrl,
+  onCameraChange: () => { updateCameraClipping(true); requestRender(); }
+});
+const annotationOverlay = createAnnotationOverlay({
+  getCanvas: () => canvas,
+  adapter: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
+    clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvas) ?? null,
+    sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvas) ?? null,
+    isInteractionSuppressed: () => drawingSelection.isEnabled()
+  },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
+  enabled: annotationBubblesCheckbox.checked
+});
+annotationBubblesCheckbox.addEventListener("change", () => {
+  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+});
+
 const layerControls = createThreePdfLayerControls({
   container: requireElement<HTMLDivElement>("#pdf-layers"),
   getPdfObject: () => currentPdfObject,
   requestRender,
-  onVisibilityChange: () => drawingSelection.onFrame()
+  onVisibilityChange: () => { drawingSelection.onFrame(); annotationOverlay.onFrame(); }
 });
 
 const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
@@ -489,7 +518,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
       kind === "pdf"
         ? new File([bytes], `${baseName}.pdf`, { type: "application/pdf" })
         : new File([bytes], `${baseName}.hep`, { type: "application/x-hep" });
-    await loadSceneSource(file);
+    await loadSceneSource(file, entry.pdfPath);
   } catch (error) {
     if (activeToken !== loadToken || controller.signal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
@@ -517,7 +546,7 @@ function formatFileSize(sizeBytes: number): string {
   return `${rounded} ${units[unitIndex]}`;
 }
 
-async function loadSceneSource(file: File): Promise<boolean> {
+async function loadSceneSource(file: File, sourceUrl?: string): Promise<boolean> {
   const isHep = isHepFile(file);
   const activeToken = ++loadToken;
   sourceLoadController?.abort();
@@ -562,6 +591,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     clearCurrentPdfObject();
     currentPdfCoordinateTransform = coordinateTransform;
     currentPdfObject = pdfObject;
+    currentPdfSourceUrl = sourceUrl;
     pendingObject = null;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
@@ -571,6 +601,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     pdfValue.textContent = pdfObject.sourceLabel;
     fitCameraToObject(pdfObject);
     drawingSelection.sceneChanged();
+    annotationOverlay.sceneChanged();
     layerControls.objectChanged();
     setStatus(`${file.name} loaded. Add a TSV overlay.`);
     return true;
@@ -1264,6 +1295,7 @@ function clearCurrentPdfObject(): void {
   const previousPdfObject = currentPdfObject;
   currentPdfObject = null;
   drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   layerControls.objectChanged();
   previousPdfObject.renderer.setInteractionViewportProvider(null);
   previousPdfObject.setFrameListener(null);
@@ -1395,6 +1427,7 @@ function renderFrame(): void {
   scene.updateMatrixWorld(true);
   camera.updateMatrixWorld(true);
   drawingSelection.onFrame();
+  annotationOverlay.onFrame();
   renderer.clear(true, true, true);
   drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   const zoomText = currentPdfObject ? `${currentPdfObject.getViewState().zoom.toFixed(2)}x` : "-";
@@ -1584,6 +1617,8 @@ function disposeDemo(): void {
   controls.dispose();
   layerControls.dispose();
   drawingSelection.dispose();
+  annotationOverlay.dispose();
+  linkNavigation.dispose();
   clearCurrentPdfObject();
   renderer.dispose();
 }

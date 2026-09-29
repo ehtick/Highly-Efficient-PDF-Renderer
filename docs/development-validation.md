@@ -67,9 +67,9 @@ does not track a lockfile.
 
 `npm run release-new-version` runs `npm test` and `npm run build:all` before
 bumping the patch version and pushing its tag. The fast suite includes real
-Node worker startup with process-wide flags from CI, covering both the full
-and dense PDF workers. A successful local release command means the tag was
-pushed; check the separate **Publish to npm** workflow for publishing success.
+Node worker startup with process-wide flags from CI, covering the native PDF
+worker. A successful local release command means the tag was pushed; check the
+separate **Publish to npm** workflow for publishing success.
 
 ## Manual checks
 

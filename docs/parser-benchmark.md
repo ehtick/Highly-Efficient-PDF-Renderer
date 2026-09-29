@@ -537,3 +537,26 @@ Implementation files: `src/pdf/nativeContentCompiler.ts`, `src/pdfSession.ts`,
 `scripts/test-pdf-to-hep-progress.mjs`, `scripts/check-pdf-hep-parity.mjs`, and
 `scripts/lib/testSuites.mjs`. This document records the evidence and remaining
 manual checks. No commits, history changes, or development servers were used.
+
+### Final small follow-up
+
+The duplicate-stroke hash index reserved two 1,048,576-entry `Uint32Array`s on
+its first insertion: **8 MiB even for a one-stroke page**. It now starts with
+1,024 entries (**8 KiB**) and uses the existing geometric growth. Allocation
+regressions cover both compiler output modes, and 3,000 distinct lines repeated
+in reverse direction verify that lookups survive multiple growth steps.
+
+A serial direct-session Lower Level check measured 18.457 s before and 17.875 s
+after, with the same complete scene fingerprint. This single pair is a check
+against a material CAD regression, not evidence of a repeatable speedup. A
+500,000-stroke synthetic comparison also preserved geometry bytes; its timings
+were slightly slower with the smaller table, so this change is justified by
+small-page allocation savings, not a claim of faster per-line compilation.
+
+`npm test` now includes `ordered-stroke-culling`, `stroke-coverage-order`, and
+`pdf-load-progress`, which had remained outside the explicit fast selection.
+The gradient pixel test now explicitly routes one retained compilation through
+streaming: `compilePage` normally uses prepared input, so the previous pixel
+comparison used the same loader on both sides. The revised test asserts that
+resource numbering actually differs before asserting equal pixels. The separate
+lowered vector-scene comparison already exercised both paths and still passes.

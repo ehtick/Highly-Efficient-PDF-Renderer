@@ -63,12 +63,15 @@ try {
       const bytes = fixture([content], true);
       const expected = await compile(bytes, true), actual = await compile(bytes, false);
       assert.equal(sceneFingerprint(actual.scene), sceneFingerprint(expected.scene));
-      const pixels = [];
+      const pixels = [], gradientOrders = [];
       for (const prepared of [true, false]) {
         const session = await openPdf({ kind: "bytes", bytes });
-        if (prepared) session.prepareStreamedPageResources = async () => null;
+        // compilePage normally prepares input. Force its resource preparation
+        // through streaming so the reference renderer exercises both loaders.
+        if (!prepared) session.preparePageResources = session.prepareStreamedPageResources.bind(session);
         try {
           const page = await session.compilePage(0);
+          gradientOrders.push([...page.stores.gradients.coordinates]);
           const rendered = await renderHeprPageToCanvas2d(page, {
             scale: 1, background: [1, 1, 1, 1],
             surfaceFactory(width, height) {
@@ -78,6 +81,10 @@ try {
           });
           pixels.push(rendered.surface.context.getImageData(0, 0, 100, 100).data);
         } finally { await session.close(); }
+      }
+      if (content.startsWith("/Sh")) {
+        assert.notDeepEqual(gradientOrders[1], gradientOrders[0],
+          "the pixel comparison must exercise different retained gradient indices");
       }
       assert.deepEqual(pixels[1], pixels[0], "first-use gradient indices preserve pixels");
       assert(pixels[1].some((value, index) => index % 4 !== 3 && value < 200));

@@ -19,6 +19,7 @@ for (const compile of [compileNative]) {
     setTimeout: globalThis.setTimeout
   };
   let allocatedBytes = 0;
+  let allocatedIndexBytes = 0;
   let openedPorts = 0;
   let closedPorts = 0;
   try {
@@ -28,7 +29,10 @@ for (const compile of [compileNative]) {
       globalThis[name] = class extends originals[name] {
         constructor(...args) {
           super(...args);
-          if (!(args[0] instanceof ArrayBuffer)) allocatedBytes += this.byteLength;
+          if (!(args[0] instanceof ArrayBuffer)) {
+            allocatedBytes += this.byteLength;
+            if (name === "Uint32Array") allocatedIndexBytes += this.byteLength;
+          }
         }
       };
     }
@@ -62,15 +66,31 @@ for (const compile of [compileNative]) {
 
     // Deferred allocation must still initialize duplicate detection correctly
     // on the first stroke and keep independent state in the next compilation.
-    for (let page = 0; page < 2; page += 1) {
+    for (const output of ["geometry", "vector-scene"]) {
+      const indexesBefore = allocatedIndexBytes;
       const painted = await compile(encoder.encode(
         "2 w 10 10 m 90 10 l S 10 10 m 90 10 l S 20 20 10 10 re f"
-      ), options);
+      ), { ...options, output });
+      assert.ok(allocatedIndexBytes - indexesBefore < 1024 * 1024,
+        `A tiny ${output} page allocated ${allocatedIndexBytes - indexesBefore} bytes of index buffers.`);
       assert.equal(painted.segmentCount, 1);
       assert.equal(painted.discardedDuplicateCount, 1);
       assert.equal(painted.fillPathCount, 1);
     }
     assert.equal(closedPorts, openedPorts);
+
+    // Growing the initially small index must preserve every stored entry.
+    // Repeat reversed lines so lookup also exercises canonicalized geometry.
+    const count = 3000;
+    const lines = Array.from({ length: count }, (_, y) => `10 ${y} m 90 ${y} l S`).join("\n");
+    const reversed = Array.from({ length: count }, (_, y) => `90 ${y} m 10 ${y} l S`).join("\n");
+    for (const output of ["geometry", "vector-scene"]) {
+      const grown = await compile(encoder.encode(`2 w ${lines}\n${reversed}`), {
+        ...options, output, pageBounds: { minX: 0, minY: -10, maxX: 100, maxY: count + 10 }
+      });
+      assert.equal(grown.segmentCount, count);
+      assert.equal(grown.discardedDuplicateCount, count, `${output}: duplicate lookup survives growth`);
+    }
 
     const controller = new AbortController();
     await assert.rejects(compile(encoder.encode(""), {

@@ -5978,7 +5978,9 @@ class DenseDuplicateIndex {
   private grow(): void {
     const oldHashes = this.hashes;
     const oldIndices = this.indices;
-    this.hashes = new Uint32Array(oldHashes.length === 0 ? 1 << 20 : oldHashes.length * 2);
+    // Most pages have few strokes. Reserve 8 KiB across both index arrays on
+    // first use; dense CAD pages grow geometrically as unique strokes arrive.
+    this.hashes = new Uint32Array(oldHashes.length === 0 ? 1 << 10 : oldHashes.length * 2);
     this.indices = new Uint32Array(this.hashes.length);
     const mask = this.hashes.length - 1;
     for (let i = 0; i < oldHashes.length; i += 1) {

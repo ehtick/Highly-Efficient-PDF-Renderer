@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -8,15 +8,6 @@ const sourceRoot = path.join(repositoryRoot, "src");
 const legacyCompilerPath = path.join(sourceRoot, "densePdfContentCompiler.ts");
 const nativeCompilerPath = path.join(sourceRoot, "pdf/nativeContentCompiler.ts");
 
-const expectedLegacyConsumers = [
-  "src/densePdfFastWorker.ts",
-  "src/densePdfFastWorkerClient.ts",
-  "src/nativeDenseRetainedTextCompiler.ts"
-];
-const exclusiveLegacyConsumers = [
-  "src/densePdfFastWorker.ts",
-  "src/densePdfFastWorkerClient.ts"
-];
 const requiredNativeConsumers = [
   "src/densePdfPageData.ts",
   "src/pdf/nativeFormGeometry.ts",
@@ -25,7 +16,6 @@ const requiredNativeConsumers = [
 ];
 
 await assertCompilerImportBoundary();
-await assertWorkerIsTypeChecked();
 await assertCompilerRuntimeBoundary();
 await assertDirectVectorBoundary();
 
@@ -45,47 +35,18 @@ async function assertCompilerImportBoundary() {
     }
   }
 
-  assert.deepEqual(
-    [...legacyConsumers].sort(),
-    expectedLegacyConsumers,
-    "only the established dense path and retained-text compatibility bridge may import the legacy compiler"
-  );
+  assert.deepEqual([...legacyConsumers], [], "the native compiler is the only PDF content compiler");
   for (const consumer of requiredNativeConsumers) {
     assert.ok(
       nativeConsumers.has(consumer),
       `${consumer} must import pdf/nativeContentCompiler`
     );
   }
-  for (const consumer of exclusiveLegacyConsumers) {
-    assert.equal(
-      nativeConsumers.has(consumer),
-      false,
-      `${consumer} must not import the native compiler`
-    );
-  }
-}
-
-async function assertWorkerIsTypeChecked() {
-  const configPath = path.join(repositoryRoot, "tsconfig.json");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  const worker = "src/densePdfFastWorker.ts";
-  const explicitFiles = config.files ?? [];
-  const includePatterns = config.include ?? (config.files ? [] : ["**/*"]);
-  const excludePatterns = config.exclude ?? ["node_modules", "bower_components", "jspm_packages"];
-  const explicitlyIncluded = explicitFiles.some((pattern) => matchesConfigPath(pattern, worker));
-  const includedByPattern = includePatterns.some((pattern) => matchesConfigPath(pattern, worker));
-  const excludedByPattern = excludePatterns.some((pattern) => matchesConfigPath(pattern, worker));
-  assert.ok(
-    explicitlyIncluded || (includedByPattern && !excludedByPattern),
-    "tsconfig.json must include densePdfFastWorker.ts so compiler ABI drift fails type-checking"
-  );
 }
 
 async function assertCompilerRuntimeBoundary() {
-  const [legacyCompiler, nativeCompiler] = await Promise.all([
-    import(pathToFileURL(legacyCompilerPath).href),
-    import(pathToFileURL(nativeCompilerPath).href)
-  ]);
+  await assert.rejects(access(legacyCompilerPath), "the separate dense-vector compiler stays removed");
+  const nativeCompiler = await import(pathToFileURL(nativeCompilerPath).href);
   const content = new TextEncoder().encode("0 0 m 10 10 l S\n");
   const options = {
     pageMatrix: [1, 0, 0, 1, 0, 0],
@@ -93,10 +54,6 @@ async function assertCompilerRuntimeBoundary() {
     enableSegmentMerge: false,
     enableInvisibleCull: false
   };
-
-  const legacyResult = await legacyCompiler.compileDensePdfContent(content, options);
-  assert.ok(legacyResult.retainedTextContent instanceof Uint8Array);
-  assert.equal("paintRuns" in legacyResult, false);
 
   const nativeResult = await nativeCompiler.compileDensePdfContent(content, {
     ...options,
@@ -106,7 +63,6 @@ async function assertCompilerRuntimeBoundary() {
   assert.ok(Array.isArray(nativeResult.paintRunCompositeStates));
   assert.equal("retainedTextContent" in nativeResult, false);
   assert.equal(typeof nativeCompiler.DensePdfResourceLimitError, "function");
-  assert.equal(legacyCompiler.DensePdfResourceLimitError, undefined);
 }
 
 async function assertDirectVectorBoundary() {
@@ -174,32 +130,4 @@ function readMethodBody(source, methodName) {
     if (depth === 0) return source.slice(start, index);
   }
   assert.fail(`unterminated ${methodName}()`);
-}
-
-function matchesConfigPath(pattern, filePath) {
-  const normalizedPattern = pattern.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
-  const normalizedFile = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
-  if (!/[?*]/.test(normalizedPattern)) {
-    return normalizedFile === normalizedPattern || normalizedFile.startsWith(`${normalizedPattern}/`);
-  }
-  let expression = "^";
-  for (let index = 0; index < normalizedPattern.length; index += 1) {
-    const character = normalizedPattern[index];
-    if (character === "*" && normalizedPattern[index + 1] === "*") {
-      index += 1;
-      if (normalizedPattern[index + 1] === "/") {
-        index += 1;
-        expression += "(?:.*/)?";
-      } else {
-        expression += ".*";
-      }
-    } else if (character === "*") {
-      expression += "[^/]*";
-    } else if (character === "?") {
-      expression += "[^/]";
-    } else {
-      expression += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-    }
-  }
-  return new RegExp(`${expression}$`).test(normalizedFile);
 }

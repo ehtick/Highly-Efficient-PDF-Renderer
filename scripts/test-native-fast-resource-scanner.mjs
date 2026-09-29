@@ -133,15 +133,30 @@ function testSimpleTierAndConservativeFallback() {
   assert.equal(simple.stats.scannerTier, "simple");
   assert.deepEqual(simple.references, scanDensePdfPreparedResourceReferences(segments));
 
+  // Text and dash operands carry no resource names: the simple tier steps over
+  // literal strings and flat arrays of numbers and strings.
   for (const content of [
-    "% comment\n0 0 m S",
     "(text) Tj",
     "[1 2] TJ",
-    "/Span << /MCID 1 >> BDC"
+    "[(a) -120 <0041> 3.5 (b\\)c)] TJ /F1 9 Tf",
+    "(nested (paren) and \\( escape) Tj [3 2] 0 d /GS gs",
+    "[] 0 d 0 0 m 10 0 l S"
+  ]) {
+    const segments = contentSegments(content);
+    const simpleText = tryScanFastPreparedResourceReferences(segments);
+    assert.equal(simpleText.kind, "complete", content);
+    assert.equal(simpleText.stats.scannerTier, "simple", content);
+    assert.deepEqual(simpleText.references, scanDensePdfPreparedResourceReferences(segments), content);
+  }
+  for (const content of [
+    "% comment\n0 0 m S",
+    "/Span << /MCID 1 >> BDC",
+    "[[1] 2] TJ",
+    "[/Name 1] TJ",
+    "[1 2] gs"
   ]) {
     const general = tryScanFastPreparedResourceReferences(contentSegments(content));
-    assert.equal(general.kind, "complete");
-    assert.equal(general.stats.scannerTier, "general");
+    assert.equal(general.stats.scannerTier, "general", content);
   }
   for (const [content, reason] of [
     [")", "malformed-token"],

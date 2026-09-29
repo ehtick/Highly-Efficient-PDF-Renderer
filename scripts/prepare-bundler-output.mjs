@@ -8,7 +8,6 @@ const outputDir = fileURLToPath(new URL("../dist/bundler/", import.meta.url));
 
 // Shared Node clients expect the historical worker filenames. Keep their
 // references inside this module graph too, without loading dist/lib copies.
-await writeFile(resolve(outputDir, "dense-pdf-worker.js"), 'import "./densePdfNodeWorkerEntry.js";\n');
 await writeFile(resolve(outputDir, "pdf-worker.js"), 'import "./pdf/pdfWorkerEntry.js";\n');
 await writeFile(resolve(outputDir, "pdf/pdf-worker.js"), 'import "./pdfWorkerEntry.js";\n');
 

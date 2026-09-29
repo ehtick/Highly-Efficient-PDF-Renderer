@@ -5,8 +5,7 @@ import {
   formatLoadProgressStage
 } from "../src/loadProgress.ts";
 
-assert.equal(formatLoadProgressStage("pdf-fast-check"), "Checking fast PDF path");
-assert.equal(formatLoadProgressStage("pdf-fast-decode"), "Decoding PDF vectors");
+assert.equal(formatLoadProgressStage("pdf-page"), "Processing pages");
 assert.equal(formatLoadProgressStage("pdf-operators"), "Scanning operators");
 assert.equal(formatLoadProgressStage("pdf-optimize"), "Optimizing geometry");
 
@@ -17,16 +16,16 @@ const directReporter = createLoadProgressReporter(
 );
 
 directReporter.report(0.1, {
-  stage: "pdf-fast-check",
-  executionPath: "dense-vector-worker",
+  stage: "pdf-operators",
+  executionPath: "worker",
   sourceType: "pdf",
   unit: "bytes",
   processed: 10,
   total: 100
 });
 directReporter.report(0.2, {
-  stage: "pdf-fast-decode",
-  executionPath: "dense-vector-worker",
+  stage: "pdf-optimize",
+  executionPath: "worker",
   sourceType: "pdf",
   unit: "bytes",
   processed: 20,
@@ -36,8 +35,8 @@ directReporter.report(0.2, {
 assert.deepEqual(
   directEvents.map(({ stage, executionPath }) => ({ stage, executionPath })),
   [
-    { stage: "pdf-fast-check", executionPath: "dense-vector-worker" },
-    { stage: "pdf-fast-decode", executionPath: "dense-vector-worker" }
+    { stage: "pdf-operators", executionPath: "worker" },
+    { stage: "pdf-optimize", executionPath: "worker" }
   ]
 );
 
@@ -48,8 +47,8 @@ const indeterminateReporter = createLoadProgressReporter(
 );
 
 await indeterminateReporter.withIndeterminateProgress(Promise.resolve("done"), {
-  stage: "pdf-fast-decode",
-  executionPath: "dense-vector-worker",
+  stage: "pdf-operators",
+  executionPath: "worker",
   sourceType: "pdf"
 });
 
@@ -57,10 +56,10 @@ assert.ok(indeterminateEvents.length >= 2);
 assert.ok(
   indeterminateEvents.every(
     (event) =>
-      event.stage === "pdf-fast-decode" &&
-      event.executionPath === "dense-vector-worker" &&
+      event.stage === "pdf-operators" &&
+      event.executionPath === "worker" &&
       event.sourceType === "pdf"
   )
 );
 
-console.log("PDF fast-path progress tests passed.");
+console.log("PDF load progress tests passed.");

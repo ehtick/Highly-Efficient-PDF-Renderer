@@ -14,7 +14,6 @@ This page covers the main integration APIs. The package ships TypeScript declara
 | `@soadzoor/hepr/bundler` | Same public API as the main entry, with modules and assets prepared for browser application bundlers. |
 | `@soadzoor/hepr/node` | Node file sources, PDF worker sessions, and bundled standard-font resolution. |
 | `@soadzoor/hepr/experimental/pdf-worker` | Worker entry used by the PDF session infrastructure. |
-| `@soadzoor/hepr/experimental/dense-pdf-worker` | Worker entry for the specialized dense-vector parser. |
 
 For bundled browser applications, consistently use the `/bundler` entry and the
 [Vite settings in the quick start](../README.md#quick-start). The main and
@@ -53,7 +52,6 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
-| `pdfFastPath` | `"auto"` | Try the specialized dense-vector parser; `"off"` uses the full parser. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |

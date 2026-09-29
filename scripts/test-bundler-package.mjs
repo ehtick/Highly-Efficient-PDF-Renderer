@@ -49,7 +49,7 @@ try {
     }
     assert([...files.keys()].some(name => /LiberationSans-Regular-.*\.ttf$/.test(name)),
       "standard fonts must be emitted by the consumer");
-    for (const worker of ["pdfWorkerEntry", "densePdfFastWorker", "roomDetectorWorker"]) {
+    for (const worker of ["pdfWorkerEntry", "roomDetectorWorker"]) {
       assert([...files.keys()].some(name => new RegExp(`/${worker}-.*\\.js$`).test(name)),
         `${worker} must be built by the consumer`);
     }

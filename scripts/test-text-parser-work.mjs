@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { compileDensePdfContent as compileDense } from "../src/densePdfContentCompiler.ts";
 import { compileDensePdfContent as compileNative } from "../src/pdf/nativeContentCompiler.ts";
 
 const encoder = new TextEncoder();
@@ -12,7 +11,7 @@ const options = {
   enableInvisibleCull: true
 };
 
-for (const compile of [compileDense, compileNative]) {
+for (const compile of [compileNative]) {
   const originals = {
     Float32Array: globalThis.Float32Array,
     Uint32Array: globalThis.Uint32Array,

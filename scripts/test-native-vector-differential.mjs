@@ -39,7 +39,6 @@ try {
   });
   for (const fixture of createFixtures()) {
     const legacyScenes = await extractPdfPageScenes(toArrayBuffer(fixture.bytes), {
-      pdfFastPath: "off",
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       extractTextContent: true
@@ -66,28 +65,6 @@ try {
         assert.ok(nativeScene.textClipRects?.length >= 4, `${fixture.name}: native clip sidecar`);
         assert.ok(nativeScene.textInstanceB.some((_, index) => index % 4 === 3 &&
           nativeScene.textInstanceB[index] > 0), `${fixture.name}: clipped instance reference`);
-
-        const denseProgress = [];
-        const [denseScene] = await extractPdfPageScenes(toArrayBuffer(fixture.bytes), {
-          enableSegmentMerge: false,
-          enableInvisibleCull: false,
-          extractTextContent: true,
-          onProgress: (event) => denseProgress.push(event)
-        });
-        assert.ok(
-          denseProgress.some(({ executionPath }) => executionPath === "dense-vector-worker"),
-          `${fixture.name}: regression must exercise the dense geometry/text merge`
-        );
-        assert.deepEqual(
-          denseScene.textClipRects,
-          nativeScene.textClipRects,
-          `${fixture.name}: dense merge must retain page-space text clips`
-        );
-        assert.deepEqual(
-          denseScene.textInstanceB,
-          nativeScene.textInstanceB,
-          `${fixture.name}: dense merge must retain text clip references`
-        );
       }
     } finally {
       await session.close();

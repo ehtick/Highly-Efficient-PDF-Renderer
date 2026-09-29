@@ -47,11 +47,11 @@ try {
     globalThis.fetch = originalFetch;
   }
 
-  for (const pdfFastPath of ["auto", "off"]) {
+  {
     const controller = new AbortController();
     let reachedWorker = false;
     await assert.rejects(loadPdfSceneFromSource(bytes, {
-      signal: controller.signal, pdfFastPath,
+      signal: controller.signal,
       onProgress: (event) => {
         if (event.executionPath && !controller.signal.aborted) {
           reachedWorker = true;
@@ -59,7 +59,7 @@ try {
         }
       }
     }), (error) => error === reason);
-    assert.equal(reachedWorker, true, `${pdfFastPath} must exercise parser cancellation`);
+    assert.equal(reachedWorker, true, "loading must exercise parser cancellation");
   }
 
   // An original, tiny archive fixture; no PDF conversion or corpus files.

@@ -345,28 +345,26 @@ async function testFallbackDiagnostics(openSession) {
 
 async function testPublicColorOptions() {
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
-  for (const pdfFastPath of ["auto", "off"]) {
-    const diagnostics = [];
-    const loaded = await loadPdfSceneFromSource(iccFixture(), {
-      pdfFastPath, onDiagnostic: diagnostic => diagnostics.push(diagnostic)
-    });
-    assert.equal(loaded.scene.fillPathCount, 1);
-    assert.equal(diagnostics.filter(d => d.code === "icc-alternate-used").length, 1);
-    await assert.rejects(loadPdfSceneFromSource(iccFixture(), { pdfFastPath, iccEngine: "none" }),
-      error => error?.code === "unsupported-color");
-    let calls = 0;
-    diagnostics.length = 0;
-    const resolved = await loadPdfSceneFromSource(iccFixture(), {
-      pdfFastPath, iccEngine: "alternate", onDiagnostic: diagnostic => diagnostics.push(diagnostic),
-      iccTransformResolver(request) {
-        calls += 1;
-        return transformResult(request.inputSamples.map(value => 255 - value), request.sampleCount);
-      }
-    });
-    assert.equal(calls, 1);
-    assertRgb([...resolved.scene.fillPathMetaB.subarray(2, 4), resolved.scene.fillPathMetaC[2]], [0, 1, 1]);
-    assert.equal(diagnostics.some(d => d.code === "icc-alternate-used"), false);
-  }
+  const diagnostics = [];
+  const loaded = await loadPdfSceneFromSource(iccFixture(), {
+    onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+  });
+  assert.equal(loaded.scene.fillPathCount, 1);
+  assert.equal(diagnostics.filter(d => d.code === "icc-alternate-used").length, 1);
+  await assert.rejects(loadPdfSceneFromSource(iccFixture(), { iccEngine: "none" }),
+    error => error?.code === "unsupported-color");
+  let calls = 0;
+  diagnostics.length = 0;
+  const resolved = await loadPdfSceneFromSource(iccFixture(), {
+    iccEngine: "alternate", onDiagnostic: diagnostic => diagnostics.push(diagnostic),
+    iccTransformResolver(request) {
+      calls += 1;
+      return transformResult(request.inputSamples.map(value => 255 - value), request.sampleCount);
+    }
+  });
+  assert.equal(calls, 1);
+  assertRgb([...resolved.scene.fillPathMetaB.subarray(2, 4), resolved.scene.fillPathMetaC[2]], [0, 1, 1]);
+  assert.equal(diagnostics.some(d => d.code === "icc-alternate-used"), false);
 }
 
 function iccFixture({ lab = false, image = false } = {}) {

@@ -6,9 +6,11 @@ checks before comparing the new paint-graph and layer paths against those result
 
 Use the production-bundle benchmark for parser cutover decisions. The older
 `benchmark:native-vector-page` script intentionally calls the TypeScript
-session directly, so it omits worker startup and transfer costs. Likewise,
-`benchmark:native-dense-cutover` is a useful dense-pipeline microbenchmark but
-does not exercise tier routing.
+session directly, so it omits worker startup and transfer costs.
+
+The separate dense-vector route was removed in favor of the single native
+compiler (see the last section). Earlier sections describe that route, its
+tests, and its benchmarks as they were when measured.
 
 Build each checkout first, then run the same benchmark driver against each
 build directory. For example, from the current checkout:
@@ -379,3 +381,45 @@ between each original PDF load, and compare the `[Page grid] ... parsed ... ms`
 values. Check page appearance at high zoom and search/selection in both books,
 then load their existing HEP files. The user starts any server; no browser,
 server, HEP regeneration, or git-history operation was run during this fix.
+
+## Single native parser — 2026-09-29
+
+The dense-vector route (its worker, compiler, preflight document, and retained
+text compiler) was removed. Every page now goes through the native session
+compiler, which took over the dense route's advantages and keeps paint in
+source order:
+
+- Page content streams into the compiler as it decodes. Fonts, ExtGStates,
+  marked-content properties, color spaces, and XObjects load when the content
+  first uses them, so the decoded content is neither held whole nor scanned
+  for resource names first. Pages with patterns, shadings, or inline images
+  still compile from prepared content.
+- Duplicate strokes are removed in source order: of two identical opaque
+  strokes in one paint context, the earlier goes. Containment culling only
+  lets a later segment, or an earlier one in the same run of one paint, cover
+  a segment.
+- The lexer parses numbers while finding token boundaries, and single-line
+  paths take a direct path even when clipped.
+
+Output order changes where the dense route drew in fixed fill/stroke/text
+passes; duplicate and contained segment counts change slightly on those pages.
+
+Production bundles, `npm run benchmark:production-parser -- <pdf> --runs 5`,
+median parser time and RSS increase, same machine and Node version as above,
+HEAD `f0594ea` (dense route) against this change:
+
+| PDF | HEAD parser | Single parser | Time change | HEAD RSS | Single RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Livermore_L1 | 6,336 ms | 6,387 ms | +0.8% | +281 MiB | +309 MiB |
+| Level 1 | 7,120 ms | 7,509 ms | +5.5% | +584 MiB | +613 MiB |
+| Lower Level | 12,557 ms | 13,440 ms | +7.0% | +620 MiB | +572 MiB |
+| stn_arch | 3,927 ms | 4,126 ms | +5.1% | +401 MiB | +392 MiB |
+| Baldwin Park | 2,079 ms | 2,139 ms | +2.9% | +241 MiB | +248 MiB |
+| Murietta | 2,087 ms | 2,136 ms | +2.3% | +213 MiB | +194 MiB |
+
+Across all 17 example PDFs in the source-level harness (three interleaved
+runs each, minimum), the remaining pages were faster than HEAD, for example the
+brochure −19%, Dublin −14%, SimiValley −19%, layers −22%, and thesis −10%.
+The dense CAD pages above remain slower by up to 7%; the difference is spread
+over per-line ordered-output bookkeeping (paint-run tracking, composite
+validation, paint contexts), not a single hot spot.

@@ -9,7 +9,7 @@ document.querySelector("#file").addEventListener("change", async event => {
   status.textContent = "Loading…";
   try {
     for (let iteration = 0; iteration < 2; iteration += 1) {
-      const pdf = await hepr.pdfObjectGenerator(file, { pdfFastPath: "off" });
+      const pdf = await hepr.pdfObjectGenerator(file);
       try {
         if (pdf.sceneData.pageCount < 1) throw new Error("No PDF pages loaded.");
         status.textContent = `Loaded ${pdf.sceneData.pageCount} page(s), pass ${iteration + 1}/2.`;

@@ -316,12 +316,7 @@ function createMemorySampler() {
 }
 
 function classifyRoute(paths) {
-  if (paths.includes("worker") && paths.includes("dense-vector-worker")) {
-    return "native-full-after-dense";
-  }
-  if (paths.includes("worker")) return "native-full";
-  if (paths.includes("dense-vector-worker")) return "dense";
-  return "unknown";
+  return paths.includes("worker") ? "native-full" : "unknown";
 }
 
 function parseArguments(args) {

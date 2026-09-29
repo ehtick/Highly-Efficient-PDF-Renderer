@@ -91,8 +91,8 @@ try {
       sourceKind: "pdf",
       onProgress: (event) => {
         // A small page compiles between progress yields, so the first
-        // deterministic point inside the worker is its content decode.
-        if (event.stage === "pdf-fast-decode" && !parseController.signal.aborted) {
+        // deterministic point inside the worker is where its content starts.
+        if (event.stage === "pdf-operators" && !parseController.signal.aborted) {
           reachedContentDecode = true;
           parseController.abort();
         }

@@ -118,8 +118,8 @@ async function runBenchmark({
       printTiming("load exact resources", phaseMedian(phaseTimings, "resourceLoadMs"));
       printTiming("  root fonts", phaseMedian(phaseTimings, "fontLoadMs"));
       printTiming("  root images/colors", phaseMedian(phaseTimings, "imageLoadMs"));
-      printTiming("dense compiler scan", phaseMedian(phaseTimings, "compileScanMs"));
-      printTiming("dense compiler finalize", phaseMedian(phaseTimings, "compileFinalizeMs"));
+      printTiming("compiler scan", phaseMedian(phaseTimings, "compileScanMs"));
+      printTiming("compiler finalize", phaseMedian(phaseTimings, "compileFinalizeMs"));
       printTiming("adapt to VectorScene", phaseMedian(phaseTimings, "vectorSceneAdaptationMs"));
       printTiming("  second compilation", phaseMedian(phaseTimings, "selectiveCompileMs"));
       printTiming("  selective compositing", phaseMedian(phaseTimings, "selectiveRasterMs"));
@@ -137,7 +137,7 @@ async function runBenchmark({
         printTiming("load exact resources", phaseMedian(second, "resourceLoadMs"));
         printTiming("  root fonts", phaseMedian(second, "fontLoadMs"));
         printTiming("  root images/colors", phaseMedian(second, "imageLoadMs"));
-        printTiming("dense compiler scan", phaseMedian(second, "compileScanMs"));
+        printTiming("compiler scan", phaseMedian(second, "compileScanMs"));
         printPreparationCounts("second pass", second);
       }
     }

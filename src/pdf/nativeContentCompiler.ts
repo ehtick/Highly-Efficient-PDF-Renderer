@@ -220,6 +220,32 @@ export interface DensePdfPatternPaint {
 }
 
 /** Pre-resolved page/Form `/Properties` semantics used by BDC and DP. */
+/**
+ * Loads page resources on first use while content streams in. Fonts and color
+ * spaces go to the caller's own text engine and `colorSpaceResolver`.
+ */
+export interface DensePdfResourceLoader {
+  font(resourceName: string): Promise<void>;
+  extGState(resourceName: string): Promise<DensePdfExtGStateDefinition>;
+  /** `optionalContent` when the property is named by an `/OC` tag. */
+  markedContentProperty(
+    resourceName: string,
+    optionalContent: boolean
+  ): Promise<Readonly<DensePdfMarkedContentPropertyDefinition> | undefined>;
+  colorSpace(resourceName: string): Promise<void>;
+  /** A page Image or Form XObject, before the first `Do` that names it. */
+  xObject(resourceName: string): Promise<void>;
+}
+
+export interface DensePdfLoadedResourceNames {
+  readonly fonts: Iterable<string>;
+  readonly extGStates: Iterable<string>;
+  readonly properties: Iterable<string>;
+  readonly optionalContentProperties: Iterable<string>;
+  readonly colorSpaces: Iterable<string>;
+  readonly xObjects: Iterable<string>;
+}
+
 export interface DensePdfMarkedContentPropertyDefinition {
   readonly resourceName: string;
   readonly optionalContentIndex: number;
@@ -298,6 +324,20 @@ export interface DensePdfContentCompileOptions {
   patterns?: ReadonlyMap<string, Readonly<DensePdfPatternDefinition>>;
   /** Pre-resolved page `/ColorSpace` resources plus DefaultGray/RGB/CMYK handling. */
   colorSpaceResolver?: DensePdfColorSpaceResolver;
+  /**
+   * Streamed content: load each font, ExtGState, marked-content property,
+   * color space and XObject when the content first uses it instead of
+   * resolving every reference before compilation. Content that needs
+   * shadings, patterns or inline images fails and must be compiled from
+   * prepared input.
+   */
+  resourceLoader?: DensePdfResourceLoader;
+  /**
+   * Streamed content: resources an earlier compilation of the same content
+   * already loaded. Their fonts, ExtGStates and properties must be among the
+   * prepared inputs; the loader is not asked for them again.
+   */
+  loadedResources?: Readonly<DensePdfLoadedResourceNames>;
   /** Keep paint in initially hidden layers for interactive VectorScene output. */
   retainOptionalContent?: boolean;
   combineOptionalContent?: (parent: number, own: number) => number;
@@ -514,6 +554,11 @@ export interface DensePdfVectorSceneData {
   readonly shadingPaints?: readonly DensePdfVectorShadingPaint[];
   /** Optional first/count pairs addressed by FILL/STROKE source events. */
   readonly pathPaintRanges?: Uint32Array;
+  /**
+   * Fill and stroke paint operations behind the FILL/STROKE events. Adjacent
+   * compatible paints share one event, so events undercount them.
+   */
+  readonly pathPaintCount?: number;
   readonly sourceClips?: readonly (DensePdfTextClip | null)[];
   /** One blend per source event: 0 Normal, 1 Multiply. */
   readonly sourceBlendModes?: Uint8Array;
@@ -700,6 +745,21 @@ export class DensePdfUnsupportedError extends Error {
   }
 }
 
+/**
+ * Streamed content reached what only prepared content can compile, such as
+ * an inline image, a shading or a pattern. Compile the page from prepared
+ * input instead; nothing about the page itself is wrong.
+ */
+export class DensePdfStreamingUnsupportedError extends Error {
+  readonly operator: string;
+
+  constructor(message: string, operator: string) {
+    super(message);
+    this.name = "DensePdfStreamingUnsupportedError";
+    this.operator = operator;
+  }
+}
+
 export class DensePdfSyntaxError extends Error {
   constructor(message: string) {
     super(message);
@@ -742,6 +802,20 @@ const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
 const ALPHA_INVISIBLE_EPSILON = 1e-3;
 const OPAQUE_ALPHA_EPSILON = 0.999;
 const DUPLICATE_POSITION_SCALE = 1_000;
+/** Duplicate key components describing a primitive's geometry and style, before its clip bounds. */
+const DUPLICATE_TUPLE_GEOMETRY = 13;
+/** Ordered stroke culling inputs: each primitive's run and each run's paint context. */
+interface StrokePaintOrder {
+  readonly runs: Uint32Array;
+  readonly runContexts: Uint32Array;
+}
+
+/** Coverage culling steps between cooperative yields. */
+const COVERAGE_WORK_PER_CHECKPOINT = 1 << 18;
+/** Coverage-group key components describing line, style and flags. */
+const COVERAGE_TUPLE_GEOMETRY = 7;
+/** Stroke paint context of primitives that must never be merged (Multiply). */
+const NO_STROKE_PAINT_CONTEXT = 0xffff_ffff;
 const DUPLICATE_STYLE_SCALE = 10_000;
 const COVER_DIRECTION_SCALE = 2_000;
 const COVER_OFFSET_SCALE = 200;
@@ -806,6 +880,24 @@ type PdfValue =
   | boolean
   | null;
 
+type StreamedResourceKind =
+  "font" | "extGState" | "property" | "optionalContentProperty" | "colorSpace" | "xObject";
+
+/**
+ * Thrown through the lexer when streamed content first uses a resource that
+ * is not loaded. Deliberately not an Error: suspending captures no stack.
+ */
+class ContentResourceSuspension {
+  readonly kind: StreamedResourceKind;
+
+  readonly resourceName: string;
+
+  constructor(kind: StreamedResourceKind, resourceName: string) {
+    this.kind = kind;
+    this.resourceName = resourceName;
+  }
+}
+
 type LexerToken =
   | { kind: "number"; value: number }
   | { kind: "name"; value: string }
@@ -820,7 +912,11 @@ interface ActiveMarkedContentScope {
 }
 
 function isTextSinkOperator(operator: string): boolean {
-  return TEXT_SINK_OPERATORS.has(operator);
+  // Reject path and color operators, which dominate CAD content, by first byte.
+  const first = operator.charCodeAt(0);
+  return (first === 0x54 || first === 0x71 || first === 0x51 || first === 0x63 ||
+    first === 0x42 || first === 0x45 || first === 0x27 || first === 0x22) &&
+    TEXT_SINK_OPERATORS.has(operator);
 }
 
 function toTextSinkOperand(value: PdfValue): unknown {
@@ -976,17 +1072,36 @@ async function compileContent(
   options.signal?.throwIfAborted();
 
   const compiler = new DenseContentCompiler(options, policy);
-  const lexer = new IncrementalPdfLexer((token) => compiler.consumeToken(token));
+  const lexer = new IncrementalPdfLexer(
+    (token) => compiler.consumeToken(token),
+    (value) => compiler.consumeNumber(value)
+  );
   const yieldIntervalMs = Math.max(4, options.yieldIntervalMs ?? DEFAULT_YIELD_INTERVAL_MS);
   let processedBytes = 0;
   let lastYieldAt = nowMs();
+
+  // Streamed content suspends at an operator whose resource is not loaded
+  // yet; load it, then resume lexing at that operator.
+  const feed = async (slice: Uint8Array, final: boolean, sourceOffset?: number): Promise<void> => {
+    for (let input = slice; ; input = EMPTY_CONTENT_BYTES, sourceOffset = undefined) {
+      try {
+        if (final) lexer.finish();
+        else lexer.feed(input, false, sourceOffset);
+        return;
+      } catch (error) {
+        if (!(error instanceof ContentResourceSuspension)) throw error;
+        await compiler.loadStreamedResource(error);
+        options.signal?.throwIfAborted();
+      }
+    }
+  };
 
   for await (const segment of normalizeContentSegments(source)) {
     if (segment.kind === "image") {
       // BI…EI is structurally prepared before resource resolution. Flush the
       // lexical boundary without finalizing the long-lived graphics parser,
       // then interleave one paint event at the exact source position.
-      lexer.finish();
+      await feed(EMPTY_CONTENT_BYTES, true);
       compiler.consumeInlineImage(segment);
       processedBytes += segment.sourceLength;
       continue;
@@ -998,8 +1113,9 @@ async function compileContent(
         offset,
         Math.min(inputChunk.length, offset + MAX_INPUT_SLICE_BYTES)
       );
-      lexer.feed(slice, false, segment.sourceOffset + offset);
+      await feed(slice, false, segment.sourceOffset + offset);
       processedBytes += slice.length;
+      compiler.compactStrokesIfWorthwhile();
 
       const now = nowMs();
       if (now - lastYieldAt >= yieldIntervalMs) {
@@ -1017,7 +1133,7 @@ async function compileContent(
     }
   }
 
-  lexer.finish();
+  await feed(EMPTY_CONTENT_BYTES, true);
   options.signal?.throwIfAborted();
   let lastFinalizeYieldAt = nowMs();
   const finalizeCheckpoint = async (force = false): Promise<void> => {
@@ -1134,7 +1250,7 @@ export function scanDensePdfMarkedContentPropertyReferences(
 
 function normalizeExtGStateDefinitions(
   options: DensePdfContentInputOptions
-): ReadonlyMap<string, DensePdfExtGStateDefinition> {
+): Map<string, DensePdfExtGStateDefinition> {
   const definitions = new Map<string, DensePdfExtGStateDefinition>();
   for (const resourceName of options.availableExtGStates ?? []) {
     if (typeof resourceName !== "string" || resourceName.length === 0) {
@@ -1145,24 +1261,30 @@ function normalizeExtGStateDefinitions(
     });
   }
   for (const definition of options.extGStates ?? []) {
-    if (
-      !definition ||
-      typeof definition.resourceName !== "string" ||
-      definition.resourceName.length === 0 ||
-      !isOptionalUnitInterval(definition.strokeAlpha) ||
-      !isOptionalUnitInterval(definition.fillAlpha) ||
-      (definition.alphaIsShape !== undefined && typeof definition.alphaIsShape !== "boolean") ||
-      (definition.blendMode !== undefined && !isDensePdfBlendMode(definition.blendMode)) ||
-      (definition.softMaskIndex !== undefined && definition.softMaskIndex !== null &&
-        (!Number.isSafeInteger(definition.softMaskIndex) || definition.softMaskIndex < 0)) ||
-      (definition.overprintMode !== undefined &&
-        definition.overprintMode !== 0 && definition.overprintMode !== 1)
-    ) {
-      throw new TypeError("extGStates contains an invalid supported graphics-state definition.");
-    }
-    definitions.set(definition.resourceName, { ...definition });
+    definitions.set(definition.resourceName, validateExtGStateDefinition(definition));
   }
   return definitions;
+}
+
+function validateExtGStateDefinition(
+  definition: DensePdfExtGStateDefinition
+): DensePdfExtGStateDefinition {
+  if (
+    !definition ||
+    typeof definition.resourceName !== "string" ||
+    definition.resourceName.length === 0 ||
+    !isOptionalUnitInterval(definition.strokeAlpha) ||
+    !isOptionalUnitInterval(definition.fillAlpha) ||
+    (definition.alphaIsShape !== undefined && typeof definition.alphaIsShape !== "boolean") ||
+    (definition.blendMode !== undefined && !isDensePdfBlendMode(definition.blendMode)) ||
+    (definition.softMaskIndex !== undefined && definition.softMaskIndex !== null &&
+      (!Number.isSafeInteger(definition.softMaskIndex) || definition.softMaskIndex < 0)) ||
+    (definition.overprintMode !== undefined &&
+      definition.overprintMode !== 0 && definition.overprintMode !== 1)
+  ) {
+    throw new TypeError("extGStates contains an invalid supported graphics-state definition.");
+  }
+  return { ...definition };
 }
 
 function normalizePositiveLimit(
@@ -1260,17 +1382,43 @@ class DenseContentCompiler {
 
   readonly referencedPatterns = new Set<string>();
 
-  readonly operands: PdfValue[] = [];
+  /**
+   * Operand stack, reused across operators: only the first `operandCount`
+   * entries are live. Truncating an array to zero would drop and reallocate
+   * its backing store for every operator.
+   */
+  private readonly operands: PdfValue[] = [];
+
+  private operandCount = 0;
 
   readonly containers: ParserContainer[] = [];
 
   readonly stateStack: GraphicsState[] = [];
 
-  readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
+  readonly extGStates: Map<string, DensePdfExtGStateDefinition>;
 
   readonly alwaysVisibleOptionalContentProperties: ReadonlySet<string>;
 
   readonly markedContentProperties: ReadonlyMap<string, Readonly<DensePdfMarkedContentPropertyDefinition>> | undefined;
+
+  /** Per-operator option checks, resolved once. */
+  private readonly streamed: boolean;
+
+  private readonly textSink: DensePdfTextOperatorSink | undefined;
+
+  private readonly type3PaintTracked: boolean;
+
+  private readonly uncoloredPaintOnly: boolean;
+
+  /** Streamed compilation: resources already loaded, by kind. */
+  private readonly loadedResources = {
+    font: new Set<string>(),
+    extGState: new Set<string>(),
+    property: new Set<string>(),
+    optionalContentProperty: new Set<string>(),
+    colorSpace: new Set<string>(),
+    xObject: new Set<string>()
+  };
 
   readonly formOptionalContent: ReadonlyMap<string, Readonly<DensePdfOptionalContentDefinition>>;
 
@@ -1355,6 +1503,16 @@ class DenseContentCompiler {
   readonly vectorFormClipIndices: number[] = [];
   readonly vectorPathPaintRanges: number[] = [];
 
+  private readonly strokePaintContexts = new Map<number, number>();
+
+  private lastContextClipIndex = -2;
+
+  private lastContextOptionalContent = -2;
+
+  private lastStrokePaintContext = -1;
+
+  private vectorPathPaintCount = 0;
+
   private vectorPathSpanStartFillCount = 0;
 
   private vectorPathSpanStartStrokeCount = 0;
@@ -1387,6 +1545,14 @@ class DenseContentCompiler {
   private genericMaxHalfWidth = 0;
 
   private operatorSourceOffset = -1;
+
+  /** Innermost marked-content node and optional content, or -1. */
+  private activeMarkedContentIndex = -1;
+
+  private activeOptionalContentIndex = -1;
+
+  /** Whether paint here shows: retained layers, or visible by default. */
+  private contentVisible = true;
 
   private operatorSourceLength = -1;
 
@@ -1440,7 +1606,24 @@ class DenseContentCompiler {
     this.alwaysVisibleOptionalContentProperties = new Set(
       options.alwaysVisibleOptionalContentProperties ?? []
     );
-    this.markedContentProperties = options.markedContentProperties;
+    this.streamed = options.resourceLoader !== undefined;
+    const loaded = options.loadedResources;
+    if (loaded) {
+      for (const name of loaded.fonts) this.loadedResources.font.add(name);
+      for (const name of loaded.extGStates) this.loadedResources.extGState.add(name);
+      for (const name of loaded.properties) this.loadedResources.property.add(name);
+      for (const name of loaded.optionalContentProperties) this.loadedResources.optionalContentProperty.add(name);
+      for (const name of loaded.colorSpaces) this.loadedResources.colorSpace.add(name);
+      for (const name of loaded.xObjects) this.loadedResources.xObject.add(name);
+    }
+    this.textSink = options.textOperatorSink;
+    this.type3PaintTracked = options.type3PaintMode !== undefined;
+    this.uncoloredPaintOnly = options.type3PaintMode === "uncolored" ||
+      options.uncoloredPatternPaint === true;
+    // Streamed compilation adds each property to its own copy as it loads.
+    this.markedContentProperties = options.resourceLoader
+      ? new Map(options.markedContentProperties ?? [])
+      : options.markedContentProperties;
     this.formOptionalContent = options.formOptionalContent ?? new Map();
     this.imageOptionalContent = options.imageOptionalContent ?? new Map();
     this.maxMarkedContentDepth = normalizePositiveLimit(
@@ -1545,7 +1728,8 @@ class DenseContentCompiler {
     };
     this.strokes = new DenseStrokeBuilder(
       options.enableInvisibleCull !== false,
-      policy.displayProgram === true || policy.orderedPaint === true
+      policy.displayProgram === true || policy.orderedPaint === true,
+      policy.vectorScene === true && policy.orderedPaint === true && policy.displayProgram !== true
     );
     this.fillPathMetaA = new Float4Builder(2_048);
     this.fillPathMetaB = new Float4Builder(2_048);
@@ -1558,11 +1742,25 @@ class DenseContentCompiler {
     return this.strokes.sourceSegmentCount;
   }
 
+  /** A top-level number is an operand; anything else takes the general path. */
+  consumeNumber(value: number): void {
+    if (this.finished || this.containers.length !== 0 || this.operandCount >= MAX_OPERAND_COUNT) {
+      this.consumeToken({ kind: "number", value });
+      return;
+    }
+    this.operands[this.operandCount++] = value;
+  }
+
   consumeToken(token: LexerToken): void {
     if (this.finished) {
       throw new DensePdfSyntaxError("Content appeared after the compiler was finalized.");
     }
 
+    // Numeric operands dominate content streams.
+    if (token.kind === "number") {
+      this.appendValue(token.value);
+      return;
+    }
     if (token.kind === "array-start") {
       this.containers.push({ kind: "array", values: [], entries: [], pendingKey: null });
       return;
@@ -1573,10 +1771,6 @@ class DenseContentCompiler {
     }
     if (token.kind === "array-end" || token.kind === "dict-end") {
       this.closeContainer(token.kind);
-      return;
-    }
-    if (token.kind === "number") {
-      this.appendValue(token.value);
       return;
     }
     if (token.kind === "name") {
@@ -1601,16 +1795,131 @@ class DenseContentCompiler {
       );
     }
 
+    // Path construction dominates CAD content. `m` and `l` need no graphics
+    // state, resources or text, so they skip the general dispatcher.
+    const operator = token.value;
+    if ((operator === "l" || operator === "m") && this.operandCount === 2) {
+      const x = this.operands[0];
+      const y = this.operands[1];
+      if (typeof x === "number" && typeof y === "number" && Number.isFinite(x) && Number.isFinite(y)) {
+        if (operator === "l") this.path.lineTo(x, y);
+        else this.path.moveTo(x, y);
+        this.assertCurrentPathLimits(operator);
+        this.operatorCount += 1;
+        this.operandCount = 0;
+        return;
+      }
+    }
+    if (this.streamed) this.requireStreamedResource(token.value);
+    // A thrown error ends the compilation, so the span needs no finally.
     this.operatorSourceOffset = token.sourceOffset;
     this.operatorSourceLength = token.sourceLength;
-    try {
-      this.executeOperator(token.value, this.operands);
-      this.operatorCount += 1;
-      this.operands.length = 0;
-    } finally {
-      this.operatorSourceOffset = -1;
-      this.operatorSourceLength = -1;
+    this.executeOperator(token.value, this.operands);
+    this.operatorCount += 1;
+    this.operandCount = 0;
+    this.operatorSourceOffset = -1;
+    this.operatorSourceLength = -1;
+  }
+
+  /**
+   * Streamed compilation: suspend before the first operator that uses a
+   * resource not loaded yet. The lexer resumes at this operator, with its
+   * operands still on the stack, once `loadStreamedResource` has run.
+   */
+  private requireStreamedResource(operator: string): void {
+    const operands = this.operands;
+    const count = this.operandCount;
+    let kind: StreamedResourceKind;
+    let operand: PdfValue;
+    switch (operator) {
+      case "Tf":
+        if (count !== 2) return;
+        kind = "font";
+        operand = operands[0];
+        break;
+      case "gs":
+        if (count !== 1) return;
+        kind = "extGState";
+        operand = operands[0];
+        break;
+      case "cs":
+      case "CS":
+        if (count !== 1) return;
+        kind = "colorSpace";
+        operand = operands[0];
+        break;
+      case "BDC":
+      case "DP":
+        if (count !== 2 || !isPdfName(operands[0])) return;
+        kind = operands[0].value === "OC" ? "optionalContentProperty" : "property";
+        operand = operands[1];
+        break;
+      case "Do":
+        if (count !== 1) return;
+        kind = "xObject";
+        operand = operands[0];
+        break;
+      case "sh":
+      case "BI":
+        throw new DensePdfStreamingUnsupportedError(
+          `Streamed content cannot resolve operator ${operator}; it needs prepared resources.`,
+          operator
+        );
+      case "SCN":
+      case "scn":
+        if (count > 0 && isPdfName(operands[count - 1])) {
+          throw new DensePdfStreamingUnsupportedError(
+            "Streamed content cannot resolve patterns; they need prepared resources.",
+            operator
+          );
+        }
+        return;
+      default:
+        return;
     }
+    if (!isPdfName(operand) || this.loadedResources[kind].has(operand.value)) return;
+    throw new ContentResourceSuspension(kind, operand.value);
+  }
+
+  /** Load the resource a suspended operator needs, before resuming it. */
+  async loadStreamedResource(request: ContentResourceSuspension): Promise<void> {
+    const loader = this.options.resourceLoader;
+    if (!loader) throw new DensePdfSyntaxError("Content suspended without a resource loader.");
+    const { kind, resourceName } = request;
+    switch (kind) {
+      case "font":
+        await loader.font(resourceName);
+        break;
+      case "extGState": {
+        const definition = await loader.extGState(resourceName);
+        if (definition.resourceName !== resourceName) {
+          throw new TypeError(`The resource loader returned ExtGState /${definition.resourceName} for /${resourceName}.`);
+        }
+        this.extGStates.set(resourceName, validateExtGStateDefinition(definition));
+        break;
+      }
+      case "property":
+      case "optionalContentProperty": {
+        const definition = await loader.markedContentProperty(
+          resourceName,
+          kind === "optionalContentProperty"
+        );
+        if (definition) {
+          const definitions = new Map([[resourceName, definition]]);
+          validateMarkedContentDefinitions(definitions);
+          (this.markedContentProperties as Map<string, Readonly<DensePdfMarkedContentPropertyDefinition>>)
+            .set(resourceName, definition);
+        }
+        break;
+      }
+      case "colorSpace":
+        await loader.colorSpace(resourceName);
+        break;
+      case "xObject":
+        await loader.xObject(resourceName);
+        break;
+    }
+    this.loadedResources[kind].add(resourceName);
   }
 
   consumeInlineImage(segment: Readonly<DensePdfInlineImageSegment>): void {
@@ -1618,7 +1927,7 @@ class DenseContentCompiler {
       throw new DensePdfSyntaxError("Inline image appeared after the compiler was finalized.");
     }
     validateContentSegment(segment);
-    if (this.containers.length > 0 || this.operands.length > 0) {
+    if (this.containers.length > 0 || this.operandCount > 0) {
       throw new DensePdfSyntaxError("Inline image interrupts a pending content object or operand list.");
     }
     this.rejectTransformChangeInsidePath("BI");
@@ -1651,7 +1960,7 @@ class DenseContentCompiler {
     if (this.containers.length > 0) {
       throw new DensePdfSyntaxError("Unterminated array or dictionary in PDF content.");
     }
-    if (this.operands.length > 0) {
+    if (this.operandCount > 0) {
       throw new DensePdfSyntaxError("Dangling operands at the end of PDF content.");
     }
     if (this.path.length > 0 || this.pendingClipRule !== null) {
@@ -1681,6 +1990,9 @@ class DenseContentCompiler {
       this.vectorSourceClipIndices.every(index => index === this.vectorSourceClipIndices[0]) &&
       this.vectorSourceBlendModes.every(mode => mode === 0) &&
       this.strokes.hasUniformOpaqueColor();
+    this.remapStrokeIndices(compactOrderedStrokes
+      ? this.strokes.compactRemoved()
+      : await this.strokes.cullContainedInOrder(checkpoint));
     const strokeResult = await this.strokes.finalize(checkpoint, compactOrderedStrokes);
     if (compactOrderedStrokes) {
       const clipIndex = this.vectorSourceClipIndices[0] ?? -1;
@@ -1748,6 +2060,7 @@ class DenseContentCompiler {
           sourceBlendModes: Uint8Array.from(this.vectorSourceBlendModes),
           ...(this.policy.orderedPaint ? {
             pathPaintRanges: Uint32Array.from(this.vectorPathPaintRanges),
+            pathPaintCount: this.vectorPathPaintCount,
             sourceClips: this.vectorSourceClipIndices.map(index => textClips[index] ?? this.options.initialVectorClip ?? null)
           } : {}),
           glyphRunMeta: Uint32Array.from(this.vectorGlyphRunMeta),
@@ -1900,10 +2213,10 @@ class DenseContentCompiler {
   private appendValue(value: PdfValue): void {
     const container = this.containers.at(-1);
     if (!container) {
-      if (this.operands.length >= MAX_OPERAND_COUNT) {
+      if (this.operandCount >= MAX_OPERAND_COUNT) {
         throw new DensePdfSyntaxError("PDF content operand stack exceeded its safety limit.");
       }
-      this.operands.push(value);
+      this.operands[this.operandCount++] = value;
       return;
     }
 
@@ -1940,11 +2253,7 @@ class DenseContentCompiler {
   }
 
   private executeOperator(operator: string, args: PdfValue[]): void {
-    if (
-      (this.options.type3PaintMode === "uncolored" ||
-        this.options.uncoloredPatternPaint === true) &&
-      TYPE3_UNCOLORED_FORBIDDEN_OPERATORS.has(operator)
-    ) {
+    if (this.uncoloredPaintOnly && TYPE3_UNCOLORED_FORBIDDEN_OPERATORS.has(operator)) {
       throw new DensePdfUnsupportedError(
         `Uncolored ${this.options.uncoloredPatternPaint === true
           ? "tiling-pattern cell"
@@ -1952,14 +2261,14 @@ class DenseContentCompiler {
         operator
       );
     }
-    if (this.options.type3PaintMode !== undefined) {
+    if (this.type3PaintTracked) {
       if (TYPE3_STROKE_COLOR_OPERATORS.has(operator)) this.state.strokePaintInherited = false;
       if (TYPE3_FILL_COLOR_OPERATORS.has(operator)) this.state.fillPaintInherited = false;
     }
-    if (this.options.textOperatorSink && isTextSinkOperator(operator)) {
-      const glyphRuns = this.options.textOperatorSink.applyOperator(
+    if (this.textSink && isTextSinkOperator(operator)) {
+      const glyphRuns = this.textSink.applyOperator(
         operator,
-        args.map(toTextSinkOperand),
+        this.textSinkOperands(),
         {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
@@ -2138,7 +2447,7 @@ class DenseContentCompiler {
         const definition = this.extGStates.get(resourceName);
         if (!definition) {
           throw new DensePdfUnsupportedError(
-            `Graphics state /${resourceName} was not validated for the dense-vector path.`,
+            `Graphics state /${resourceName} was not resolved for this content.`,
             operator
           );
         }
@@ -2291,6 +2600,7 @@ class DenseContentCompiler {
       case "sc":
       case "SCN":
       case "scn": {
+        args = this.operandList();
         const stroke = operator === "SC" || operator === "SCN";
         const patternColorSpace = stroke
           ? this.state.strokePatternColorSpace
@@ -2626,6 +2936,7 @@ class DenseContentCompiler {
         if (!this.markedContentStack.pop()) {
           throw new DensePdfSyntaxError("EMC has no matching BMC or BDC scope.");
         }
+        this.syncActiveMarkedContent();
         return;
       case "MP":
         this.requireArgs(operator, args, 1);
@@ -2673,7 +2984,7 @@ class DenseContentCompiler {
         return;
       default:
         throw new DensePdfUnsupportedError(
-          `PDF content operator ${operator} is not supported by the dense-vector path.`,
+          `PDF content operator ${operator} is not supported.`,
           operator
         );
     }
@@ -2910,18 +3221,25 @@ class DenseContentCompiler {
       operator === "S" &&
       this.state.strokePatternColorSpace === null &&
       this.pendingClipRule === null &&
-      this.state.clipIndex < 0 &&
+      // Ordered output records each paint's exact clip path; like the general
+      // path, the stroke store itself only culls against the clip's bounds.
+      (this.state.clipIndex < 0 || this.policy.orderedPaint) &&
       this.state.lineDash.length === 0 &&
       this.state.lineCap !== 2 &&
-      this.state.lineJoin === 0 &&
-      Math.abs(this.state.miterLimit - 10) <= 1e-6 &&
-      !this.state.strokeAdjustment &&
-      isPackedStrokeTransformCompatible(
-        this.state.matrix,
-        this.state.lineWidth,
-        this.state.lineDash.length > 0
-      ) &&
-      this.path.isSingleLine()
+      this.path.isSingleLine() &&
+      // A single segment has no joins, stroke adjustment is not applied, and
+      // the general path packs this line exactly the same way. Only display
+      // programs, which otherwise retain the exact style, need the defaults.
+      (!this.policy.displayProgram || (
+        this.state.lineJoin === 0 &&
+        Math.abs(this.state.miterLimit - 10) <= 1e-6 &&
+        !this.state.strokeAdjustment &&
+        isPackedStrokeTransformCompatible(
+          this.state.matrix,
+          this.state.lineWidth,
+          this.state.lineDash.length > 0
+        )
+      ))
     ) {
       this.paintSimpleStrokeLine();
       return;
@@ -2930,7 +3248,7 @@ class DenseContentCompiler {
     const pathData = this.path.view();
     if (!this.policy.displayProgram && pathData.length > MAX_PAINT_PATH_FLOATS) {
       throw new DensePdfUnsupportedError(
-        "A single PDF path is too large for cooperative dense-vector compilation.",
+        "A single PDF path is too large for cooperative vector compilation.",
         operator
       );
     }
@@ -3130,6 +3448,9 @@ class DenseContentCompiler {
     let strokeStart = 0;
     let strokeCount = 0;
     if (visibleStroke) {
+      strokes.paintContext = this.strokePaintContext();
+      // This path's fill paints before its stroke: the stroke starts a new run.
+      if (visibleFill) strokes.breakRun();
       strokeStart = strokes.primitiveCount;
       const isHairline = this.state.lineWidth <= 0;
       const halfWidth = isHairline ? 0 : this.state.lineWidth * this.state.matrixScale * 0.5;
@@ -3157,7 +3478,7 @@ class DenseContentCompiler {
       );
       strokeCount = strokes.primitiveCount - strokeStart;
       if (strokeCount > 0 && (!fillPaint || !visibleFill)) {
-        this.recordPaintRun(DENSE_PDF_PAINT_RUN_STROKE, strokeStart, strokeCount);
+        this.recordPaintRun(DENSE_PDF_PAINT_RUN_STROKE, strokeStart, strokeCount, true);
       }
     }
 
@@ -3193,14 +3514,15 @@ class DenseContentCompiler {
       }
       const fillCount = this.fillPathCount - fillStart;
       if (fillCount > 0) {
-        this.recordPaintRun(DENSE_PDF_PAINT_RUN_FILL, fillStart, fillCount);
+        this.recordPaintRun(DENSE_PDF_PAINT_RUN_FILL, fillStart, fillCount, true);
       }
       if (strokePaint) {
         if (strokeCount > 0) {
           this.recordPaintRun(
             DENSE_PDF_PAINT_RUN_STROKE,
             strokeStart,
-            strokeCount
+            strokeCount,
+            true
           );
         }
       }
@@ -3244,13 +3566,13 @@ class DenseContentCompiler {
       this.path.clear();
       return;
     }
+    const validated = this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON && this.policy.vectorScene === true;
     if (this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON) {
-      if (this.policy.vectorScene === true) {
-        this.noteVectorOrdinaryPaint("stroke", "S");
-      }
+      if (validated) this.noteVectorOrdinaryPaint("stroke", "S");
       this.assertSupportedStrokeState("S");
     }
     strokes.sourceSegmentCount += 1;
+    strokes.paintContext = this.strokePaintContext();
     const strokeStart = strokes.primitiveCount;
     let flags = hairline ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0;
     if (this.state.lineCap === 1) flags |= STROKE_STYLE_FLAG_ROUND_CAP;
@@ -3280,7 +3602,7 @@ class DenseContentCompiler {
     }
     const strokeCount = strokes.primitiveCount - strokeStart;
     if (strokeCount > 0) {
-      this.recordPaintRun(DENSE_PDF_PAINT_RUN_STROKE, strokeStart, strokeCount);
+      this.recordPaintRun(DENSE_PDF_PAINT_RUN_STROKE, strokeStart, strokeCount, validated);
     }
     this.path.clear();
   }
@@ -3480,6 +3802,7 @@ class DenseContentCompiler {
         operator
       );
     }
+    if (kind !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) this.strokes.breakRun();
     this.vectorSourceEvents.push(kind, index);
     this.vectorSourceOptionalContentIndices.push(optionalContentIndex);
     this.vectorSourceClipIndices.push(this.state.clipIndex);
@@ -3498,23 +3821,25 @@ class DenseContentCompiler {
 
   private recordVectorOrdinaryPaint(
     role: "stroke" | "nonstroke",
-    operator: string
+    operator: string,
+    validated = false
   ): void {
-    this.assertVectorSceneComposite(role, operator);
+    if (!validated) this.assertVectorSceneComposite(role, operator);
     this.nextVectorPaintOrdinal(operator);
     this.recordVectorOrdinaryPaintBarrier(operator);
   }
 
   private recordVectorPathPaint(
     role: "stroke" | "nonstroke",
-    operator: string
+    operator: string,
+    validated: boolean
   ): void {
     if (!this.vectorPathSpanHasPaint) {
       this.vectorPathSpanSourceOffset = this.operatorSourceOffset;
       this.vectorPathSpanSourceLength = this.operatorSourceLength;
       this.vectorPathSpanHasPaint = true;
     }
-    this.recordVectorOrdinaryPaint(role, operator);
+    this.recordVectorOrdinaryPaint(role, operator, validated);
     this.vectorSawPathPaint = true;
   }
 
@@ -3527,7 +3852,73 @@ class DenseContentCompiler {
     this.vectorSawPathPaint = true;
   }
 
-  private recordPaintRun(kind: number, start: number, count: number): void {
+  /**
+   * Consecutive paths of one kind, clip, blend mode and layer draw as one run,
+   * so extend the previous range instead of recording an event per path.
+   */
+  private extendLastPathPaint(event: number, start: number, count: number): boolean {
+    const eventOffset = this.vectorSourceEvents.length - 2;
+    const rangeOffset = this.vectorPathPaintRanges.length - 2;
+    if (eventOffset < 0 || rangeOffset < 0 ||
+        this.vectorSourceEvents[eventOffset] !== event ||
+        this.vectorSourceEvents[eventOffset + 1] !== rangeOffset / 2 ||
+        this.vectorPathPaintRanges[rangeOffset] + this.vectorPathPaintRanges[rangeOffset + 1] !== start) return false;
+    const last = eventOffset / 2;
+    if (this.vectorSourceOptionalContentIndices[last] !== this.activeOptionalContentIndex ||
+        this.vectorSourceClipIndices[last] !== this.state.clipIndex ||
+        this.vectorSourceBlendModes[last] !== (this.state.blendMode === "Multiply" ? 1 : 0)) return false;
+    this.vectorPathPaintRanges[rangeOffset + 1] += count;
+    return true;
+  }
+
+  /** Tag strokes with their paint context; Multiply strokes never merge. */
+  private strokePaintContext(): number {
+    if (this.state.blendMode !== "Normal") return -1;
+    const clipIndex = this.state.clipIndex;
+    const optionalContentIndex = this.activeOptionalContentIndex;
+    if (clipIndex === this.lastContextClipIndex && optionalContentIndex === this.lastContextOptionalContent) {
+      return this.lastStrokePaintContext;
+    }
+    const key = (clipIndex + 1) * 0x1_0000_0000 + (optionalContentIndex + 1);
+    let context = this.strokePaintContexts.get(key);
+    if (context === undefined) {
+      context = this.strokePaintContexts.size;
+      this.strokePaintContexts.set(key, context);
+    }
+    this.lastContextClipIndex = clipIndex;
+    this.lastContextOptionalContent = optionalContentIndex;
+    this.lastStrokePaintContext = context;
+    return context;
+  }
+
+  /** Apply a stroke compaction remap to every stored stroke index. */
+  private remapStrokeIndices(remap: Uint32Array | null): void {
+    if (!remap) return;
+    for (let offset = 0; offset < this.vectorSourceEvents.length; offset += 2) {
+      if (this.vectorSourceEvents[offset] !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) continue;
+      const range = this.vectorSourceEvents[offset + 1] * 2;
+      const start = this.vectorPathPaintRanges[range];
+      const end = start + this.vectorPathPaintRanges[range + 1];
+      this.vectorPathPaintRanges[range] = remap[start];
+      this.vectorPathPaintRanges[range + 1] = remap[end] - remap[start];
+    }
+    for (let offset = 0; offset < this.vectorImagePathSpanCheckpoints.length; offset += 6) {
+      this.vectorImagePathSpanCheckpoints[offset + 2] = remap[this.vectorImagePathSpanCheckpoints[offset + 2]];
+      this.vectorImagePathSpanCheckpoints[offset + 3] = remap[this.vectorImagePathSpanCheckpoints[offset + 3]];
+    }
+    this.vectorPathSpanStartStrokeCount = remap[this.vectorPathSpanStartStrokeCount];
+  }
+
+  /** Keep removed duplicates from accumulating: compact once they outnumber live strokes. */
+  compactStrokesIfWorthwhile(): void {
+    const removed = this.strokes.removedCount;
+    if (removed >= 262_144 && removed * 2 >= this.strokes.primitiveCount) {
+      this.remapStrokeIndices(this.strokes.compactRemoved());
+    }
+  }
+
+  /** `validated`: this paint's composite state was just checked for VectorScene output. */
+  private recordPaintRun(kind: number, start: number, count: number, validated = false): void {
     if (count <= 0) return;
     const role = kind === DENSE_PDF_PAINT_RUN_STROKE
       ? "stroke"
@@ -3546,16 +3937,18 @@ class DenseContentCompiler {
       }
       this.recordVectorPathPaint(
         role,
-        kind === DENSE_PDF_PAINT_RUN_STROKE ? "S" : "f"
+        kind === DENSE_PDF_PAINT_RUN_STROKE ? "S" : "f",
+        validated
       );
       if (this.policy.orderedPaint) {
-        this.recordVectorSourceEvent(
-          kind === DENSE_PDF_PAINT_RUN_STROKE
-            ? DENSE_PDF_VECTOR_SCENE_EVENT_STROKE : DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
-          this.vectorPathPaintRanges.length / 2,
-          role === "stroke" ? "S" : "f"
-        );
-        this.vectorPathPaintRanges.push(start, count);
+        const event = kind === DENSE_PDF_PAINT_RUN_STROKE
+          ? DENSE_PDF_VECTOR_SCENE_EVENT_STROKE : DENSE_PDF_VECTOR_SCENE_EVENT_FILL;
+        if (event !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) this.strokes.breakRun();
+        this.vectorPathPaintCount += 1;
+        if (!this.extendLastPathPaint(event, start, count)) {
+          this.recordVectorSourceEvent(event, this.vectorPathPaintRanges.length / 2, role === "stroke" ? "S" : "f");
+          this.vectorPathPaintRanges.push(start, count);
+        }
       }
     }
     if (!this.policy.displayProgram) return;
@@ -4217,6 +4610,7 @@ class DenseContentCompiler {
       optionalContentIndex: this.combineOptionalContent(parent?.optionalContentIndex ?? -1, optionalContentIndex),
       defaultVisible: (parent?.defaultVisible ?? true) && ownDefaultVisible
     });
+    this.syncActiveMarkedContent();
   }
 
   private resolveMarkedContentProperty(
@@ -4242,16 +4636,12 @@ class DenseContentCompiler {
     return undefined;
   }
 
-  private get activeMarkedContentIndex(): number {
-    return this.markedContentStack.at(-1)?.nodeIndex ?? -1;
-  }
-
-  private get activeOptionalContentIndex(): number {
-    return this.markedContentStack.at(-1)?.optionalContentIndex ?? -1;
-  }
-
-  private get contentVisible(): boolean {
-    return this.options.retainOptionalContent === true || (this.markedContentStack.at(-1)?.defaultVisible ?? true);
+  /** Follow the innermost marked-content scope after a push or pop. */
+  private syncActiveMarkedContent(): void {
+    const active = this.markedContentStack.at(-1);
+    this.activeMarkedContentIndex = active?.nodeIndex ?? -1;
+    this.activeOptionalContentIndex = active?.optionalContentIndex ?? -1;
+    this.contentVisible = this.options.retainOptionalContent === true || (active?.defaultVisible ?? true);
   }
 
   private combineOptionalContent(parent: number, own: number): number {
@@ -4263,12 +4653,25 @@ class DenseContentCompiler {
     this.pendingClipRule = null;
   }
 
-  private requireArgs(operator: string, args: PdfValue[], count: number): void {
-    if (args.length !== count) {
+  private requireArgs(operator: string, _args: PdfValue[], count: number): void {
+    if (this.operandCount !== count) {
       throw new DensePdfSyntaxError(
-        `Operator ${operator} expected ${count} operands but received ${args.length}.`
+        `Operator ${operator} expected ${count} operands but received ${this.operandCount}.`
       );
     }
+  }
+
+  /** The live operands as an exact-length array, for variable-arity operators. */
+  private operandList(): PdfValue[] {
+    return this.operands.slice(0, this.operandCount);
+  }
+
+  private textSinkOperands(): unknown[] {
+    const operands = new Array<unknown>(this.operandCount);
+    for (let index = 0; index < this.operandCount; index += 1) {
+      operands[index] = toTextSinkOperand(this.operands[index]);
+    }
+    return operands;
   }
 
   private requireNativeTextSinkForVisiblePaint(operator: string): void {
@@ -4476,6 +4879,9 @@ class IncrementalPdfLexer {
 
   private readonly onToken: (token: LexerToken) => void;
 
+  /** Numbers, most tokens of a content stream, skip the token object. */
+  private readonly onNumber: (value: number) => void;
+
   private readonly numberToken: Extract<LexerToken, { kind: "number" }> = {
     kind: "number",
     value: 0
@@ -4492,8 +4898,15 @@ class IncrementalPdfLexer {
 
   private nextSourceOffset = 0;
 
-  constructor(onToken: (token: LexerToken) => void) {
+  /** Start of the last operator word handed to `onToken`. */
+  private wordStart = 0;
+
+  constructor(onToken: (token: LexerToken) => void, onNumber?: (value: number) => void) {
     this.onToken = onToken;
+    this.onNumber = onNumber ?? ((value) => {
+      this.numberToken.value = value;
+      onToken(this.numberToken);
+    });
   }
 
   feed(chunk: Uint8Array, final: boolean, sourceOffset = this.nextSourceOffset): void {
@@ -4519,18 +4932,18 @@ class IncrementalPdfLexer {
       this.nextSourceOffset = sourceOffset + chunk.length;
     }
 
-    let offset = 0;
-    while (true) {
-      const nextOffset = this.readToken(offset, final);
-      if (nextOffset === null) {
-        break;
-      }
-      offset = nextOffset;
-      if (offset >= this.buffer.length) {
-        break;
-      }
+    let offset: number;
+    try {
+      offset = this.readTokens(final);
+    } catch (error) {
+      // Resume at the suspended operator: its operands are already consumed.
+      if (error instanceof ContentResourceSuspension) this.retainFrom(this.wordStart);
+      throw error;
     }
+    this.retainFrom(offset);
+  }
 
+  private retainFrom(offset: number): void {
     this.buffer = offset >= this.buffer.length
       ? new Uint8Array(0)
       : this.buffer.slice(offset);
@@ -4544,109 +4957,155 @@ class IncrementalPdfLexer {
     }
   }
 
-  private readToken(
-    initialOffset: number,
-    final: boolean
-  ): number | null {
+  /**
+   * Parse the whole available buffer in one hot loop instead of one call per
+   * token. Returns the offset of the first byte of an incomplete trailing token.
+   */
+  private readTokens(final: boolean): number {
     const bytes = this.buffer;
-    let offset = initialOffset;
-    while (offset < bytes.length) {
-      const byte = bytes[offset];
-      if (isPdfWhitespace(byte)) {
+    let offset = 0;
+    while (true) {
+      const initialOffset = offset;
+      while (offset < bytes.length) {
+        const byte = bytes[offset];
+        if (PDF_BYTE_CLASSES[byte] === PDF_BYTE_WHITESPACE) {
+          offset += 1;
+          continue;
+        }
+        if (byte === 0x25) {
+          const end = findLineEnd(bytes, offset + 1);
+          if (end < 0) {
+            return final ? bytes.length : initialOffset;
+          }
+          offset = end;
+          continue;
+        }
+        break;
+      }
+
+      if (offset >= bytes.length) {
+        return offset;
+      }
+
+      const start = offset;
+      const byte = bytes[offset++];
+      if (byte === 0x5b) {
+        this.onToken(ARRAY_START_TOKEN);
+        continue;
+      }
+      if (byte === 0x5d) {
+        this.onToken(ARRAY_END_TOKEN);
+        continue;
+      }
+      if (byte === 0x3c) {
+        if (offset >= bytes.length && !final) {
+          return initialOffset;
+        }
+        if (bytes[offset] === 0x3c) {
+          this.onToken(DICT_START_TOKEN);
+          offset += 1;
+          continue;
+        }
+        const end = findByte(bytes, 0x3e, offset);
+        if (end < 0) {
+          if (!final) {
+            return initialOffset;
+          }
+          throw new DensePdfSyntaxError("Unterminated hexadecimal string in PDF content.");
+        }
+        this.onToken({ kind: "string", value: decodeHexString(bytes.subarray(offset, end)) });
+        offset = end + 1;
+        continue;
+      }
+      if (byte === 0x3e) {
+        if (offset >= bytes.length && !final) {
+          return initialOffset;
+        }
+        if (bytes[offset] !== 0x3e) {
+          throw new DensePdfSyntaxError("Unexpected > delimiter in PDF content.");
+        }
+        this.onToken(DICT_END_TOKEN);
         offset += 1;
         continue;
       }
-      if (byte === 0x25) {
-        const end = findLineEnd(bytes, offset + 1);
-        if (end < 0) {
-          return final ? bytes.length : null;
+      if (byte === 0x28) {
+        const parsed = parseLiteralString(bytes, offset, final);
+        if (!parsed) {
+          return initialOffset;
         }
+        this.onToken({ kind: "string", value: parsed.value });
+        offset = parsed.offset;
+        continue;
+      }
+      if (byte === 0x2f) {
+        const end = findRegularTokenEnd(bytes, offset);
+        if (end === bytes.length && !final) {
+          return initialOffset;
+        }
+        this.onToken({ kind: "name", value: decodePdfName(bytes.subarray(offset, end)) });
         offset = end;
         continue;
       }
-      break;
-    }
 
-    if (offset >= bytes.length) {
-      return offset;
-    }
-
-    const start = offset;
-    const byte = bytes[offset++];
-    if (byte === 0x5b) {
-      this.onToken(ARRAY_START_TOKEN);
-      return offset;
-    }
-    if (byte === 0x5d) {
-      this.onToken(ARRAY_END_TOKEN);
-      return offset;
-    }
-    if (byte === 0x3c) {
-      if (offset >= bytes.length && !final) {
-        return null;
-      }
-      if (bytes[offset] === 0x3c) {
-        this.onToken(DICT_START_TOKEN);
-        return offset + 1;
-      }
-      const end = findByte(bytes, 0x3e, offset);
-      if (end < 0) {
-        if (!final) {
-          return null;
+      // Numeric operands dominate CAD content streams: parse the value while
+      // finding the token boundary instead of scanning its bytes twice.
+      if ((byte >= 0x30 && byte <= 0x39) || byte === 0x2b || byte === 0x2d || byte === 0x2e) {
+        let numberOffset = start;
+        let sign = 1;
+        if (byte === 0x2b || byte === 0x2d) {
+          if (byte === 0x2d) sign = -1;
+          numberOffset += 1;
         }
-        throw new DensePdfSyntaxError("Unterminated hexadecimal string in PDF content.");
+        let divideBy = 0;
+        if (numberOffset < bytes.length && bytes[numberOffset] === 0x2e) {
+          divideBy = 10;
+          numberOffset += 1;
+        }
+        let valid = numberOffset < bytes.length &&
+          bytes[numberOffset] >= 0x30 && bytes[numberOffset] <= 0x39;
+        let value = valid ? bytes[numberOffset++] - 0x30 : 0;
+        while (numberOffset < bytes.length) {
+          const numberByte = bytes[numberOffset];
+          if (PDF_BYTE_CLASSES[numberByte] !== PDF_BYTE_REGULAR) break;
+          numberOffset += 1;
+          if (valid && numberByte >= 0x30 && numberByte <= 0x39) {
+            if (divideBy !== 0) divideBy *= 10;
+            value = value * 10 + numberByte - 0x30;
+          } else if (valid && numberByte === 0x2e && divideBy === 0) {
+            divideBy = 1;
+          } else {
+            valid = false;
+          }
+        }
+        if (numberOffset === bytes.length && !final) {
+          return initialOffset;
+        }
+        if (!valid) {
+          throw new DensePdfSyntaxError("Malformed numeric token in PDF content.");
+        }
+        const parsed = sign * (divideBy === 0 ? value : value / divideBy);
+        if (!Number.isFinite(parsed)) {
+          throw new DensePdfSyntaxError("Invalid numeric token in PDF content.");
+        }
+        this.onNumber(parsed);
+        offset = numberOffset;
+        continue;
       }
-      this.onToken({ kind: "string", value: decodeHexString(bytes.subarray(offset, end)) });
-      return end + 1;
-    }
-    if (byte === 0x3e) {
-      if (offset >= bytes.length && !final) {
-        return null;
-      }
-      if (bytes[offset] !== 0x3e) {
-        throw new DensePdfSyntaxError("Unexpected > delimiter in PDF content.");
-      }
-      this.onToken(DICT_END_TOKEN);
-      return offset + 1;
-    }
-    if (byte === 0x28) {
-      const parsed = parseLiteralString(bytes, offset, final);
-      if (!parsed) {
-        return null;
-      }
-      this.onToken({ kind: "string", value: parsed.value });
-      return parsed.offset;
-    }
-    if (byte === 0x2f) {
-      const end = findRegularTokenEnd(bytes, offset);
-      if (end === bytes.length && !final) {
-        return null;
-      }
-      this.onToken({ kind: "name", value: decodePdfName(bytes.subarray(offset, end)) });
-      return end;
-    }
 
-    const end = findRegularTokenEnd(bytes, start);
-    if (end === bytes.length && !final) {
-      return null;
-    }
-    if (end === start) {
-      throw new DensePdfSyntaxError(`Unexpected delimiter byte 0x${byte.toString(16)}.`);
-    }
-    if (looksLikePdfNumberBytes(bytes, start, end)) {
-      const value = parsePdfNumberBytes(bytes, start, end);
-      if (!Number.isFinite(value)) {
-        throw new DensePdfSyntaxError("Invalid numeric token in PDF content.");
+      const end = findRegularTokenEnd(bytes, start);
+      if (end === bytes.length && !final) {
+        return initialOffset;
       }
-      this.numberToken.value = value;
-      this.onToken(this.numberToken);
-      return end;
+      if (end === start) {
+        throw new DensePdfSyntaxError(`Unexpected delimiter byte 0x${byte.toString(16)}.`);
+      }
+      this.wordToken.value = internPdfWord(bytes, start, end);
+      this.wordToken.sourceOffset = this.bufferSourceOffset + start;
+      this.wordToken.sourceLength = end - start;
+      this.wordStart = start;
+      this.onToken(this.wordToken);
+      offset = end;
     }
-    this.wordToken.value = internPdfWord(bytes, start, end);
-    this.wordToken.sourceOffset = this.bufferSourceOffset + start;
-    this.wordToken.sourceLength = end - start;
-    this.onToken(this.wordToken);
-    return end;
   }
 }
 
@@ -4830,6 +5289,11 @@ class Float4Builder {
     this.length = clampInt(quadCount, 0, this.quadCount) * 4;
   }
 
+  /** Move quads `[start, end)` to `target`, as one run of a compaction. */
+  moveQuads(target: number, start: number, end: number): void {
+    this.data.copyWithin(target * 4, start * 4, end * 4);
+  }
+
   push(a: number, b: number, c: number, d: number): void {
     this.ensureCapacity(4);
     this.data[this.length] = a;
@@ -4839,8 +5303,9 @@ class Float4Builder {
     this.length += 4;
   }
 
-  valueAt(index: number): number {
-    return this.data[index];
+  /** The backing store, valid until the next push; for hot read loops. */
+  values(): Float32Array {
+    return this.data;
   }
 
   usedView(): Float32Array {
@@ -4851,17 +5316,12 @@ class Float4Builder {
     return this.data.slice(0, this.length);
   }
 
-  async toTypedArrayCooperative(
-    checkpoint: (force?: boolean) => Promise<void>
-  ): Promise<Float32Array> {
-    const output = new Float32Array(this.length);
-    const chunkLength = 256 * 1024;
-    for (let offset = 0; offset < this.length; offset += chunkLength) {
-      const end = Math.min(this.length, offset + chunkLength);
-      output.set(this.data.subarray(offset, end), offset);
-      await checkpoint();
-    }
-    return output;
+  /** Hand over the used values and empty the builder. */
+  take(): Float32Array {
+    const values = takeFloat32Prefix(this.data, this.length);
+    this.data = new Float32Array(0);
+    this.length = 0;
+    return values;
   }
 
   private ensureCapacity(extra: number): void {
@@ -4891,19 +5351,44 @@ class DenseStrokeBuilder {
 
   readonly duplicateTuple = new Float64Array(17);
 
-  readonly duplicateTupleWords = new Uint32Array(
-    this.duplicateTuple.buffer,
-    this.duplicateTuple.byteOffset,
-    this.duplicateTuple.length * 2
-  );
-
-  readonly ordinaryDuplicateTupleWords = new Uint32Array(
-    this.duplicateTuple.buffer,
-    this.duplicateTuple.byteOffset,
-    13 * 2
-  );
-
   readonly existingDuplicateTuple = new Float64Array(17);
+
+  /**
+   * The primitive being emitted, as it will be stored. Repeated source
+   * strokes store bit-identical values, which a duplicate lookup can match
+   * without requantizing the stored primitive.
+   */
+  private candidateX0 = 0;
+
+  private candidateY0 = 0;
+
+  private candidateCx = 0;
+
+  private candidateCy = 0;
+
+  private candidateX1 = 0;
+
+  private candidateY1 = 0;
+
+  private candidateType = 0;
+
+  private candidateStyle = 0;
+
+  private candidateWidth = 0;
+
+  private candidateR = 0;
+
+  private candidateG = 0;
+
+  private candidateB = 0;
+
+  private candidateMinX = 0;
+
+  private candidateMinY = 0;
+
+  private candidateMaxX = 0;
+
+  private candidateMaxY = 0;
 
   private readonly duplicateEquals = (index: number, tuple: Float64Array): boolean =>
     this.matchesDuplicateTuple(index, tuple);
@@ -4911,6 +5396,45 @@ class DenseStrokeBuilder {
   readonly enableInvisibleCull: boolean;
 
   readonly preservePrimitiveOrder: boolean;
+
+  /**
+   * Ordered output: of two identical opaque strokes in one paint context, the
+   * earlier is removed. The later one repaints exactly its pixels, so this is
+   * safe whatever was painted in between; removing the later one is not.
+   */
+  readonly keepLastDuplicate: boolean;
+
+  /** Paint context of the primitives now emitted; -1 disables duplicate removal. */
+  paintContext = -1;
+
+  /** Per primitive when `keepLastDuplicate`: its removal flag. */
+  private removed = new Uint8Array(0);
+
+  /**
+   * Per primitive: consecutive opaque strokes of one color and context with no
+   * other paint between them share a run. Order within a run cannot change
+   * the result, so containment inside a run is order-free.
+   */
+  private runs = new Uint32Array(0);
+
+  /** Per run: the paint context all of its primitives share. */
+  private runContexts = new Uint32Array(1_024);
+
+  private currentRun = 0;
+
+  private runBroken = true;
+
+  private runContext = -1;
+
+  private runR = 0;
+
+  private runG = 0;
+
+  private runB = 0;
+
+  removedCount = 0;
+
+  private orderedContainedCount = 0;
 
   sourceSegmentCount = 0;
 
@@ -4924,9 +5448,66 @@ class DenseStrokeBuilder {
 
   emittedMaxHalfWidth = 0;
 
-  constructor(enableInvisibleCull: boolean, preservePrimitiveOrder: boolean) {
+  constructor(enableInvisibleCull: boolean, preservePrimitiveOrder: boolean, keepLastDuplicate = false) {
     this.enableInvisibleCull = enableInvisibleCull;
     this.preservePrimitiveOrder = preservePrimitiveOrder;
+    this.keepLastDuplicate = keepLastDuplicate && enableInvisibleCull && preservePrimitiveOrder;
+  }
+
+  /** Each live primitive's run and each run's paint context, for ordered culling. */
+  paintOrder(): StrokePaintOrder | null {
+    return this.keepLastDuplicate
+      ? { runs: this.runs.subarray(0, this.endpoints.quadCount), runContexts: this.runContexts }
+      : null;
+  }
+
+  /** Another kind of paint happened: later strokes cannot join the current run. */
+  breakRun(): void {
+    this.runBroken = true;
+  }
+
+  /**
+   * Drop removed primitives in place. Returns `remap`, where `remap[i]` is the
+   * new index of old primitive `i` and `remap[count]` the new count, so a range
+   * `[start, end)` becomes `[remap[start], remap[end])`.
+   */
+  compactRemoved(): Uint32Array | null {
+    if (this.removedCount === 0) return null;
+    const count = this.endpoints.quadCount;
+    const removed = this.removed;
+    const remap = new Uint32Array(count + 1);
+    let out = 0;
+    let index = 0;
+    while (index < count) {
+      if (removed[index] !== 0) {
+        remap[index] = out;
+        index += 1;
+        continue;
+      }
+      // Kept primitives mostly come in long runs: move each run at once.
+      const start = index;
+      while (index < count && removed[index] === 0) {
+        remap[index] = out + index - start;
+        index += 1;
+      }
+      if (out !== start) {
+        this.endpoints.moveQuads(out, start, index);
+        this.primitiveMeta.moveQuads(out, start, index);
+        this.primitiveBounds.moveQuads(out, start, index);
+        this.styles.moveQuads(out, start, index);
+        this.runs.copyWithin(out, start, index);
+      }
+      out += index - start;
+    }
+    remap[count] = out;
+    this.endpoints.truncateQuads(out);
+    this.primitiveMeta.truncateQuads(out);
+    this.primitiveBounds.truncateQuads(out);
+    this.styles.truncateQuads(out);
+    this.removed.fill(0, 0, count);
+    this.removedCount = 0;
+    this.duplicateIndex.remap(remap);
+    return remap;
   }
 
   get primitiveCount(): number {
@@ -4987,6 +5568,23 @@ class DenseStrokeBuilder {
         this.discardedTransparentCount += 1;
         return;
       }
+      this.candidateX0 = x0;
+      this.candidateY0 = y0;
+      this.candidateCx = cx;
+      this.candidateCy = cy;
+      this.candidateX1 = x1;
+      this.candidateY1 = y1;
+      this.candidateType = type;
+      this.candidateStyle = encodedStyle;
+      this.candidateWidth = width;
+      this.candidateR = r;
+      this.candidateG = g;
+      this.candidateB = b;
+      // Bounds are stored as Float32 values.
+      this.candidateMinX = Math.fround(visibleMinX);
+      this.candidateMinY = Math.fround(visibleMinY);
+      this.candidateMaxX = Math.fround(visibleMaxX);
+      this.candidateMaxY = Math.fround(visibleMaxY);
       const isQuadratic = type >= STROKE_PRIMITIVE_QUADRATIC - 0.5;
       const isDegenerate = isQuadratic
         ? Math.hypot(cx - x0, cy - y0) + Math.hypot(x1 - cx, y1 - cy) < 1e-5
@@ -5012,17 +5610,41 @@ class DenseStrokeBuilder {
         if (this.duplicateIndex.hasOrInsert(
           this.duplicateTuple,
           (decodedFlags & DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED) !== 0
-            ? this.duplicateTupleWords
-            : this.ordinaryDuplicateTupleWords,
+            ? this.duplicateTuple.length
+            : DUPLICATE_TUPLE_GEOMETRY,
           this.endpoints.quadCount,
           this.duplicateEquals
         )) {
           this.discardedDuplicateCount += 1;
           return;
         }
+      } else if (this.keepLastDuplicate && this.paintContext >= 0 && decodedAlpha >= OPAQUE_ALPHA_EPSILON) {
+        fillDuplicateTuple(
+          this.duplicateTuple,
+          x0, y0, cx, cy, x1, y1, type, width, r, g, b, decodedAlpha,
+          decodedFlags,
+          visibleMinX, visibleMinY, visibleMaxX, visibleMaxY
+        );
+        const slot = this.duplicateIndex.findOrInsert(
+          this.duplicateTuple,
+          DUPLICATE_TUPLE_GEOMETRY,
+          this.endpoints.quadCount,
+          this.duplicateEquals
+        );
+        if (slot >= 0) {
+          this.discardedDuplicateCount += 1;
+          const previous = this.duplicateIndex.indexAt(slot);
+          // Order inside one run is free: an equal stroke already in the run
+          // this one would join stays, and this one is not stored.
+          if (this.runs[previous] === this.runFor(this.paintContext, r, g, b, decodedAlpha)) return;
+          this.duplicateIndex.replaceAt(slot, this.endpoints.quadCount);
+          this.removed[previous] = 1;
+          this.removedCount += 1;
+        }
       }
     }
 
+    if (this.keepLastDuplicate) this.recordContext(this.endpoints.quadCount, r, g, b, decodedAlpha);
     this.endpoints.push(x0, y0, cx, cy);
     this.primitiveMeta.push(x1, y1, type, encodedStyle);
     this.styles.push(width, r, g, b);
@@ -5034,6 +5656,45 @@ class DenseStrokeBuilder {
     );
   }
 
+  /** The run the next primitive with this paint would join. */
+  private runFor(paintContext: number, r: number, g: number, b: number, alpha: number): number {
+    const context = paintContext >= 0 ? paintContext : NO_STROKE_PAINT_CONTEXT;
+    const joins = !this.runBroken && context !== NO_STROKE_PAINT_CONTEXT && alpha >= OPAQUE_ALPHA_EPSILON &&
+      context === this.runContext && r === this.runR && g === this.runG && b === this.runB;
+    return joins ? this.currentRun : this.currentRun + 1;
+  }
+
+  private recordContext(index: number, r: number, g: number, b: number, alpha: number): void {
+    if (index >= this.runs.length) {
+      const length = Math.max(65_536, this.runs.length * 2);
+      const removed = new Uint8Array(length);
+      removed.set(this.removed);
+      this.removed = removed;
+      const runs = new Uint32Array(length);
+      runs.set(this.runs);
+      this.runs = runs;
+    }
+    const context = this.paintContext >= 0 ? this.paintContext : NO_STROKE_PAINT_CONTEXT;
+    if (this.runBroken || context === NO_STROKE_PAINT_CONTEXT || alpha < OPAQUE_ALPHA_EPSILON ||
+        context !== this.runContext || r !== this.runR || g !== this.runG || b !== this.runB) {
+      this.currentRun += 1;
+      if (this.currentRun >= this.runContexts.length) {
+        const runContexts = new Uint32Array(this.runContexts.length * 2);
+        runContexts.set(this.runContexts);
+        this.runContexts = runContexts;
+      }
+      this.runContexts[this.currentRun] = context;
+      this.runContext = context;
+      this.runR = r;
+      this.runG = g;
+      this.runB = b;
+      // A translucent or blended stroke cannot share its run with any other.
+      this.runBroken = context === NO_STROKE_PAINT_CONTEXT || alpha < OPAQUE_ALPHA_EPSILON;
+    }
+    // `removed` is clear here: stores start zeroed and compaction clears them.
+    this.runs[index] = this.currentRun;
+  }
+
   hasUniformOpaqueColor(): boolean {
     const styles = this.styles.usedView();
     const meta = this.primitiveMeta.usedView();
@@ -5043,6 +5704,34 @@ class DenseStrokeBuilder {
           styles[i + 1] !== styles[1] || styles[i + 2] !== styles[2] || styles[i + 3] !== styles[3]) return false;
     }
     return true;
+  }
+
+  /**
+   * Ordered output: remove segments that a later segment in the same paint
+   * context covers. Returns the index remap, or null when nothing moved.
+   */
+  async cullContainedInOrder(checkpoint: (force?: boolean) => Promise<void>): Promise<Uint32Array | null> {
+    if (!this.keepLastDuplicate || this.endpoints.quadCount === 0) return this.compactRemoved();
+    // No primitive is emitted after this; the duplicate index is not needed.
+    this.duplicateIndex.release();
+    const { keep, discardedContainedCount } = await markContainedSegments(
+      this.endpoints.usedView(),
+      this.primitiveMeta.usedView(),
+      this.primitiveBounds.usedView(),
+      this.styles.usedView(),
+      checkpoint,
+      this.paintOrder(),
+      this.removedCount > 0 ? this.removed : null
+    );
+    if (discardedContainedCount > 0) {
+      for (let index = 0; index < keep.length; index += 1) {
+        if (keep[index] === 0) this.removed[index] = 1;
+      }
+      this.removedCount += discardedContainedCount;
+      this.orderedContainedCount += discardedContainedCount;
+    }
+    // Removed duplicates and contained segments go in one compaction.
+    return this.compactRemoved();
   }
 
   async finalize(
@@ -5058,11 +5747,11 @@ class DenseStrokeBuilder {
       (this.preservePrimitiveOrder && !compactOrderedStrokes) ||
       this.endpoints.quadCount === 0
     ) {
-      const endpoints = await this.endpoints.toTypedArrayCooperative(checkpoint);
-      const primitiveMeta = await this.primitiveMeta.toTypedArrayCooperative(checkpoint);
-      const primitiveBounds = await this.primitiveBounds.toTypedArrayCooperative(checkpoint);
-      const styles = await this.styles.toTypedArrayCooperative(checkpoint);
-      return buildUncompactedStrokeResult(
+      const endpoints = this.endpoints.take();
+      const primitiveMeta = this.primitiveMeta.take();
+      const primitiveBounds = this.primitiveBounds.take();
+      const styles = this.styles.take();
+      const result = await buildUncompactedStrokeResult(
         endpoints,
         primitiveMeta,
         primitiveBounds,
@@ -5070,6 +5759,8 @@ class DenseStrokeBuilder {
         checkpoint,
         this.enableInvisibleCull ? null : this.emittedMaxHalfWidth
       );
+      result.discardedContainedCount = this.orderedContainedCount;
+      return result;
     }
     return cullContainedSegments(
       this.endpoints.usedView(),
@@ -5081,31 +5772,61 @@ class DenseStrokeBuilder {
   }
 
   private matchesDuplicateTuple(index: number, tuple: Float64Array): boolean {
+    if (this.keepLastDuplicate && this.runContexts[this.runs[index]] !== this.paintContext) return false;
     const offset = index * 4;
-    const encoded = this.primitiveMeta.valueAt(offset + 3);
+    const endpoints = this.endpoints.values();
+    const meta = this.primitiveMeta.values();
+    const styles = this.styles.values();
+    const bounds = this.primitiveBounds.values();
+    // Bit-identical stored values quantize to an identical tuple.
+    if (
+      endpoints[offset] === this.candidateX0 &&
+      endpoints[offset + 1] === this.candidateY0 &&
+      endpoints[offset + 2] === this.candidateCx &&
+      endpoints[offset + 3] === this.candidateCy &&
+      meta[offset] === this.candidateX1 &&
+      meta[offset + 1] === this.candidateY1 &&
+      meta[offset + 2] === this.candidateType &&
+      meta[offset + 3] === this.candidateStyle &&
+      styles[offset] === this.candidateWidth &&
+      styles[offset + 1] === this.candidateR &&
+      styles[offset + 2] === this.candidateG &&
+      styles[offset + 3] === this.candidateB
+    ) {
+      // Unordered clipped primitives also compare their clip bounds.
+      if (this.keepLastDuplicate || (tuple[6] & DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED) === 0) return true;
+      if (
+        bounds[offset] === this.candidateMinX && bounds[offset + 1] === this.candidateMinY &&
+        bounds[offset + 2] === this.candidateMaxX && bounds[offset + 3] === this.candidateMaxY
+      ) return true;
+    }
+    const encoded = meta[offset + 3];
     const decodedFlags = Math.max(0, Math.trunc(encoded / STROKE_STYLE_FLAG_OFFSET + 1e-6));
     const decodedAlpha = clamp01(encoded - decodedFlags * STROKE_STYLE_FLAG_OFFSET);
     fillDuplicateTuple(
       this.existingDuplicateTuple,
-      this.endpoints.valueAt(offset),
-      this.endpoints.valueAt(offset + 1),
-      this.endpoints.valueAt(offset + 2),
-      this.endpoints.valueAt(offset + 3),
-      this.primitiveMeta.valueAt(offset),
-      this.primitiveMeta.valueAt(offset + 1),
-      this.primitiveMeta.valueAt(offset + 2),
-      this.styles.valueAt(offset),
-      this.styles.valueAt(offset + 1),
-      this.styles.valueAt(offset + 2),
-      this.styles.valueAt(offset + 3),
+      endpoints[offset],
+      endpoints[offset + 1],
+      endpoints[offset + 2],
+      endpoints[offset + 3],
+      meta[offset],
+      meta[offset + 1],
+      meta[offset + 2],
+      styles[offset],
+      styles[offset + 1],
+      styles[offset + 2],
+      styles[offset + 3],
       decodedAlpha,
       decodedFlags,
-      this.primitiveBounds.valueAt(offset),
-      this.primitiveBounds.valueAt(offset + 1),
-      this.primitiveBounds.valueAt(offset + 2),
-      this.primitiveBounds.valueAt(offset + 3)
+      bounds[offset],
+      bounds[offset + 1],
+      bounds[offset + 2],
+      bounds[offset + 3]
     );
-    for (let i = 0; i < tuple.length; i += 1) {
+    // An ordered primitive's paint context names its clip, so its clip
+    // bounds need no comparison.
+    const count = this.keepLastDuplicate ? DUPLICATE_TUPLE_GEOMETRY : tuple.length;
+    for (let i = 0; i < count; i += 1) {
       if (this.existingDuplicateTuple[i] !== tuple[i]) {
         return false;
       }
@@ -5121,16 +5842,17 @@ class DenseDuplicateIndex {
 
   private size = 0;
 
+  /** Hash the first `hashedLength` components; `equals` decides equality. */
   hasOrInsert(
     tuple: Float64Array,
-    tupleWords: Uint32Array,
+    hashedLength: number,
     newIndex: number,
     equals: (index: number, tuple: Float64Array) => boolean
   ): boolean {
     if ((this.size + 1) * 10 >= this.hashes.length * 7) {
       this.grow();
     }
-    const hash = hashFloatTuple(tupleWords);
+    const hash = hashQuantizedTuple(tuple, hashedLength);
     let slot = hash & (this.hashes.length - 1);
     while (this.hashes[slot] !== 0) {
       if (this.hashes[slot] === hash && equals(this.indices[slot] - 1, tuple)) {
@@ -5142,6 +5864,47 @@ class DenseDuplicateIndex {
     this.indices[slot] = newIndex + 1;
     this.size += 1;
     return false;
+  }
+
+  /**
+   * The slot of an equal entry, left unchanged, or -1 after inserting
+   * `newIndex` for a new tuple.
+   */
+  findOrInsert(
+    tuple: Float64Array,
+    hashedLength: number,
+    newIndex: number,
+    equals: (index: number, tuple: Float64Array) => boolean
+  ): number {
+    if ((this.size + 1) * 10 >= this.hashes.length * 7) {
+      this.grow();
+    }
+    const hash = hashQuantizedTuple(tuple, hashedLength);
+    let slot = hash & (this.hashes.length - 1);
+    while (this.hashes[slot] !== 0) {
+      if (this.hashes[slot] === hash && equals(this.indices[slot] - 1, tuple)) return slot;
+      slot = (slot + 1) & (this.hashes.length - 1);
+    }
+    this.hashes[slot] = hash;
+    this.indices[slot] = newIndex + 1;
+    this.size += 1;
+    return -1;
+  }
+
+  indexAt(slot: number): number {
+    return this.indices[slot] - 1;
+  }
+
+  /** Point an equal entry's slot at a later primitive. */
+  replaceAt(slot: number, newIndex: number): void {
+    this.indices[slot] = newIndex + 1;
+  }
+
+  /** Rewrite stored indices after compaction; every indexed entry is live. */
+  remap(remap: Uint32Array): void {
+    for (let slot = 0; slot < this.indices.length; slot += 1) {
+      if (this.indices[slot] !== 0) this.indices[slot] = remap[this.indices[slot] - 1] + 1;
+    }
   }
 
   release(): void {
@@ -5197,9 +5960,14 @@ function emitSegmentsFromPath(
   let pendingY1 = 0;
   let hasPending = false;
 
-  const dashScale = matrixScale(matrix);
-  const dashPattern = lineDash.map((entry) => entry * dashScale);
-  const dashPatternLength = dashPattern.reduce((sum, entry) => sum + entry, 0);
+  const dashScale = lineDash.length > 0 ? matrixScale(matrix) : 1;
+  const dashPattern = lineDash.length > 0
+    ? lineDash.map((entry) => entry * dashScale)
+    : lineDash;
+  let dashPatternLength = 0;
+  for (let index = 0; index < dashPattern.length; index += 1) {
+    dashPatternLength += dashPattern[index];
+  }
   const hasDashPattern = dashPattern.length > 0 && dashPatternLength > 1e-9;
   let dashIndex = 0;
   let dashRemaining = Number.POSITIVE_INFINITY;
@@ -5218,21 +5986,22 @@ function emitSegmentsFromPath(
     const minY = Math.min(p0y, p1y, p2y);
     const maxX = Math.max(p0x, p1x, p2x);
     const maxY = Math.max(p0y, p1y, p2y);
-    const paintBounds = {
-      minX: minX - halfWidth,
-      minY: minY - halfWidth,
-      maxX: maxX + halfWidth,
-      maxY: maxY + halfWidth
-    };
-    const visiblePaintBounds = clipBounds ? intersectBounds(clipBounds, paintBounds) : paintBounds;
-    if (!isNonEmptyBounds(visiblePaintBounds)) {
+    const paintMinX = minX - halfWidth;
+    const paintMinY = minY - halfWidth;
+    const paintMaxX = maxX + halfWidth;
+    const paintMaxY = maxY + halfWidth;
+    const visibleMinX = clipBounds ? Math.max(clipBounds.minX, paintMinX) : paintMinX;
+    const visibleMinY = clipBounds ? Math.max(clipBounds.minY, paintMinY) : paintMinY;
+    const visibleMaxX = clipBounds ? Math.min(clipBounds.maxX, paintMaxX) : paintMaxX;
+    const visibleMaxY = clipBounds ? Math.min(clipBounds.maxY, paintMaxY) : paintMaxY;
+    if (!(visibleMinX <= visibleMaxX && visibleMinY <= visibleMaxY)) {
       return;
     }
-    const clipped = Boolean(clipBounds) && (
-      visiblePaintBounds.minX > paintBounds.minX + 1e-6 ||
-      visiblePaintBounds.minY > paintBounds.minY + 1e-6 ||
-      visiblePaintBounds.maxX < paintBounds.maxX - 1e-6 ||
-      visiblePaintBounds.maxY < paintBounds.maxY - 1e-6
+    const clipped = clipBounds !== null && (
+      visibleMinX > paintMinX + 1e-6 ||
+      visibleMinY > paintMinY + 1e-6 ||
+      visibleMaxX < paintMaxX - 1e-6 ||
+      visibleMaxY < paintMaxY - 1e-6
     );
     output.emitPrimitive(
       p0x, p0y, p1x, p1y, p2x, p2y, primitiveType,
@@ -5679,107 +6448,114 @@ async function cullContainedSegments(
   styles: Float32Array,
   checkpoint: (force?: boolean) => Promise<void>
 ): Promise<StrokeFinalizeResult> {
+  const { keep, discardedContainedCount } = await markContainedSegments(
+    endpoints, primitiveMeta, primitiveBounds, styles, checkpoint, null);
+  return compactStrokeBuffers(
+    endpoints,
+    primitiveMeta,
+    primitiveBounds,
+    styles,
+    keep,
+    keep.length - discardedContainedCount,
+    discardedContainedCount,
+    checkpoint
+  );
+}
+
+/**
+ * Mark segments that an opaque collinear segment of the same style covers.
+ * Unordered output may drop any covered segment. With `order`, output keeps
+ * source order: a segment is dropped only when a later segment in the same
+ * paint context, or an earlier one in its run, covers it, and oversized
+ * groups are kept rather than refused.
+ */
+async function markContainedSegments(
+  endpoints: Float32Array,
+  primitiveMeta: Float32Array,
+  primitiveBounds: Float32Array,
+  styles: Float32Array,
+  checkpoint: (force?: boolean) => Promise<void>,
+  order: StrokePaintOrder | null,
+  removed: Uint8Array | null = null
+): Promise<{ keep: Uint8Array; discardedContainedCount: number }> {
+  const runs = order?.runs ?? null;
+  const runContexts = order?.runContexts ?? null;
   const count = endpoints.length >> 2;
   const keep = new Uint8Array(count);
   keep.fill(1);
-  let starts = new Float64Array(count);
-  let ends = new Float64Array(count);
-  const groups: number[][] = [];
-  const tuple = new Float64Array(11);
-  const tupleWords = new Uint32Array(
-    tuple.buffer,
-    tuple.byteOffset,
-    tuple.length * 2
-  );
-  const representativeTuple = new Float64Array(11);
-  const groupIndex = new DenseCoverageGroupIndex();
-  const matchesRepresentative = (representativeIndex: number, candidate: Float64Array): boolean => {
-    if (!fillCoverageGroupTuple(
-      representativeTuple,
-      representativeIndex,
-      endpoints,
-      primitiveMeta,
-      styles,
-      primitiveBounds
-    )) {
+  // A paint context names its clip, so ordered groups key on the context in
+  // place of the clipped segments' clip bounds.
+  const tupleLength = order ? COVERAGE_TUPLE_GEOMETRY + 1 : COVERAGE_TUPLE_GEOMETRY + 4;
+  const tuple = new Float64Array(tupleLength);
+  const representative = new Float64Array(tupleLength);
+  const fillTuple = (target: Float64Array, index: number): boolean => {
+    if (!fillCoverageGroupTuple(target, index, endpoints, primitiveMeta, styles, primitiveBounds)) {
       return false;
     }
-    for (let component = 0; component < representativeTuple.length; component += 1) {
-      if (representativeTuple[component] !== candidate[component]) {
-        return false;
-      }
-    }
+    if (runs && runContexts) target[COVERAGE_TUPLE_GEOMETRY] = runContexts[runs[index]];
     return true;
   };
 
+  // Group segments with equal keys: hash each key in one sequential pass,
+  // sort the (hash, index) pairs, then split every run of equal hashes by
+  // exact key. Most CAD segments share no line with any other, and this never
+  // probes a table for them.
+  let hashes: Uint32Array = new Uint32Array(count);
+  let indices: Uint32Array = new Uint32Array(count);
+  let grouped = 0;
   for (let index = 0; index < count; index += 1) {
     if ((index & 0x1fff) === 0) await checkpoint();
-    if (!fillCoverageGroupTuple(
-      tuple,
-      index,
-      endpoints,
-      primitiveMeta,
-      styles,
-      primitiveBounds,
-      starts,
-      ends
-    )) {
-      continue;
-    }
-    const groupId = groupIndex.getOrInsert(
-      tuple,
-      tupleWords,
-      index,
-      groups.length,
-      matchesRepresentative
-    );
-    if (groupId === groups.length) {
-      groups.push([]);
-    }
-    groups[groupId].push(index);
+    if (runs && runContexts && runContexts[runs[index]] === NO_STROKE_PAINT_CONTEXT) continue;
+    // An already removed duplicate neither paints nor covers.
+    if (removed && removed[index] !== 0) continue;
+    if (!fillTuple(tuple, index)) continue;
+    hashes[grouped] = hashQuantizedTuple(tuple, tupleLength);
+    indices[grouped] = index;
+    grouped += 1;
   }
-  groupIndex.release();
+  ({ keys: hashes, values: indices } = await radixSortPairs(hashes, indices, grouped, checkpoint));
 
+  // Only groups with several candidates need line extents.
+  let starts = new Float64Array(64);
+  let ends = new Float64Array(64);
   let discardedContainedCount = 0;
   const coverageSorter = new CoverageObjectSorter();
-  for (let groupNumber = 0; groupNumber < groups.length; groupNumber += 1) {
-    const candidates = groups[groupNumber];
+  const opaqueCovers: number[] = [];
+  const cullGroup = (candidates: number[]): void => {
     if (candidates.length > MAX_COVERAGE_GROUP_SIZE) {
+      if (order) return;
       throw new DensePdfUnsupportedError(
-        "A collinear stroke group is too large for cooperative dense-vector culling."
+        "A collinear stroke group is too large for cooperative vector culling."
       );
     }
-    // A singleton has no other segment that can contain it (or be contained by
-    // it), so sorting and building an opaque-cover list cannot change output.
-    if (candidates.length === 1) {
-      if ((groupNumber & 0xff) === 0) await checkpoint();
-      continue;
+    if (candidates.length > starts.length) {
+      starts = new Float64Array(Math.max(candidates.length, starts.length * 2));
+      ends = new Float64Array(starts.length);
     }
-    await coverageSorter.sort(
-      candidates,
-      starts,
-      ends,
-      styles,
-      primitiveMeta,
-      checkpoint
-    );
-    const opaqueCovers: number[] = [];
+    for (let position = 0; position < candidates.length; position += 1) {
+      coverageExtent(candidates[position], endpoints, primitiveMeta, starts, ends, position);
+    }
+    coverageSorter.sortNow(candidates, starts, ends, styles, primitiveMeta);
+    // Covers are positions in the sorted group, which index `starts`/`ends`.
+    opaqueCovers.length = 0;
     for (let candidateNumber = 0; candidateNumber < candidates.length; candidateNumber += 1) {
-      if ((candidateNumber & 0x1fff) === 0) await checkpoint();
       const candidate = candidates[candidateNumber];
       const candidateOffset = candidate * 4;
       const candidateWidth = styles[candidateOffset];
       let covered = false;
       for (let coverNumber = 0; coverNumber < opaqueCovers.length; coverNumber += 1) {
-        if (coverNumber > 0 && (coverNumber & 0x1fff) === 0) await checkpoint();
-        const cover = opaqueCovers[coverNumber];
+        const coverPosition = opaqueCovers[coverNumber];
+        const cover = candidates[coverPosition];
         if (styles[cover * 4] + COVER_HALF_WIDTH_EPSILON < candidateWidth) {
           continue;
         }
         if (
-          starts[cover] - COVER_INTERVAL_EPSILON <= starts[candidate] &&
-          ends[cover] + COVER_INTERVAL_EPSILON >= ends[candidate]
+          starts[coverPosition] - COVER_INTERVAL_EPSILON <= starts[candidateNumber] &&
+          ends[coverPosition] + COVER_INTERVAL_EPSILON >= ends[candidateNumber]
         ) {
+          // In source order an earlier cover repaints nothing painted after it,
+          // unless both belong to one run of the same paint.
+          if (runs && cover < candidate && runs[cover] !== runs[candidate]) continue;
           covered = true;
           break;
         }
@@ -5794,30 +6570,137 @@ async function cullContainedSegments(
           Math.trunc(encodedStyle / STROKE_STYLE_FLAG_OFFSET + 1e-6)
         );
         if (clamp01(encodedStyle - flags * STROKE_STYLE_FLAG_OFFSET) >= OPAQUE_ALPHA_EPSILON) {
-          opaqueCovers.push(candidate);
+          opaqueCovers.push(candidateNumber);
         }
       }
     }
-    opaqueCovers.length = 0;
-    if ((groupNumber & 0xff) === 0) await checkpoint();
+  };
+
+  // Within a group the sorter imposes a total order ending in the segment
+  // index, and groups are independent, so discovery order cannot matter.
+  // Groups are culled without yielding; yield after enough work instead of
+  // paying a promise per group.
+  const candidates: number[] = [];
+  const pending: number[] = [];
+  let workSinceCheckpoint = 0;
+  for (let first = 0; first < grouped;) {
+    if (workSinceCheckpoint >= COVERAGE_WORK_PER_CHECKPOINT) {
+      workSinceCheckpoint = 0;
+      await checkpoint();
+    }
+    workSinceCheckpoint += 1;
+    let end = first + 1;
+    while (end < grouped && hashes[end] === hashes[first]) end += 1;
+    if (end - first >= 2) {
+      pending.length = 0;
+      for (let position = first; position < end; position += 1) pending.push(indices[position]);
+      // Split the run by exact key; distinct keys rarely share a hash.
+      while (pending.length >= 2) {
+        fillTuple(representative, pending[0]);
+        candidates.length = 0;
+        let rest = 0;
+        for (let position = 0; position < pending.length; position += 1) {
+          const index = pending[position];
+          fillTuple(tuple, index);
+          let equal = true;
+          for (let component = 0; component < tupleLength; component += 1) {
+            if (tuple[component] !== representative[component]) {
+              equal = false;
+              break;
+            }
+          }
+          if (equal) candidates.push(index);
+          else pending[rest++] = index;
+        }
+        pending.length = rest;
+        workSinceCheckpoint += candidates.length;
+        if (candidates.length >= 2) {
+          // The cover scan is quadratic in the worst case.
+          workSinceCheckpoint += candidates.length * candidates.length;
+          cullGroup(candidates);
+        }
+      }
+    }
+    first = end;
   }
 
-  groups.length = 0;
+  candidates.length = 0;
+  pending.length = 0;
+  opaqueCovers.length = 0;
+  hashes = new Uint32Array(0);
+  indices = new Uint32Array(0);
   coverageSorter.release();
   starts = new Float64Array(0);
   ends = new Float64Array(0);
   await checkpoint(true);
+  return { keep, discardedContainedCount };
+}
 
-  return compactStrokeBuffers(
-    endpoints,
-    primitiveMeta,
-    primitiveBounds,
-    styles,
-    keep,
-    count - discardedContainedCount,
-    discardedContainedCount,
-    checkpoint
-  );
+/** Stable least-significant-digit radix sort of `length` (key, value) pairs by key. */
+async function radixSortPairs(
+  keys: Uint32Array,
+  values: Uint32Array,
+  length: number,
+  checkpoint: (force?: boolean) => Promise<void>
+): Promise<{ keys: Uint32Array; values: Uint32Array }> {
+  let sourceKeys: Uint32Array = keys;
+  let sourceValues: Uint32Array = values;
+  let targetKeys: Uint32Array = new Uint32Array(length);
+  let targetValues: Uint32Array = new Uint32Array(length);
+  const counts = new Uint32Array(1 << 16);
+  for (let shift = 0; shift < 32; shift += 16) {
+    counts.fill(0);
+    for (let index = 0; index < length; index += 1) counts[(sourceKeys[index] >>> shift) & 0xffff] += 1;
+    let total = 0;
+    for (let digit = 0; digit < counts.length; digit += 1) {
+      const digitCount = counts[digit];
+      counts[digit] = total;
+      total += digitCount;
+    }
+    for (let index = 0; index < length; index += 1) {
+      const key = sourceKeys[index];
+      const position = counts[(key >>> shift) & 0xffff]++;
+      targetKeys[position] = key;
+      targetValues[position] = sourceValues[index];
+    }
+    [sourceKeys, targetKeys] = [targetKeys, sourceKeys];
+    [sourceValues, targetValues] = [targetValues, sourceValues];
+    await checkpoint();
+  }
+  return { keys: sourceKeys, values: sourceValues };
+}
+
+/**
+ * A grouped line's extent along its direction, computed exactly as
+ * `fillCoverageGroupTuple` computes it; grouping already rejected lines too
+ * short to have a direction.
+ */
+function coverageExtent(
+  index: number,
+  endpoints: Float32Array,
+  primitiveMeta: Float32Array,
+  starts: Float64Array,
+  ends: Float64Array,
+  slot: number
+): void {
+  const offset = index * 4;
+  let ax = endpoints[offset];
+  let ay = endpoints[offset + 1];
+  let bx = primitiveMeta[offset];
+  let by = primitiveMeta[offset + 1];
+  const length = Math.hypot(bx - ax, by - ay);
+  let ux = (bx - ax) / length;
+  let uy = (by - ay) / length;
+  if (ux < 0 || (Math.abs(ux) < 1e-10 && uy < 0)) {
+    ux = -ux;
+    uy = -uy;
+    ax = primitiveMeta[offset];
+    ay = primitiveMeta[offset + 1];
+    bx = endpoints[offset];
+    by = endpoints[offset + 1];
+  }
+  starts[slot] = Math.min(ux * ax + uy * ay, ux * bx + uy * by);
+  ends[slot] = Math.max(ux * ax + uy * ay, ux * bx + uy * by);
 }
 
 function fillCoverageGroupTuple(
@@ -5826,9 +6709,7 @@ function fillCoverageGroupTuple(
   endpoints: Float32Array,
   primitiveMeta: Float32Array,
   styles: Float32Array,
-  primitiveBounds: Float32Array,
-  starts?: Float64Array,
-  ends?: Float64Array
+  primitiveBounds: Float32Array
 ): boolean {
   const offset = index * 4;
   if (primitiveMeta[offset + 2] >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
@@ -5856,10 +6737,6 @@ function fillCoverageGroupTuple(
   }
   const nx = -uy;
   const ny = ux;
-  if (starts && ends) {
-    starts[index] = Math.min(ux * ax + uy * ay, ux * bx + uy * by);
-    ends[index] = Math.max(ux * ax + uy * ay, ux * bx + uy * by);
-  }
   const encodedStyle = primitiveMeta[offset + 3];
   const decodedFlags = Math.max(
     0,
@@ -5872,11 +6749,13 @@ function fillCoverageGroupTuple(
   tuple[4] = quantize(styles[offset + 2], DUPLICATE_STYLE_SCALE);
   tuple[5] = quantize(styles[offset + 3], DUPLICATE_STYLE_SCALE);
   tuple[6] = quantize(decodedFlags, 1);
-  const clipped = (decodedFlags & DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED) !== 0;
-  tuple[7] = clipped ? primitiveBounds[offset] : 0;
-  tuple[8] = clipped ? primitiveBounds[offset + 1] : 0;
-  tuple[9] = clipped ? primitiveBounds[offset + 2] : 0;
-  tuple[10] = clipped ? primitiveBounds[offset + 3] : 0;
+  if (tuple.length === COVERAGE_TUPLE_GEOMETRY + 4) {
+    const clipped = (decodedFlags & DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED) !== 0;
+    tuple[7] = clipped ? primitiveBounds[offset] : 0;
+    tuple[8] = clipped ? primitiveBounds[offset + 1] : 0;
+    tuple[9] = clipped ? primitiveBounds[offset + 2] : 0;
+    tuple[10] = clipped ? primitiveBounds[offset + 3] : 0;
+  }
   return true;
 }
 
@@ -5885,14 +6764,14 @@ class CoverageObjectSorter {
 
   private readonly work: CoverageCandidate[] = [];
 
-  async sort(
+  /** Sort a group's candidates; `starts`/`ends` are by position and move with them. */
+  sortNow(
     values: number[],
     starts: Float64Array,
     ends: Float64Array,
     styles: Float32Array,
-    primitiveMeta: Float32Array,
-    checkpoint: (force?: boolean) => Promise<void>
-  ): Promise<void> {
+    primitiveMeta: Float32Array
+  ): void {
     // Reuse candidate objects to bound allocation across dense coverage groups.
     this.work.length = 0;
     for (let offset = 0; offset < values.length; offset += 1) {
@@ -5911,8 +6790,8 @@ class CoverageObjectSorter {
         styleFlags: 0
       });
       candidate.index = index;
-      candidate.start = starts[index];
-      candidate.end = ends[index];
+      candidate.start = starts[offset];
+      candidate.end = ends[offset];
       candidate.halfWidth = styles[index * 4];
       candidate.alpha = clamp01(encoded - styleFlags * STROKE_STYLE_FLAG_OFFSET);
       candidate.styleFlags = styleFlags;
@@ -5929,81 +6808,14 @@ class CoverageObjectSorter {
     );
     for (let offset = 0; offset < values.length; offset += 1) {
       values[offset] = this.work[offset].index;
+      starts[offset] = this.work[offset].start;
+      ends[offset] = this.work[offset].end;
     }
-    await checkpoint();
   }
 
   release(): void {
     this.pool.length = 0;
     this.work.length = 0;
-  }
-}
-
-class DenseCoverageGroupIndex {
-  private hashes = new Uint32Array(1 << 16);
-
-  private groupIds = new Uint32Array(1 << 16);
-
-  private representativeIndices = new Uint32Array(1 << 16);
-
-  private size = 0;
-
-  getOrInsert(
-    tuple: Float64Array,
-    tupleWords: Uint32Array,
-    representativeIndex: number,
-    newGroupId: number,
-    equals: (representativeIndex: number, tuple: Float64Array) => boolean
-  ): number {
-    if ((this.size + 1) * 10 >= this.hashes.length * 7) {
-      this.grow();
-    }
-    const hash = hashFloatTuple(tupleWords);
-    let slot = hash & (this.hashes.length - 1);
-    while (this.hashes[slot] !== 0) {
-      if (
-        this.hashes[slot] === hash &&
-        equals(this.representativeIndices[slot] - 1, tuple)
-      ) {
-        return this.groupIds[slot] - 1;
-      }
-      slot = (slot + 1) & (this.hashes.length - 1);
-    }
-    this.hashes[slot] = hash;
-    this.groupIds[slot] = newGroupId + 1;
-    this.representativeIndices[slot] = representativeIndex + 1;
-    this.size += 1;
-    return newGroupId;
-  }
-
-  release(): void {
-    this.hashes = new Uint32Array(0);
-    this.groupIds = new Uint32Array(0);
-    this.representativeIndices = new Uint32Array(0);
-    this.size = 0;
-  }
-
-  private grow(): void {
-    const oldHashes = this.hashes;
-    const oldIds = this.groupIds;
-    const oldRepresentativeIndices = this.representativeIndices;
-    this.hashes = new Uint32Array(oldHashes.length * 2);
-    this.groupIds = new Uint32Array(oldIds.length * 2);
-    this.representativeIndices = new Uint32Array(oldRepresentativeIndices.length * 2);
-    const mask = this.hashes.length - 1;
-    for (let oldSlot = 0; oldSlot < oldHashes.length; oldSlot += 1) {
-      const hash = oldHashes[oldSlot];
-      if (hash === 0) {
-        continue;
-      }
-      let slot = hash & mask;
-      while (this.hashes[slot] !== 0) {
-        slot = (slot + 1) & mask;
-      }
-      this.hashes[slot] = hash;
-      this.groupIds[slot] = oldIds[oldSlot];
-      this.representativeIndices[slot] = oldRepresentativeIndices[oldSlot];
-    }
   }
 }
 
@@ -6017,10 +6829,8 @@ async function compactStrokeBuffers(
   discardedContainedCount: number,
   checkpoint: (force?: boolean) => Promise<void>
 ): Promise<StrokeFinalizeResult> {
-  const outEndpoints = new Float32Array(visibleCount * 4);
-  const outMeta = new Float32Array(visibleCount * 4);
-  const outBoundsArray = new Float32Array(visibleCount * 4);
-  const outStyles = new Float32Array(visibleCount * 4);
+  // Finalization owns the builder stores: compact them in place, then shrink
+  // them instead of copying four output stores at peak memory.
   const bounds = emptyBounds();
   let maxHalfWidth = 0;
   let out = 0;
@@ -6031,26 +6841,53 @@ async function compactStrokeBuffers(
     }
     const inputOffset = index * 4;
     const outputOffset = out * 4;
-    for (let component = 0; component < 4; component += 1) {
-      outEndpoints[outputOffset + component] = endpoints[inputOffset + component];
-      outMeta[outputOffset + component] = primitiveMeta[inputOffset + component];
-      outBoundsArray[outputOffset + component] = primitiveBounds[inputOffset + component];
-      outStyles[outputOffset + component] = styles[inputOffset + component];
-    }
     includePoint(bounds, primitiveBounds[inputOffset], primitiveBounds[inputOffset + 1]);
     includePoint(bounds, primitiveBounds[inputOffset + 2], primitiveBounds[inputOffset + 3]);
     maxHalfWidth = Math.max(maxHalfWidth, styles[inputOffset]);
+    if (outputOffset !== inputOffset) {
+      for (let component = 0; component < 4; component += 1) {
+        endpoints[outputOffset + component] = endpoints[inputOffset + component];
+        primitiveMeta[outputOffset + component] = primitiveMeta[inputOffset + component];
+        primitiveBounds[outputOffset + component] = primitiveBounds[inputOffset + component];
+        styles[outputOffset + component] = styles[inputOffset + component];
+      }
+    }
     out += 1;
   }
   return {
-    endpoints: outEndpoints,
-    primitiveMeta: outMeta,
-    primitiveBounds: outBoundsArray,
-    styles: outStyles,
+    endpoints: takeFloat32Prefix(endpoints, visibleCount * 4),
+    primitiveMeta: takeFloat32Prefix(primitiveMeta, visibleCount * 4),
+    primitiveBounds: takeFloat32Prefix(primitiveBounds, visibleCount * 4),
+    styles: takeFloat32Prefix(styles, visibleCount * 4),
     bounds: visibleCount > 0 ? bounds : null,
     maxHalfWidth,
     discardedContainedCount
   };
+}
+
+/**
+ * The prefix of a store the caller owns, transferred rather than sliced where
+ * the runtime supports it. The input is unusable afterwards either way.
+ */
+function takeFloat32Prefix(values: Float32Array, floatCount: number): Float32Array<ArrayBuffer> {
+  if (canShrinkInPlace(values)) {
+    return new Float32Array(transferableBuffer(values).transferToFixedLength!(
+      floatCount * Float32Array.BYTES_PER_ELEMENT
+    ));
+  }
+  return values.slice(0, floatCount);
+}
+
+function canShrinkInPlace(values: ArrayBufferView): boolean {
+  const buffer = transferableBuffer(values);
+  return values.byteOffset === 0 && buffer instanceof ArrayBuffer &&
+    typeof buffer.transferToFixedLength === "function";
+}
+
+function transferableBuffer(values: ArrayBufferView): ArrayBuffer & {
+  transferToFixedLength?: (newByteLength?: number) => ArrayBuffer;
+} {
+  return values.buffer as ArrayBuffer;
 }
 
 async function buildUncompactedStrokeResult(
@@ -6084,6 +6921,7 @@ async function buildUncompactedStrokeResult(
   };
 }
 
+const EMPTY_CONTENT_BYTES = new Uint8Array(0);
 const ARRAY_START_TOKEN: LexerToken = { kind: "array-start" };
 const ARRAY_END_TOKEN: LexerToken = { kind: "array-end" };
 const DICT_START_TOKEN: LexerToken = { kind: "dict-start" };
@@ -6200,22 +7038,21 @@ function assertValidBounds(bounds: DensePdfBounds, label: string): void {
   }
 }
 
-function isPdfWhitespace(byte: number): boolean {
-  return byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32;
+const PDF_BYTE_REGULAR = 0;
+const PDF_BYTE_WHITESPACE = 1;
+const PDF_BYTE_DELIMITER = 2;
+const PDF_BYTE_CLASSES = new Uint8Array(256);
+for (const byte of [0, 9, 10, 12, 13, 32]) PDF_BYTE_CLASSES[byte] = PDF_BYTE_WHITESPACE;
+for (const byte of [0x28, 0x29, 0x3c, 0x3e, 0x5b, 0x5d, 0x7b, 0x7d, 0x2f, 0x25]) {
+  PDF_BYTE_CLASSES[byte] = PDF_BYTE_DELIMITER;
 }
 
-function isPdfDelimiter(byte: number): boolean {
-  return byte === 0x28 || byte === 0x29 || byte === 0x3c || byte === 0x3e ||
-    byte === 0x5b || byte === 0x5d || byte === 0x7b || byte === 0x7d ||
-    byte === 0x2f || byte === 0x25;
+function isPdfWhitespace(byte: number): boolean {
+  return PDF_BYTE_CLASSES[byte] === PDF_BYTE_WHITESPACE;
 }
 
 function findRegularTokenEnd(bytes: Uint8Array, offset: number): number {
-  while (
-    offset < bytes.length &&
-    !isPdfWhitespace(bytes[offset]) &&
-    !isPdfDelimiter(bytes[offset])
-  ) {
+  while (offset < bytes.length && PDF_BYTE_CLASSES[bytes[offset]] === PDF_BYTE_REGULAR) {
     offset += 1;
   }
   return offset;
@@ -6355,42 +7192,6 @@ function decodePdfName(bytes: Uint8Array): string {
     output += String.fromCharCode(byte);
   }
   return output;
-}
-
-function looksLikePdfNumberBytes(bytes: Uint8Array, start: number, end: number): boolean {
-  if (start >= end) return false;
-  const first = bytes[start];
-  return (first >= 0x30 && first <= 0x39) || first === 0x2b || first === 0x2d || first === 0x2e;
-}
-
-function parsePdfNumberBytes(bytes: Uint8Array, start: number, end: number): number {
-  let offset = start;
-  let sign = 1;
-  if (bytes[offset] === 0x2b || bytes[offset] === 0x2d) {
-    if (bytes[offset] === 0x2d) sign = -1;
-    offset += 1;
-  }
-  let divideBy = 0;
-  if (offset < end && bytes[offset] === 0x2e) {
-    divideBy = 10;
-    offset += 1;
-  }
-  if (offset >= end || bytes[offset] < 0x30 || bytes[offset] > 0x39) {
-    throw new DensePdfSyntaxError("Malformed numeric token in PDF content.");
-  }
-  let value = bytes[offset++] - 0x30;
-  while (offset < end) {
-    const byte = bytes[offset++];
-    if (byte >= 0x30 && byte <= 0x39) {
-      if (divideBy !== 0) divideBy *= 10;
-      value = value * 10 + byte - 0x30;
-    } else if (byte === 0x2e && divideBy === 0) {
-      divideBy = 1;
-    } else {
-      throw new DensePdfSyntaxError("Malformed numeric token in PDF content.");
-    }
-  }
-  return sign * (divideBy === 0 ? value : value / divideBy);
 }
 
 function internPdfWord(bytes: Uint8Array, start: number, end: number): string {
@@ -7293,14 +8094,20 @@ function fillDuplicateTuple(
   tuple[16] = clipped ? Math.fround(clipMaxY) : 0;
 }
 
-function hashFloatTuple(words: Uint32Array): number {
+/**
+ * Hash quantized key components as 32-bit integers. Equal keys hash equally,
+ * which is all the indexes need; their equality callbacks decide matches.
+ */
+function hashQuantizedTuple(tuple: Float64Array, length: number): number {
   let hash = 0x811c9dc5;
-  for (let index = 0; index < words.length; index += 1) {
-    let value = words[index];
-    hash = Math.imul(hash ^ value, 0x01000193);
-    value >>>= 16;
-    hash = Math.imul(hash ^ value, 0x01000193);
+  for (let index = 0; index < length; index += 1) {
+    hash = Math.imul(hash ^ (tuple[index] | 0), 0x01000193);
   }
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35);
+  hash ^= hash >>> 16;
   hash >>>= 0;
   return hash === 0 ? 1 : hash;
 }

@@ -48,17 +48,6 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   invisibleCull?: boolean;
 
   /**
-   * Use HEPR's specialized worker path for compatible, unusually dense vector
-   * PDFs. In `"auto"` mode HEPR checks each page and transparently continues
-   * with its full native parser when the dense tier does not support content.
-   *
-   * PDF sources only; HEP sources ignore this option.
-   *
-   * @default "auto"
-   */
-  pdfFastPath?: "auto" | "off";
-
-  /**
    * One-based PDF pages to parse, using Chrome-style ASCII print syntax.
    * Separate individual page numbers or inclusive ranges with commas.
    * Open ranges such as `"5-"` and `"-3"` are also supported.
@@ -158,7 +147,6 @@ async function loadPdfSceneFromSourceInternal(
       onDiagnostic: options.onDiagnostic,
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
-      pdfFastPath: options.pdfFastPath ?? "auto",
       pages: options.pages,
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()

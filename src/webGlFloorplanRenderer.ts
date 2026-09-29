@@ -440,6 +440,8 @@ void main() {
   // is thinner than a pixel and falls between pixel centres.
   vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
+    uUseLocalToClip, uLocalToClip, uViewport);
   vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);
 
   if (uUseLocalToClip >= 0.5) {
@@ -672,6 +674,8 @@ void main() {
   vec2 margin = heprCoverageMargin(heprPathToPixel(
     glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy,
     uUseLocalToClip, uLocalToClip, uZoom, uViewport) * glyphToWorld);
+  margin = heprBoundCoverageMargin(glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy,
+    margin, glyphToWorld, uUseLocalToClip, uLocalToClip, uViewport);
   vec2 local = mix(minBounds - margin, maxBounds + margin, corner01);
 
   vec2 world = vec2(

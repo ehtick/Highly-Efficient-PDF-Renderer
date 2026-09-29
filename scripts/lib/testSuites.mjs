@@ -36,6 +36,7 @@ export const fastTests = [
   "webgl-shader-precision",
   "subpixel-stroke-coverage",
   "fill-area-coverage",
+  "projected-coverage-margin",
   "pdf-layer-controls",
   "raster-layer-updates",
   "raster-strip-batches",

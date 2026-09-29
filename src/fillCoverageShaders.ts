@@ -361,7 +361,9 @@ export const FILL_COVERAGE_MARGIN_PX = 1;
  * projective local-to-clip transform. `heprCoverageMargin` inverts it into
  * the path-space extent of the quad margin along each axis: the same
  * per-axis pixel extent the fragment stage's derivatives measure as the
- * footprint. A degenerate transform gets no margin.
+ * footprint. A degenerate transform gets no margin. Projected callers must
+ * also apply `heprBoundCoverageMargin`: inverse footprints alone are unbounded
+ * near the eye plane or an edge-on view.
  */
 export const FILL_COVERAGE_VERTEX_GLSL = `
 mat2 heprPathToPixel(vec2 world, float useLocalToClip, mat4 localToClip, float zoom, vec2 viewport) {
@@ -384,6 +386,35 @@ vec2 heprCoverageMargin(mat2 pathToPixel) {
     return vec2(0.0);
   }
   return vec2(length(pathToPixel[1]), length(pathToPixel[0])) * (${FILL_COVERAGE_MARGIN_PX.toFixed(1)} / det);
+}
+
+// An inverse pixel footprint grows without bound at a grazing angle. Keep its
+// projected AABB within two pixels and its depth change within 25% of clip W.
+// The latter prevents padding (not source geometry) from crossing the eye plane.
+float heprCoverageExpansionScale(vec4 clip, vec4 deltaX, vec4 deltaY, vec2 viewport) {
+  float w = abs(clip.w);
+  if (!(w > 1e-6)) return 0.0;
+  float relativeW = (abs(deltaX.w) + abs(deltaY.w)) / w;
+  float pixelX = (abs(deltaX.x - clip.x / clip.w * deltaX.w) +
+    abs(deltaY.x - clip.x / clip.w * deltaY.w)) * (0.5 * viewport.x / w);
+  float pixelY = (abs(deltaX.y - clip.y / clip.w * deltaX.w) +
+    abs(deltaY.y - clip.y / clip.w * deltaY.w)) * (0.5 * viewport.y / w);
+  // For scale t, displacement is at most t * pixels / (1 - t * relativeW).
+  float demand = max(pixelX, pixelY) + 2.0 * relativeW;
+  if (!(demand < 1e30) || !(relativeW < 1e30)) return 0.0;
+  return min(1.0, min(0.25 / max(relativeW, 1e-30), 2.0 / max(demand, 1e-30)));
+}
+
+vec2 heprBoundCoverageMargin(vec2 world, vec2 margin, mat2 pathToWorld,
+    float useLocalToClip, mat4 localToClip, vec2 viewport) {
+  if (useLocalToClip < 0.5) return margin;
+  vec4 clip = localToClip * vec4(world, 0.0, 1.0);
+  vec4 deltaX = localToClip * vec4(pathToWorld[0] * margin.x, 0.0, 0.0);
+  vec4 deltaY = localToClip * vec4(pathToWorld[1] * margin.y, 0.0, 0.0);
+  float scale = heprCoverageExpansionScale(clip, deltaX, deltaY, viewport);
+  // Avoid multiplying an overflowing inverse margin by zero.
+  if (!(scale > 0.0)) return vec2(0.0);
+  return margin * scale;
 }
 `;
 
@@ -409,6 +440,31 @@ fn heprCoverageMargin(pathToPixel: mat2x2<f32>) -> vec2<f32> {
   }
   return vec2<f32>(length(pathToPixel[1]), length(pathToPixel[0])) * (${FILL_COVERAGE_MARGIN_PX.toFixed(1)} / det);
 }
+
+// Bound projected padding, including its depth change, before moving a vertex.
+fn heprCoverageExpansionScale(clip: vec4<f32>, deltaX: vec4<f32>, deltaY: vec4<f32>, viewport: vec2<f32>) -> f32 {
+  let w = abs(clip.w);
+  if (!(w > 0.000001)) { return 0.0; }
+  let relativeW = (abs(deltaX.w) + abs(deltaY.w)) / w;
+  let pixelX = (abs(deltaX.x - clip.x / clip.w * deltaX.w) +
+    abs(deltaY.x - clip.x / clip.w * deltaY.w)) * (0.5 * viewport.x / w);
+  let pixelY = (abs(deltaX.y - clip.y / clip.w * deltaX.w) +
+    abs(deltaY.y - clip.y / clip.w * deltaY.w)) * (0.5 * viewport.y / w);
+  let demand = max(pixelX, pixelY) + 2.0 * relativeW;
+  if (!(demand < 1e30) || !(relativeW < 1e30)) { return 0.0; }
+  return min(1.0, min(0.25 / max(relativeW, 1e-30), 2.0 / max(demand, 1e-30)));
+}
+
+fn heprBoundCoverageMargin(world: vec2<f32>, margin: vec2<f32>, pathToWorld: mat2x2<f32>,
+    useLocalToClip: f32, localToClip: mat4x4<f32>, viewport: vec2<f32>) -> vec2<f32> {
+  if (useLocalToClip < 0.5) { return margin; }
+  let clip = localToClip * vec4<f32>(world, 0.0, 1.0);
+  let deltaX = localToClip * vec4<f32>(pathToWorld[0] * margin.x, 0.0, 0.0);
+  let deltaY = localToClip * vec4<f32>(pathToWorld[1] * margin.y, 0.0, 0.0);
+  let scale = heprCoverageExpansionScale(clip, deltaX, deltaY, viewport);
+  if (!(scale > 0.0)) { return vec2<f32>(0.0); }
+  return margin * scale;
+}
 `;
 
 /**
@@ -418,7 +474,8 @@ fn heprCoverageMargin(pathToPixel: mat2x2<f32>) -> vec2<f32> {
  * margin keeps; a paint and clip farther apart than that share no pixel and
  * get low > high. The margin is the largest at any corner of the clamped
  * rectangle, so the four vertices of a projected quad agree on it, and on
- * whether the quad is empty. Unbounded clip bounds leave the paint's own.
+ * whether the quad is empty. Its safe projected limit is shared by all four
+ * corners too. Unbounded clip bounds leave the paint's own.
  * Needs FILL_COVERAGE_VERTEX_GLSL.
  */
 export const CLIPPED_PAINT_QUAD_GLSL = `
@@ -433,6 +490,11 @@ vec4 heprClippedPaintQuad(vec2 minBounds, vec2 maxBounds, vec4 clipBounds, float
       heprCoverageMargin(heprPathToPixel(b, useLocalToClip, localToClip, zoom, viewport))),
     max(heprCoverageMargin(heprPathToPixel(vec2(a.x, b.y), useLocalToClip, localToClip, zoom, viewport)),
       heprCoverageMargin(heprPathToPixel(vec2(b.x, a.y), useLocalToClip, localToClip, zoom, viewport))));
+  margin = min(
+    min(heprBoundCoverageMargin(a, margin, mat2(1.0), useLocalToClip, localToClip, viewport),
+      heprBoundCoverageMargin(b, margin, mat2(1.0), useLocalToClip, localToClip, viewport)),
+    min(heprBoundCoverageMargin(vec2(a.x, b.y), margin, mat2(1.0), useLocalToClip, localToClip, viewport),
+      heprBoundCoverageMargin(vec2(b.x, a.y), margin, mat2(1.0), useLocalToClip, localToClip, viewport)));
   return vec4(low - margin, high + margin);
 }
 `;
@@ -445,11 +507,17 @@ fn heprClippedPaintQuad(minBounds: vec2<f32>, maxBounds: vec2<f32>, clipBounds: 
   let high = min(maxBounds, clipBounds.zw);
   let a = min(low, high);
   let b = max(low, high);
-  let margin = max(
+  var margin = max(
     max(heprCoverageMargin(heprPathToPixel(a, useLocalToClip, localToClip, zoom, viewport)),
       heprCoverageMargin(heprPathToPixel(b, useLocalToClip, localToClip, zoom, viewport))),
     max(heprCoverageMargin(heprPathToPixel(vec2<f32>(a.x, b.y), useLocalToClip, localToClip, zoom, viewport)),
       heprCoverageMargin(heprPathToPixel(vec2<f32>(b.x, a.y), useLocalToClip, localToClip, zoom, viewport))));
+  let identity = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);
+  margin = min(
+    min(heprBoundCoverageMargin(a, margin, identity, useLocalToClip, localToClip, viewport),
+      heprBoundCoverageMargin(b, margin, identity, useLocalToClip, localToClip, viewport)),
+    min(heprBoundCoverageMargin(vec2<f32>(a.x, b.y), margin, identity, useLocalToClip, localToClip, viewport),
+      heprBoundCoverageMargin(vec2<f32>(b.x, a.y), margin, identity, useLocalToClip, localToClip, viewport)));
   return vec4<f32>(low - margin, high + margin);
 }
 `;

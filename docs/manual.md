@@ -122,18 +122,17 @@ fine detail and hatch density for performance while keeping vector rendering.
 The HUD labels these selections `(overview)` and shows the total target.
 
 Tiles that fit their budget retain exact or fine geometry. Very dense views can
-retain coarser overview levels when zoomed in: front-facing views prioritize the
-budget over the usual 5-pixel overview error limit only when the whole visible
-draw list exceeds the soft budget. Hatching in affordable views keeps its usual
+retain coarser overview levels when zoomed in: front-facing and tilted views
+prioritize the budget over the usual 5-pixel overview error limit only when the
+whole visible draw list exceeds the soft budget. Hatching in affordable views keeps its usual
 detail even when individual tiles exceed their share. Detail returns as the
 visible tiles fit their budget; zoom alone does not force every tiny mark to render.
-Tilted three.js cameras retain the 5-pixel limit and choose detail per tile:
+Tilted three.js cameras choose detail per tile:
 content near the camera receives more of the budget and finer geometry, distant
 content thins out, and tiles outside the view are skipped. The antialiasing filter
 still fades retained thin strokes continuously. The target is soft: limited
-simplification, clipping, or complex
-compositing can keep a document above it. Set Vector LOD to Off for exact strokes
-at every zoom. Embedded PDF images remain raster layers.
+simplification, clipping, or complex compositing can keep a document above it.
+Set Vector LOD to Off for exact strokes at every zoom. Embedded PDF images remain raster layers.
 
 The Draw counter reports selected vector representatives. During native cached
 panning it describes the cached content, not a fresh submission of every stroke

@@ -189,19 +189,18 @@ and remains preferred when it fits the tile budget.
 
 The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
 coarser levels up to a 5-pixel nominal overview tolerance, also past the first
-normal LOD threshold. Planar views first select within those limits and count
-the actual culled, deduplicated draw IDs. Only if that count exceeds the global
+normal LOD threshold. Planar and tilted views first select within those limits
+and count the actual culled, deduplicated draw IDs. Only if that count exceeds the global
 soft budget (82,500 strokes) may tiles exceeding their share search coarser
 overview levels beyond that limit, stopping at the finest one that fits. If none
-fits, they use the smallest
-available representation. This prevents a zoom threshold from forcing a dense
-tile back to millions of strokes without thinning out affordable hatching just
+fits, they use the smallest available representation. This prevents a zoom
+threshold from forcing a dense tile back to millions of strokes without thinning out affordable hatching just
 because it crosses multiple tiles. The initial counting pass stops at 82,501 IDs;
 only over-budget views need a second selection pass. Exact geometry returns
-whenever it fits the tile budget. Effect scenes have no overview levels and stay exact past the
-threshold; force-exact bypasses budget selection. Tilted views retain the
-5-pixel limit and the primitive-reach checks described below. Visibility
-cache keys include both the normal baseline and the pressure limit, including
+whenever it fits the tile budget. Effect scenes have no overview levels and stay
+exact past the threshold; force-exact bypasses budget selection. Tilted views
+keep their projected budget shares and frustum culling during the retry.
+Visibility cache keys include both the normal baseline and the pressure limit, including
 when discarded build levels leave gaps in the tolerance sequence. Active-level
 stats mark overview approximations for the HUD.
 
@@ -214,10 +213,12 @@ over a clipped polygon. That bound, over the tile widened by a quarter tile,
 sets the tile's baseline and pressure limit. The budget is shared by screen-area
 magnification, |det H| / W^3 for the plane homography H, normalized over the
 visible area of occupied tiles, so nearer tiles receive more strokes. Merged
-lines can reach far past their tile into nearer, more magnified tiles. A tile
-may use a level only while everything that level lists in it stays within the
-5-pixel limit wherever visible; these per-level tile bounds are built on first
-tilted use. The HUD reports the nearest tile's baseline and the mean tile target.
+lines can reach far past their tile into nearer, more magnified tiles. The first
+selection pass allows a level only while everything it lists in the tile stays
+within the 5-pixel limit wherever visible; these per-level tile bounds are built
+on first tilted use. The over-budget retry may relax this primitive-reach limit
+for overview levels as well. The HUD reports the nearest tile's baseline and the
+mean tile target from the final selection pass.
 Tilted selections are recomputed every frame.
 Canonical PDF/HEP geometry is unchanged. Native panning, inertia, zooming and
 settled frames render directly at the current camera and viewport, with vector

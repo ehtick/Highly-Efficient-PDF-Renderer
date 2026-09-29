@@ -7,7 +7,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
+  const { VectorStrokeLodRuntime, buildRuntimeTileBuckets } = await import("../src/vectorStrokeLodCore.ts");
   // Dense short hatching plus long double walls running from the near to the
   // far side of a tilted view. Coarse overview levels merge each wall pair into
   // one line that spans the page, so a far tile must not draw it where the
@@ -42,7 +42,7 @@ try {
   const fitDistance = 500 / Math.tan(THREE.MathUtils.degToRad(22.5));
   // The runtime receives the host's center-plane scale, as the Three object does.
   const centerUnitsPerPixel = distance => 2 * distance * Math.tan(THREE.MathUtils.degToRad(22.5)) / viewport.height;
-  const view = (polarDegrees, distance, target = new THREE.Vector3()) => {
+  const view = (polarDegrees, distance, target = new THREE.Vector3(), subject = runtime) => {
     const polar = THREE.MathUtils.degToRad(polarDegrees);
     camera.position.set(0, -Math.sin(polar), Math.cos(polar)).multiplyScalar(distance).add(target);
     camera.up.set(0, 1, 0);
@@ -50,16 +50,16 @@ try {
     camera.near = distance * .01; camera.far = distance * 20; camera.updateProjectionMatrix();
     camera.updateMatrixWorld(true);
     localToClip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).multiply(dataToLocal);
-    runtime.setLocalToClipTransform(localToClip.elements, centerUnitsPerPixel(distance));
-    runtime.update({ cameraCenterX: 500 + target.x, cameraCenterY: 500 + target.y, zoom: 1 / centerUnitsPerPixel(distance) },
+    subject.setLocalToClipTransform(localToClip.elements, centerUnitsPerPixel(distance));
+    subject.update({ cameraCenterX: 500 + target.x, cameraCenterY: 500 + target.y, zoom: 1 / centerUnitsPerPixel(distance) },
       viewport, scene.bounds);
-    return runtime.getRenderedSegmentCount();
+    return subject.getRenderedSegmentCount();
   };
 
   // Largest pixel magnification over a drawing-plane rectangle inside the
   // frustum (with the runtime's 16 px margin), or 0 when none of it is visible.
   const magnification = (minX, minY, maxX, maxY) => {
-    const m = runtime.localToClip, halfWidth = viewport.width / 2, halfHeight = viewport.height / 2;
+    const m = localToClip.elements, halfWidth = viewport.width / 2, halfHeight = viewport.height / 2;
     let polygon = [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]];
     for (const [axis, half] of [[0, halfWidth], [1, halfHeight]]) for (const sign of [1, -1]) {
       const widen = 1 + 16 / half;
@@ -87,9 +87,9 @@ try {
     }
     return largest;
   };
-  const drawn = () => runtime.levels.flatMap((level, index) =>
+  const drawn = (subject = runtime) => subject.levels.flatMap((level, index) =>
     Array.from(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount), id => ({ level, index, id })));
-  const screenErrors = () => drawn().filter(({ level }) => level.tolerance > 0).map(({ level, id }) =>
+  const screenErrors = (subject = runtime) => drawn(subject).filter(({ level }) => level.tolerance > 0).map(({ level, id }) =>
     level.tolerance * magnification(level.segmentMinX[id], level.segmentMinY[id], level.segmentMaxX[id], level.segmentMaxY[id]));
 
   const planar = view(0, fitDistance);
@@ -138,6 +138,58 @@ try {
   const closest = closeup.filter(({ level, id }) =>
     0.5 * magnification(level.segmentMinX[id], level.segmentMinY[id], level.segmentMaxX[id], level.segmentMaxY[id]) > 5);
   assert(closest.length > 0 && closest.every(({ index }) => index === 0), "near primitives past the overview limit stay exact");
+
+  // A dense view can need overview levels beyond the nominal 5 px limit,
+  // including levels rejected because long lines reach into the near side.
+  // Keep the hierarchy deterministic so this tests selection independently
+  // of the simplifier's decisions about this particular hatch pattern.
+  const pressureRuntime = (grid = runtime.tileGrid, allowOverview = true) => new VectorStrokeLodRuntime(scene, { tileGrid: grid, elapsedMs: 0,
+    levels: [[0, count, false], [.5, 120_000, false], [8, 40_000, true], [16, 8000, true]]
+      .map(([tolerance, segmentCount, overview]) => {
+        const reduced = { ...scene, segmentCount };
+        return { tolerance, segmentCount, overview: overview && allowOverview, scene: reduced, ...buildRuntimeTileBuckets(reduced, grid) };
+      }) });
+  const pressure = pressureRuntime();
+  for (const polar of [0, 1e-4, 45, 70]) {
+    const rendered = view(polar, fitDistance, undefined, pressure);
+    assert(rendered > 0 && rendered <= 82_500,
+      `${polar}°: dense views may exceed the nominal error limit to meet the soft budget: ${rendered}`);
+    assert(pressure.getStats().activeLevels.some(level => level.overview), "budget pressure selects overview geometry");
+    if (polar > 0) {
+      for (const { level, id } of drawn(pressure)) {
+        assert(magnification(level.segmentMinX[id], level.segmentMinY[id], level.segmentMaxX[id], level.segmentMaxY[id]) > 0,
+          "budget fallback retains frustum culling");
+      }
+      assert(screenErrors(pressure).some(error => error > 5), "dense tilted views can relax the overview error limit");
+    }
+    console.log(`Dense tilt ${polar}°: ${count} → ${rendered} strokes`);
+  }
+  pressure.setForceExact(true);
+  const exactPressure = view(45, fitDistance, undefined, pressure);
+  assert(exactPressure > 82_500 && pressure.getStats().activeLevels.every(level => level.index === 0),
+    "force-exact bypasses the budget fallback in an over-budget tilted view");
+  pressure.setForceExact(false);
+  // A narrow visible part of an overfull tile must recover detail when its
+  // actual culled draw list fits, including after a pressure selection.
+  const affordable = view(45, fitDistance / 20, undefined, pressure);
+  assert(affordable > 0 && affordable < 50_000);
+  assert(pressure.getStats().activeLevels.every(level => level.index === 0),
+    "affordable tilted close-ups restore exact detail instead of retaining pressure LOD");
+
+  // A single fully visible tile makes the budget and HUD mean unambiguous:
+  // choose the finest affordable overview and count only the final pass.
+  const oneTile = { ...runtime.tileGrid, columns: 1, rows: 1, tileWidth: 1000, tileHeight: 1000,
+    xEdges: Float64Array.of(0, 1000), yEdges: Float64Array.of(0, 1000) };
+  const single = pressureRuntime(oneTile);
+  for (let frame = 0; frame < 2; frame++) {
+    assert.equal(view(45, fitDistance * 2, undefined, single), 40_000,
+      "tilted budget pressure selects the finest overview that fits");
+    assert.equal(single.getStats().targetSegmentsPerTile, 50_000,
+      "the pressure pass does not double-count the projected tile budget in the HUD");
+  }
+  const qualityOnly = pressureRuntime(oneTile, false);
+  assert(view(45, fitDistance * 2, undefined, qualityOnly) > 82_500,
+    "tilted budget pressure cannot relax quality for a hierarchy without overview permission");
 
   runtime.setForceExact(true);
   view(60, fitDistance / 3);

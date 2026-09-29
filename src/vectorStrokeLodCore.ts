@@ -309,7 +309,7 @@ const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
-// Prefer overview levels within four times the normal tolerance. Planar views
+// Prefer overview levels within four times the normal tolerance. Dense views
 // may retain coarser overview geometry when the visible draw list exceeds budget.
 const LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX = 5;
 // Relative to the entire drawing, not a world-space slope threshold. Three's
@@ -618,8 +618,7 @@ export class VectorStrokeLodRuntime {
     let maxSelectedTileSegments = 0;
     let maxSelectedTileLevelIndex = screenErrorLevelIndex;
 
-    const canRelaxOverview = !this.forceExact && (!this.useLocalToClip || this.constantClipW) &&
-      this.levels.some(level => level.overview);
+    const canRelaxOverview = !this.forceExact && this.levels.some(level => level.overview);
     const softVisibleLimit = VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS * LOD_TILE_SOFT_OVERSHOOT_RATIO;
     // First keep the normal screen-error limits. A tile exceeding its equal
     // share does not imply that the whole view is expensive (e.g. sparse hatch
@@ -629,6 +628,8 @@ export class VectorStrokeLodRuntime {
     for (let pass = 0; pass < 2; pass++) {
       if (pass > 0) {
         this.resetLevelDrawLists();
+        baselineLevelIndex = projected ? this.levels.length : screenErrorLevelIndex;
+        projectedTargetSum = 0;
         maxBaselineTileSegments = 0;
         maxSelectedTileSegments = 0;
       }
@@ -739,9 +740,10 @@ export class VectorStrokeLodRuntime {
     let bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile, maxLevelIndex);
     const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
     // A zoom threshold must not replace a usable overview with millions of
-    // strokes. In planar views, relax the quality limit only for explicit
-    // overview levels, stopping at the finest one that fits the soft budget.
-    // Tilted projections retain their per-tile and primitive-reach safeguards.
+    // strokes. Relax the quality limit only for explicit overview levels,
+    // stopping at the finest one that fits the soft budget. For tilted views
+    // this also relaxes the primitive-reach limit, but keeps frustum culling
+    // and the projected budget shares.
     if (allowBudgetFallback &&
         this.levels[bestIndex].tileCounts[tileIndex] > softOvershootLimit) {
       for (let index = maxLevelIndex + 1; index < this.levels.length; index++) {

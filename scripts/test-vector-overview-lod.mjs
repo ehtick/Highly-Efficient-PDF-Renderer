@@ -166,6 +166,13 @@ try {
   assert.deepEqual(hatches.getStats().activeLevels.map(level => level.index), [0]);
   assert.equal(hatches.update(hatchView, fullSceneViewport), false, "under-budget hatch selections remain cacheable");
 
+  // Tilted views must also count shared hatch IDs only once before relaxing
+  // quality, even though every tile exceeds its projected budget share.
+  hatches.setLocalToClipTransform([.004, 0, 0, 0, 0, .015, 0, .001, 0, 0, 1, 0, -.8, -.75, 0, 1], .1);
+  hatches.update(hatchView, fullSceneViewport, hatchScene.bounds);
+  assert.equal(hatches.getRenderedSegmentCount(), hatchCount, "tilted global headroom preserves every shared hatch");
+  assert.deepEqual(hatches.getStats().activeLevels.map(level => level.index), [0]);
+
   // An overfull tile can also contain mostly offscreen geometry. Returning
   // from a dense view must discard its pressure choice when the new view fits.
   pressure.setScreenSpaceTransform();

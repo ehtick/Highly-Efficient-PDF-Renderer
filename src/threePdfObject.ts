@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
-import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
   type PrimitiveKind } from "./scenePrimitives";
 import { PrimitiveAppearanceState, type PrimitiveColorUpdate, type PrimitiveHighlightSet,
@@ -1378,7 +1378,7 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.isDisposed) {
       return;
     }
-    const nextMode: TextLodMode = this.sceneData.drawRuns || mode === "off" ? "off" : "auto";
+    const nextMode: TextLodMode = this.paintVisibility.requiresCompositing || mode === "off" ? "off" : "auto";
     this.rendererConfig.textLodMode = nextMode;
     this.renderer.setTextLodMode?.(nextMode);
     const replacementScene = this.textLodLayer?.setMode(this.primitiveAppearance.hasOverrides("text") ? "off" : nextMode, this.sceneData) ?? null;
@@ -2449,6 +2449,8 @@ export class HeprThreePdfObject extends THREE.Group {
     // Only the material layers submit from this plan. While the native renderer
     // draws into a texture instead, replanning would rebuild batches nothing draws.
     if (!vectorPipelineActive) return;
+    this.drawPlan?.setTextLodEnabled(this.textLodLayer?.hasCombinedPayload() === true &&
+      this.rendererConfig.textLodMode === "auto" && !this.primitiveAppearance.hasOverrides("text"));
     this.drawPlan?.update(localUnitsPerPixel);
     this.syncVectorDrawPlanOrder();
   }
@@ -3200,7 +3202,7 @@ export async function createThreePdfObject(
 
     const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
 
-    const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, loadedScene.scene.drawRuns ? "off" : rendererConfig.textLodMode);
+    const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, sceneRequiresPaintCompositing(loadedScene.scene) ? "off" : rendererConfig.textLodMode);
     let textMaterialLayer: ThreeMaterialTextLayer;
     try {
       textMaterialLayer = new ThreeMaterialTextLayer(textLodLayer.getRenderScene(), {

@@ -1,3 +1,4 @@
+import type { OrderedTextLodSelection } from "./orderedTextLod";
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeInstanceVectorClipMaterial, createThreeVectorClipMaterial,
   VECTOR_CLIP_INSTANCE_ATTRIBUTE } from "./threeVectorClips";
@@ -64,6 +65,8 @@ export class ThreeVectorDrawRuns {
   private readonly selectedRankWords: Uint32Array | null = null;
   private selectedRanks = new Uint32Array(0);
   private selectedRankCount = 0;
+  private textSelection: OrderedTextLodSelection | null = null;
+  private textSelectionRevision = -1;
 
   static create(scene: VectorScene, kind: VectorDrawRun["kind"],
     parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
@@ -116,6 +119,13 @@ export class ThreeVectorDrawRuns {
     this.setEnabled(true);
   }
 
+  setTextSelection(selection: OrderedTextLodSelection | null): void {
+    if (this.textSelection === selection) return;
+    this.textSelection = selection;
+    this.textSelectionRevision = -1;
+    this.sourceVersion = -1;
+  }
+
   beginUpdate(): void {
     this.parent.geometry.instanceCount = this.sourceCount;
   }
@@ -128,6 +138,13 @@ export class ThreeVectorDrawRuns {
     // primitives are on screen, so it invalidates the reuse checks below.
     const replanned = this.plan.version !== this.planVersion;
     if (replanned) this.rebuildEntries();
+    if (this.textSelection) {
+      if (replanned || this.textSelectionRevision !== this.textSelection.revision) {
+        this.textSelectionRevision = this.textSelection.revision;
+        this.updateEntries();
+      }
+      return;
+    }
     if (!replanned && source.version === this.sourceVersion && count === this.sourceCount) return;
     // Spatial culling can repack the same IDs in a different order. The ordered
     // batches only depend on membership, so reuse their buffers and redundancy
@@ -343,14 +360,25 @@ export class ThreeVectorDrawRuns {
           : !this.visibility.isRunVisible(range.run)) continue;
         const clipCode = (range.run.clipIndex ?? -1) + 1;
         const sparse = range.ids !== undefined && this.lodIdToRank !== null;
-        const first = sparse ? this.selectedRankOffset(range.rankFirst) : 0;
-        const end = sparse ? this.selectedRankOffset(range.rankFirst + range.ids!.length) : range.count;
+        const text = this.textSelection;
+        let first = sparse ? this.selectedRankOffset(range.rankFirst) : 0;
+        let end = sparse ? this.selectedRankOffset(range.rankFirst + range.ids!.length) : range.count;
+        if (text) {
+          first = text.ranges[range.index * 2];
+          end = first + text.ranges[range.index * 2 + 1];
+          // Multiply stays exact and expands to two passes per glyph. Search
+          // its selected IDs instead of scanning the whole paint for each pass.
+          if (range.first !== range.run.first || range.count !== range.run.count) {
+            first = lowerBound(text.instanceIds, first, end, range.first);
+            end = lowerBound(text.instanceIds, first, end, range.first + range.count);
+          }
+        }
         const ids = entry.idValues, clips = entry.clipValues;
         profile?.add("three.batchCandidateInstances", end - first);
         for (let item = first; item < end; item++) {
           const rangeIndex = sparse ? this.selectedRanks[item] - range.rankFirst : item;
-          const id = range.ids ? range.ids[rangeIndex] : range.first + rangeIndex;
-          if (!this.visibleIds[id]) continue;
+          const id = text ? text.instanceIds[item] : range.ids ? range.ids[rangeIndex] : range.first + rangeIndex;
+          if (!text && !this.visibleIds[id]) continue;
           if (this.strokeRedundancyEnabled && this.strokeRedundancy && !this.strokeRedundancy.isRetained(id)) continue;
           if (ids[visible] !== id) { ids[visible] = id; changed = true; }
           if (clips && clips[visible] !== clipCode) { clips[visible] = clipCode; clipsChanged = true; }
@@ -422,4 +450,12 @@ function markInstanceUpdate(attribute: THREE.InstancedBufferAttribute, count: nu
   attribute.clearUpdateRanges();
   if (count > 0) attribute.addUpdateRange(0, count);
   attribute.needsUpdate = true;
+}
+
+function lowerBound(ids: Uint32Array, first: number, end: number, id: number): number {
+  while (first < end) {
+    const middle = (first + end) >>> 1;
+    if (ids[middle] < id) first = middle + 1; else end = middle;
+  }
+  return first;
 }

@@ -1,3 +1,4 @@
+import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
@@ -387,7 +388,7 @@ export class ThreeMaterialTextLayer {
   }
 
   getRenderedTextInstanceCount(): number {
-    return this.renderedTextInstanceCount;
+    return this.orderedRuns?.getRenderedCount() ?? this.renderedTextInstanceCount;
   }
 
   getTextInstanceCount(): number {
@@ -449,11 +450,19 @@ export class ThreeMaterialTextLayer {
     return true;
   }
 
+  /** Share the native paint-aware selection without copying the parent ID buffer. */
+  setOrderedTextSelection(selection: OrderedTextLodSelection): void {
+    if (!this.orderedRuns) throw new Error("Ordered text selection requires PDF paint ranges.");
+    this.orderedRuns.setTextSelection(selection);
+    this.usingExternalSelection = true;
+  }
+
   /** Restore the ordinary page-range culling path. */
   clearSelectedTextInstanceIds(): void {
     if (!this.usingExternalSelection) {
       return;
     }
+    this.orderedRuns?.setTextSelection(null);
     this.usingExternalSelection = false;
     this.externalSelectionCount = -1;
     this.usingAllTextInstances = false;
@@ -468,6 +477,7 @@ export class ThreeMaterialTextLayer {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
     }
     if (this.usingExternalSelection) {
+      this.orderedRuns?.finishUpdate();
       return;
     }
     this.orderedRuns?.beginUpdate();

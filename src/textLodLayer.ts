@@ -1,5 +1,6 @@
 import * as THREE from "three";
 
+import { OrderedTextLodSelection } from "./orderedTextLod";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { createOrthographicLocalToClip } from "./planarProjection";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
@@ -46,6 +47,7 @@ export class ThreeTextLodLayer {
   private useLocalToClip = false;
   private readonly localToClip = new THREE.Matrix4();
   private selectionApplied = false;
+  private orderedSelection: OrderedTextLodSelection | null = null;
 
   private constructor(scene: VectorScene, mode: TextLodMode) {
     this.runtime = null;
@@ -126,6 +128,7 @@ export class ThreeTextLodLayer {
     this.setResourceFallback(reason);
     this.resourceFallback = true;
     this.combinedPayload = false;
+    this.orderedSelection = null;
     this.renderScene = null;
     if (exactScene) {
       this.requiredTextureDimension = requiredTextPayloadTextureDimension(exactScene);
@@ -169,7 +172,10 @@ export class ThreeTextLodLayer {
       viewportHeight,
       cullingBounds: cullingBounds ?? undefined
     });
-    if (selection.changed || !this.selectionApplied) {
+    if (this.orderedSelection) {
+      this.orderedSelection.update(selection);
+      materialLayer.setOrderedTextSelection(this.orderedSelection);
+    } else if (selection.changed || !this.selectionApplied) {
       materialLayer.setSelectedTextInstanceIds(selection.instanceIds);
       this.selectionApplied = true;
     }
@@ -183,6 +189,7 @@ export class ThreeTextLodLayer {
   dispose(): void {
     this.runtime?.dispose();
     this.runtime = null;
+    this.orderedSelection = null;
     this.renderScene = null;
     this.selectionApplied = false;
   }
@@ -195,6 +202,7 @@ export class ThreeTextLodLayer {
     if (result.data && canMaterializeCombinedPayload(scene, result.data)) {
       try {
         const payload = createTextLodCombinedPayload(scene, result.data);
+        this.orderedSelection = scene.drawRuns ? new OrderedTextLodSelection(scene, result.data) : null;
         this.renderScene = payload.scene;
         this.combinedPayload = true;
         this.requiredTextureDimension = requiredTextPayloadTextureDimension(payload.scene);

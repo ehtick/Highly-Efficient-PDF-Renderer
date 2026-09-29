@@ -26,6 +26,7 @@ export class ThreeVectorDrawPlan {
   private readonly scene: VectorScene;
   private unitsPerPixel: number | null = null;
   private colorCommutationEnabled = true;
+  private textLodEnabled = false;
   private readonly all: readonly number[];
   private ordered: number[];
   private readonly positionOfRun: Int32Array;
@@ -48,7 +49,14 @@ export class ThreeVectorDrawPlan {
   get positions(): Int32Array { return this.positionOfRun; }
 
   /** True while minification holds the scheduler's coverage margin. */
-  get paintOrderApproximated(): boolean { return this.scheduler?.paintOrderApproximated ?? false; }
+  get paintOrderApproximated(): boolean { return !this.textLodEnabled && (this.scheduler?.paintOrderApproximated ?? false); }
+
+  /** Coarse text can fill glyph gaps, invalidating exact-geometry commutation. */
+  setTextLodEnabled(enabled: boolean): boolean {
+    if (this.textLodEnabled === enabled) return false;
+    this.textLodEnabled = enabled;
+    return this.reschedule();
+  }
 
   /** Temporary primitive colors invalidate the source-color commutation proof. */
   setColorCommutationEnabled(enabled: boolean): boolean {
@@ -87,9 +95,8 @@ export class ThreeVectorDrawPlan {
   }
 
   private reschedule(): boolean {
-    if (!this.scheduler) return false;
     // The scheduler returns its input untouched while no scale is set.
-    const next = this.scheduler.schedule(this.all);
+    const next = this.textLodEnabled ? this.all : this.scheduler?.schedule(this.all) ?? this.all;
     let same = next.length === this.ordered.length;
     for (let index = 0; same && index < next.length; index++) same = next[index] === this.ordered[index];
     if (same) return false;

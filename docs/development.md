@@ -194,16 +194,21 @@ paint/clip identity and flush legacy color cohorts in order. Effect scenes keep
 the conservative hierarchy. The fine level preserves weighted subpixel coverage
 and remains preferred when it fits the tile budget.
 
-Native WebGL and WebGPU also apply text LOD to source-ordered scenes. Coarse
+Native and Three WebGL/WebGPU apply text LOD to source-ordered scenes. Coarse
 text runs stop at each PDF paint boundary and retain its clip and layer. Selected
 IDs are grouped back into canonical paint order; unchanged selections reuse the
 instance buffer during panning. Coarse text keeps its original clips and bypasses
 paint reordering based on exact geometry. Text with Multiply blending and scenes
 requiring effect composition stay exact. Readable text and primitive color
 overrides also retain exact glyphs. This keeps direct rendering practical for
-large books without changing HEP data. The synthetic `native-ordered-text-lod`
-test covers both native paths, paint boundaries, clips, layers, selection reuse,
-exact zoom and resource fallback. Browser FPS and visual checks remain manual.
+large books without changing HEP data. Three batches consume selected exact or
+coarse IDs directly, without scanning the full glyph store. Its shared paint plan
+keeps canonical order while text LOD is active. The synthetic
+`native-ordered-text-lod` and `three-ordered-text-lod` tests cover all four paths,
+paint boundaries, clips, layers, selection reuse, exact zoom and resource
+fallback. Three also exercises MapControls panning, perspective tilt, lazy
+Off-to-Auto material replacement and temporary text colors. Browser FPS and
+visual checks remain manual.
 
 The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
 coarser levels up to a 5-pixel nominal overview tolerance, also past the first

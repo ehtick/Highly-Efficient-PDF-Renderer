@@ -91,10 +91,73 @@ try {
   assert.equal(navigation.getActivationLabel(target), "Go to destination");
   assert.equal(navigation.activate(target), true); assert.equal(cancelledGesture, 1);
   window.advance(225);
-  near(cameraView.centerX, current.centerX + (view.centerX - current.centerX) * 0.875);
-  near(cameraView.zoom, Math.exp(Math.log(current.zoom) + Math.log(view.zoom / current.zoom) * 0.875));
-  window.advance(225); near(cameraView.centerX, view.centerX); near(cameraView.centerY, view.centerY); near(cameraView.zoom, view.zoom);
+  assert(cameraView.centerX > current.centerX && cameraView.centerX < view.centerX, "the camera moves while zooming");
+  assert(cameraView.zoom > 0 && cameraView.zoom < current.zoom);
+  window.advance(1200);
+  assert.deepEqual(cameraView, view, "the final destination is applied exactly");
   assert.equal(window.frames.size, 0);
+
+  function sampleFlight(start, annotation, flightScene, flightViewport = viewport) {
+    const flightWindow = new Window(), samples = [];
+    let flightView = { ...start };
+    const flightCanvas = { ownerDocument: { defaultView: flightWindow }, getBoundingClientRect: () => flightViewport };
+    const flight = createViewerLinkNavigation({ getCanvas: () => flightCanvas, getScene: () => flightScene,
+      getIdentity: () => flightScene, getView: () => flightView, setView: v => { flightView = v; samples.push(v); } });
+    const end = resolveAnnotationView(flightScene, annotation, start, flightViewport);
+    assert(flight.activate(annotation));
+    flightWindow.advance(0);
+    near(flightView.centerX, start.centerX); near(flightView.centerY, start.centerY); near(flightView.zoom, start.zoom);
+    while (flightWindow.frames.size && flightWindow.time < 1216) flightWindow.advance(16);
+    assert.equal(flightWindow.frames.size, 0, "even very distant trips finish within the duration cap");
+    assert.deepEqual(flightView, end);
+    for (const sample of samples) {
+      assert(Object.values(sample).every(Number.isFinite) && sample.zoom > 0);
+      for (const key of ["centerX", "centerY"]) {
+        assert(sample[key] >= Math.min(start[key], end[key]) - 1e-7 && sample[key] <= Math.max(start[key], end[key]) + 1e-7,
+          "camera travel never overshoots");
+      }
+    }
+    flight.dispose();
+    return { samples, duration: flightWindow.time, minZoom: Math.min(...samples.map(v => v.zoom)) };
+  }
+  const longScene = composeVectorScenesInGrid(Array.from({ length: 21 }, (_, i) => page(i)), 1);
+  const longStart = resolveAnnotationView(longScene, destination(0, "Fit"), current, viewport);
+  const farLink = destination(20, "Fit"), longEnd = resolveAnnotationView(longScene, farLink, longStart, viewport);
+  const nearby = sampleFlight({ ...longEnd, centerX: longEnd.centerX - viewport.width * 0.1 / longEnd.zoom }, farLink, longScene);
+  assert(nearby.minZoom > longEnd.zoom * 0.98 && nearby.minZoom < longEnd.zoom, "nearby links get only a subtle pullback");
+  const stationary = sampleFlight(longEnd, farLink, longScene);
+  assert(stationary.samples.every(v => Math.abs(v.zoom - longEnd.zoom) < 1e-7), "no zoom pulse at the current destination");
+  const distant = sampleFlight(longStart, farLink, longScene);
+  assert(distant.minZoom < longStart.zoom * 0.1, "a twenty-page trip pulls back to show the route");
+  assert(distant.duration > nearby.duration && nearby.duration >= stationary.duration);
+  const minimumIndex = distant.samples.findIndex(v => v.zoom === distant.minZoom);
+  assert(minimumIndex > 0 && minimumIndex < distant.samples.length - 1, "the camera zooms out then back in");
+  assert(Math.abs(distant.samples[minimumIndex].centerY - longStart.centerY) > Math.abs(longEnd.centerY - longStart.centerY) * 0.4);
+  assert(Math.abs(distant.samples[minimumIndex].centerY - longEnd.centerY) > Math.abs(longEnd.centerY - longStart.centerY) * 0.4);
+  for (let i = 1; i < distant.samples.length; i++) {
+    assert(i <= minimumIndex ? distant.samples[i].zoom <= distant.samples[i - 1].zoom : distant.samples[i].zoom >= distant.samples[i - 1].zoom);
+  }
+  const reverse = sampleFlight(longEnd, destination(0, "Fit"), longScene);
+  near(reverse.minZoom, distant.minZoom); assert.equal(reverse.duration, distant.duration);
+  const extreme = sampleFlight({ ...longEnd, centerX: longEnd.centerX - 1e9 }, farLink, longScene);
+  assert(extreme.minZoom >= longEnd.zoom / 32 - 1e-7, "pullback is bounded even for extreme distances");
+
+  // A different destination zoom is still honored, including zoom-only links.
+  sampleFlight({ ...longStart, zoom: longStart.zoom * 4 }, farLink, longScene);
+  const zoomOnly = sampleFlight({ ...longEnd, zoom: longEnd.zoom / 4 }, farLink, longScene);
+  for (let i = 1; i < zoomOnly.samples.length; i++) assert(zoomOnly.samples[i].zoom >= zoomOnly.samples[i - 1].zoom);
+
+  // Scaling the CSS viewport and endpoint zooms equally preserves perceived travel.
+  const pointLink = destination(20, "XYZ", [30, 40, 1]);
+  const normal = sampleFlight(longStart, pointLink, longScene);
+  const scaled = sampleFlight({ ...longStart, zoom: longStart.zoom * 2 }, destination(20, "XYZ", [30, 40, 2]), longScene,
+    { width: viewport.width * 2, height: viewport.height * 2 });
+  assert.equal(scaled.duration, normal.duration);
+  for (let i = 0; i < normal.samples.length; i++) {
+    near(scaled.samples[i].centerX, normal.samples[i].centerX);
+    near(scaled.samples[i].centerY, normal.samples[i].centerY);
+    near(scaled.samples[i].zoom, normal.samples[i].zoom * 2);
+  }
   function event(type, target = canvas, extra = {}) {
     const e = new Event(type); Object.defineProperty(e, "target", { value: target }); Object.assign(e, extra); window.dispatchEvent(e);
   }
@@ -108,9 +171,14 @@ try {
   assert.equal(changes, count, "document changes cancel navigation");
   navigation.activate(target); identity = {}; window.advance(500);
   assert.equal(changes, count, "backend changes cancel navigation");
-  navigation.activate(target); navigation.activate(destination(7, "Fit")); window.advance(500);
+  navigation.activate(target); navigation.activate(destination(7, "Fit")); window.advance(1200);
   const replaced = resolveAnnotationView(scene, destination(7, "Fit"), cameraView, viewport);
-  near(cameraView.centerX, replaced.centerX); near(cameraView.centerY, replaced.centerY);
+  assert.deepEqual(cameraView, replaced);
+  navigation.activate(target); window.advance(100);
+  const interrupted = { ...cameraView };
+  navigation.activate(destination(7, "Fit")); window.advance(0);
+  near(cameraView.centerX, interrupted.centerX); near(cameraView.centerY, interrupted.centerY); near(cameraView.zoom, interrupted.zoom);
+  window.advance(1200); assert.deepEqual(cameraView, replaced, "a replacement flight starts at the current view without a jump");
   window.reducedMotion = true; navigation.activate(target); assert.equal(window.frames.size, 0); near(cameraView.centerX, view.centerX);
   window.reducedMotion = false; navigation.activate(target); count = changes;
   navigation.dispose(); window.advance(500); assert.equal(changes, count, "disposal cancels scheduled frames");
@@ -146,5 +214,5 @@ try {
   near(camera.position.clone().sub(controls.target).normalize().distanceTo(new Vector3(0, 0, 1)), 0);
   near(camera.position.distanceTo(controls.target), viewport.height * 0.01 / (2 * Math.tan(Math.PI / 6)) / (96 / 72));
   threeNavigation.dispose();
-  console.log("Annotation links: URL policy, destination geometry, legacy metadata, ease-out animation, cancellation, native DPR and Three camera transforms passed.");
+  console.log("Annotation links: URL policy, destination geometry, legacy metadata, distance-aware zoom flights, cancellation, native DPR and Three camera transforms passed.");
 } finally { hooks.deregister(); }

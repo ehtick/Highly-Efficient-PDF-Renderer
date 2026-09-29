@@ -333,7 +333,10 @@ hotspot markers. `pickSceneAnnotation` is also exported for custom UIs; it tests
 individual markup quads, ink proximity and other annotation bounds.
 
 All three examples opt into opening HTTP(S) links in a new tab and navigating
-local `/GoTo` or `/Dest` links with a 450 ms ease-out camera animation. The
+local `/GoTo` or `/Dest` links with a distance-aware camera animation: nearby
+jumps have a subtle zoom arc, while longer jumps pull back as they move and
+zoom in on arrival. Travel takes 450–1200 ms with a smooth departure and
+ease-out arrival, preserving the destination's final position and zoom. The
 preview follows the mouse while the canvas shows a pointer over interactive
 annotations. Clicking the link activates it directly. Camera jumps respect
 reduced-motion preferences and stop on user input, document replacement or

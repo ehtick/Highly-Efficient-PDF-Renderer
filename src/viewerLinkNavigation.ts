@@ -129,20 +129,33 @@ export function createViewerLinkNavigation(adapter: LinkNavigationAdapter) {
       }
       const scene = adapter.getScene(), start = adapter.getView();
       if (!scene || !start || !Object.values(start).every(Number.isFinite) || start.zoom <= 0) return false;
-      const target = resolveAnnotationView(scene, annotation, start, adapter.getCanvas().getBoundingClientRect());
+      const viewport = adapter.getCanvas().getBoundingClientRect();
+      const target = resolveAnnotationView(scene, annotation, start, viewport);
       if (!target) return false;
       cancel(); adapter.beforeNavigate?.();
       if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) { adapter.setView(target); return true; }
       const identity = adapter.getIdentity(), started = window.performance.now();
+      // Measure travel in viewport lengths at the wider endpoint view, independent of DPR
+      // and scene units. An existing overview needs less additional pullback.
+      const dx = target.centerX - start.centerX, dy = target.centerY - start.centerY;
+      const travel = Math.hypot(dx / viewport.width, dy / viewport.height) * Math.min(start.zoom, target.zoom);
+      const duration = 450 + Math.min(750, 200 * Math.log2(1 + travel));
+      // Negligible for nearby links; distant flights reveal the route, up to a 32x
+      // pullback. Interpolate in log zoom so zooming out and back in feels symmetric.
+      const pullback = Math.min(Math.log(32), Math.log(Math.hypot(1, travel)));
+      const startZoom = Math.log(start.zoom), targetZoom = Math.log(target.zoom);
       function animate(now: number): void {
         frame = 0;
         if (disposed || adapter.getScene() !== scene || adapter.getIdentity() !== identity) return;
-        const progress = Math.min(1, Math.max(0, (now - started) / 450));
-        const eased = 1 - (1 - progress) ** 3;
-        adapter.setView({ centerX: start!.centerX + (target!.centerX - start!.centerX) * eased,
-          centerY: start!.centerY + (target!.centerY - start!.centerY) * eased,
-          zoom: Math.exp(Math.log(start!.zoom) + Math.log(target!.zoom / start!.zoom) * eased) });
-        if (progress < 1) frame = window.requestAnimationFrame(animate);
+        const progress = Math.min(1, Math.max(0, (now - started) / duration));
+        if (progress === 1) { adapter.setView(target!); return; }
+        // Smooth departure and ease-out arrival; pull back through the middle of travel.
+        const eased = progress * progress * (3 - 2 * progress);
+        const arc = 4 * eased * (1 - eased);
+        adapter.setView({ centerX: start!.centerX + dx * eased,
+          centerY: start!.centerY + dy * eased,
+          zoom: Math.exp(startZoom + (targetZoom - startZoom) * eased - pullback * arc) });
+        frame = window.requestAnimationFrame(animate);
       }
       frame = window.requestAnimationFrame(animate);
       return true;

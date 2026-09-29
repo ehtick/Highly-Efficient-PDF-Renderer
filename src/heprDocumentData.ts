@@ -137,6 +137,9 @@ export const PDF_DIAGNOSTIC_CODES = {
   InvalidToUnicode: "font.invalid-to-unicode",
   MissingUnicodeMapping: "font.missing-unicode-mapping",
   AppearanceSynthesized: "annotation.appearance-synthesized",
+  AppearanceApproximated: "annotation.appearance-approximated",
+  AnnotationMetadataInvalid: "annotation.metadata-invalid",
+  AnnotationViewTransformApproximated: "annotation.view-transform-approximated",
   AppearanceStateInferred: "annotation.appearance-state-inferred",
   OptionalContentHidden: "optional-content.hidden",
   ColorProfileFallback: "color.profile-fallback",
@@ -769,6 +772,8 @@ export interface HeprTextIndex {
 }
 
 export interface HeprPageData {
+  /** Detached annotation metadata in page-native Y-up coordinates. */
+  annotations?: readonly import("./annotationData").PdfAnnotation[];
   kind: "hepr-page";
   version: HeprDocumentDataVersion;
   pageInfo: Readonly<PdfPageInfo>;

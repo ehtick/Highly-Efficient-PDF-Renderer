@@ -1,3 +1,4 @@
+import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
 import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
@@ -193,11 +194,27 @@ const drawingSelection = createDrawingSelectionControls({
   })
 });
 
+const annotationBubblesCheckbox = requireElement<HTMLInputElement>("#annotation-bubbles-checkbox");
+const annotationOverlay = createAnnotationOverlay({
+  getCanvas: () => canvas,
+  adapter: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
+    clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvas) ?? null,
+    sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvas) ?? null,
+    isInteractionSuppressed: () => drawingSelection.isEnabled()
+  },
+  enabled: annotationBubblesCheckbox.checked
+});
+annotationBubblesCheckbox.addEventListener("change", () => {
+  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+});
+
 const layerControls = createThreePdfLayerControls({
   container: requireElement<HTMLDivElement>("#pdf-layers"),
   getPdfObject: () => currentPdfObject,
   requestRender,
-  onVisibilityChange: () => drawingSelection.onFrame()
+  onVisibilityChange: () => { drawingSelection.onFrame(); annotationOverlay.onFrame(); }
 });
 
 const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
@@ -571,6 +588,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     pdfValue.textContent = pdfObject.sourceLabel;
     fitCameraToObject(pdfObject);
     drawingSelection.sceneChanged();
+    annotationOverlay.sceneChanged();
     layerControls.objectChanged();
     setStatus(`${file.name} loaded. Add a TSV overlay.`);
     return true;
@@ -1264,6 +1282,7 @@ function clearCurrentPdfObject(): void {
   const previousPdfObject = currentPdfObject;
   currentPdfObject = null;
   drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   layerControls.objectChanged();
   previousPdfObject.renderer.setInteractionViewportProvider(null);
   previousPdfObject.setFrameListener(null);
@@ -1395,6 +1414,7 @@ function renderFrame(): void {
   scene.updateMatrixWorld(true);
   camera.updateMatrixWorld(true);
   drawingSelection.onFrame();
+  annotationOverlay.onFrame();
   renderer.clear(true, true, true);
   drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   const zoomText = currentPdfObject ? `${currentPdfObject.getViewState().zoom.toFixed(2)}x` : "-";
@@ -1584,6 +1604,7 @@ function disposeDemo(): void {
   controls.dispose();
   layerControls.dispose();
   drawingSelection.dispose();
+  annotationOverlay.dispose();
   clearCurrentPdfObject();
   renderer.dispose();
 }

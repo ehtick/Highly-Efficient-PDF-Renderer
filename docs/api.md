@@ -224,6 +224,90 @@ pdf.dispose();
 fallback viewport. In an ordinary Three.js integration, use your application's
 camera and controls. Full method contracts: [HeprThreePdfObject](../src/threePdfObject.ts).
 
+### PDF annotations and HTML bubbles
+
+Read `pdf.sceneData.annotations ?? []` for clone-safe `SceneAnnotation` records.
+HEPR extracts metadata independently of bubble rendering. Native appearances
+remain page content; missing highlights, underlines, ink and note icons receive
+vector appearances. Unknown missing appearances use a diagnosed outline. Popup
+annotations carry relationships only, without a separate drawable or hotspot.
+Comment text never enters the page's searchable text index.
+
+Records preserve source `/Annots` order, including hidden annotations. Their
+`id` is stable within the source document; `sourcePageIndex` and
+`annotationIndex` are zero-based source indexes. `pageIndex` is the composed
+scene page slot, so selected or reordered pages keep their source identity.
+`bounds`, `quadPoints`, `line`, `vertices` and `inkList` use composed Y-up
+scene coordinates. `pdfGeometry` retains the original PDF coordinates before
+crop offsets, rotation, UserUnit and page placement. An annotation can extend
+beyond its page crop; hosts should clip interaction to `scene.pageRects`.
+
+Decoded fields include `contents` (`/Contents`), `tooltip` (`/TU`),
+`author` (`/T` for comments), subject, name, original PDF date strings, icon,
+open state, color, opacity and border. Widgets use `field.name` for the
+qualified field name, plus type, flags and decoded values; their `/TU` is the
+field's alternate UI name and is resolved through the field ancestry.
+`popupId`, `parentId` and `replyToId` link records without recursive objects.
+
+`action` and `destination` are inert descriptions. URI, GoTo, GoToR and Named
+actions include bounded `next` chains; local destinations resolve to source page
+indexes where possible. Destination parameters stay in the target page's
+original PDF coordinates. Unresolved names and unsupported action types are
+retained. HEPR never executes actions, follows links, edits comments or interacts
+with fields.
+
+The optional HTML helper uses your existing projection and layer APIs:
+
+```ts
+import { createAnnotationOverlay } from "@soadzoor/hepr";
+
+const bubbles = createAnnotationOverlay({
+  getCanvas: () => renderer.domElement,
+  adapter: {
+    getScene: () => pdf.sceneData,
+    getOptionalContentVisibility: () => pdf.getOptionalContentVisibility(),
+    clientToScenePoint: (x, y) =>
+      pdf.clientToScenePoint(camera, x, y, renderer.domElement),
+    sceneToClientPoint: (x, y) =>
+      pdf.sceneToClientPoint(camera, x, y, renderer.domElement),
+    isInteractionSuppressed: () => drawingSelectionEnabled
+  },
+  // Optional: replace the bubble body while keeping its lifecycle and controls.
+  renderContent(annotation, container) {
+    const text = container.ownerDocument.createElement("p");
+    text.textContent = annotation.contents ?? annotation.tooltip ?? annotation.subtype;
+    container.appendChild(text); // Treat all PDF strings as text.
+  }
+});
+
+// Call after camera/layer changes or in your existing frame loop.
+bubbles.onFrame();
+// After replacing the document or rendering backend:
+bubbles.sceneChanged();
+// During teardown:
+bubbles.dispose();
+```
+
+Omit `renderContent` to use selectable plain text with tooltip/comment,
+author/date and informational link details. Hover previews one bubble; click or
+tap pins it. A pinned bubble survives hover and backend replacement for the
+same scene object. Another click, the close button, Escape, hiding its layer or
+replacing its scene dismisses it. Dragging and multi-touch never pin a bubble.
+Call `enable()` / `disable()` for a toggle, or `show(annotation)` /
+`hide()` for an accessible host-provided annotation list. Call `onFrame()`
+after visibility changes even when the camera is idle. Use
+`isInteractionSuppressed` to give drawing or active text selection precedence.
+
+The native viewer uses its renderer's `clientToScenePoint` and
+`sceneToClientPoint` methods with the same helper. Native, three-example and
+room-detection enable **Annotation bubbles** by default, with no permanent
+hotspot markers. `pickSceneAnnotation` is also exported for custom UIs; it tests
+individual markup quads, ink proximity and other annotation bounds.
+
+HEP files preserve these records in an optional JSON section. Supported HEP
+files written without that section load with an empty annotation collection.
+Recovering their metadata requires reconversion from the original PDF.
+
 ### Drawing primitives
 
 `pick({ camera, element, clientX, clientY, tolerancePx?, kinds?, signal? })`
@@ -625,6 +709,29 @@ for lazy bundled font loading. Close worker sessions with `await session.close()
 close a file source yourself if it is never handed to a session. Session options
 and methods are defined in [workerClient.ts](../src/pdf/workerClient.ts) and
 [nativeTypes.ts](../src/pdf/nativeTypes.ts).
+
+Both direct `PdfSession` and worker sessions expose
+`await session.getPageAnnotations(sourcePageIndex, { signal })`. This reads
+metadata without compiling page content or decoding appearance streams. It
+returns detached `PdfAnnotation` records with page-native Y-up geometry,
+including crop, rotation and UserUnit, before scene placement. Newly compiled
+`HeprPageData.annotations` and `VectorScene.annotations` are arrays, including
+an empty array for pages without annotations. Optional malformed fields emit
+`annotation.metadata-invalid` diagnostics while preserving usable fields;
+cancellation and resource limits remain enforced.
+
+```ts
+import { createNodeFilePdfSource, openPdfInNodeWorker } from "@soadzoor/hepr/node";
+
+const session = await openPdfInNodeWorker(await createNodeFilePdfSource("drawing.pdf"));
+try {
+  const annotations = await session.getPageAnnotations(0);
+  console.log(annotations.map(({ id, bounds, contents, tooltip }) =>
+    ({ id, bounds, contents, tooltip })));
+} finally {
+  await session.close();
+}
+```
 
 The standalone native viewer is a repository application. Its renderer classes
 are source modules, not named exports from the npm entry point. Use

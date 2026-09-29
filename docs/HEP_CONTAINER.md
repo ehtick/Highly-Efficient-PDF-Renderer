@@ -85,6 +85,32 @@ per-entry `STORE` overrides are grouped separately from compressed entries.
 CRC32 is the IEEE reflected polynomial `0xedb88320`, initialized and finalized
 with XOR `0xffffffff` (the same convention as ZIP and zlib).
 
+## Annotation metadata
+
+Scene v9 optionally references `annotations/annotations.json` through
+`manifest.scene.annotations`:
+
+```json
+{ "file": "annotations/annotations.json", "version": 1, "count": 0 }
+```
+
+The UTF-8 JSON section contains `{ "version": 1, "annotations": [] }` with
+`SceneAnnotation` records as described in [the API reference](api.md#pdf-annotations-and-html-bubbles).
+It preserves original PDF geometry alongside composed scene geometry, source
+identities, decoded strings, field metadata, relationships, inert actions and
+optional-content condition indexes. It contains no appearance streams.
+
+The reader validates the descriptor, version, count, geometry, scalar types,
+page slots, condition indexes and bounded action nesting. Section size is
+limited to 64 MiB before decompression; record, coordinate, text and action
+budgets also apply. Invalid metadata fails validation rather than becoming
+interactive UI data. A missing descriptor produces an empty annotation array.
+
+This optional section changes none of the container v1, scene v9 or page v8
+versions. Existing supported files without metadata remain readable.
+Repacking cannot recover omitted annotations; reconvert the original PDF to
+obtain them.
+
 ## Scene draw order
 
 ### Scene structure sections

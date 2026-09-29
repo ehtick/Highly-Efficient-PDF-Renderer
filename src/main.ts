@@ -1,3 +1,4 @@
+import { createAnnotationOverlay } from "./annotationOverlay";
 import "./style.css";
 import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
@@ -213,6 +214,7 @@ const vectorColorInputElement = vectorColorInput;
 const vectorOpacitySliderElement = vectorOpacitySlider;
 const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
+let lastParsedScene: VectorScene | null = null;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
@@ -266,6 +268,7 @@ function applyTextSearchScene(scene: VectorScene): void {
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
   drawingSelection.sceneChanged();
+  annotationOverlay.sceneChanged();
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
@@ -316,6 +319,22 @@ const drawingSelection = createDrawingSelectionControls({
   }
 });
 
+const annotationBubblesCheckbox = document.querySelector<HTMLInputElement>("#annotation-bubbles-checkbox")!;
+const annotationOverlay = createAnnotationOverlay({
+  getCanvas: () => canvasElement,
+  adapter: {
+    getScene: () => lastParsedScene,
+    getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
+    clientToScenePoint: (x, y) => renderer.clientToScenePoint?.(x, y) ?? null,
+    sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
+  },
+  enabled: annotationBubblesCheckbox.checked
+});
+annotationBubblesCheckbox.addEventListener("change", () => {
+  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+});
+
 const layerVisibility = createLayerVisibilityController({
   getScene: () => lastParsedScene,
   getRenderer: () => renderer,
@@ -324,6 +343,7 @@ const layerVisibility = createLayerVisibilityController({
     textSearchController.refreshVisibility();
     textSelection.clearSelection();
     drawingSelection.onFrame();
+    annotationOverlay.onFrame();
   }
 });
 const pdfLayerControls = createPdfLayerControls({
@@ -337,6 +357,7 @@ function onRendererFrame(stats: DrawStats): void {
   drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
   drawingSelection.onFrame();
+  annotationOverlay.onFrame();
 
   // Camera/interaction work stays per frame; formatting and replacing the HUD
   // text hundreds of times per second adds unnecessary browser work.
@@ -409,7 +430,6 @@ interface LoadedSource {
 }
 
 let lastLoadedSource: LoadedSource | null = null;
-let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
@@ -583,6 +603,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 window.addEventListener("beforeunload", () => {
   drawCallMeter.dispose();
   drawingSelection.dispose();
+  annotationOverlay.dispose();
   pdfLayerControls.dispose();
   layerVisibility.dispose();
   activeHepExportController?.abort();

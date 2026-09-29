@@ -25,6 +25,8 @@ import {
   type PdfPageInfo
 } from "./heprDocumentData";
 
+import { validateAnnotations } from "./annotationData";
+
 export const HEPR_DATA_VALIDATION_CODES = {
   InvalidShape: "hepr.invalid-shape",
   IncompatibleVersion: "hepr.incompatible-version",
@@ -2336,9 +2338,10 @@ export function validateHeprPageData(
 ): asserts value is HeprPageData {
   const limits = mergeLimits(limitOverrides);
   requireRecord(value, "page");
-  requireExactKeys(
+  requireAllowedKeys(
     value,
     ["kind", "version", "pageInfo", "displayProgram", "stores", "textIndex", "diagnostics"],
+    ["annotations"],
     "page"
   );
   const page = value as unknown as HeprPageData;
@@ -2365,6 +2368,11 @@ export function validateHeprPageData(
   validateDisplayProgram(page, counts, limits, "page.displayProgram");
   validateTextIndex(page, limits, "page.textIndex");
   validateDiagnostics(page.diagnostics, "page.diagnostics");
+  if (page.annotations !== undefined) {
+    try { validateAnnotations(page.annotations, { sourcePageIndex: page.pageInfo.sourcePageIndex,
+      conditionCount: page.stores.optionalContent.defaultVisible.length }); }
+    catch { fail(HEPR_DATA_VALIDATION_CODES.InvalidShape, "page.annotations", "invalid annotation metadata"); }
+  }
 }
 
 export function validateHeprDocumentData(

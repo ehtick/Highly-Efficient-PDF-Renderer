@@ -37,14 +37,15 @@ try {
       { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>" },
       {
         number: 3,
-        body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R >>"
+        body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Annots [7 0 R] >>"
       },
       { number: 4, body: tinyPdfStream("", "1 0 0 rg 10 5 20 10 re f\n") },
       {
         number: 5,
         body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] /Contents 6 0 R >>"
       },
-      { number: 6, body: tinyPdfStream("", "0 0 0 RG 10 20 m 80 20 l S\n") }
+      { number: 6, body: tinyPdfStream("", "0 0 0 RG 10 20 m 80 20 l S\n") },
+      { number: 7, body: "<< /Subtype /Text /Rect [10 10 30 30] /F 2 /Contents (Worker comment) >>" }
     ]
   });
 
@@ -95,12 +96,19 @@ try {
   });
 
   assert.equal(session.info.pageCount, 2);
+  const workerAnnotations = await session.getPageAnnotations(0);
+  assert.equal(workerAnnotations.length, 1);
+  assert.equal(workerAnnotations[0].contents, "Worker comment");
+  assert.equal(workerAnnotations[0].visibleInDefaultView, false);
+  await assert.rejects(session.getPageAnnotations(0, { signal: AbortSignal.abort() }), e => e.code === "aborted");
   assert.ok(rangeReads.length > 0);
   const [first, second] = await Promise.all([
     session.compilePage(0),
     session.compilePage(1)
   ]);
   assert.equal(first.pageInfo.sourcePageIndex, 0);
+  assert.deepEqual(first.annotations, workerAnnotations);
+  assert.deepEqual(second.annotations, []);
   assert.equal(second.pageInfo.sourcePageIndex, 1);
   assert.ok(first.stores.paths.fillPathMetaA.byteLength > 0);
   assert.ok(second.stores.strokes.endpoints.byteLength > 0);
@@ -111,6 +119,7 @@ try {
     enableInvisibleCull: true
   });
   assert.equal(vectorPage.pageCount, 1);
+  assert.deepEqual(vectorPage.annotations.map(({ pageIndex, ...rest }) => rest), workerAnnotations);
   assert.equal(vectorPage.fillPathCount, 1);
   assert.ok(vectorPage.fillSegmentsA.byteLength > 0);
   assert.equal(vectorTransferChecked, true);
@@ -140,6 +149,7 @@ try {
   await session.close();
   assert.equal(rangeCloseCount, 1);
   assert.equal(terminationCount, 1);
+  await assert.rejects(session.getPageAnnotations(0), e => e.code === "closed");
   await runtime.close();
 
   await testWorkerSourceVariants(

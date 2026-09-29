@@ -1,3 +1,4 @@
+import { buildNativeMarkupAppearance } from "./nativeMarkupAppearance";
 import {
   isPdfDictionary,
   isPdfName,
@@ -133,8 +134,8 @@ const MAX_CLOUD_LOBES = 4096;
 
 /**
  * Deterministically synthesizes static default-view appearances for common
- * AcroForm widgets, Link borders, and Squares. It never changes field values or the PDF.
- * Unsupported semantics fail with a typed error instead of being omitted.
+ * AcroForm widgets, borders, markup and note icons. It never changes field values
+ * or the PDF. Unknown annotation subtypes receive a diagnosed outline placeholder.
  */
 export class NativePdfAppearanceSynthesizer {
   readonly document: NativePdfDocument;
@@ -214,11 +215,10 @@ export class NativePdfAppearanceSynthesizer {
       await this.requireMissingNormalAppearance(annotation, signal);
       return await this.synthesizeSquare(annotation, optionalContentIndex, signal);
     }
+    if (annotation.subtype === "Popup") return null;
     if (annotation.subtype !== "Widget" || !annotation.widget) {
-      throw synthesisError(annotation, "Only AcroForm Widgets, Link borders, and Squares have synthesizable appearances.", {
-        reason: "appearance-synthesis-unsupported-subtype",
-        subtype: annotation.subtype
-      });
+      await this.requireMissingNormalAppearance(annotation, signal);
+      return this.synthesizeMarkup(annotation, optionalContentIndex, signal);
     }
     await this.requireMissingNormalAppearance(annotation, signal);
 
@@ -372,6 +372,28 @@ export class NativePdfAppearanceSynthesizer {
     this.diagnostics.push(diagnostic);
     this.onDiagnostic?.(diagnostic);
     return result;
+  }
+
+  private async synthesizeMarkup(annotation: NativePdfAnnotationAppearance, optionalContentIndex: number,
+    signal?: AbortSignal): Promise<NativePdfSynthesizedAppearance | null> {
+    const geometry = this.readAnnotationGeometry(annotation, annotation.subtype);
+    if (!geometry) return null;
+    let built;
+    try { built = await buildNativeMarkupAppearance(this.document, annotation, signal); }
+    catch (error) {
+      throwIfAborted(signal);
+      if (!(error instanceof PdfError) || error.code !== "invalid-object") throw error;
+      built = await buildNativeMarkupAppearance(this.document,
+        { ...annotation, subtype: "Fallback", dictionary: new Map() }, signal);
+      built.approximation = `/${annotation.subtype} has unusable markup geometry or style; its bounds are marked instead: ${error.message}`;
+    }
+    if (built.approximation) {
+      const diagnostic: PdfDiagnostic = { code: "annotation.appearance-approximated", severity: "warning",
+        pageIndex: annotation.pageIndex, message: built.approximation,
+        details: { annotationIndex: annotation.annotationIndex, subtype: annotation.subtype } };
+      this.diagnostics.push(diagnostic); this.onDiagnostic?.(diagnostic);
+    }
+    return this.finishSynthesis(annotation, geometry, built.content, built.resources, "empty", optionalContentIndex);
   }
 
   private async synthesizeLinkBorder(
@@ -1335,9 +1357,7 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
     if (
       !(error instanceof PdfError) ||
       error.code !== "unsupported-content" ||
-      error.details?.reason !== "appearance-synthesis-not-implemented" ||
-      (annotation.subtype !== "Link" && annotation.subtype !== "Square" &&
-        (annotation.subtype !== "Widget" || !annotation.widget))
+      error.details?.reason !== "appearance-synthesis-not-implemented"
     ) {
       throw error;
     }

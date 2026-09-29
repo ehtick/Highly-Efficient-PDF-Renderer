@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-29T05:57:20.328Z",
+  "generatedAt": "2026-09-29T09:16:40.835Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -34,7 +34,7 @@
       },
       "hep": {
         "path": "examples/heps/Chino_MOB_FLOOR_1-parsed-data.hep",
-        "sizeBytes": 187512
+        "sizeBytes": 188128
       }
     },
     {
@@ -130,7 +130,7 @@
       },
       "hep": {
         "path": "examples/heps/optimizing_cpp-parsed-data.hep",
-        "sizeBytes": 793896
+        "sizeBytes": 820784
       }
     },
     {
@@ -166,7 +166,7 @@
       },
       "hep": {
         "path": "examples/heps/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
-        "sizeBytes": 236088
+        "sizeBytes": 242020
       }
     },
     {
@@ -190,7 +190,7 @@
       },
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1512124
+        "sizeBytes": 1520944
       }
     },
     {

@@ -1,3 +1,4 @@
+import type { PdfAnnotation } from "../annotationData";
 import type {
   HeprPageData,
   PdfCompileOptions,
@@ -30,10 +31,11 @@ import type {
   NativeIccTransformResult
 } from "./nativeIcc";
 
+// Version 10 adds independent annotation metadata extraction.
 // Version 9 replaces iccFallback with four ICC engine modes and automatic fallback.
 // Retained page color stores remain at version 8.
 // Older workers must not silently ignore the requested color behavior.
-export const PDF_WORKER_PROTOCOL_VERSION = 9 as const;
+export const PDF_WORKER_PROTOCOL_VERSION = 10 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -101,6 +103,13 @@ export type PdfWorkerRequest =
       readonly type: "hepr-pdf-request";
       readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
       readonly requestId: number;
+      readonly operation: "get-page-annotations";
+      readonly sourcePageIndex: number;
+    }
+  | {
+      readonly type: "hepr-pdf-request";
+      readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
+      readonly requestId: number;
       readonly operation: "open";
       readonly source: PdfWorkerSource;
       readonly options: PdfWorkerOpenOptions;
@@ -145,6 +154,15 @@ export interface SerializedPdfError {
 }
 
 export type PdfWorkerSuccess =
+  | {
+      readonly type: "hepr-pdf-result";
+      readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
+      readonly requestId: number;
+      readonly ok: true;
+      readonly operation: "get-page-annotations";
+      readonly annotations: readonly PdfAnnotation[];
+      readonly diagnostics: readonly PdfDiagnostic[];
+    }
   | {
       readonly type: "hepr-pdf-result";
       readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;

@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { buildVectorFillBandIndex } from "./vectorFillBands";
 import { vectorIndexedPathStore, type VectorIndexedPathStore } from "./vectorCellIndex";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
@@ -33,6 +34,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface GradientLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -93,6 +95,7 @@ interface GradientLayerEntry extends ThreePdfOrderedPaintMesh {
 const GRADIENT_LUT_WIDTH = 1024;
 
 export class ThreeMaterialGradientLayer {
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly scene: VectorScene;
   private readonly visibility: ScenePaintVisibility;
   private readonly fillRuns: (VectorDrawRun | undefined)[];
@@ -116,6 +119,7 @@ export class ThreeMaterialGradientLayer {
 
   constructor(scene: VectorScene, options: GradientLayerOptions) {
     this.scene = scene;
+    this.pageTransforms = options.pageTransforms;
     this.visibility = new ScenePaintVisibility(scene);
     this.fillRuns = Array(scene.gradientFillPathCount);
     this.strokeRuns = Array(scene.gradientStrokeRunCount);
@@ -314,6 +318,7 @@ export class ThreeMaterialGradientLayer {
       let fillState: ThreeWebGpuGradientFillMaterialState | undefined;
       if (materialBackend === "webgpu") {
         fillState = createThreeWebGpuGradientFillMaterial({
+          pageBinding: this.pageTransforms?.page("gradient-fill", pathIndex),
           mesh: meshCount > 0,
           fillPathMetaTextureA: pathMetaA,
           fillPathMetaTextureB: pathMetaB,
@@ -368,6 +373,7 @@ export class ThreeMaterialGradientLayer {
         material.fragmentShader = pdfShapeCoverageGlsl(material.fragmentShader)
           .replace(/sourcePaint.a \* maskPaint.a/g, "sourcePaint.a * mix(maskPaint.a, 1.0, uPdfShapeOnly)");
       }
+      bindRawPageTransform(material, this.pageTransforms?.page("gradient-fill", pathIndex));
       material = this.clipMaterial(material, this.fillClipIndices[pathIndex]);
       // A folded paint can compute a soft mask made of this paint alone.
       if (!meshCount) {
@@ -443,6 +449,7 @@ export class ThreeMaterialGradientLayer {
       let strokeState: ThreeWebGpuGradientStrokeMaterialState | undefined;
       if (materialBackend === "webgpu") {
         strokeState = createThreeWebGpuGradientStrokeMaterial({
+          pageBinding: this.pageTransforms?.page("gradient-stroke", runIndex),
           segmentTextureA: segmentA,
           segmentTextureB: segmentB,
           segmentStyleTexture: segmentStyles,
@@ -473,6 +480,7 @@ export class ThreeMaterialGradientLayer {
         material.fragmentShader = pdfShapeCoverageGlsl(material.fragmentShader)
           .replace(/sourcePaint.a \* maskPaint.a/g, "sourcePaint.a * mix(maskPaint.a, 1.0, uPdfShapeOnly)");
       }
+      bindRawPageTransform(material, this.pageTransforms?.page("gradient-stroke", runIndex));
       material = this.clipMaterial(material, this.strokeClipIndices[runIndex]);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = false;

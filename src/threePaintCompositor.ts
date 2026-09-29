@@ -211,6 +211,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private readonly passRect = new THREE.Vector4(-1, -1, 1, 1);
   private readonly presentationBinding: TextureBinding;
   private readonly linearPresentation = { value: 0 };
+  private readonly pageDepth = new THREE.Vector3();
   /**
    * WebGPU clears not yet encoded. There a clear is a render pass and a queue
    * submission of its own, so it waits for the next render into its target,
@@ -288,8 +289,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         fragmentShader: PDF_COMPOSITE_FRAGMENT_GLSL.replace(/^#version 300 es\s*/, ""), uniforms });
       this.presentationBinding = { value: this.presentZero };
       const material = new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3,
-        vertexShader: `precision highp float; in vec3 position; out vec2 vUv;
-          void main(){vUv=position.xy*0.5+0.5; gl_Position=vec4(position.xy,0.0,1.0);}`,
+        vertexShader: `precision highp float; in vec3 position; uniform vec3 uPageDepth; out vec2 vUv;
+          void main(){vUv=position.xy*0.5+0.5; gl_Position=vec4(position.xy,dot(uPageDepth,vec3(position.xy,1.0)),1.0);}`,
         fragmentShader: `precision highp float; uniform sampler2D uImage; uniform float uLinearOutput; in vec2 vUv; out vec4 outColor;
           void main(){
             vec4 color=texture(uImage,vUv);
@@ -300,7 +301,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
             }
             outColor=color;
           }`,
-        uniforms: { uImage: this.presentationBinding, uLinearOutput: this.linearPresentation } });
+        uniforms: { uImage: this.presentationBinding, uLinearOutput: this.linearPresentation, uPageDepth: { value: this.pageDepth } } });
       this.mesh = new THREE.Mesh(this.geometry, material);
     } else {
       const material = new NodeMaterial();
@@ -323,7 +324,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         p: TSL.uniform(this.params), q: TSL.uniform(this.extra), backdrop: TSL.uniform(this.backdropColor) });
       this.passMaterial = material;
       const present = new NodeMaterial();
-      present.vertexNode = TSL.vec4(TSL.positionLocal.xy, 0, 1);
+      present.vertexNode = callNode(TSL.wgslFn(`fn heprPagePresentPosition(position: vec3f, depth: vec3f) -> vec4f {
+        return vec4f(position.xy, dot(depth, vec3f(position.xy, 1.0)), 1.0);
+      }`), { position: TSL.positionLocal, depth: TSL.uniform(this.pageDepth) });
       const texture = TSL.texture(this.presentZero, TSL.uv().flipY());
       // Three applies the host output transfer to straight color before blending.
       present.fragmentNode = callNode(presentNodeFn, { color: texture });
@@ -619,6 +622,15 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     mesh.material = material;
     this.enqueue(mesh, true);
   }
+  /** Give a screen-space composited page its original projected plane depth. */
+  setPageDepth(localToClip: THREE.Matrix4): void {
+    const inverse = localToClip.clone().invert().elements;
+    const z = inverse[10];
+    if (Math.abs(z) > 1e-15) this.pageDepth.set(-inverse[2] / z, -inverse[6] / z, -inverse[14] / z);
+    else this.pageDepth.set(0, 0, 0);
+    if (!this.mesh.material.depthTest) { this.mesh.material.depthTest = true; this.mesh.material.needsUpdate = true; }
+  }
+
   dispose(): void {
     this.releaseSurfaces();
     for (const proxy of this.proxies.values()) this.disposePartial(proxy);

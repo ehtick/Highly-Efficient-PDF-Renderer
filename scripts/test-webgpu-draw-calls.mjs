@@ -24,13 +24,14 @@ try {
       scene: createEmptyVectorScene(), fillPathCount: 5, segmentCount: 10, textInstanceCount: 3,
       fillBindGroup: {}, strokeBindGroupAll: {}, textBindGroup: {},
       vectorClipBindGroups: [{}, {}], usingAllSegments: true,
-      pageBackgroundResources: [{ bindGroup: {} }], rasterLayerResources: [{ bindGroup: {} }],
+      rasterLayerResources: [{ bindGroup: {} }],
       orderedGradientPaintCommands: [{ kind: "raster", index: 0 }],
       needsVisibleSetUpdate: false,
       requestFrame() {}, updateStrokeVisibleSet() {},
       resolveClientToPixelScale: () => ({ x: 1, y: 1 }),
       shouldUseVectorMinifyPath: () => false
     });
+    renderer.configurePageBackgroundResources(renderer.scene);
     let report;
     renderer.setFrameListener(stats => { report = stats; });
     const frame = () => {
@@ -122,6 +123,63 @@ try {
     assert.equal(frame(), 1, "culled runs issue no commands");
   }
 
+  {
+    const { renderer, device, frame } = create();
+    renderer.scene.pageRects = Float32Array.from({ length: 396 * 4 }, (_, i) =>
+      [Math.floor(i / 4) * 20, 0, Math.floor(i / 4) * 20 + 10, 10][i % 4]);
+    renderer.configurePageBackgroundResources(renderer.scene);
+    assert.equal(frame(), 5, "396 backgrounds batch into one draw alongside four content draws");
+    const [batch] = renderer.pageBackgroundResources;
+    assert.equal(renderer.pageBackgroundResources.length, 1);
+    assert.equal(batch.count, 396);
+    const upload = device.writes.find(write => write.buffer === batch.instanceBuffer);
+    assert.equal(upload.values.length, 396 * 4);
+    assert.deepEqual(upload.values.slice(0,8), [0,0,10,10, 20,0,10,10]);
+    assert.deepEqual(upload.values.slice(-4), [7900,0,10,10]);
+    assert.equal(batch.instanceBuffer.descriptor.usage, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const shader = renderer.pageBackgroundPipeline.descriptor.vertex.module.code;
+    assert.match(shader, /var<storage, read> uPageRects/);
+    assert.match(shader, /uPageRects\[instanceIndex\]/);
+    assert.doesNotMatch(shader, /uRaster\./, "background shader cannot read a per-image uniform buffer");
+    assert.equal(renderer.pageBackgroundPipeline.descriptor.fragment.targets[0].blend.color.srcFactor, "one");
+    assert.equal(batch.bindGroup.entries[1].resource.buffer, batch.instanceBuffer);
+    const profiler = renderer.getPerformanceProfiler();
+    profiler.start({ gpu: false });
+    for (let i = 0; i < 3; i++) { renderer.cameraCenterX += 1; renderer.zoom *= 1.1; assert.equal(frame(), 5); }
+    const report = profiler.stop();
+    assert.equal(report.counters.pageBackgroundBatches.average, 1);
+    assert.equal(report.counters.pageBackgroundInstances.average, 396);
+    assert.equal(device.writes.filter(write => write.buffer === batch.instanceBuffer).length, 1,
+      "camera motion reuses background instance data");
+    renderer.setPageBackgroundColor(.2,.4,.6,.5);
+    assert.equal(device.writes.filter(write => write.buffer === batch.instanceBuffer).length, 1);
+    assert.equal(frame(), 5);
+    renderer.rasterRenderingEnabled = false;
+    assert.equal(frame(), 3, "disabling raster rendering hides both backgrounds and images");
+    renderer.rasterRenderingEnabled = true;
+
+    // Device buffer limits split only oversized page sets into bounded batches.
+    device.limits.maxStorageBufferBindingSize = 32;
+    device.limits.maxBufferSize = 64;
+    renderer.scene.pageRects = Float32Array.of(0,0,1,1, 2,0,3,1, 4,0,5,1, 6,0,7,1, 8,0,9,1);
+    renderer.configurePageBackgroundResources(renderer.scene);
+    assert(batch.instanceBuffer.destroyed, "replacing the document releases previous geometry");
+    assert.deepEqual(renderer.pageBackgroundResources.map(resource => resource.count), [2,2,1]);
+    assert(renderer.pageBackgroundResources.every(resource => resource.instanceBuffer.descriptor.size <= 32));
+    assert.equal(frame(), 7, "frame metrics count the bounded batches");
+    const chunks = [...renderer.pageBackgroundResources];
+    renderer.scene.pageRects = Float32Array.of(NaN,0,1,1, -5,-6,-5,-8);
+    renderer.configurePageBackgroundResources(renderer.scene);
+    assert(chunks.every(resource => resource.instanceBuffer.destroyed));
+    assert.equal(renderer.pageBackgroundResources[0].count, 1, "invalid rectangles are skipped");
+    assert.deepEqual(device.writes.at(-1).values, [-5,-6,Math.fround(1e-6),Math.fround(1e-6)],
+      "degenerate rectangle handling is preserved");
+    const finalBuffer = renderer.pageBackgroundResources[0].instanceBuffer;
+    const texture = renderer.pageBackgroundTexture;
+    renderer.dispose(); renderer.dispose();
+    assert(finalBuffer.destroyed); assert(texture.destroyed);
+  }
+
   for (const blendMode of ["Normal", "Multiply"]) {
     const { renderer, device, frame } = create();
     renderer.scene.drawRuns = [{ kind: "fill", first: 0, count: 5 }];
@@ -176,9 +234,10 @@ try {
 
 function makeDevice() {
   const device = {
-    draws: 0, copies: 0, shaders: [], cameraData: null,
+    draws: 0, copies: 0, shaders: [], writes: [], cameraData: null,
     limits: { maxTextureDimension2D: 2048 },
-    queue: { writeBuffer(_buffer, _offset, data) {
+    queue: { writeBuffer(buffer, _offset, data) {
+      device.writes.push({ buffer, values: Array.from(data) });
       if (data instanceof Float32Array && data.length === 24) device.cameraData = [...data];
     }, writeTexture() {}, submit() {} },
     createShaderModule: descriptor => { device.shaders.push(descriptor.code); return descriptor; },
@@ -187,8 +246,8 @@ function makeDevice() {
     createSampler: descriptor => descriptor,
     createBindGroup: descriptor => descriptor,
     createRenderPipeline: descriptor => ({ descriptor, getBindGroupLayout: index => descriptor.layout.bindGroupLayouts[index] }),
-    createBuffer: () => ({ destroy() {} }),
-    createTexture: () => ({ createView() { return { texture: this }; }, destroy() {} }),
+    createBuffer: descriptor => ({ descriptor, destroy() { this.destroyed = true; } }),
+    createTexture: () => ({ createView() { return { texture: this }; }, destroy() { this.destroyed = true; } }),
     createCommandEncoder: () => ({
       beginRenderPass: () => ({ setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, setScissorRect() {},
         draw() { device.draws++; }, end() {} }),

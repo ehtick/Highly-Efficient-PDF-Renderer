@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
@@ -22,6 +23,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface FillLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
@@ -146,6 +148,7 @@ export class ThreeMaterialFillLayer {
       options.vectorOverride[3]
     );
 
+    const pageBinding = options.pageTransforms?.instances("fill", scene);
     let material: THREE.Material;
     if ((options.materialBackend ?? "webgl") === "webgpu") {
       const state = createThreeWebGpuFillMaterial({
@@ -163,6 +166,7 @@ export class ThreeMaterialFillLayer {
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
+        pageBinding,
         vectorOverride: this.vectorOverrideUniform
       });
       state.zoomUniform.value = this.zoomUniform.value;
@@ -210,6 +214,7 @@ export class ThreeMaterialFillLayer {
     }
     configureStraightAlphaBlending(material);
 
+    bindRawPageTransform(material, pageBinding);
     initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;

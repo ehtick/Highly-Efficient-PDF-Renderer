@@ -4,6 +4,7 @@ import type { TextLodBuildData, TextLodSelectionResult } from "./textLodCore";
 /** Route selected exact/coarse glyphs back to their canonical PDF paint. */
 export class OrderedTextLodSelection {
   readonly ranges: Uint32Array;
+  readonly data: TextLodBuildData;
   instanceIds = new Uint32Array(0);
   revision = 0;
   private readonly paints: { first: number; end: number; index: number }[];
@@ -14,6 +15,7 @@ export class OrderedTextLodSelection {
   private selectedPaints = new Uint32Array(0);
 
   constructor(scene: VectorScene, data: TextLodBuildData) {
+    this.data = data;
     const runs = scene.drawRuns ?? [];
     this.paints = runs.flatMap((run, index) => run.kind === "text"
       ? [{ first: run.first, end: run.first + run.count, index }] : []).sort((a, b) => a.first - b.first);

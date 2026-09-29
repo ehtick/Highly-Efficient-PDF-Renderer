@@ -71,6 +71,69 @@ try {
   assert(expanded.select(edgeView, .001).includes(unclipped.drawRuns[0]), "coarse bounds invalidate a prior culling result");
   culler.includeTextLod(build.data);
 
+  // A text-heavy guide interleaves thousands of text/fill paints. Enabling LOD
+  // must retain safe batching rather than force a draw for every alternation.
+  // Exercise both subset scheduling and the large monochrome schedule cache.
+  for (const glyphsPerPaint of [500, 50]) {
+    const rows = count / glyphsPerPaint;
+    const batchScene = { ...scene, clipPaths: [], optionalContent: undefined,
+      pageRects: Float32Array.of(-1,-1,701,241), fillPathCount: rows,
+      fillPathMetaA: new Float32Array(rows * 4), fillPathMetaB: new Float32Array(rows * 4),
+      fillPathMetaC: new Float32Array(rows * 4), drawRuns: [] };
+    for (let row = 0; row < rows; row++) {
+      batchScene.drawRuns.push({ kind: "text", first: row * glyphsPerPaint, count: glyphsPerPaint }, { kind: "fill", first: row, count: 1 });
+      const y = Math.floor(row * glyphsPerPaint / 500) * 2;
+      batchScene.fillPathMetaA.set([0,0,600,y], row * 4);
+      batchScene.fillPathMetaB.set([601,y + 1,glyphsPerPaint === 500 ? 1 : 0,0], row * 4);
+      batchScene.fillPathMetaC.set([0,0,0,1], row * 4);
+    }
+    const batchBuild = buildTextLod(batchScene), batchRuntime = new TextLodRuntime(batchBuild);
+    const batchSelection = new OrderedTextLodSelection(batchScene, batchBuild.data);
+    const batchPlan = new VectorOrderedBatches(batchScene, null);
+    batchPlan.update(batchScene.drawRuns, 50);
+    assert.equal(batchPlan.batches.length, 2, "independent text and fills batch before LOD is enabled");
+    for (const zoom of [.02, 1, .02]) {
+      const result = batchRuntime.update({ ...view, localToClip: createOrthographicLocalToClip(350,120,zoom,1000,600) });
+      batchSelection.update(result); batchPlan.setTextSelection(batchSelection);
+      batchPlan.update(batchScene.drawRuns, 1 / zoom);
+      assert.equal(batchPlan.batches.length, 2, "both coarse and exact LOD selections retain safe batching");
+      const textBatch = batchPlan.batches.find(b => b.kind === "text");
+      assert.deepEqual(Array.from({ length: textBatch.count }, (_, i) => batchPlan.uintInstances[(textBatch.first + i) * 2]),
+        Array.from(result.instanceIds), "batching preserves every selected exact/coarse glyph");
+      assert.equal(batchPlan.instanceCount, result.instanceIds.length + rows, "all fill instances remain present");
+      assert.equal(batchPlan.update(batchScene.drawRuns, 1 / zoom), false, "unchanged selection reuses the instance upload");
+    }
+    batchPlan.setTextSelection(null); batchPlan.update(batchScene.drawRuns, 50);
+    assert.equal(batchPlan.batches.length, 2, "LOD Off keeps batching");
+    assert.equal(batchPlan.instanceCount, count + rows);
+  }
+
+  // The bounding rectangle of rotated glyphs may reach beyond their exact
+  // combined bounds. A fill in that extra coverage must retain paint order.
+  const cornerScene = { ...scene, clipPaths: [], optionalContent: undefined,
+    textInstanceCount: 3, textGlyphCount: 2,
+    textInstanceA: Float32Array.of(1,0,0,1, 1,1,-1,1, 1,1,-1,1),
+    textInstanceB: Float32Array.of(-20,0,0,0, 0,0,0,0, 3,3,1,0),
+    textInstanceC: Float32Array.of(0,0,0,1, 0,0,0,1, 0,0,0,1),
+    textGlyphMetaA: Float32Array.of(0,0,0,0, 0,0,0,0), textGlyphMetaB: Float32Array.of(1,2,0,0, 2,1,0,0),
+    fillPathMetaA: Float32Array.of(0,0,3.4,6.5), fillPathMetaB: Float32Array.of(3.6,6.8,1,0),
+    fillPathMetaC: Float32Array.of(0,0,0,1), pageRects: Float32Array.of(-30,-10,10,10),
+    drawRuns: [{ kind: "text", first: 0, count: 1 }, { kind: "fill", first: 0, count: 1 },
+      { kind: "text", first: 1, count: 2 }] };
+  const cornerData = { ...build.data, exactInstanceCount: 3, coarseInstanceCount: 1, combinedInstanceCount: 4,
+    runs: [{ exactStart: 1, exactCount: 2, coarseIndex: 0, bounds: { minX: -2,minY: 0,maxX: 5,maxY: 7 } }] };
+  const cornerSelection = new OrderedTextLodSelection(cornerScene, cornerData);
+  cornerSelection.update({ instanceIds: Uint32Array.of(0,3), changed: true });
+  const cornerPlan = new VectorOrderedBatches(cornerScene, null);
+  cornerPlan.update(cornerScene.drawRuns, .01);
+  assert.equal(cornerPlan.batches.length, 2, "exact glyphs do not reach the fill");
+  cornerPlan.setTextSelection(cornerSelection); cornerPlan.update(cornerScene.drawRuns, .01);
+  assert.deepEqual(cornerPlan.batches.map(b => b.kind), ["text","fill","text"],
+    "coarse coverage invalidates an existing schedule even within the same scale bucket");
+  cornerPlan.update(cornerScene.drawRuns.slice(0,2), .01);
+  cornerPlan.update(cornerScene.drawRuns, .01);
+  assert.deepEqual(cornerPlan.batches.map(b => b.kind), ["text","fill","text"], "returning paints retain coarse overlap order");
+
   let reference;
   for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
     const runtime = new TextLodRuntime(build), selection = new OrderedTextLodSelection(scene, build.data);
@@ -124,6 +187,20 @@ try {
     instance.zoom = 1; render();
     assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: readable text returns to exact glyphs`);
     assert(plan.instanceCount > count / 2);
+    instance.canvas.clientWidth = instance.canvas.width / 3;
+    instance.zoom = 1.2; render();
+    assert(plan.instanceCount < count / 10, `${backend}: DPR 3 uses CSS-pixel ink height`);
+    const retinaIds = runtime.getSelectedInstanceIds().slice();
+    const retinaUploads = uploads;
+    render();
+    assert.equal(uploads, retinaUploads, `${backend}: stationary Retina frames do not reupload`);
+    instance.canvas.clientWidth = instance.canvas.width; render();
+    assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: actual canvas presentation scale controls detail`);
+    instance.canvas.clientWidth = instance.canvas.width / 3; render();
+    assert.deepEqual(runtime.getSelectedInstanceIds(), retinaIds);
+    instance.zoom = 3; render();
+    assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: readable Retina text returns to exact glyphs`);
+    instance.zoom = 1;
     runtime.setResourceFallback("resource-capacity"); instance.textLodGpuActive = false; render();
     assert.equal(plan.instanceCount, count + 1, `${backend}: resource fallback retains exact drawing`);
   }
@@ -136,5 +213,5 @@ try {
     assert.match(source, /scene.drawRuns && textLodUploadData \? new OrderedTextLodSelection/,
       "ordered LOD is activated only after a successful combined texture upload");
   }
-  console.log("Native ordered text LOD: paint boundaries, clipping, layers, canonical order, native parity, pan reuse, exact zoom and fallback passed.");
+  console.log("Native ordered text LOD: safe batching, coarse overlap order, paint boundaries, clipping, layers, native parity, pan reuse, exact zoom and fallback passed.");
 } finally { hooks.deregister(); }

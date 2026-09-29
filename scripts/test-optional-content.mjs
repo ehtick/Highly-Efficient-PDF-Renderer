@@ -158,7 +158,9 @@ try {
 
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
   const threeBulk = new OptionalContentController(bulkScene);
-  await HeprThreePdfObject.prototype.setAllLayerVisibility.call({ layerVisibility: threeBulk }, false, ["preferred"]);
+  const threeObject = Object.assign(Object.create(HeprThreePdfObject.prototype), { layerVisibility: threeBulk });
+  await threeObject.setAllLayerVisibility(false, ["preferred"]);
+  assert.equal(threeObject.pendingLayerUpdate, null, "completed bulk changes release page-preparation tracking");
   assert.equal(threeBulk.getLayers().find(layer => layer.id === "preferred").visible, false);
   assert.deepEqual(HeprThreePdfObject.prototype.getAllLayerVisibility.call({ layerVisibility: threeBulk }),
     { checked: false, indeterminate: false, disabled: false });

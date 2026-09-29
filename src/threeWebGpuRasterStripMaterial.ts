@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
@@ -20,6 +21,7 @@ interface ThreeWebGpuRasterStripMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
 }
 
 // Keep TSL proxies opaque to avoid instantiating recursive @types/three types.
@@ -39,6 +41,7 @@ export function createThreeWebGpuRasterStripMaterial(
   options: ThreeWebGpuRasterStripMaterialOptions
 ): ThreeWebGpuRasterStripMaterialState {
   const material = new NodeMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
@@ -69,7 +72,7 @@ export function createThreeWebGpuRasterStripMaterial(
     cameraCenter: TSL.uniform(options.cameraCenter),
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
-    localToClip: TSL.uniform(options.localToClip)
+    localToClip: pageProjection.matrix
   });
   const widthOpacity = varyingNode(matrixB.zw, true) as { x: unknown; y: unknown };
   const inputColor = callNode(rasterStripSampleFn, {
@@ -79,6 +82,7 @@ export function createThreeWebGpuRasterStripMaterial(
     row: varyingNode(TSL.instanceIndex, true),
     width: widthOpacity.x
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
     inputColor,
     opacity: widthOpacity.y,

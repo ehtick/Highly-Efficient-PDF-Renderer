@@ -29,9 +29,9 @@ export {
 /** Automatic clustered selection, or the original exact-only representation. */
 export type TextLodMode = "auto" | "off";
 
-/** Exact-to-coarse transition threshold for a previously exact cluster. */
+/** Exact-to-coarse ink-height threshold in CSS pixels for a previously exact cluster. */
 export const TEXT_LOD_COARSE_ENTER_PX = 0.5;
-/** Coarse-to-exact threshold for a previously coarse cluster. */
+/** Coarse-to-exact ink-height threshold in CSS pixels for a previously coarse cluster. */
 export const TEXT_LOD_EXACT_ENTER_PX = 0.75;
 /**
  * Fraction of the view size used as the visibility quantisation step.
@@ -53,10 +53,18 @@ const TEXT_LOD_VISIBILITY_STEP_RATIO = 0.1;
 export const TEXT_LOD_SOFT_EXACT_GLYPH_BUDGET = 200_000;
 
 export interface TextLodSelectionUpdate {
+  /** Shared page batches select each page at its own scale and projection. */
+  pageLocalToClip?: readonly ArrayLike<number>[];
+  pageVisibility?: Uint8Array;
+  /** Increment after changing page projections or visibility; omit to disable reuse. */
+  pageRevision?: number;
   /** Column-major PDF-local-to-clip 4x4 matrix. */
   localToClip: ArrayLike<number>;
+  /** Render viewport dimensions in device pixels. */
   viewportWidth: number;
   viewportHeight: number;
+  /** Device pixels per CSS pixel; defaults to 1 for offscreen rendering. */
+  pixelRatio?: number;
   /** Optional conservative local-space visibility bounds. */
   cullingBounds?: Bounds | null;
 }
@@ -149,6 +157,8 @@ export class TextLodRuntime {
   private selectionScratch: Uint32Array = new Uint32Array(0);
   private selectionInitialized = false;
   private lastUpdateValid = false;
+  private lastPageMatrices: TextLodSelectionUpdate["pageLocalToClip"];
+  private lastPageRevision: number | undefined;
   private readonly lastLocalToClip = new Float64Array(16);
   private lastViewportWidth = 0;
   private lastViewportHeight = 0;
@@ -228,6 +238,16 @@ export class TextLodRuntime {
     if (!data || this.resourceFallbackReason) {
       return this.finishUnavailableSelection();
     }
+    // Retina backing resolution must not turn unreadable overview text into
+    // millions of exact glyphs. Select detail in presentation pixels while
+    // leaving the clip transform and the actual GPU viewport unchanged. Below
+    // DPR 1, keep device-pixel thresholds so reduced resolution stays coarse.
+    const pixelRatio = update.pixelRatio ?? 1;
+    if (Number.isFinite(pixelRatio) && pixelRatio > 1) {
+      update = {...update,
+        viewportWidth: update.viewportWidth / pixelRatio,
+        viewportHeight: update.viewportHeight / pixelRatio};
+    }
     if (this.selectionInitialized && this.isSameSelectionUpdate(update)) {
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
     }
@@ -236,7 +256,7 @@ export class TextLodRuntime {
     // page and cluster, and its visibility is the snapped local rectangle alone.
     // The same scale and rectangle therefore reproduce the previous selection,
     // which lets a pan skip the whole pass until it crosses a visibility step.
-    const affine = this.resolveAffineView(update);
+    const affine = !update.pageLocalToClip && this.resolveAffineView(update);
     if (affine && this.selectionInitialized && this.isSameAffineSelection()) {
       this.rememberSelectionUpdate(update);
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
@@ -254,7 +274,8 @@ export class TextLodRuntime {
       : this.resolveVisibilityBounds(update.cullingBounds);
 
     for (const page of data.pages) {
-      if (cullingBounds && !boundsIntersect(page.bounds, cullingBounds)) {
+      const pageMatrix = update.pageLocalToClip?.[page.pageIndex] ?? update.localToClip;
+      if (update.pageVisibility?.[page.pageIndex] === 0 || (cullingBounds && !boundsIntersect(page.bounds, cullingBounds))) {
         if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
           selectionDecisionChanged = true;
         }
@@ -262,7 +283,7 @@ export class TextLodRuntime {
       }
       const pageProjection = affine ? null : analyzePlanarBoundsProjectionInto(
         page.bounds,
-        update.localToClip,
+        pageMatrix,
         this.selectionViewport(update),
         this.pageProjection,
         page.inkHeightDirection,
@@ -343,7 +364,7 @@ export class TextLodRuntime {
         if (decision < 0) {
           const projection = analyzePlanarBoundsProjectionInto(
             cluster.bounds,
-            update.localToClip,
+            pageMatrix,
             this.selectionViewport(update),
             this.clusterProjection,
             cluster.inkHeightDirection,
@@ -632,14 +653,15 @@ export class TextLodRuntime {
   }
 
   private isSameSelectionUpdate(update: TextLodSelectionUpdate): boolean {
-    if (!this.lastUpdateValid || update.localToClip.length < 16) return false;
+    if (!this.lastUpdateValid || update.localToClip.length < 16 || this.lastPageMatrices !== update.pageLocalToClip ||
+        this.lastPageRevision !== update.pageRevision || (update.pageLocalToClip && update.pageRevision === undefined)) return false;
     if (
       Number(update.viewportWidth) !== this.lastViewportWidth ||
       Number(update.viewportHeight) !== this.lastViewportHeight
     ) {
       return false;
     }
-    for (let i = 0; i < 16; i += 1) {
+    if (!update.pageLocalToClip) for (let i = 0; i < 16; i += 1) {
       if (Number(update.localToClip[i]) !== this.lastLocalToClip[i]) return false;
     }
     const bounds = update.cullingBounds;
@@ -654,6 +676,7 @@ export class TextLodRuntime {
   }
 
   private rememberSelectionUpdate(update: TextLodSelectionUpdate): void {
+    this.lastPageMatrices = update.pageLocalToClip; this.lastPageRevision = update.pageRevision;
     if (update.localToClip.length < 16) {
       this.lastUpdateValid = false;
       return;

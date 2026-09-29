@@ -1,3 +1,4 @@
+import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { placeSceneAnnotation, type AnnotationAppearanceMode, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
@@ -122,6 +123,8 @@ export interface VectorScene {
   pagesPerRow: number;
   pageRects: Float32Array;
   pageTextRanges: Uint32Array;
+  /** Per-page [first,count] pairs: stroke, fill, text, raster, gradient-fill, gradient-stroke. */
+  pagePrimitiveRanges?: Uint32Array;
   textIndex: SceneTextIndex | null;
   fillPathCount: number;
   fillSegmentCount: number;
@@ -821,7 +824,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   if (pageScenes.length === 1) {
     return {
       ...pageScenes[0],
-      pageCount: 1,
+      pageCount: Math.max(1, pageScenes[0].pageRects.length / 4),
       pagesPerRow: 1,
       pageTextRanges: normalizePageTextRangesForScene(pageScenes[0])
     };
@@ -955,6 +958,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const retainedPages: SceneRetainedPage[] = [];
   const clipPaths: VectorClipPath[] = [];
   const drawRuns: VectorDrawRun[] | undefined = paintGraph || pageScenes.some(scene => scene.drawRuns) ? [] : undefined;
+  const pagePrimitiveRanges = pageScenes.every(scene => scene.pageRects.length <= 4 || scene.pagePrimitiveRanges)
+    ? new Uint32Array(totalPageRectCount * PAGE_PRIMITIVE_RANGE_STRIDE) : undefined;
   const rasterLayers: RasterLayer[] = [];
   const mergedTextIndexPages: PageTextIndex[] = [];
   const combinedTextContent: SceneTextItem[] = [];
@@ -969,6 +974,18 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
+    if (pagePrimitiveRanges) {
+      validatePagePrimitiveRanges(scene);
+      const offsets = [segmentOffset, fillPathOffset, textInstanceOffset, rasterLayers.length, gradientFillPathOffset, gradientStrokeRunOffset];
+      const counts = scenePrimitiveCounts({ ...scene, rasterLayers: listSceneRasterLayers(scene) });
+      const localPages = Math.max(1, scene.pageRects.length / 4);
+      for (let local = 0; local < localPages; local++) PAGE_PRIMITIVE_KINDS.forEach((kind, k) => {
+        const src = local * PAGE_PRIMITIVE_RANGE_STRIDE + k * 2;
+        const dst = (pageRectBase + local) * PAGE_PRIMITIVE_RANGE_STRIDE + k * 2;
+        pagePrimitiveRanges[dst] = offsets[k] + (scene.pagePrimitiveRanges?.[src] ?? 0);
+        pagePrimitiveRanges[dst + 1] = scene.pagePrimitiveRanges?.[src + 1] ?? counts[kind];
+      });
+    }
     for (const page of scene.pdfPages ?? []) {
       const [a, b, c, d, e, f] = page.pdfToScene;
       pdfPages.push({ ...page, pageIndex: pageRectBase + page.pageIndex, pdfToScene: [a, b, c, d, e + tx, f + ty] });
@@ -1303,10 +1320,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     ...(layers.data ? { optionalContent: layers.data } : {}),
     ...(clipPaths.length ? { clipPaths } : {}),
     ...(drawRuns ? { drawRuns } : {}),
-    pageCount: pageScenes.length,
+    pageCount: totalPageRectCount,
     pagesPerRow,
     pageRects,
     pageTextRanges,
+    ...(pagePrimitiveRanges ? { pagePrimitiveRanges } : {}),
     textIndex: hasAnyTextIndex ? { version: 2, pages: mergedTextIndexPages } : null,
     fillPathCount: totalFillPathCount,
     fillSegmentCount: totalFillSegmentCount,

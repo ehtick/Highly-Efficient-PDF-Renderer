@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
@@ -24,6 +25,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface StrokeLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   canonicalScene?: VectorScene;
   strokeOrigins?: Uint32Array;
@@ -48,6 +50,7 @@ interface CullingBounds {
 export class ThreeMaterialStrokeLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly solidColorOverrides = new Set<string>();
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
@@ -147,6 +150,8 @@ export class ThreeMaterialStrokeLayer {
       options.vectorOverride[3]
     );
 
+    this.pageTransforms = options.pageTransforms;
+    const pageBinding = options.pageTransforms?.instances("stroke", scene, options.strokeOrigins);
     const materialBackend = options.materialBackend ?? "webgl";
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
@@ -160,6 +165,7 @@ export class ThreeMaterialStrokeLayer {
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
+        pageBinding,
         vectorOverride: this.vectorOverrideUniform,
         strokeCurveEnabled: options.strokeCurveEnabled
       });
@@ -200,11 +206,14 @@ export class ThreeMaterialStrokeLayer {
     }
     configureStraightAlphaBlending(material);
 
+    bindRawPageTransform(material, pageBinding);
     initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
     this.orderedRuns = ThreeVectorDrawRuns.create(options.canonicalScene ?? scene, "stroke", this.mesh, "aSegmentIndex", options.drawPlan, options.strokeOrigins);
+    // Coverage in the original layout cannot prove redundancy after pages move.
+    if (this.pageTransforms) this.orderedRuns?.setStrokeRedundancyEnabled(false);
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -250,7 +259,7 @@ export class ThreeMaterialStrokeLayer {
       if (update.color) this.solidColorOverrides.add(key);
       else this.solidColorOverrides.delete(key);
     }
-    this.orderedRuns?.setStrokeRedundancyEnabled(this.solidColorOverrides.size === 0);
+    this.orderedRuns?.setStrokeRedundancyEnabled(!this.pageTransforms && this.solidColorOverrides.size === 0);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

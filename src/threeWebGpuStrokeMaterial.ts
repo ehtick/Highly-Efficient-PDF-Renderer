@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
@@ -37,6 +38,7 @@ interface ThreeWebGpuStrokeMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
   vectorOverride: THREE.Vector4;
   strokeCurveEnabled: boolean;
 }
@@ -249,6 +251,7 @@ export function createThreeWebGpuStrokeMaterial(
   options: ThreeWebGpuStrokeMaterialOptions
 ): ThreeWebGpuStrokeMaterialState {
   const material = new NodeMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
@@ -286,7 +289,7 @@ export function createThreeWebGpuStrokeMaterial(
     primitiveBounds,
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
-    localUnitsPerPixelInput: localUnitsPerPixelUniform,
+    localUnitsPerPixelInput: pageProjection.units ?? localUnitsPerPixelUniform,
     aaScreenPx: aaScreenPxUniform,
     shapeOnly: shapeOnlyUniform
   }));
@@ -297,7 +300,7 @@ export function createThreeWebGpuStrokeMaterial(
 
   const viewportUniform = TSL.uniform(options.viewport);
   const cameraCenterUniform = TSL.uniform(options.cameraCenter);
-  const localToClipUniform = TSL.uniform(options.localToClip);
+  const localToClipUniform = pageProjection.matrix;
   const vectorOverrideUniform = TSL.uniform(options.vectorOverride);
 
   material.vertexNode = callNode(clipPositionFn, {
@@ -308,6 +311,7 @@ export function createThreeWebGpuStrokeMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: localToClipUniform
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(fragmentFns[options.colorCompositing], {
     local: worldPackValue.xy,
     primitiveA,

@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
@@ -20,6 +21,7 @@ export interface ThreeWebGpuRasterMaterialState {
 }
 
 interface ThreeWebGpuRasterMaterialOptions {
+  instancedPageBackground?: boolean;
   opacity?: number;
   colorCompositing: ThreeColorCompositing;
   texture: THREE.Texture;
@@ -28,6 +30,7 @@ interface ThreeWebGpuRasterMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
 }
 
 // Deliberately typed as `unknown`: naming the TSL function type (e.g. via
@@ -53,6 +56,15 @@ fn heprRasterPack(
     matrixABCD.x * localTopDown.x + matrixABCD.z * localTopDown.y + matrixEF.x,
     matrixABCD.y * localTopDown.x + matrixABCD.w * localTopDown.y + matrixEF.y
   );
+  return vec4<f32>(world, localTopDown);
+}
+`);
+
+const pageBackgroundPackFn: unknown = TSL.wgslFn(`
+fn heprPageBackgroundPack(corner: vec2<f32>, pageRect: vec4<f32>) -> vec4<f32> {
+  let corner01 = corner * 0.5 + vec2<f32>(0.5);
+  let localTopDown = vec2<f32>(corner01.x, 1.0 - corner01.y);
+  let world = pageRect.xy + pageRect.zw * localTopDown;
   return vec4<f32>(world, localTopDown);
 }
 `);
@@ -94,6 +106,7 @@ export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions
 ): ThreeWebGpuRasterMaterialState {
   const material = new NodeMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
@@ -112,11 +125,13 @@ export function createThreeWebGpuRasterMaterial(
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const corner = TSL.attribute("aCorner", "vec2");
-  const rasterPack = varyingNode(callNode(rasterPackFn, {
-    corner,
-    matrixABCD: TSL.uniform(options.matrixABCD),
-    matrixEF: TSL.uniform(options.matrixEF)
-  }));
+  const rasterPack = varyingNode(options.instancedPageBackground
+    ? callNode(pageBackgroundPackFn, { corner, pageRect: TSL.attribute("aPageRect", "vec4") })
+    : callNode(rasterPackFn, {
+      corner,
+      matrixABCD: TSL.uniform(options.matrixABCD),
+      matrixEF: TSL.uniform(options.matrixEF)
+    }));
   const rasterPackValue = rasterPack as { zw: unknown };
   const textureNode = TSL.texture(options.texture, rasterPackValue.zw as never);
   const opacityUniform = TSL.uniform(options.opacity ?? 1);
@@ -127,8 +142,9 @@ export function createThreeWebGpuRasterMaterial(
     cameraCenter: TSL.uniform(options.cameraCenter),
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
-    localToClip: TSL.uniform(options.localToClip)
+    localToClip: pageProjection.matrix
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
     inputColor: textureNode,
     opacity: opacityUniform,

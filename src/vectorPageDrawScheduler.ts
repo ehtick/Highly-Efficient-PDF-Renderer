@@ -1,4 +1,5 @@
 import type { VectorScene } from "./pdfVectorExtractor";
+import type { TextLodBuildData } from "./textGreekLod";
 import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 const kinds = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
@@ -49,33 +50,38 @@ export class VectorPageDrawScheduler {
   private readonly filtered: number[] = [];
   private readonly segmentRuns: number[] = [];
   private readonly segments: Uint32Array | null;
+  private readonly independentPages: boolean;
   private readonly paddingLimit: number;
   private previousPaintCount = -1;
   private scheduleDirty = true;
   private padding = NaN;
   private enabled = false;
   private colorCommutationEnabled = true;
+  private textLodData: TextLodBuildData | null = null;
 
   /**
    * `segments` restricts reordering to paints that share a compositor span; see
-   * scenePaintSpanSegments. Omitting it schedules the page as one span, which
-   * is what a document without transparency groups already is.
+   * scenePaintSpanSegments. Omitting it schedules the document as one span.
+   * `independentPageRuns` is only valid when the caller separately proves that
+   * pages cannot paint over one another (or supplies an opaque depth pass).
    */
   static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array,
-    segments: Uint32Array | null = null): VectorPageDrawScheduler | null {
+    segments: Uint32Array | null = null, independentPageRuns: Uint16Array | null = null): VectorPageDrawScheduler | null {
     // Bound setup work for arbitrary public scenes, including invalid layouts
     // and scenes that carry draw runs but no page rectangles.
     const pages = (scene.pageRects?.length ?? 0) / 4;
     if (!scene.drawRuns || pages < 1 || pages > 512 || !Number.isInteger(pages) ||
         !scene.pageRects.every(Number.isFinite)) return null;
     if (segments && segments.length !== scene.drawRuns.length) return null;
-    return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments);
+    if (independentPageRuns && (independentPageRuns.length !== scene.drawRuns.length || independentPageRuns.some(page => page >= pages))) return null;
+    return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments, independentPageRuns);
   }
 
-  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array, segments: Uint32Array | null) {
+  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array, segments: Uint32Array | null, independentPageRuns: Uint16Array | null) {
     const runs = scene.drawRuns!;
     const pages = scene.pageRects.length / 4;
     this.segments = segments;
+    this.independentPages = independentPageRuns !== null;
     this.bounds = new VectorDrawRunCuller(scene, { scene: strokes, sourceRuns });
     this.pageForRun = new Uint16Array(runs.length);
     this.kindForRun = new Uint8Array(runs.length);
@@ -102,6 +108,7 @@ export class VectorPageDrawScheduler {
     const box = [0, 0, 0, 0];
     runs.forEach((run, index) => {
       this.kindForRun[index] = kinds.indexOf(run.kind);
+      if (independentPageRuns) { this.pageForRun[index] = independentPageRuns[index]; return; }
       this.bounds.getBounds(index, 0, box);
       const x = (box[0] + box[2]) * 0.5, y = (box[1] + box[3]) * 0.5;
       let nearest = 0, distance = Infinity;
@@ -115,6 +122,16 @@ export class VectorPageDrawScheduler {
       // actual paint bounds below, including content outside the page rect.
       this.pageForRun[index] = nearest;
     });
+  }
+
+  /** Include dormant coarse coverage so exact/coarse switches share a safe schedule. */
+  includeTextLod(data: TextLodBuildData): void {
+    if (this.textLodData === data) return;
+    this.textLodData = data;
+    this.bounds.includeTextLod(data);
+    // updateScale must refresh paint/page bounds even in the same AA bucket.
+    this.padding = NaN;
+    this.scheduleDirty = true;
   }
 
   /** Temporary primitive colors can invalidate source-color equivalence. */
@@ -173,7 +190,7 @@ export class VectorPageDrawScheduler {
       while (parents[index] !== index) { parents[index] = parents[parents[index]]; index = parents[index]; }
       return index;
     };
-    for (let page = 0; page < pages; page++) {
+    for (let page = 0; !this.independentPages && page < pages; page++) {
       const a = page * 4, bounds = this.pageBounds;
       if (bounds[a] > bounds[a + 2] || bounds[a + 1] > bounds[a + 3]) continue;
       for (let other = 0; other < page; other++) {
@@ -344,6 +361,9 @@ export class VectorPageDrawScheduler {
   }
 
   private dependsOn(first: number, second: number): boolean {
+    // The Three page-table caller proves screen-space/depth independence every
+    // frame. Original-layout proximity and AA margins cannot invalidate it.
+    if (this.independentPages && this.pageForRun[first] !== this.pageForRun[second]) return false;
     // Alpha, antialiasing, and clipping change coverage, but equal RGB still
     // gives C * (a + b - a*b) over the same backdrop in either paint order.
     const color = this.colorForRun[first];

@@ -151,6 +151,70 @@ The [parser benchmark guide](parser-benchmark.md) describes production parser
 measurements and their scope. Run corpus benchmarks manually; the default tests
 do not establish full-corpus visual fidelity or browser performance.
 
+All four backends batch page backgrounds before page content. Native WebGL
+instances the visible page rectangles; native WebGPU instances the document's
+rectangles and lets the GPU clip offscreen pages. WebGPU splits unusually large
+page sets only when needed to respect device buffer limits. Both Three backends
+use one indexed quad with `InstancedBufferGeometry`: each page has one packed
+`(x, y, width, height)` instance (16 bytes), in `scene.pageRects` order. Camera,
+document/ancestor transforms and background-color changes reuse the geometry in
+all four paths. Both Three shaders apply the same document-to-clip matrix used
+by content after reconstructing each background corner.
+Native captures report `pageBackgroundBatches` and `pageBackgroundInstances`
+separately from content batches. The viewer's draw-call total includes both,
+plus any compositing and overlay draws. The `webgl-page-background-batching`,
+`webgpu-draw-calls` and `three-page-background-batching` tests cover 396 pages,
+upload reuse, color and cleanup. WebGL also tests visibility changes; WebGPU
+checks bounded allocations; Three verifies both materials, document/ancestor
+translation, tilt, nonuniform scale and reflection, and generates WGSL without
+a GPU. Browser draw counts and visual checks remain manual. In each Three
+backend, check the CS-MAP overview, zoom into individual pages, then translate,
+rotate and scale the PDF group under a transformed parent; backgrounds must
+stay aligned with content and contribute one draw call.
+
+Independent page transforms are opt-in through `pdf.getPage(index)` / `getPages()`.
+The original batched object stays visible during preparation; completed page
+views replace its rendering and depth rectangle. `scenePageViews.ts` compacts
+page stores and remaps clips, glyphs, gradients, retained replay and paint graphs
+while preserving canonical coordinates and a primitive-ID map. The original
+scene stays immutable. The views share layer visibility and a native fallback
+context (`sharedPageRenderer.ts`). Compatible material rendering uses a shared
+batch object and `threePageTransforms.ts`: canonical primitive IDs resolve an
+immutable page-owner texture, then a small mutable matrix/visibility table.
+Backgrounds and raster strips carry instanced page IDs; gradients and individual
+images use constant IDs. GLSL and WGSL share the same tables. Camera/document
+movement updates only the document projection. Text LOD selects per page;
+stroke LOD uses the finest visible page tolerance. Page views' material resources
+stay dormant until needed for fallback. Runtime matrices are not persisted in HEP.
+
+`threePageBatchFrame.ts` projects paint extents, including coarse text and AA,
+to prove screen-space independence or opaque depth separation. Only then may
+the scheduler interleave page streams independently of their original layout.
+Compositing, unsafe overlaps, per-page appearance differences, and capability
+limits use independent submissions, and compatible layouts automatically rejoin
+the shared batches. `getPageBatchingStats()` exposes the decision.
+
+The `three-page-transform-batching`, `three-page-transforms`, `scene-page-views`,
+and `shared-page-renderer` tests
+cover both material backends, affine transforms, automatic scene preparation,
+picking, highlights, rollback, cancellation, shared native state, all paint types
+and synthetic HEP ownership round trips. Compositor tests check projected page
+depth and generate WGSL without starting a browser.
+
+Manual verification: in an existing Three.js integration, load the CS-MAP HEP and
+call `await pdf.getPages()`. Move, tilt, rotate, reflect and scale individual pages
+under a transformed document; include overlapping pages at different Z values.
+Check backgrounds, text, images, gradients, clips, search highlights and picking
+at overview and close zoom. Repeat with WebGL and WebGPU hosts, a layered or
+composited document, and a native texture fallback. Confirm layer toggles and
+cleanup, and measure FPS/draw calls separately before and after accessing page
+views. Confirm `getPageBatchingStats().mode` is `pages-batched` for disjoint pages
+and remains so during animation; move translucent pages into overlap and back
+to verify the separate-rendering transition. Headless tests count content meshes
+and generate shaders; browser FPS and driver shader validation remain manual.
+Transparent intersecting pages retain Three's object-level transparency
+sorting; exact order-independent transparency is not provided.
+
 Adjacent strokes, fills, or text share instanced draws even when their clip roots
 differ. Spatially independent
 pages also share draws: their paint streams are interleaved by type while keeping
@@ -197,10 +261,13 @@ and remains preferred when it fits the tile budget.
 Native and Three WebGL/WebGPU apply text LOD to source-ordered scenes. Coarse
 text runs stop at each PDF paint boundary and retain its clip and layer. Selected
 IDs are grouped back into canonical paint order; unchanged selections reuse the
-instance buffer during panning. Coarse text keeps its original clips and bypasses
-paint reordering based on exact geometry. Text with Multiply blending and scenes
-requiring effect composition stay exact. Readable text and primitive color
-overrides also retain exact glyphs. This keeps direct rendering practical for
+instance buffer during panning. Coarse text keeps its original clips. Native
+paint scheduling includes both exact glyph bounds and all coarse replacement
+bounds, so Auto retains safe batching across disjoint or equal-color paints.
+Adding coarse bounds invalidates cached dependencies even at an unchanged zoom;
+subsequent exact/coarse selection changes reuse those conservative dependencies.
+Text with Multiply blending and scenes requiring effect composition stay exact.
+Readable text and primitive color overrides also retain exact glyphs. This keeps direct rendering practical for
 large books without changing HEP data. Three batches consume selected exact or
 coarse IDs directly, without scanning the full glyph store. Its shared paint plan
 keeps canonical order while text LOD is active. The synthetic
@@ -209,6 +276,14 @@ paint boundaries, clips, layers, selection reuse, exact zoom and resource
 fallback. Three also exercises MapControls panning, perspective tilt, lazy
 Off-to-Auto material replacement and temporary text colors. Browser FPS and
 visual checks remain manual.
+
+Text LOD's 0.5/0.75 ink-height thresholds use CSS pixels on high-DPI canvases;
+the GPU still renders at full backing resolution. Native rendering uses the
+canvas backing-to-client size ratio, and Three uses the host renderer's pixel
+ratio. Offscreen targets and resolution below DPR 1 retain device-pixel
+thresholds. This prevents DPR alone from expanding unreadable overview text
+into millions of exact glyphs; zooming restores exact detail. The 200,000-glyph
+soft target remains diagnostic, not a cap on readable text.
 
 Text LOD measures glyph height perpendicular to the projected text baseline,
 so steep perspective views can simplify distant text even when it stretches

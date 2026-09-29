@@ -279,6 +279,43 @@ const viewportWidth = 2000;
 const viewportHeight = 2000;
 const centerX = 500;
 const centerY = 500;
+// A higher backing resolution must not promote the same unreadable text.
+// Exercise affine, perspective and per-page selection, including both caches.
+for (const projection of ["affine", "perspective", "pages"]) {
+  const matrix = createOrthographicLocalToClip(centerX, centerY, 0.4, viewportWidth, viewportHeight);
+  if (projection === "perspective") matrix[7] = 0.0001;
+  const view = { localToClip: matrix, viewportWidth, viewportHeight,
+    ...(projection === "pages" ? { pageLocalToClip: [matrix], pageRevision: 1 } : {}) };
+  const reference = new TextLodRuntime(result).update(view);
+  assert(reference.stats.coarseClusters > 0);
+  for (const pixelRatio of [1.25, 2, 3]) {
+    const retina = new TextLodRuntime(result);
+    const update = { ...view, viewportWidth: viewportWidth * pixelRatio,
+      viewportHeight: viewportHeight * pixelRatio, pixelRatio };
+    const selection = retina.update(update);
+    assert.deepEqual(selection.instanceIds, reference.instanceIds, `${projection}: DPR ${pixelRatio} preserves detail and culling`);
+    assert.equal(retina.update(update).changed, false, "stationary Retina frames reuse their selection");
+    const physical = retina.update({ ...update, pixelRatio: 1 });
+    if (pixelRatio === 3) assert(physical.stats.renderedGlyphs > selection.stats.renderedGlyphs,
+      "changing only presentation scale invalidates a cached selection");
+    assert.deepEqual(retina.update(update).instanceIds, reference.instanceIds);
+    retina.setMode("off");
+    assert.equal(retina.update(update).stats.coarseClusters, 0, "Off remains exact at high DPR");
+  }
+  for (const pixelRatio of [0, -1, NaN, Infinity, 0.5]) {
+    assert.deepEqual(new TextLodRuntime(result).update({ ...view, pixelRatio }).instanceIds, reference.instanceIds,
+      "invalid or reduced pixel ratios retain device-pixel selection");
+  }
+}
+const retinaRuntime = new TextLodRuntime(result);
+for (const [zoom, expectCoarse] of [[0.4, true], [0.6, true], [0.8, false]]) {
+  const selection = retinaRuntime.update({
+    localToClip: createOrthographicLocalToClip(centerX, centerY, zoom, viewportWidth, viewportHeight),
+    viewportWidth: viewportWidth * 3, viewportHeight: viewportHeight * 3, pixelRatio: 3
+  });
+  assert.equal(selection.stats.coarseClusters > 0, expectCoarse, "Retina text retains hysteresis and returns to exact on zoom");
+}
+
 const atCoarseThreshold = runtime.update({
   localToClip: createOrthographicLocalToClip(centerX, centerY, TEXT_LOD_COARSE_ENTER_PX, viewportWidth, viewportHeight),
   viewportWidth,

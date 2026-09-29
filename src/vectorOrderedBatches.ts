@@ -161,6 +161,7 @@ export class VectorOrderedBatches {
   setTextSelection(selection: OrderedTextLodSelection | null): void {
     const revision = selection?.revision ?? 0;
     if (this.textSelection === selection && this.textSelectionRevision === revision) return;
+    if (selection) this.scheduler?.includeTextLod(selection.data);
     this.textSelection = selection;
     this.textSelectionRevision = revision;
     this.orderDirty = true;
@@ -312,9 +313,9 @@ export class VectorOrderedBatches {
     }
     // Schedule paint ranges first, then write selected instances directly in
     // final order. No intermediate instance copy or per-run array views.
-    // Coarse rectangles can cover gaps between source glyphs. Keep canonical
-    // paint order instead of using a commutation proof over the exact geometry.
-    const order = this.textSelection ? this.visiblePaints : this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints;
+    // The scheduler includes coarse text bounds; LOD retains the same safe
+    // batching as exact glyphs without moving overlapping paints out of order.
+    const order = this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints;
     for (const runIndex of order) {
       const run = this.sourceRuns[runIndex];
       const segment = this.segments ? this.segments[runIndex] : 0;

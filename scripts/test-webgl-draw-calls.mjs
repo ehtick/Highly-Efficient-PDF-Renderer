@@ -43,24 +43,24 @@ try {
     renderer.renderExternalFrame();
     assert.equal(frames.at(-1).drawCalls, expected);
   };
-  frame(10); // Two pages, fill, stroke, two text ranges, and four overlay batches.
-  frame(10); // Counts describe the current frame, rather than accumulating.
+  frame(9); // One page-background batch, fill, stroke, two text ranges, and four overlay batches.
+  frame(9); // Counts describe the current frame, rather than accumulating.
   assert.equal(frames.at(-1).renderedSegments, 100, "instances remain separate from draw calls");
 
   // Minified pages hold the paint scheduler's coverage margin. Every path that
   // reports stats forwards that, because order between neighbours is relaxed.
   assert.equal(frames.at(-1).paintOrderApproximated, false, "an exact schedule reports exact paint order");
   renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
-  frame(10);
+  frame(9);
   assert.equal(frames.at(-1).paintOrderApproximated, true, "a held margin reaches the frame listener");
   draws.length = 0;
   assert.equal(renderer.renderProjectedFrame({ viewportWidth: 100, viewportHeight: 100, localUnitsPerPixel: 1,
     localToClip: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }).paintOrderApproximated, true,
     "and a projected one");
   renderer.orderedBatches = null;
-  frame(10);
+  frame(9);
   renderer.textRenderingEnabled = false;
-  frame(8);
+  frame(7);
   renderer.textRenderingEnabled = true;
 
   renderer.shouldUseVectorMinifyPath = () => true;
@@ -68,16 +68,16 @@ try {
   renderer.vectorMinifyFramebuffer = {};
   renderer.vectorMinifyWidth = renderer.vectorMinifyHeight = 200;
   renderer.ensureVectorMinifyResources = () => true;
-  frame(11);
+  frame(10);
   renderer.shouldUseVectorMinifyPath = () => false;
 
   const projected = { viewportWidth: 100, viewportHeight: 100, localUnitsPerPixel: 1,
     localToClip: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] };
   draws.length = 0;
-  assert.equal(renderer.renderProjectedFrame(projected).drawCalls, 10);
+  assert.equal(renderer.renderProjectedFrame(projected).drawCalls, 9);
   assert.equal(renderer.renderProjectedFrame({ ...projected, localToClip: [] }).drawCalls, 0);
   assert.equal(renderer.renderProjectedFrame({ ...projected, localToClip: new Array(16).fill(NaN) }).drawCalls, 0);
-  frame(10);
+  frame(9);
 
   // The retained paint graph adds its compositing passes. Framebuffer copies
   // and clears are not GPU draw commands and are not counted, and without a

@@ -1,3 +1,4 @@
+import type { ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
@@ -33,6 +34,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 interface VectorStrokeLodLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
@@ -44,6 +46,7 @@ export class ThreeVectorLodStrokeLayer {
   readonly group = new THREE.Group();
 
   private readonly scene: VectorScene;
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly runtime: VectorStrokeLodRuntime;
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
@@ -58,6 +61,7 @@ export class ThreeVectorLodStrokeLayer {
     preparedRuntime?: VectorStrokeLodRuntimeReservation | null
   ) {
     this.scene = scene;
+    this.pageTransforms = options.pageTransforms;
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
     this.layers = [];
@@ -131,7 +135,10 @@ export class ThreeVectorLodStrokeLayer {
   }
 
   setLocalToClipTransform(localToClip: THREE.Matrix4, localUnitsPerPixel: number): void {
-    this.runtime.setLocalToClipTransform(localToClip.elements, localUnitsPerPixel);
+    // One conservative global stroke tolerance is bounded by the most magnified
+    // visible page. The renderer still projects each primitive with its own matrix.
+    if (this.pageTransforms) this.runtime.setScreenSpaceTransform();
+    else this.runtime.setLocalToClipTransform(localToClip.elements, localUnitsPerPixel);
     for (const layer of this.layers) {
       layer.setLocalToClipTransform(localToClip, localUnitsPerPixel);
     }

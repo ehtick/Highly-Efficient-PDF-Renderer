@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
@@ -21,6 +22,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   pageBackground: [number, number, number, number];
@@ -54,6 +56,7 @@ interface RasterLayerSource {
 }
 
 export class ThreeMaterialRasterLayer {
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly visibility: ScenePaintVisibility;
   private snapshot: OptionalContentSnapshot;
   private readonly vectorClipTexture: THREE.DataTexture;
@@ -83,6 +86,7 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.pageTransforms = options.pageTransforms;
     this.appliedRasterLayers = [...scene.rasterLayers];
     this.visibility = new ScenePaintVisibility(scene);
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
@@ -113,6 +117,8 @@ export class ThreeMaterialRasterLayer {
 
     const pageRects = normalizePageRects(scene);
     this.pageBackgroundGeometry = createPageBackgroundGeometry(pageRects);
+    if (this.pageTransforms && this.pageBackgroundGeometry) this.pageBackgroundGeometry.setAttribute("aPageIndex",
+      new THREE.InstancedBufferAttribute(Float32Array.from({ length: pageRects.length / 4 }, (_, i) => i), 1));
     if (this.pageBackgroundGeometry) {
       const entry = this.createEntry(
         this.pageBackgroundTexture,
@@ -400,9 +406,12 @@ export class ThreeMaterialRasterLayer {
     let material: THREE.Material | undefined;
     try {
       geometry = createRasterStripGeometry(batch);
+      const pageBinding = this.pageTransforms ? { table: this.pageTransforms } : undefined;
+      if (this.pageTransforms) geometry.setAttribute("aPageIndex", new THREE.InstancedBufferAttribute(
+        Float32Array.from({ length: batch.count }, (_, i) => this.pageTransforms!.page("raster", batch.first + i).page!), 1));
       let webGpuState: RasterLayerEntry["webGpuState"];
       if (this.materialBackend === "webgpu") {
-        const state = createThreeWebGpuRasterStripMaterial({ texture, colorCompositing: this.colorCompositing,
+        const state = createThreeWebGpuRasterStripMaterial({ pageBinding, texture, colorCompositing: this.colorCompositing,
           viewport: this.viewportUniform, cameraCenter: this.cameraCenterUniform, localToClip: this.localToClipUniform });
         material = state.material;
         webGpuState = state;
@@ -424,6 +433,7 @@ export class ThreeMaterialRasterLayer {
           }
         });
       }
+      bindRawPageTransform(material, pageBinding);
       initializeThreeVectorClip(material, this.vectorClipTexture);
       const clipped = createThreeVectorClipMaterial(material, this.vectorClipIndices[batch.first]);
       if (clipped !== material) material.dispose();
@@ -479,9 +489,14 @@ export class ThreeMaterialRasterLayer {
     opacity = 1
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
+    const instancedPageBackground = geometry.hasAttribute("aPageRect");
+    const pageBinding = this.pageTransforms ? instancedPageBackground ? { table: this.pageTransforms }
+      : this.pageTransforms.page("raster", this.rasterEntries.length) : undefined;
 
     if (this.materialBackend === "webgpu") {
       const state = createThreeWebGpuRasterMaterial({
+        instancedPageBackground,
+        pageBinding,
         colorCompositing: this.colorCompositing,
         opacity,
         texture,
@@ -506,6 +521,7 @@ export class ThreeMaterialRasterLayer {
 
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
+      defines: instancedPageBackground ? { INSTANCED_PAGE_BACKGROUNDS: 1 } : {},
       vertexShader: normalizeCoreShaderSource(CORE_RASTER_VERTEX_SHADER_SOURCE),
       fragmentShader: normalizeCoreShaderSource(CORE_RASTER_FRAGMENT_SHADER_SOURCE),
       transparent: false,
@@ -531,6 +547,7 @@ export class ThreeMaterialRasterLayer {
       }
     });
 
+    bindRawPageTransform(material, pageBinding);
     initializeThreeVectorClip(material, this.vectorClipTexture);
     const clippedMaterial = createThreeVectorClipMaterial(material, clipIndex);
     if (clippedMaterial !== material) material.dispose();
@@ -542,72 +559,40 @@ export class ThreeMaterialRasterLayer {
   }
 }
 
-/**
- * Placement matrix that leaves the raster vertex shader's mapped quad position
- * untouched, so the merged page-background geometry supplies scene coordinates
- * itself. See {@link createPageBackgroundGeometry}.
- */
+// Background placement comes from aPageRect; ordinary rasters use their matrix.
 const PAGE_BACKGROUND_PLACEMENT_MATRIX = new Float32Array([1, 0, 0, 1, 0, 0]);
 
 /**
- * All page backgrounds as one indexed mesh.
- *
- * A mesh per page meant a draw call, program setup, attribute rebind and uniform
- * upload per page every frame, which dominates the frame on documents with
- * hundreds of pages. Merging them costs one small buffer and leaves a single
- * draw call at every zoom level.
- *
- * The raster vertex shader maps `aCorner` through the unit quad into the
- * placement matrix. With an identity placement the mapping reduces to
- * `world = (aCorner.x * 0.5 + 0.5, 0.5 - aCorner.y * 0.5)`, so storing its
- * inverse per vertex puts scene coordinates on the attribute and keeps both
- * backends on their existing shader.
+ * One shared quad and a packed (x, y, width, height) instance per page.
+ * Instance order matches scene.pageRects, preserving each page's identity.
+ * These are document-space rectangles, not independent page transforms: any
+ * future page matrix must also be applied to content, culling and interaction.
  */
-function createPageBackgroundGeometry(pageRects: Float32Array): THREE.BufferGeometry | null {
+function createPageBackgroundGeometry(pageRects: Float32Array): THREE.InstancedBufferGeometry | null {
   const pageCount = Math.floor(pageRects.length / 4);
   if (pageCount <= 0) {
     return null;
   }
 
-  const corners = new Float32Array(pageCount * 8);
-  const indices = new Uint32Array(pageCount * 6);
+  const rects = new Float32Array(pageCount * 4);
   for (let page = 0; page < pageCount; page += 1) {
     const rect = page * 4;
     const minX = Math.min(pageRects[rect], pageRects[rect + 2]);
     const minY = Math.min(pageRects[rect + 1], pageRects[rect + 3]);
-    const maxX = Math.max(pageRects[rect], pageRects[rect + 2]);
-    const maxY = Math.max(pageRects[rect + 1], pageRects[rect + 3]);
-
-    const vertex = page * 8;
-    writePageBackgroundCorner(corners, vertex, minX, minY);
-    writePageBackgroundCorner(corners, vertex + 2, maxX, minY);
-    writePageBackgroundCorner(corners, vertex + 4, maxX, maxY);
-    writePageBackgroundCorner(corners, vertex + 6, minX, maxY);
-
-    const base = page * 4;
-    const index = page * 6;
-    indices[index] = base;
-    indices[index + 1] = base + 1;
-    indices[index + 2] = base + 2;
-    indices[index + 3] = base;
-    indices[index + 4] = base + 2;
-    indices[index + 5] = base + 3;
+    rects[rect] = minX;
+    rects[rect + 1] = minY;
+    rects[rect + 2] = Math.max(pageRects[rect], pageRects[rect + 2]) - minX;
+    rects[rect + 3] = Math.max(pageRects[rect + 1], pageRects[rect + 3]) - minY;
   }
 
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
-  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  const geometry = new THREE.InstancedBufferGeometry();
+  // position supplies Three's vertex count; projection uses aCorner/aPageRect.
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0], 3));
+  geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, 1, 1, 1, 1, -1, -1, -1], 2));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
+  geometry.setAttribute("aPageRect", new THREE.InstancedBufferAttribute(rects, 4));
+  geometry.instanceCount = pageCount;
   return geometry;
-}
-
-function writePageBackgroundCorner(
-  out: Float32Array,
-  offset: number,
-  worldX: number,
-  worldY: number
-): void {
-  out[offset] = 2 * worldX - 1;
-  out[offset + 1] = 1 - 2 * worldY;
 }
 
 function createRasterGeometry(): THREE.BufferGeometry {

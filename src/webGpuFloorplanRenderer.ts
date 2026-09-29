@@ -1255,6 +1255,7 @@ export class WebGpuFloorplanRenderer {
   /** Per kind, canonical run indices sorted by their first primitive. */
   private runLookup: CanonicalRunLookup | null = null;
   private orderedInstanceBuffer: any = null;
+  private orderedInstanceCapacityBytes = 0;
   private scene: VectorScene | null = null;
   private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
   private paintCompositor: WebGpuPaintCompositor | null = null;
@@ -1929,7 +1930,7 @@ export class WebGpuFloorplanRenderer {
     this.vectorLodMode = nextMode;
     if (this.scene) {
       const vectorLodActive = this.rebuildVectorLod(this.scene);
-      this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
+      this.grid = !vectorLodActive && !this.scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
     }
 
     this.needsVisibleSetUpdate = true;
@@ -2346,7 +2347,6 @@ export class WebGpuFloorplanRenderer {
       }
     }
 
-    const segmentDims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
@@ -2370,6 +2370,9 @@ export class WebGpuFloorplanRenderer {
     );
 
     this.destroyDataResources();
+    const vectorLodActive = this.prepareVectorLod(scene);
+    const strokeScene = this.orderedBatches?.strokeScene ?? scene;
+    const segmentDims = chooseTextureDimensions(strokeScene.segmentCount, maxTextureSize);
     let textCpuPayload: NativeTextUploadArrays;
     try {
       textCpuPayload = prepareNativeTextUploadArrays(
@@ -2411,10 +2414,10 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureWidth = textSegmentDims.width;
     this.textGlyphSegmentTextureHeight = textSegmentDims.height;
 
-    this.segmentTextureA = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.endpoints);
-    this.segmentTextureB = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.primitiveMeta);
-    this.segmentTextureC = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.styles);
-    this.segmentTextureD = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.primitiveBounds);
+    this.segmentTextureA = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.endpoints);
+    this.segmentTextureB = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.primitiveMeta);
+    this.segmentTextureC = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.styles);
+    this.segmentTextureD = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.primitiveBounds);
 
     this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
     this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
@@ -2479,13 +2482,17 @@ export class WebGpuFloorplanRenderer {
     }
     this.configureGradientPaint(scene, maxTextureSize);
 
-    this.allSegmentIds = new Uint32Array(this.segmentCount);
-    for (let i = 0; i < this.segmentCount; i += 1) {
+    // Plain ordered draws already carry IDs in the instance plan. Compositor
+    // partial spans and soft masks still need exact canonical identity IDs.
+    const legacySegmentCount = scene.drawRuns ? 0 : this.segmentCount;
+    const identitySegmentCount = this.scenePaintVisibility.requiresCompositing ? this.segmentCount : legacySegmentCount;
+    this.allSegmentIds = new Uint32Array(identitySegmentCount);
+    for (let i = 0; i < identitySegmentCount; i += 1) {
       this.allSegmentIds[i] = i;
     }
 
-    this.ensureSegmentIdBuffers(Math.max(1, this.segmentCount));
-    if (this.segmentCount > 0) {
+    this.ensureSegmentIdBuffers(Math.max(1, identitySegmentCount));
+    if (identitySegmentCount > 0) {
       this.gpuDevice.queue.writeBuffer(this.segmentIdBufferAll, 0, this.allSegmentIds);
       this.gpuDevice.queue.writeBuffer(this.segmentIdBufferVisible, 0, this.allSegmentIds);
     }
@@ -2575,80 +2582,22 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
-    this.strokeBindGroupAll = this.gpuDevice.createBindGroup({
-      layout: this.strokePipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
-        },
-        {
-          binding: 1,
-          resource: this.segmentTextureA.createView()
-        },
-        {
-          binding: 2,
-          resource: this.segmentTextureB.createView()
-        },
-        {
-          binding: 3,
-          resource: this.segmentTextureC.createView()
-        },
-        {
-          binding: 4,
-          resource: this.segmentTextureD.createView()
-        },
-        {
-          binding: 5,
-          resource: { buffer: this.segmentIdBufferAll }
-        }
-      ]
-    });
+    this.refreshStrokeBindGroups();
 
-    this.strokeBindGroupVisible = this.gpuDevice.createBindGroup({
-      layout: this.strokePipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
-        },
-        {
-          binding: 1,
-          resource: this.segmentTextureA.createView()
-        },
-        {
-          binding: 2,
-          resource: this.segmentTextureB.createView()
-        },
-        {
-          binding: 3,
-          resource: this.segmentTextureC.createView()
-        },
-        {
-          binding: 4,
-          resource: this.segmentTextureD.createView()
-        },
-        {
-          binding: 5,
-          resource: { buffer: this.segmentIdBufferVisible }
-        }
-      ]
-    });
-
-    if (this.visibleSegmentIds.length < this.segmentCount) {
-      this.visibleSegmentIds = new Uint32Array(this.segmentCount);
+    if (scene.drawRuns || this.visibleSegmentIds.length < legacySegmentCount) {
+      this.visibleSegmentIds = new Uint32Array(legacySegmentCount);
     }
 
-    if (this.segmentMarks.length < this.segmentCount) {
-      this.segmentMarks = new Uint32Array(this.segmentCount);
+    if (scene.drawRuns || this.segmentMarks.length < legacySegmentCount) {
+      this.segmentMarks = new Uint32Array(legacySegmentCount);
       this.markToken = 1;
     }
 
     this.visibleSegmentCount = this.segmentCount;
     this.usingAllSegments = true;
 
-    const vectorLodActive = this.rebuildVectorLod(scene);
-    this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.uploadVectorLodLevels();
+    this.grid = !vectorLodActive && !scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
 
     this.orderedTextLod = scene.drawRuns && textLodUploadData ? new OrderedTextLodSelection(scene, textLodUploadData) : null;
     if (this.orderedTextLod && textLodUploadData) this.orderedRunCuller?.includeTextLod(textLodUploadData);
@@ -3705,13 +3654,32 @@ export class WebGpuFloorplanRenderer {
       const bounds = index >= 0 ? this.vectorClipBounds.subarray(index * 4, index * 4 + 4) : UNBOUNDED_VECTOR_CLIP_BOUNDS;
       this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0, ...bounds]));
       this.vectorClipBuffers.push(buffer);
-      this.vectorClipBindGroups.push(this.gpuDevice.createBindGroup({ layout: this.vectorClipBindGroupLayout, entries: [
-        { binding: 0, resource: this.vectorClipTexture.createView() },
+    }
+    this.refreshVectorClipBindGroups();
+    this.vectorClipIndex = -1;
+  }
+
+  private refreshVectorClipBindGroups(): void {
+    const view = this.vectorClipTexture.createView();
+    this.vectorClipBindGroups = this.vectorClipBuffers.map(buffer => this.gpuDevice.createBindGroup({
+      layout: this.vectorClipBindGroupLayout, entries: [
+        { binding: 0, resource: view },
         { binding: 1, resource: { buffer } },
         { binding: 2, resource: { buffer: this.orderedInstanceBuffer } }
-      ] }));
+      ]
+    }));
+  }
+
+  private growOrderedInstanceBuffer(byteLength: number): void {
+    if (byteLength > this.orderedInstanceCapacityBytes) {
+      const usage = (globalThis as any).GPUBufferUsage;
+      this.orderedInstanceBuffer?.destroy();
+      this.orderedInstanceCapacityBytes = Math.max(8, byteLength);
+      this.orderedInstanceBuffer = this.gpuDevice.createBuffer({
+        size: this.orderedInstanceCapacityBytes, usage: usage.STORAGE | usage.COPY_DST
+      });
+      this.refreshVectorClipBindGroups();
     }
-    this.vectorClipIndex = -1;
   }
 
   private bindVectorClip(pass: any): void {
@@ -3720,7 +3688,6 @@ export class WebGpuFloorplanRenderer {
 
   private drawSourceOrderedContentIntoPass(pass: any): number {
     this.vectorClipIndex = -1;
-    this.drawPageBackgroundContentIntoPass(pass);
     let strokes = 0;
     const candidates = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
     const visibility = this.optionalContentVisibility;
@@ -3734,8 +3701,12 @@ export class WebGpuFloorplanRenderer {
     const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {
+      this.growOrderedInstanceBuffer(plan.uintInstances.byteLength);
       this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
     }
+    // Grow/rebind before recording any draws: even page backgrounds bind the
+    // instance store through the shared clip layout.
+    this.drawPageBackgroundContentIntoPass(pass);
     const draw = (run: NonNullable<VectorScene["drawRuns"]>[number], multiplyPass?: 0 | 1): void => {
       this.vectorClipIndex = run.clipIndex ?? -1;
       const pipeline = run.kind === "fill" && this.fillRenderingEnabled ? this.fillPipeline
@@ -4076,8 +4047,8 @@ export class WebGpuFloorplanRenderer {
     viewportHeightPx: number = this.canvas.height,
     zoomValue: number = this.zoom
   ): void {
-    if (!this.scene || !this.grid) {
-      this.visibleSegmentCount = 0;
+    if (!this.scene || !this.grid || this.orderedBatches) {
+      this.visibleSegmentCount = this.scene && this.orderedBatches ? this.segmentCount : 0;
       this.usingAllSegments = true;
       return;
     }
@@ -4212,6 +4183,14 @@ export class WebGpuFloorplanRenderer {
       }
       const drawCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
       if (drawCount > 0) {
+        if (drawCount * 4 > resource.visibleSegmentIdBuffer.size) {
+          const capacity = Math.min(runtimeLevel.segmentCount,
+            Math.max(drawCount, Math.ceil(resource.visibleSegmentIdBuffer.size / 4 * 1.5)));
+          resource.visibleSegmentIdBuffer.destroy();
+          resource.visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(capacity, false);
+          resource.bindGroup = this.createStrokeBindGroup(resource.textureA, resource.textureB,
+            resource.textureC, resource.textureD, resource.visibleSegmentIdBuffer);
+        }
         this.gpuDevice.queue.writeBuffer(
           resource.visibleSegmentIdBuffer,
           0,
@@ -4222,6 +4201,32 @@ export class WebGpuFloorplanRenderer {
   }
 
   private rebuildVectorLod(scene: VectorScene): boolean {
+    this.destroyVectorLodResources();
+    const active = this.prepareVectorLod(scene);
+    const strokeScene = this.orderedBatches?.strokeScene ?? scene;
+    const dims = chooseTextureDimensions(strokeScene.segmentCount, this.maxTextureSize());
+    for (const texture of [this.segmentTextureA, this.segmentTextureB, this.segmentTextureC, this.segmentTextureD]) {
+      texture?.destroy();
+    }
+    this.segmentTextureWidth = dims.width;
+    this.segmentTextureHeight = dims.height;
+    this.segmentTextureA = this.createFloatTexture(dims.width, dims.height, strokeScene.endpoints);
+    this.segmentTextureB = this.createFloatTexture(dims.width, dims.height, strokeScene.primitiveMeta);
+    this.segmentTextureC = this.createFloatTexture(dims.width, dims.height, strokeScene.styles);
+    this.segmentTextureD = this.createFloatTexture(dims.width, dims.height, strokeScene.primitiveBounds);
+    this.refreshStrokeBindGroups();
+    this.uploadVectorLodLevels();
+    return active;
+  }
+
+  private refreshStrokeBindGroups(): void {
+    this.strokeBindGroupAll = this.createStrokeBindGroup(this.segmentTextureA, this.segmentTextureB,
+      this.segmentTextureC, this.segmentTextureD, this.segmentIdBufferAll);
+    this.strokeBindGroupVisible = this.createStrokeBindGroup(this.segmentTextureA, this.segmentTextureB,
+      this.segmentTextureC, this.segmentTextureD, this.segmentIdBufferVisible);
+  }
+
+  private prepareVectorLod(scene: VectorScene): boolean {
     if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
       this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
@@ -4236,18 +4241,17 @@ export class WebGpuFloorplanRenderer {
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
     this.orderedInstanceBuffer?.destroy();
     const usage = (globalThis as any).GPUBufferUsage;
+    this.orderedInstanceCapacityBytes = Math.max(8, this.orderedBatches?.uintInstances.byteLength ?? 0);
     this.orderedInstanceBuffer = this.gpuDevice.createBuffer({
-      size: Math.max(8, this.orderedBatches?.uintInstances.byteLength ?? 0), usage: usage.STORAGE | usage.COPY_DST
+      size: this.orderedInstanceCapacityBytes, usage: usage.STORAGE | usage.COPY_DST
     });
     this.uploadVectorClips(scene);
 
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
-      this.destroyVectorLodResources();
       this.vectorLodRuntime = null;
       return false;
     }
 
-    this.uploadVectorLodLevels();
     return this.vectorLodRuntime.levels.length > 1;
   }
 
@@ -4259,24 +4263,22 @@ export class WebGpuFloorplanRenderer {
 
     const maxTextureSize = this.maxTextureSize();
     if (this.orderedBatches) {
-      const scene = this.orderedBatches.strokeScene;
-      const dims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
-      const textureA = this.createFloatTexture(dims.width, dims.height, scene.endpoints);
-      const textureB = this.createFloatTexture(dims.width, dims.height, scene.primitiveMeta);
-      const textureC = this.createFloatTexture(dims.width, dims.height, scene.styles);
-      const textureD = this.createFloatTexture(dims.width, dims.height, scene.primitiveBounds);
-      // Ordered shaders obtain IDs from group 1; group 0 retains a valid dummy
-      // binding for the legacy stroke shader branch.
+      // Canonical IDs are the prefix of the combined store. Both exact and
+      // ordered draws share its textures rather than retaining two base copies.
+      const textureA = this.segmentTextureA, textureB = this.segmentTextureB;
+      const textureC = this.segmentTextureC, textureD = this.segmentTextureD;
+      // Ordered shaders obtain IDs from group 1; canonical compositor spans
+      // use the exact identity binding already present in group 0.
       const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(1, false);
       this.vectorLodLevelResources.push({ textureA, textureB, textureC, textureD,
-        textureWidth: dims.width, textureHeight: dims.height, ownsTextures: true, visibleSegmentIdBuffer,
-        bindGroup: this.createStrokeBindGroup(textureA, textureB, textureC, textureD, visibleSegmentIdBuffer) });
+        textureWidth: this.segmentTextureWidth, textureHeight: this.segmentTextureHeight,
+        ownsTextures: false, visibleSegmentIdBuffer, bindGroup: this.strokeBindGroupAll });
       return;
     }
 
     for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
       const level = this.vectorLodRuntime.levels[levelIndex];
-      const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(Math.max(1, level.segmentCount), false);
+      const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(1, false);
       if (levelIndex === 0) {
         this.vectorLodLevelResources.push({
           textureA: this.segmentTextureA,
@@ -4364,6 +4366,14 @@ export class WebGpuFloorplanRenderer {
   }
 
   private buildSegmentBounds(scene: VectorScene): void {
+    if (scene.drawRuns) {
+      // VectorDrawRunCuller and the ordered plan own this scene's visibility.
+      this.segmentMinX = new Float32Array(0);
+      this.segmentMinY = new Float32Array(0);
+      this.segmentMaxX = new Float32Array(0);
+      this.segmentMaxY = new Float32Array(0);
+      return;
+    }
     if (this.segmentMinX.length < this.segmentCount) {
       this.segmentMinX = new Float32Array(this.segmentCount);
       this.segmentMinY = new Float32Array(this.segmentCount);
@@ -4815,8 +4825,7 @@ export class WebGpuFloorplanRenderer {
       usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
     });
 
-    const padded = createPaddedFloatTextureData(source, width, height);
-    this.writeFloatTexture(texture, width, height, padded);
+    this.writeFloatTexture(texture, width, height, source);
 
     return texture;
   }
@@ -4886,44 +4895,36 @@ export class WebGpuFloorplanRenderer {
   }
 
   private writeFloatTexture(texture: any, width: number, height: number, data: Float32Array): void {
-    const bytesPerRowUnpadded = width * 16;
-    const bytesPerRowAligned = alignTo(bytesPerRowUnpadded, 256);
-
-    if (height <= 1 && bytesPerRowUnpadded === bytesPerRowAligned) {
+    const expectedLength = width * height * 4;
+    if (data.length > expectedLength) {
+      throw new Error(`Texture source data exceeds texture size (${data.length} > ${expectedLength}).`);
+    }
+    // writeTexture does not require the 256-byte row alignment of buffer-to-
+    // texture copies. Newly allocated texture texels are zero-initialized, so
+    // upload the existing rows directly and leave the unused suffix untouched.
+    const rowLength = width * 4;
+    const fullRows = Math.floor(data.length / rowLength);
+    const batchRows = Math.max(1, Math.floor(4 * 1024 * 1024 / (rowLength * 4)));
+    for (let row = 0; row < fullRows; row += batchRows) {
+      const rows = Math.min(batchRows, fullRows - row);
       this.gpuDevice.queue.writeTexture(
-        { texture },
-        data,
-        { offset: 0 },
-        { width, height, depthOrArrayLayers: 1 }
+        { texture, origin: [0, row] },
+        data.subarray(row * rowLength, (row + rows) * rowLength),
+        { bytesPerRow: rowLength * 4 },
+        { width, height: rows, depthOrArrayLayers: 1 }
       );
-      return;
     }
-
-    if (bytesPerRowUnpadded === bytesPerRowAligned) {
-      this.gpuDevice.queue.writeTexture(
-        { texture },
-        data,
-        { offset: 0, bytesPerRow: bytesPerRowUnpadded, rowsPerImage: height },
-        { width, height, depthOrArrayLayers: 1 }
-      );
-      return;
+    const remainder = data.length - fullRows * rowLength;
+    if (remainder > 0) {
+      let tail = data.subarray(fullRows * rowLength);
+      if (remainder % 4 !== 0) {
+        const padded = new Float32Array(Math.ceil(remainder / 4) * 4);
+        padded.set(tail);
+        tail = padded;
+      }
+      this.gpuDevice.queue.writeTexture({ texture, origin: [0, fullRows] }, tail, {},
+        { width: tail.length / 4, height: 1, depthOrArrayLayers: 1 });
     }
-
-    const srcBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    const paddedBytes = new Uint8Array(bytesPerRowAligned * height);
-
-    for (let row = 0; row < height; row += 1) {
-      const srcOffset = row * bytesPerRowUnpadded;
-      const dstOffset = row * bytesPerRowAligned;
-      paddedBytes.set(srcBytes.subarray(srcOffset, srcOffset + bytesPerRowUnpadded), dstOffset);
-    }
-
-    this.gpuDevice.queue.writeTexture(
-      { texture },
-      paddedBytes,
-      { offset: 0, bytesPerRow: bytesPerRowAligned, rowsPerImage: height },
-      { width, height, depthOrArrayLayers: 1 }
-    );
   }
 
   private writeRgba8Texture(texture: any, width: number, height: number, data: Uint8Array, mipLevel = 0): void {
@@ -5294,17 +5295,6 @@ export class WebGpuFloorplanRenderer {
       y: Math.max(1e-6, scaleY)
     };
   }
-}
-
-function createPaddedFloatTextureData(source: Float32Array, width: number, height: number): Float32Array {
-  const expectedLength = width * height * 4;
-  if (source.length > expectedLength) {
-    throw new Error(`Texture source data exceeds texture size (${source.length} > ${expectedLength}).`);
-  }
-
-  const padded = new Float32Array(expectedLength);
-  padded.set(source);
-  return padded;
 }
 
 function createPaddedByteTextureData(source: Uint8Array, width: number, height: number, bytesPerPixel = 4): Uint8Array {

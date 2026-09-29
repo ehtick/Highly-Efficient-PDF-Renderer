@@ -7,6 +7,7 @@ import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 import { VectorRunClipElision } from "./vectorRunClipElision";
+import { getCombinedVectorStrokeLodStorage } from "./vectorStrokeLodStorage";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -32,8 +33,21 @@ export class VectorOrderedBatches {
    */
   readonly scheduledRuns: Uint8Array;
   private readonly scheduledSpanPrefix: Uint32Array;
-  readonly floatInstances: Float32Array;
-  readonly uintInstances: Uint32Array;
+  private floatInstanceData = new Float32Array(0);
+  private uintInstanceData = new Uint32Array(2);
+  private floatInstancesDirty = true;
+  /** WebGPU consumes integer IDs directly; create the WebGL copy only on demand. */
+  get floatInstances(): Float32Array {
+    if (this.floatInstanceData.length < this.uintInstanceData.length) {
+      this.floatInstanceData = new Float32Array(this.uintInstanceData.length);
+    }
+    if (this.floatInstancesDirty) {
+      this.floatInstanceData.set(this.uintInstanceData.subarray(0, this.instanceCount * 2));
+      this.floatInstancesDirty = false;
+    }
+    return this.floatInstanceData;
+  }
+  get uintInstances(): Uint32Array { return this.uintInstanceData; }
   readonly strokeScene: VectorScene;
   readonly cullingPadding: number;
   instanceCount = 0;
@@ -45,13 +59,13 @@ export class VectorOrderedBatches {
   private readonly runIndices = new Map<VectorDrawRun, number>();
   private readonly rankToId: Uint32Array;
   private readonly idToRank: Uint32Array;
-  private readonly rankRun: Uint32Array;
+  private readonly runRankOffsets: Uint32Array;
   private readonly offsets: number[] = [];
-  private readonly selectedRanks: Uint32Array;
+  private selectedRanks = new Uint32Array(0);
   private readonly selectedRankBits: Uint32Array;
   private readonly selectedRankWords: Uint32Array;
   private orderedSelectedCount = 0;
-  private readonly previousSelectedIds: Uint32Array;
+  private previousSelectedIds = new Uint32Array(0);
   private previousSelectedCount = 0;
   private readonly sourceRuns: readonly VectorDrawRun[];
   private readonly runRanges: Uint32Array;
@@ -60,7 +74,7 @@ export class VectorOrderedBatches {
   private readonly segments: Uint32Array | null;
   private readonly clipElision: VectorRunClipElision | null;
   private readonly redundancy: VectorStrokeRedundancy;
-  private readonly redundancyIds: Uint32Array;
+  private redundancyIds = new Uint32Array(0);
   private redundancyEnabled = true;
   private previousSelectedRanks = new Uint32Array(0);
   private previousRankCount = 0;
@@ -90,30 +104,40 @@ export class VectorOrderedBatches {
     // share the same draw, in the original paint order.
     this.strokeScene = scene;
     if (runtime) {
-      const combined = { ...scene, segmentCount: total };
-      for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"] as const) {
-        combined[key] = new Float32Array(total * 4);
-        levels.forEach((level, index) => combined[key].set(level.scene[key], this.offsets[index] * 4));
-      }
-      this.strokeScene = combined;
+      this.strokeScene = getCombinedVectorStrokeLodStorage(scene, runtime.levels).scene;
     }
-    this.rankToId = Uint32Array.from({ length: total }, (_, index) => index);
+    this.rankToId = new Uint32Array(total);
     this.idToRank = new Uint32Array(total);
-    this.rankRun = new Uint32Array(total);
-    this.selectedRanks = new Uint32Array(total);
+    this.runRankOffsets = new Uint32Array(runs.length + 1);
     this.selectedRankBits = new Uint32Array(Math.ceil(total / 32));
     this.selectedRankWords = new Uint32Array(Math.ceil(this.selectedRankBits.length / 32));
-    this.previousSelectedIds = new Uint32Array(total);
     const origins = new Uint32Array(total);
     levels.forEach((level, index) => {
       origins.set(strokePaintOrigins(level.scene)!, this.offsets[index]);
     });
-    this.rankToId.sort((a, b) => sourceRun[origins[a]] - sourceRun[origins[b]] || origins[a] - origins[b] || a - b);
+    // Stable counting scatter gives the same (paint run, source origin, ID)
+    // order as comparison sorting millions of IDs, with bounded typed scratch.
+    const originRanks = new Uint32Array(scene.segmentCount);
+    for (let id = 0; id < total; id++) originRanks[origins[id]]++;
+    for (let origin = 0; origin < originRanks.length; origin++) {
+      this.runRankOffsets[sourceRun[origin] + 1] += originRanks[origin];
+    }
+    for (let index = 1; index < this.runRankOffsets.length; index++) {
+      this.runRankOffsets[index] += this.runRankOffsets[index - 1];
+    }
+    const nextRunRank = this.runRankOffsets.slice(0, -1);
+    for (let origin = 0; origin < originRanks.length; origin++) {
+      const run = sourceRun[origin], count = originRanks[origin];
+      originRanks[origin] = nextRunRank[run];
+      nextRunRank[run] += count;
+    }
     const strokeSourceRuns = new Uint32Array(total);
-    this.rankToId.forEach((id, rank) => {
+    for (let id = 0; id < total; id++) {
+      const origin = origins[id], rank = originRanks[origin]++;
+      this.rankToId[rank] = id;
       this.idToRank[id] = rank;
-      this.rankRun[rank] = strokeSourceRuns[id] = sourceRun[origins[id]];
-    });
+      strokeSourceRuns[id] = sourceRun[origin];
+    }
     // Paints reorder only within a compositor span. A page that never reaches
     // the compositor is one span whatever its graph says, so it keeps the whole
     // page to reorder in.
@@ -124,11 +148,7 @@ export class VectorOrderedBatches {
     this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns, this.segments);
     this.clipElision = VectorRunClipElision.create(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
-    this.redundancyIds = new Uint32Array(total);
     this.scheduledRuns = new Uint8Array(runs.length);
-    const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
-    this.floatInstances = new Float32Array(capacity);
-    this.uintInstances = new Uint32Array(capacity);
   }
 
   /** Number of complete canonical runs represented by a span interval. */
@@ -171,6 +191,9 @@ export class VectorOrderedBatches {
     let selectedCount = 0;
     let sameIds = this.initialized;
     if (this.runtime) {
+      const capacity = this.runtime.levels.reduce((sum, level) => sum + level.visibleSegmentCount, 0);
+      this.previousSelectedIds = growUint32(this.previousSelectedIds, capacity, this.idToRank.length, true);
+      this.selectedRanks = growUint32(this.selectedRanks, capacity, this.idToRank.length);
       this.runtime.levels.forEach((level, index) => {
         const offset = this.offsets[index];
         for (let i = 0; i < level.visibleSegmentCount; i++) {
@@ -248,9 +271,9 @@ export class VectorOrderedBatches {
       this.scheduledSpanPrefix[(this.segments?.[runIndex] ?? 0) + 1]++;
       let first = run.first, count = run.count;
       if (run.kind === "stroke" && this.runtime) {
-        while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] < runIndex) cursor++;
+        while (cursor < selectedCount && this.selectedRanks[cursor] < this.runRankOffsets[runIndex]) cursor++;
         first = cursor;
-        while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] === runIndex) cursor++;
+        while (cursor < selectedCount && this.selectedRanks[cursor] < this.runRankOffsets[runIndex + 1]) cursor++;
         count = cursor - first;
       }
       if (run.kind === "text" && this.textSelection) {
@@ -265,7 +288,16 @@ export class VectorOrderedBatches {
     for (let span = 1; span < this.scheduledSpanPrefix.length; span++) {
       this.scheduledSpanPrefix[span] += this.scheduledSpanPrefix[span - 1];
     }
+    let strokeCount = 0, instanceCapacity = 0;
+    for (const runIndex of this.visiblePaints) {
+      const kind = this.sourceRuns[runIndex].kind;
+      const count = this.runRanges[runIndex * 2 + 1];
+      if (kind === "stroke") strokeCount += count;
+      if (kind === "stroke" || kind === "fill" || kind === "text") instanceCapacity += count;
+    }
+    this.uintInstanceData = growUint32(this.uintInstanceData, instanceCapacity * 2);
     if (this.redundancyEnabled) {
+      this.redundancyIds = growUint32(this.redundancyIds, strokeCount, this.rankToId.length);
       let count = 0;
       for (const runIndex of this.visiblePaints) {
         const run = this.sourceRuns[runIndex];
@@ -313,7 +345,7 @@ export class VectorOrderedBatches {
           this.batchSegments[this.batches.length - 1] === segment) previous.count += retainedCount;
       else this.pushBatch({ kind: run.kind, first, count: retainedCount, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) }, segment);
     }
-    this.floatInstances.set(this.uintInstances.subarray(0, this.instanceCount * 2));
+    this.floatInstancesDirty = true;
     return true;
   }
 
@@ -329,4 +361,12 @@ export class VectorOrderedBatches {
     this.uintInstances[offset + 1] = clipCode;
     this.instanceCount++;
   }
+}
+
+/** Selection buffers follow the visible set instead of every dormant LOD level. */
+function growUint32(values: Uint32Array<ArrayBuffer>, count: number, limit = Infinity, preserve = false): Uint32Array<ArrayBuffer> {
+  if (values.length >= count) return values;
+  const grown = new Uint32Array(Math.min(limit, Math.max(count, values.length * 2, 256)));
+  if (preserve) grown.set(values);
+  return grown;
 }

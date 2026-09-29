@@ -1,3 +1,6 @@
+import {
+  CompactStrokeIntervalGroups, type StrokeIntervalPrimitive as StrokePrimitive, type StrokeIntervalGroup as IntervalGroup
+} from "./vectorStrokeIntervalGroups";
 import { strokePaintGroups, strokePaintOrigins, setStrokePaintOrigins } from "./vectorStrokePaintOrder";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
@@ -175,50 +178,6 @@ export interface RuntimeVectorStrokeLodLevel extends RuntimeStrokeTileBuckets {
   segmentCount: number;
 }
 
-interface StrokePrimitive {
-  paintOrder?: number;
-  paintGroup?: number;
-  x0: number;
-  y0: number;
-  cx: number;
-  cy: number;
-  x1: number;
-  y1: number;
-  primitiveType: number;
-  halfWidth: number;
-  flags: number;
-  alpha: number;
-  colorR: number;
-  colorG: number;
-  colorB: number;
-  /** Exact fragment clip; only set for primitives carrying the clipped flag. */
-  visibleBounds?: Bounds;
-}
-
-interface IntervalGroup {
-  paintOrder?: number;
-  paintGroup?: number;
-  tileIndex: number;
-  axisX: number;
-  axisY: number;
-  normalX: number;
-  normalY: number;
-  offset: number;
-  offsetSum: number;
-  offsetWeightSum: number;
-  clipMinX: number;
-  clipMinY: number;
-  clipMaxX: number;
-  clipMaxY: number;
-  halfWidth: number;
-  flags: number;
-  alpha: number;
-  colorR: number;
-  colorG: number;
-  colorB: number;
-  intervals: number[];
-}
-
 interface DenseStrokeGroup {
   /** Retain exact source IDs until the group is large enough to aggregate. */
   members: number[];
@@ -259,43 +218,88 @@ let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
 
 const prebuiltRuntimeByScene = new WeakMap<VectorScene, VectorStrokeLodRuntime[]>();
 
+// Fixed-size chunks avoid repeatedly doubling and copying multi-million-stroke
+// buffers. Finalization releases each chunk as it copies into the exact-sized
+// result, so only one attribute is consolidated at a time.
 class Float4Builder {
+  private readonly chunks: Float32Array[] = [];
   private data: Float32Array;
+  private offset = 0;
   private length = 0;
 
   constructor(initialQuads = 16_384) {
-    this.data = new Float32Array(Math.max(1, initialQuads) * 4);
+    this.data = new Float32Array(Math.max(1, Math.min(initialQuads, 65_536)) * 4);
   }
 
   get quadCount(): number {
-    return this.length >> 2;
+    return this.length / 4;
   }
 
   push(a: number, b: number, c: number, d: number): void {
-    this.ensureCapacity(4);
-    const offset = this.length;
+    if (this.offset === this.data.length) {
+      this.chunks.push(this.data);
+      this.data = new Float32Array(this.data.length);
+      this.offset = 0;
+    }
+    const offset = this.offset;
     this.data[offset] = a;
     this.data[offset + 1] = b;
     this.data[offset + 2] = c;
     this.data[offset + 3] = d;
+    this.offset += 4;
     this.length += 4;
   }
 
   toTypedArray(): Float32Array {
-    return this.data.slice(0, this.length);
+    if (this.chunks.length === 0 && this.offset === this.data.length) return this.data;
+    const result = new Float32Array(this.length);
+    let offset = 0;
+    for (let i = 0; i < this.chunks.length; i++) {
+      const chunk = this.chunks[i];
+      result.set(chunk, offset);
+      offset += chunk.length;
+      this.chunks[i] = new Float32Array(0);
+    }
+    result.set(this.data.subarray(0, this.offset), offset);
+    this.chunks.length = 0;
+    this.data = new Float32Array(0);
+    return result;
+  }
+}
+
+/** Source paint IDs need four bytes each, not a growing JavaScript number array. */
+class StrokeOriginBuilder {
+  private readonly chunks: Uint32Array[] = [];
+  private data: Uint32Array;
+  private offset = 0;
+  private length = 0;
+
+  constructor(initialCount: number) {
+    this.data = new Uint32Array(Math.max(1, Math.min(initialCount, 65_536)));
   }
 
-  private ensureCapacity(extraFloats: number): void {
-    if (this.length + extraFloats <= this.data.length) {
-      return;
+  push(value: number): void {
+    if (this.offset === this.data.length) {
+      this.chunks.push(this.data);
+      this.data = new Uint32Array(this.data.length);
+      this.offset = 0;
     }
-    let nextLength = this.data.length;
-    while (this.length + extraFloats > nextLength) {
-      nextLength *= 2;
+    this.data[this.offset++] = value;
+    this.length++;
+  }
+
+  toTypedArray(): Uint32Array {
+    const result = new Uint32Array(this.length);
+    let offset = 0;
+    for (let i = 0; i < this.chunks.length; i++) {
+      result.set(this.chunks[i], offset);
+      offset += this.chunks[i].length;
+      this.chunks[i] = new Uint32Array(0);
     }
-    const next = new Float32Array(nextLength);
-    next.set(this.data);
-    this.data = next;
+    result.set(this.data.subarray(0, this.offset), offset);
+    this.chunks.length = 0;
+    this.data = new Uint32Array(0);
+    return result;
   }
 }
 
@@ -305,8 +309,7 @@ const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
 const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
 const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const STROKE_STYLE_FLAG_OFFSET = 2;
-const ANGLE_BIN_COUNT = 720;
-const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
+const ANGLE_STEP = Math.PI / 720;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
 // Prefer overview levels within four times the normal tolerance. Dense views
@@ -1284,7 +1287,7 @@ async function buildSimplifiedStrokeSceneAsync(
   }
 
   const grid = createTileGrid(scene.bounds, tolerance);
-  const groups = new Map<string, IntervalGroup>();
+  const groups = new CompactStrokeIntervalGroups(tolerance, overview, index => readStrokePrimitive(scene, index));
   const densityGroups = !overview && !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
     ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -1292,9 +1295,14 @@ async function buildSimplifiedStrokeSceneAsync(
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
   const styles = new Float4Builder(Math.min(segmentCount, 65_536));
   const outBounds = createEmptyBounds();
-  const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
+  const paintOrigins = strokePaintOrigins(scene) ? new StrokeOriginBuilder(segmentCount) : undefined;
   let maxHalfWidth = 0;
   let densityR = NaN, densityG = NaN, densityB = NaN;
+  const streamPaintGroups = canStreamStrokePaintGroups(scene);
+  let previousPaintGroup: number | undefined;
+  // The original density admission limit spans the whole ordered scene. A
+  // completed paint can release its groups without admitting extra groups.
+  let completedDensityGroupCount = 0;
 
   for (let index = 0; index < segmentCount; index += 1) {
     if ((index & 4095) === 0) {
@@ -1305,10 +1313,12 @@ async function buildSimplifiedStrokeSceneAsync(
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
-    // before a differently colored exact mark can cover it in source order.
-    if ((densityGroups || overview) && !scene.drawRuns && (primitive.colorR !== densityR ||
-        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+    // Paint groups occupy consecutive source ranges and never merge with
+    // each other. Release each completed group instead of retaining the entire
+    // document's maps. Legacy scenes still flush only at color barriers.
+    const paintGroupChanged = streamPaintGroups && primitive.paintGroup !== previousPaintGroup;
+    if (paintGroupChanged || ((densityGroups || overview) && !scene.drawRuns &&
+        (primitive.colorR !== densityR || primitive.colorG !== densityG || primitive.colorB !== densityB))) {
       let completedGroups = 0;
       for (const group of densityGroups?.values() ?? []) {
         emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
@@ -1319,7 +1329,7 @@ async function buildSimplifiedStrokeSceneAsync(
             `Aggregating ${formatToleranceName(tolerance)}`);
         }
       }
-      if (overview) {
+      if (overview || paintGroupChanged) {
         for (const group of groups.values()) {
           emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
           if ((++completedGroups & 1023) === 0) {
@@ -1330,13 +1340,15 @@ async function buildSimplifiedStrokeSceneAsync(
         }
         groups.clear();
       }
+      if (paintGroupChanged) completedDensityGroupCount += densityGroups?.size ?? 0;
       densityGroups?.clear();
+      previousPaintGroup = primitive.paintGroup;
       densityR = primitive.colorR;
       densityG = primitive.colorG;
       densityB = primitive.colorB;
     }
     if (overview && shouldDropOverviewPrimitive(primitive, tolerance)) continue;
-    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance, completedDensityGroupCount)) {
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
@@ -1363,8 +1375,7 @@ async function buildSimplifiedStrokeSceneAsync(
       scene.bounds,
       grid
     );
-    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance, overview);
-    pushGroupInterval(group, primitive, tolerance);
+    groups.add(primitive, index, tileIndex);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
   }
 
@@ -1389,12 +1400,14 @@ async function buildSimplifiedStrokeSceneAsync(
     }
   }
 
+  groups.clear();
+  densityGroups?.clear();
   if (endpoints.quadCount === 0) {
     return null;
   }
 
   return {
-    paintOrigins: paintOrigins ? Uint32Array.from(paintOrigins) : undefined,
+    paintOrigins: paintOrigins?.toTypedArray(),
     segmentCount: endpoints.quadCount,
     endpoints: endpoints.toTypedArray(),
     primitiveMeta: primitiveMeta.toTypedArray(),
@@ -1469,7 +1482,7 @@ async function buildRuntimeTileBucketsAsync(
     segmentMinY: bounds.minY,
     segmentMaxX: bounds.maxX,
     segmentMaxY: bounds.maxY,
-    visibleSegmentIds: new Uint32Array(Math.max(1, segmentCount)),
+    visibleSegmentIds: new Uint32Array(Math.max(1, Math.min(4096, segmentCount))),
     visibleSegmentCount: 0,
     markToken: 1
   };
@@ -1783,7 +1796,7 @@ export function buildRuntimeTileBuckets(scene: VectorScene, grid: RuntimeTileGri
     segmentMinY: bounds.minY,
     segmentMaxX: bounds.maxX,
     segmentMaxY: bounds.maxY,
-    visibleSegmentIds: new Uint32Array(Math.max(1, segmentCount)),
+    visibleSegmentIds: new Uint32Array(Math.max(1, Math.min(4096, segmentCount))),
     visibleSegmentCount: 0,
     markToken: 1
   };
@@ -1842,6 +1855,11 @@ function appendTileSegments(
       continue;
     }
     level.segmentMarks[segmentIndex] = level.markToken;
+    if (outCount === level.visibleSegmentIds.length) {
+      const next = new Uint32Array(Math.min(level.segmentMarks.length, Math.max(1, outCount * 2)));
+      next.set(level.visibleSegmentIds);
+      level.visibleSegmentIds = next;
+    }
     level.visibleSegmentIds[outCount] = segmentIndex;
     outCount += 1;
   }
@@ -1957,7 +1975,9 @@ function tileLevelTargetScore(tileSegments: number, targetSegmentsPerTile: numbe
   return delta >= 0 ? delta : -delta * LOD_TILE_UNDERSHOOT_SCORE_WEIGHT;
 }
 
-function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overview = false): {
+function buildSimplifiedStrokeScene(
+  scene: VectorScene, tolerance: number, overview = false
+): {
   paintOrigins?: Uint32Array;
   segmentCount: number;
   endpoints: Float32Array;
@@ -1973,7 +1993,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overv
   }
 
   const grid = createTileGrid(scene.bounds, tolerance);
-  const groups = new Map<string, IntervalGroup>();
+  const groups = new CompactStrokeIntervalGroups(tolerance, overview, index => readStrokePrimitive(scene, index));
   const densityGroups = !overview && !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
     ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -1981,36 +2001,45 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overv
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
   const styles = new Float4Builder(Math.min(segmentCount, 65_536));
   const outBounds = createEmptyBounds();
-  const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
+  const paintOrigins = strokePaintOrigins(scene) ? new StrokeOriginBuilder(segmentCount) : undefined;
   let maxHalfWidth = 0;
   let densityR = NaN, densityG = NaN, densityB = NaN;
+  const streamPaintGroups = canStreamStrokePaintGroups(scene);
+  let previousPaintGroup: number | undefined;
+  // The original density admission limit spans the whole ordered scene. A
+  // completed paint can release its groups without admitting extra groups.
+  let completedDensityGroupCount = 0;
 
   for (let index = 0; index < segmentCount; index += 1) {
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
-    // before a differently colored exact mark can cover it in source order.
-    if ((densityGroups || overview) && !scene.drawRuns && (primitive.colorR !== densityR ||
-        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+    // Paint groups occupy consecutive source ranges and never merge with
+    // each other. Release each completed group instead of retaining the entire
+    // document's maps. Legacy scenes still flush only at color barriers.
+    const paintGroupChanged = streamPaintGroups && primitive.paintGroup !== previousPaintGroup;
+    if (paintGroupChanged || ((densityGroups || overview) && !scene.drawRuns &&
+        (primitive.colorR !== densityR || primitive.colorG !== densityG || primitive.colorB !== densityB))) {
       for (const group of densityGroups?.values() ?? []) {
         emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
           tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
       }
-      if (overview) {
+      if (overview || paintGroupChanged) {
         for (const group of groups.values()) {
           emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
         }
         groups.clear();
       }
+      if (paintGroupChanged) completedDensityGroupCount += densityGroups?.size ?? 0;
       densityGroups?.clear();
+      previousPaintGroup = primitive.paintGroup;
       densityR = primitive.colorR;
       densityG = primitive.colorG;
       densityB = primitive.colorB;
     }
     if (overview && shouldDropOverviewPrimitive(primitive, tolerance)) continue;
-    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance, completedDensityGroupCount)) {
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
@@ -2037,8 +2066,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overv
       scene.bounds,
       grid
     );
-    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance, overview);
-    pushGroupInterval(group, primitive, tolerance);
+    groups.add(primitive, index, tileIndex);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
   }
 
@@ -2051,12 +2079,14 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overv
     emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
   }
 
+  groups.clear();
+  densityGroups?.clear();
   if (endpoints.quadCount === 0) {
     return null;
   }
 
   return {
-    paintOrigins: paintOrigins ? Uint32Array.from(paintOrigins) : undefined,
+    paintOrigins: paintOrigins?.toTypedArray(),
     segmentCount: endpoints.quadCount,
     endpoints: endpoints.toTypedArray(),
     primitiveMeta: primitiveMeta.toTypedArray(),
@@ -2065,6 +2095,16 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overv
     bounds: normalizeOutputBounds(outBounds, scene.bounds),
     maxHalfWidth
   };
+}
+
+/** Partial/custom draw-run tables may reuse a group after another group. */
+function canStreamStrokePaintGroups(scene: VectorScene): boolean {
+  const groups = strokePaintGroups(scene);
+  if (!groups) return false;
+  for (let index = 1; index < groups.length; index++) {
+    if (groups[index] < groups[index - 1]) return false;
+  }
+  return true;
 }
 
 function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive | null {
@@ -2126,7 +2166,7 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
  * This preserves repeated-dot coverage without inflating the vector radius.
  */
 function collectDenseStroke(
-  groups: Map<string, DenseStrokeGroup>, primitive: StrokePrimitive, index: number, tolerance: number
+  groups: Map<string, DenseStrokeGroup>, primitive: StrokePrimitive, index: number, tolerance: number, completedGroupCount = 0
 ): boolean {
   const dot = primitive.x0 === primitive.x1 && primitive.y0 === primitive.y1;
   if (primitive.primitiveType !== STROKE_PRIMITIVE_LINE || primitive.alpha !== 1 ||
@@ -2148,7 +2188,7 @@ function collectDenseStroke(
   if (!group) {
     // Resource bounds reduce optimization only: unmatched marks still emit
     // their complete source geometry through the normal preservation path.
-    if (groups.size >= LOD_DENSITY_MAX_GROUPS) return false;
+    if (completedGroupCount + groups.size >= LOD_DENSITY_MAX_GROUPS) return false;
     group = createDenseStrokeGroup();
     groups.set(key, group);
   }
@@ -2181,7 +2221,7 @@ function appendDenseStroke(group: DenseStrokeGroup, primitive: StrokePrimitive, 
 function emitDenseStrokeGroup(
   scene: VectorScene, group: DenseStrokeGroup, endpoints: Float4Builder, primitiveMeta: Float4Builder,
   primitiveBounds: Float4Builder, styles: Float4Builder, bounds: Bounds, cell: number,
-  paintOrigins?: number[], depth = 0
+  paintOrigins?: StrokeOriginBuilder, depth = 0
 ): void {
   if (group.coincident ? group.count < 2 : group.count < LOD_DENSITY_MIN_MEMBERS || depth >= 8) {
     for (const index of group.members) {
@@ -2264,100 +2304,6 @@ function shouldPreservePrimitiveAtTolerance(
     (span > 0 || (primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0);
 }
 
-function resolveIntervalGroup(
-  groups: Map<string, IntervalGroup>,
-  primitive: StrokePrimitive,
-  tileIndex: number,
-  tolerance: number,
-  overview = false
-): IntervalGroup {
-  const dx = primitive.x1 - primitive.x0;
-  const dy = primitive.y1 - primitive.y0;
-  let angle = Math.atan2(dy, dx);
-  if (angle < 0) {
-    angle += Math.PI;
-  }
-  if (angle >= Math.PI) {
-    angle -= Math.PI;
-  }
-  let angleBin = Math.round(angle / ANGLE_STEP);
-  if (angleBin >= ANGLE_BIN_COUNT) {
-    angleBin = 0;
-  }
-  const snappedAngle = angleBin * ANGLE_STEP;
-  const axisX = Math.cos(snappedAngle);
-  const axisY = Math.sin(snappedAngle);
-  const normalX = -axisY;
-  const normalY = axisX;
-  const offset = primitive.x0 * normalX + primitive.y0 * normalY;
-  const hairline = (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0;
-  // Fine LOD bounds offset rounding by 1% of pen width to preserve hatch
-  // density. Budget-oriented overview levels deliberately allow wider merges.
-  const offsetStep = !overview && !hairline && primitive.halfWidth > 0
-    ? Math.min(tolerance, primitive.halfWidth * 0.02) : tolerance;
-  const offsetKey = Math.round(offset / offsetStep);
-  const widthKey = hairline ? -1 : primitive.halfWidth;
-  const colorKey =
-    `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
-    `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
-  const flags = primitive.flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP | STROKE_STYLE_FLAG_CLIPPED);
-  // A clipped primitive's bounds are semantic fragment-clip data, not merely
-  // culling bounds. Keep distinct rectangles in distinct merge groups so an
-  // approximate LOD level cannot replace their intersection with a union.
-  const clip = primitive.visibleBounds;
-  const baseKey = `${primitive.paintGroup ?? ""}|${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
-  const key = clip
-    ? `${baseKey}|clip:${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}`
-    : baseKey;
-
-  let group = groups.get(key);
-  if (!group) {
-    group = {
-      paintOrder: primitive.paintOrder,
-      paintGroup: primitive.paintGroup,
-      tileIndex,
-      axisX,
-      axisY,
-      normalX,
-      normalY,
-      offset: offsetKey * offsetStep,
-      offsetSum: 0,
-      offsetWeightSum: 0,
-      clipMinX: Number.POSITIVE_INFINITY,
-      clipMinY: Number.POSITIVE_INFINITY,
-      clipMaxX: Number.NEGATIVE_INFINITY,
-      clipMaxY: Number.NEGATIVE_INFINITY,
-      halfWidth: primitive.halfWidth,
-      flags,
-      alpha: primitive.alpha,
-      colorR: primitive.colorR,
-      colorG: primitive.colorG,
-      colorB: primitive.colorB,
-      intervals: []
-    };
-    groups.set(key, group);
-  }
-
-  // Track the length-weighted true perpendicular offset of the group's members.
-  // Emitting merged lines at this average (instead of the quantized bucket
-  // offset) keeps regular patterns like hatching evenly spaced and makes line
-  // positions agree across LOD levels, so per-tile level mixing stays seamless.
-  const memberWeight = Math.hypot(dx, dy);
-  group.offsetSum += offset * memberWeight;
-  group.offsetWeightSum += memberWeight;
-
-  // The exact clip rectangle is part of the group key above. Repeating these
-  // min/max operations is harmless for same-rectangle members and avoids a
-  // second initialization branch without ever widening across clip regions.
-  if (clip) {
-    group.clipMinX = Math.min(group.clipMinX, clip.minX);
-    group.clipMinY = Math.min(group.clipMinY, clip.minY);
-    group.clipMaxX = Math.max(group.clipMaxX, clip.maxX);
-    group.clipMaxY = Math.max(group.clipMaxY, clip.maxY);
-  }
-  return group;
-}
-
 function emitMergedIntervals(
   group: IntervalGroup,
   endpoints: Float4Builder,
@@ -2366,7 +2312,7 @@ function emitMergedIntervals(
   styles: Float4Builder,
   bounds: Bounds,
   tolerance: number,
-  paintOrigins?: number[]
+  paintOrigins?: StrokeOriginBuilder
 ): void {
   const pairCount = group.intervals.length >> 1;
   if (pairCount <= 0) {
@@ -2377,28 +2323,24 @@ function emitMergedIntervals(
     group.offset = group.offsetSum / group.offsetWeightSum;
   }
 
-  const intervals = new Array<{start: number; end: number}>(pairCount);
-  for (let i = 0; i < pairCount; i += 1) {
-    const offset = i * 2;
-    intervals[i] = {
-      start: group.intervals[offset],
-      end: group.intervals[offset + 1]
-    };
-  }
-  intervals.sort((a, b) => a.start - b.start || a.end - b.end);
+  // Sort pair indices instead of allocating an object for every source line.
+  const intervals = group.intervals;
+  const order = new Uint32Array(pairCount);
+  for (let i = 0; i < pairCount; i += 1) order[i] = i * 2;
+  order.sort((a, b) => intervals[a] - intervals[b] || intervals[a + 1] - intervals[b + 1]);
 
   const mergeGap = tolerance * LOD_MERGE_GAP_FACTOR;
-  let currentStart = intervals[0].start;
-  let currentEnd = intervals[0].end;
-  for (let i = 1; i < intervals.length; i += 1) {
-    const interval = intervals[i];
-    if (interval.start <= currentEnd + mergeGap) {
-      currentEnd = Math.max(currentEnd, interval.end);
+  let currentStart = intervals[order[0]];
+  let currentEnd = intervals[order[0] + 1];
+  for (let i = 1; i < order.length; i += 1) {
+    const start = intervals[order[i]], end = intervals[order[i] + 1];
+    if (start <= currentEnd + mergeGap) {
+      currentEnd = Math.max(currentEnd, end);
       continue;
     }
     emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd, paintOrigins);
-    currentStart = interval.start;
-    currentEnd = interval.end;
+    currentStart = start;
+    currentEnd = end;
   }
   emitInterval(group, endpoints, primitiveMeta, primitiveBounds, styles, bounds, currentStart, currentEnd, paintOrigins);
 }
@@ -2412,7 +2354,7 @@ function emitInterval(
   bounds: Bounds,
   start: number,
   end: number,
-  paintOrigins?: number[]
+  paintOrigins?: StrokeOriginBuilder
 ): void {
   if (end <= start) {
     return;
@@ -2450,7 +2392,7 @@ function emitPrimitive(
   styles: Float4Builder,
   bounds: Bounds,
   primitive: StrokePrimitive,
-  paintOrigins?: number[]
+  paintOrigins?: StrokeOriginBuilder
 ): void {
   paintOrigins?.push(primitive.paintOrder ?? 0);
   endpoints.push(primitive.x0, primitive.y0, primitive.cx, primitive.cy);
@@ -2484,33 +2426,6 @@ function primitiveCenterX(primitive: StrokePrimitive): number {
 function primitiveCenterY(primitive: StrokePrimitive): number {
   const clip = primitive.visibleBounds;
   return clip ? (clip.minY + clip.maxY) * 0.5 : (primitive.y0 + primitive.y1) * 0.5;
-}
-
-function pushGroupInterval(group: IntervalGroup, primitive: StrokePrimitive, tolerance: number): void {
-  const startProjection = primitive.x0 * group.axisX + primitive.y0 * group.axisY;
-  const endProjection = primitive.x1 * group.axisX + primitive.y1 * group.axisY;
-  let start = Math.min(startProjection, endProjection);
-  let end = Math.max(startProjection, endProjection);
-
-  // Clipped stroke geometry keeps its full unclipped extent in the source
-  // scene; trim the LOD representative to the clip window (plus a small
-  // extension so caps and AA still reach the clip edge before the fragment
-  // discard cuts them) instead of emitting the invisible remainder.
-  const clip = primitive.visibleBounds;
-  if (clip) {
-    const p0 = clip.minX * group.axisX + clip.minY * group.axisY;
-    const p1 = clip.minX * group.axisX + clip.maxY * group.axisY;
-    const p2 = clip.maxX * group.axisX + clip.minY * group.axisY;
-    const p3 = clip.maxX * group.axisX + clip.maxY * group.axisY;
-    const extension = Math.max(primitive.halfWidth * 4, tolerance, 1e-3);
-    start = Math.max(start, Math.min(p0, p1, p2, p3) - extension);
-    end = Math.min(end, Math.max(p0, p1, p2, p3) + extension);
-    if (end <= start) {
-      return;
-    }
-  }
-
-  group.intervals.push(start, end);
 }
 
 function createTileGrid(bounds: Bounds, tolerance: number): TileGrid {

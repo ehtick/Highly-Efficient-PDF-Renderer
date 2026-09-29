@@ -2,6 +2,7 @@ import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
+import { getCombinedVectorStrokeLodStorage } from "./vectorStrokeLodStorage";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 
@@ -46,7 +47,7 @@ export class ThreeVectorLodStrokeLayer {
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
   private selectionInitialized = false;
-  private readonly combinedIds: Uint32Array | null;
+  private combinedIds: Uint32Array | null;
   private readonly levelOffsets: number[] = [];
 
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
@@ -57,18 +58,14 @@ export class ThreeVectorLodStrokeLayer {
     if (scene.drawRuns) {
       let count = 0;
       for (const level of this.runtime.levels) { this.levelOffsets.push(count); count += level.segmentCount; }
-      const combined = { ...scene, segmentCount: count };
+      const combined = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels).scene;
       const origins = new Uint32Array(count);
-      for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"] as const) {
-        combined[key] = new Float32Array(count * 4);
-        this.runtime.levels.forEach((level, index) => combined[key].set(level.scene[key], this.levelOffsets[index] * 4));
-      }
       this.runtime.levels.forEach((level, index) => origins.set(strokePaintOrigins(level.scene)!, this.levelOffsets[index]));
       const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
       drawPlan.setStrokeSource(combined, origins);
       const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
       this.layers = [layer];
-      this.combinedIds = new Uint32Array(count);
+      this.combinedIds = new Uint32Array(0);
       layer.setVisible(false); layer.setDrawEnabled(false);
       this.group.add(layer.mesh);
     } else {
@@ -194,6 +191,11 @@ export class ThreeVectorLodStrokeLayer {
   private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
     const visible = this.requestedVisible && this.group.visible;
     if (this.combinedIds) {
+      const selectedCount = visible
+        ? this.runtime.levels.reduce((sum, level) => sum + level.visibleSegmentCount, 0) : 0;
+      if (this.combinedIds.length < selectedCount) {
+        this.combinedIds = new Uint32Array(Math.max(selectedCount, this.combinedIds.length * 2, 256));
+      }
       let count = 0;
       this.runtime.levels.forEach((level, index) => {
         if (!visible) return;

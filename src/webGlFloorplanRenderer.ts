@@ -2137,7 +2137,7 @@ export class WebGlFloorplanRenderer {
     if (this.scene) {
       this.destroyVectorLodResources();
       const vectorLodActive = this.rebuildVectorLod(this.scene);
-      this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
+      this.grid = !vectorLodActive && !this.scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
       this.destroyVectorMinifyResources();
       this.needsVisibleSetUpdate = true;
       this.requestFrame();
@@ -2532,9 +2532,8 @@ export class WebGlFloorplanRenderer {
     }
     this.uploadGradientPaintData(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
-    const textureStats = this.uploadSegments(scene);
     const vectorLodActive = this.rebuildVectorLod(scene);
-    this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.grid = !vectorLodActive && !scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
     let textLodUploadData: TextLodBuildData | null = null;
     if (this.textLodMode === "auto" && textLodBuildResult?.data) {
       const data = textLodBuildResult.data;
@@ -2576,9 +2575,9 @@ export class WebGlFloorplanRenderer {
       fillPathTextureHeight: fillTextureStats.pathMetaTextureHeight,
       fillSegmentTextureWidth: fillTextureStats.segmentTextureWidth,
       fillSegmentTextureHeight: fillTextureStats.segmentTextureHeight,
-      textureWidth: textureStats.textureWidth,
-      textureHeight: textureStats.textureHeight,
-      maxTextureSize: textureStats.maxTextureSize,
+      textureWidth: this.segmentTextureWidth,
+      textureHeight: this.segmentTextureHeight,
+      maxTextureSize: this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) as number,
       textInstanceTextureWidth: textTextureStats.instanceTextureWidth,
       textInstanceTextureHeight: textTextureStats.instanceTextureHeight,
       textGlyphTextureWidth: textTextureStats.glyphMetaTextureWidth,
@@ -2587,13 +2586,21 @@ export class WebGlFloorplanRenderer {
       textSegmentTextureHeight: textTextureStats.glyphSegmentTextureHeight
     };
 
-    this.allSegmentIds = new Float32Array(this.segmentCount);
-    for (let i = 0; i < this.segmentCount; i += 1) {
+    // Plain ordered draws already carry IDs in the instance plan. Compositor
+    // partial spans and soft masks still need exact canonical identity IDs.
+    const legacySegmentCount = scene.drawRuns ? 0 : this.segmentCount;
+    const identitySegmentCount = this.scenePaintVisibility.requiresCompositing ? this.segmentCount : legacySegmentCount;
+    this.allSegmentIds = new Float32Array(identitySegmentCount);
+    for (let i = 0; i < identitySegmentCount; i += 1) {
       this.allSegmentIds[i] = i;
     }
 
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allSegmentIds, this.gl.STATIC_DRAW);
+    if (scene.drawRuns) {
+      this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
+      this.gl.bufferData(this.gl.ARRAY_BUFFER, 0, this.gl.DYNAMIC_DRAW);
+    }
 
     this.allFillPathIds = new Float32Array(this.fillPathCount);
     for (let i = 0; i < this.fillPathCount; i += 1) {
@@ -2615,12 +2622,12 @@ export class WebGlFloorplanRenderer {
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allTextInstanceIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allTextInstanceIds, this.gl.STATIC_DRAW);
 
-    if (this.visibleSegmentIds.length < this.segmentCount) {
-      this.visibleSegmentIds = new Float32Array(this.segmentCount);
+    if (scene.drawRuns || this.visibleSegmentIds.length < legacySegmentCount) {
+      this.visibleSegmentIds = new Float32Array(legacySegmentCount);
     }
 
-    if (this.segmentMarks.length < this.segmentCount) {
-      this.segmentMarks = new Uint32Array(this.segmentCount);
+    if (scene.drawRuns || this.segmentMarks.length < legacySegmentCount) {
+      this.segmentMarks = new Uint32Array(legacySegmentCount);
       this.markToken = 1;
     }
 
@@ -4651,8 +4658,8 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
-    if (!this.grid) {
-      this.visibleSegmentCount = 0;
+    if (!this.grid || this.orderedBatches) {
+      this.visibleSegmentCount = this.orderedBatches ? this.segmentCount : 0;
       this.usingAllSegments = true;
       return;
     }
@@ -4741,8 +4748,8 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
-    if (!this.grid) {
-      this.visibleSegmentCount = 0;
+    if (!this.grid || this.orderedBatches) {
+      this.visibleSegmentCount = this.orderedBatches ? this.segmentCount : 0;
       this.usingAllSegments = true;
       return;
     }
@@ -4828,7 +4835,8 @@ export class WebGlFloorplanRenderer {
       }
       const drawCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
       if (gpuLevel.visibleSegmentIdsFloat.length < drawCount) {
-        gpuLevel.visibleSegmentIdsFloat = new Float32Array(Math.max(1, runtimeLevel.segmentCount));
+        gpuLevel.visibleSegmentIdsFloat = new Float32Array(Math.min(runtimeLevel.segmentCount,
+          Math.max(drawCount, Math.ceil(gpuLevel.visibleSegmentIdsFloat.length * 1.5))));
       }
       for (let i = 0; i < drawCount; i += 1) {
         gpuLevel.visibleSegmentIdsFloat[i] = runtimeLevel.visibleSegmentIds[i];
@@ -5452,35 +5460,35 @@ export class WebGlFloorplanRenderer {
       throw new Error("Segment texture exceeds GPU limits for this browser/GPU.");
     }
 
-    const texelCount = textureWidth * textureHeight;
-
-    const endpointsTextureData = new Float32Array(texelCount * 4);
-    endpointsTextureData.set(scene.endpoints.subarray(0, segmentCount * 4));
-
-    const primitiveMetaTextureData = new Float32Array(texelCount * 4);
-    primitiveMetaTextureData.set(scene.primitiveMeta.subarray(0, segmentCount * 4));
-
-    const styleTextureData = new Float32Array(texelCount * 4);
-    styleTextureData.set(scene.styles.subarray(0, segmentCount * 4));
-
-    const primitiveBoundsTextureData = new Float32Array(texelCount * 4);
-    primitiveBoundsTextureData.set(scene.primitiveBounds.subarray(0, segmentCount * 4));
-
-    gl.bindTexture(gl.TEXTURE_2D, textures.textureA);
-    configureFloatTexture(gl);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, endpointsTextureData);
-
-    gl.bindTexture(gl.TEXTURE_2D, textures.textureB);
-    configureFloatTexture(gl);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, primitiveMetaTextureData);
-
-    gl.bindTexture(gl.TEXTURE_2D, textures.textureC);
-    configureFloatTexture(gl);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, styleTextureData);
-
-    gl.bindTexture(gl.TEXTURE_2D, textures.textureD);
-    configureFloatTexture(gl);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, primitiveBoundsTextureData);
+    for (const [texture, source] of [
+      [textures.textureA, scene.endpoints], [textures.textureB, scene.primitiveMeta],
+      [textures.textureC, scene.styles], [textures.textureD, scene.primitiveBounds]
+    ] as const) {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      configureFloatTexture(gl);
+      // Allocate zero-initialized GPU storage, then upload views of the source.
+      // Four texture-sized padded arrays used to double CPU stroke memory here.
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, null);
+      const length = Math.min(source.length, segmentCount * 4);
+      const rowLength = textureWidth * 4;
+      const fullRows = Math.floor(length / rowLength);
+      const batchRows = Math.max(1, Math.floor(4 * 1024 * 1024 / (rowLength * 4)));
+      for (let row = 0; row < fullRows; row += batchRows) {
+        const rows = Math.min(batchRows, fullRows - row);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, row, textureWidth, rows, gl.RGBA, gl.FLOAT,
+          source.subarray(row * rowLength, (row + rows) * rowLength));
+      }
+      const remainder = length - fullRows * rowLength;
+      if (remainder > 0) {
+        let tail = source.subarray(fullRows * rowLength, length);
+        if (remainder % 4 !== 0) {
+          const padded = new Float32Array(Math.ceil(remainder / 4) * 4);
+          padded.set(tail);
+          tail = padded;
+        }
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, fullRows, tail.length / 4, 1, gl.RGBA, gl.FLOAT, tail);
+      }
+    }
 
     return { textureWidth, textureHeight, maxTextureSize };
   }
@@ -5500,6 +5508,10 @@ export class WebGlFloorplanRenderer {
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
     if (this.orderedBatches && !this.orderedInstanceBuffer) this.orderedInstanceBuffer = this.mustCreateBuffer();
 
+    // The combined store starts with unchanged canonical IDs, so exact draws
+    // and ordered LOD draws can share the same four GPU textures.
+    this.uploadSegments(this.orderedBatches?.strokeScene ?? scene);
+
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
       this.destroyVectorLodResources();
       this.vectorLodRuntime = null;
@@ -5517,13 +5529,9 @@ export class WebGlFloorplanRenderer {
     }
 
     if (this.orderedBatches) {
-      const textureA = this.mustCreateTexture();
-      const textureB = this.mustCreateTexture();
-      const textureC = this.mustCreateTexture();
-      const textureD = this.mustCreateTexture();
-      const stats = this.uploadStrokeTextureSet(this.orderedBatches.strokeScene, { textureA, textureB, textureC, textureD });
-      this.vectorLodLevels.push({ textureA, textureB, textureC, textureD,
-        textureWidth: stats.textureWidth, textureHeight: stats.textureHeight, ownsTextures: true,
+      this.vectorLodLevels.push({ textureA: this.segmentTextureA, textureB: this.segmentTextureB,
+        textureC: this.segmentTextureC, textureD: this.segmentTextureD,
+        textureWidth: this.segmentTextureWidth, textureHeight: this.segmentTextureHeight, ownsTextures: false,
         visibleSegmentIdBuffer: this.orderedInstanceBuffer!, visibleSegmentIdsFloat: new Float32Array(0) });
       return;
     }
@@ -5531,7 +5539,7 @@ export class WebGlFloorplanRenderer {
     for (let i = 0; i < this.vectorLodRuntime.levels.length; i += 1) {
       const level = this.vectorLodRuntime.levels[i];
       const visibleSegmentIdBuffer = this.mustCreateBuffer();
-      const visibleSegmentIdsFloat = new Float32Array(Math.max(1, level.segmentCount));
+      const visibleSegmentIdsFloat = new Float32Array(0);
       if (i === 0) {
         this.vectorLodLevels.push({
           textureA: this.segmentTextureA,
@@ -5811,6 +5819,14 @@ export class WebGlFloorplanRenderer {
   }
 
   private buildSegmentBounds(scene: VectorScene): void {
+    if (scene.drawRuns) {
+      // VectorDrawRunCuller and the ordered plan own this scene's visibility.
+      this.segmentMinX = new Float32Array(0);
+      this.segmentMinY = new Float32Array(0);
+      this.segmentMaxX = new Float32Array(0);
+      this.segmentMaxY = new Float32Array(0);
+      return;
+    }
     if (this.segmentMinX.length < this.segmentCount) {
       this.segmentMinX = new Float32Array(this.segmentCount);
       this.segmentMinY = new Float32Array(this.segmentCount);

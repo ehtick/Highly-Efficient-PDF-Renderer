@@ -115,11 +115,30 @@ vector content, raster layers, search highlights, and selection highlights.
 See the [API reference](api.md) for integration points.
 
 Vector LOD simplifies stroke geometry according to the current view, aiming for
-roughly 50,000 visible strokes. Large drawings keep a fine representation and
+roughly 50,000 visible strokes. Large drawings build a fine representation and
 additional overview levels. When a tile exceeds its budget, overview levels can
-omit tiny marks and merge nearby lines more aggressively. This trades some
-fine detail and hatch density for performance while keeping vector rendering.
+omit tiny marks and merge nearby lines more aggressively. This trades some fine
+detail and hatch density for performance while keeping vector rendering.
 The HUD labels these selections `(overview)` and shows the total target.
+
+LOD construction keeps the original tolerances and level-selection rules. It
+streams completed paint groups, stores merge membership as compact source IDs,
+and builds geometry in fixed-size chunks. Ordered renderers share one immutable
+LOD geometry store; native backends upload bounded views directly and share
+exact/LOD GPU textures. Three uses the same store for its data textures, with a
+private style copy created only when an individual stroke is recolored. Selection
+scratch grows with visible work. These storage changes preserve the geometry,
+paint order, clipping, and detail transitions of the existing LOD hierarchy;
+they do not skip levels to meet an allocation budget.
+
+For a bounded Node measurement on an existing HEP (without PDF conversion or a
+browser), run `node scripts/benchmark-vector-lod-memory.mjs path/to/file.hep`.
+`--output=path.json` records a parity snapshot; `--compare=path.json` checks every
+level's geometry bits, paint origins, spatial buckets, and sampled zoom/pan
+selections. Add `--ordered` to include ordered draw preparation and its first
+overview frame. Node process memory is a comparative measurement, not an iOS tab
+memory estimate. See [the memory optimization report](vector-lod-memory.md) for
+measurements, changed files, and device verification steps.
 
 Tiles that fit their budget retain exact or fine geometry. Very dense views can
 retain coarser overview levels when zoomed in: front-facing and tilted views

@@ -1,6 +1,7 @@
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
+import { sharedVectorStrokeLodTextureData } from "./vectorStrokeLodStorage";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
@@ -53,6 +54,7 @@ export class ThreeMaterialStrokeLayer {
   private readonly segmentTextureA: THREE.DataTexture;
   private readonly segmentTextureB: THREE.DataTexture;
   private readonly segmentStyleTexture: THREE.DataTexture;
+  private styleTextureShared: boolean;
   private readonly segmentBoundsTexture: THREE.DataTexture;
 
   private readonly viewportUniform: THREE.Vector2;
@@ -103,6 +105,7 @@ export class ThreeMaterialStrokeLayer {
       segmentTextureSize.width,
       segmentTextureSize.height
     );
+    this.styleTextureShared = (this.segmentStyleTexture.image.data as Float32Array).buffer === scene.styles.buffer;
     this.segmentBoundsTexture = createSegmentDataTexture(
       scene.primitiveBounds,
       segmentCount,
@@ -111,14 +114,16 @@ export class ThreeMaterialStrokeLayer {
     );
 
     this.grid = segmentCount > 0 && !options.strokeOrigins ? buildSpatialGrid(scene) : null;
-    this.segmentMarks = new Uint32Array(segmentCount);
+    // Ordered LOD supplies an already culled selection. Its runtime owns the
+    // spatial bounds and marks; this layer never visits them without a grid.
+    this.segmentMarks = new Uint32Array(this.grid ? segmentCount : 0);
     this.visibleSegmentIds = new Float32Array(Math.max(1, segmentCount));
-    this.allSegmentIds = new Float32Array(Math.max(1, segmentCount));
+    this.allSegmentIds = new Float32Array(options.strokeOrigins ? 0 : Math.max(1, segmentCount));
     for (let i = 0; i < segmentCount; i += 1) {
-      this.allSegmentIds[i] = i;
+      if (!options.strokeOrigins) this.allSegmentIds[i] = i;
       this.visibleSegmentIds[i] = i;
     }
-    const expandedBounds = buildExpandedSegmentBounds(scene, segmentCount);
+    const expandedBounds = buildExpandedSegmentBounds(scene, this.grid ? segmentCount : 0);
     this.segmentMinX = expandedBounds.minX;
     this.segmentMinY = expandedBounds.minY;
     this.segmentMaxX = expandedBounds.maxX;
@@ -227,6 +232,12 @@ export class ThreeMaterialStrokeLayer {
   }
 
   setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
+    if (this.styleTextureShared && updates.some(update => update.ref.kind === "stroke")) {
+      // Keep canonical and simplified geometry immutable across renderers.
+      // Recoloring forces exact LOD, but edits still belong to this texture only.
+      this.segmentStyleTexture.image.data = (this.segmentStyleTexture.image.data as Float32Array).slice();
+      this.styleTextureShared = false;
+    }
     patchPrimitiveColorTexture(this.segmentStyleTexture, scene.styles, updates, "stroke", [
       { source: 1, target: 1 }, { source: 2, target: 2 }, { source: 3, target: 3 }
     ]);
@@ -444,7 +455,11 @@ export class ThreeMaterialStrokeLayer {
 
   private setAllSegmentsVisible(): void {
     if (!this.usingAllSegments) {
-      this.visibleSegmentIds.set(this.allSegmentIds.subarray(0, this.segmentCount), 0);
+      if (this.allSegmentIds.length >= this.segmentCount) {
+        this.visibleSegmentIds.set(this.allSegmentIds.subarray(0, this.segmentCount), 0);
+      } else {
+        for (let index = 0; index < this.segmentCount; index++) this.visibleSegmentIds[index] = index;
+      }
       this.segmentIndexAttribute.addUpdateRange(0, this.segmentCount);
       this.segmentIndexAttribute.needsUpdate = true;
     }
@@ -470,10 +485,11 @@ function createSegmentDataTexture(
   width: number,
   height: number
 ): THREE.DataTexture {
-  const data = new Float32Array(width * height * 4);
-  const sourceLength = Math.min(source.length, count * 4);
-  if (sourceLength > 0) {
-    data.set(source.subarray(0, sourceLength), 0);
+  const shared = sharedVectorStrokeLodTextureData(source);
+  const data = shared?.length === width * height * 4 ? shared : new Float32Array(width * height * 4);
+  if (data !== shared) {
+    const sourceLength = Math.min(source.length, count * 4);
+    if (sourceLength > 0) data.set(source.subarray(0, sourceLength), 0);
   }
 
   const texture = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);

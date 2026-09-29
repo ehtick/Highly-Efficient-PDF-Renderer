@@ -331,6 +331,10 @@ try {
       renderer.gpuDevice = { createBuffer: () => ({ destroy() {} }) };
       renderer.uploadVectorClips = () => {};
       renderer.uploadVectorLodLevels = () => {};
+      renderer.uploadSegments = () => {};
+      renderer.maxTextureSize = () => 4096;
+      renderer.createFloatTexture = () => ({ destroy() {}, createView() { return {}; } });
+      renderer.refreshStrokeBindGroups = () => {};
       renderer.destroyVectorLodResources = () => {};
       assert(renderer.rebuildVectorLod(scene));
       assert(renderer.orderedBatches.strokeScene.segmentCount > scene.segmentCount);

@@ -133,6 +133,9 @@ export const fastTests = [
   "vector-stroke-clip-lod",
   "vector-stroke-density-lod",
   "vector-overview-lod",
+  "vector-lod-memory",
+  "vector-lod-storage",
+  "native-stroke-upload-memory",
   "vector-perspective-lod"
 ];
 

@@ -8,7 +8,8 @@ export function strokePaintOrigins(scene: VectorScene): Uint32Array | undefined 
   if (!scene.drawRuns) return origins.get(scene);
   let result = origins.get(scene);
   if (!result) {
-    result = Uint32Array.from({ length: scene.segmentCount }, (_, index) => index);
+    result = new Uint32Array(scene.segmentCount);
+    for (let index = 0; index < result.length; index++) result[index] = index;
     origins.set(scene, result);
   }
   return result;

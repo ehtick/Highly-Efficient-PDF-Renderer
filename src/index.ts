@@ -18,7 +18,7 @@ import {
   type CanvasInteractionController
 } from "./canvasInteractions";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
-import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
+import { reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import { prebuildTextLod } from "./textLodCore";
 import { yieldForLoad } from "./loadCancellation";
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -141,10 +141,11 @@ async function prepareThreePdfObject(
   const signal = options.signal;
   const rendererType = options.rendererType ?? "webgl";
   const sourceType = loadedScene.sourceKind;
+  let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
   try {
     signal?.throwIfAborted();
     progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
-    await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
+    vectorLodReservation = await reserveVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
       yieldIntervalMs: 500,
       shouldCancel: () => signal?.aborted === true,
       onProgress: (lodProgress) => {
@@ -176,7 +177,7 @@ async function prepareThreePdfObject(
     const object = await createThreePdfObjectFromLoadedScene(loadedScene, {
       ...options,
       rendererType
-    }, signal);
+    }, signal, vectorLodReservation);
     try {
       signal?.throwIfAborted();
       progress.complete({ sourceType });
@@ -193,6 +194,8 @@ async function prepareThreePdfObject(
   } catch (error) {
     signal?.throwIfAborted();
     throw error;
+  } finally {
+    vectorLodReservation?.release();
   }
 }
 

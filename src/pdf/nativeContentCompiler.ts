@@ -2065,11 +2065,11 @@ class DenseContentCompiler {
         this.vectorSourceOptionalContentIndices.push(-1, -1);
       }
     }
-    const fillPathMetaA = this.fillPathMetaA.toTypedArray();
-    const fillPathMetaB = this.fillPathMetaB.toTypedArray();
-    const fillPathMetaC = this.fillPathMetaC.toTypedArray();
-    const fillSegmentsA = this.fillSegmentsA.toTypedArray();
-    const fillSegmentsB = this.fillSegmentsB.toTypedArray();
+    const fillPathMetaA = this.fillPathMetaA.take();
+    const fillPathMetaB = this.fillPathMetaB.take();
+    const fillPathMetaC = this.fillPathMetaC.take();
+    const fillSegmentsA = this.fillSegmentsA.take();
+    const fillSegmentsB = this.fillSegmentsB.take();
     const combinedBounds = combineBounds(
       combineBounds(
         combineBounds(combineBounds(strokeResult.bounds, this.fillBounds), this.shadingBounds),
@@ -5372,10 +5372,6 @@ class Float4Builder {
 
   usedView(): Float32Array {
     return this.data.subarray(0, this.length);
-  }
-
-  toTypedArray(): Float32Array {
-    return this.data.slice(0, this.length);
   }
 
   /** Hand over the used values and empty the builder. */

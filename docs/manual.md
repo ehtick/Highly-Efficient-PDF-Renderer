@@ -703,7 +703,10 @@ The builder accepts `signal` and `onProgress`, including raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP container v1 with scene schema v9. Earlier scene schemas
+The loader supports HEP containers v1 and v2 with scene schema v9. New exports
+use v2 only when an exact stroke-style palette makes the file smaller; these
+files require an updated viewer. Existing v1 files remain supported. The palette
+changes no rendering values and stores no vector LOD data. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and

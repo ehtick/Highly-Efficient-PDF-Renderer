@@ -26,6 +26,53 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 type Color = readonly [number, number, number, number];
 interface Geometry { a: number[]; b: number[]; bounds: Bounds }
+
+/** Append-only final stroke values; no page-sized boxed arrays or growth copies. */
+class RetainedStrokeBuffer {
+  private static readonly chunkLength = 16_384;
+  private chunks: Float32Array[] = [];
+  private current: Float32Array | null = null;
+  private offset = 0;
+  length = 0;
+
+  push(a: number, b: number, c: number, d: number): void {
+    if (!this.current || this.offset === this.current.length) {
+      this.current = new Float32Array(RetainedStrokeBuffer.chunkLength);
+      this.chunks.push(this.current);
+      this.offset = 0;
+    }
+    this.current[this.offset++] = a;
+    this.current[this.offset++] = b;
+    this.current[this.offset++] = c;
+    this.current[this.offset++] = d;
+    this.length += 4;
+  }
+
+  take(): Float32Array {
+    const chunks = this.chunks, length = this.length;
+    this.chunks = []; this.current = null; this.offset = this.length = 0;
+    if (chunks.length === 0) return new Float32Array(0);
+    if (chunks.length === 1) {
+      const chunk = chunks[0], buffer = chunk.buffer as ArrayBuffer & {
+        transferToFixedLength?: (newByteLength: number) => ArrayBuffer;
+      };
+      if (length === chunk.length) return chunk;
+      return typeof buffer.transferToFixedLength === "function"
+        ? new Float32Array(buffer.transferToFixedLength(length * Float32Array.BYTES_PER_ELEMENT))
+        : chunk.slice(0, length);
+    }
+    const result = new Float32Array(length);
+    while (chunks.length) {
+      const offset = (chunks.length - 1) * RetainedStrokeBuffer.chunkLength, chunk = chunks.pop()!;
+      result.set(chunk.subarray(0, Math.min(chunk.length, length - offset)), offset);
+      // These chunks are exclusively owned. Release copied backing stores now
+      // where supported, rather than waiting for a mobile GC cycle.
+      const buffer = chunk.buffer as ArrayBuffer & { transferToFixedLength?: (newByteLength: number) => ArrayBuffer };
+      if (typeof buffer.transferToFixedLength === "function") buffer.transferToFixedLength(0);
+    }
+    return result;
+  }
+}
 /**
  * Page-space pen geometry for each glyph occurrence in a page's text index,
  * captured while compiling. It is never persisted; without it the lowered
@@ -93,7 +140,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const conditionKeys = new Map<string, number>();
   const fillsA: number[] = [], fillsB: number[] = [], fillsC: number[] = [], segmentsA: number[] = [], segmentsB: number[] = [];
   const textA: number[] = [], textB: number[] = [], textC: number[] = [], glyphMetaA: number[] = [], glyphMetaB: number[] = [], glyphA: number[] = [], glyphB: number[] = [];
-  const endpoints: number[] = [], primitiveMeta: number[] = [], primitiveBounds: number[] = [], styles: number[] = [];
+  const endpoints = new RetainedStrokeBuffer(), primitiveMeta = new RetainedStrokeBuffer(), primitiveBounds = new RetainedStrokeBuffer(), styles = new RetainedStrokeBuffer();
   const clipBuilder = new NativeVectorClipBuilder(), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
   const glyphConditions = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
   // Search references the first instance painting each glyph. A glyph whose
@@ -573,10 +620,17 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       if (Math.abs(scaleX - scaleY) > 1e-6 * Math.max(scaleX, scaleY) || Math.abs(matrix[0] * matrix[2] + matrix[1] * matrix[3]) > 1e-6) return fail("nonuniform packed stroke transform.");
       const first = endpoints.length / 4;
       for (let stroke = command.first; stroke < command.first + command.count; stroke++) { budget(16); const i = stroke * 4;
-        const p0 = point(matrix, store.endpoints[i], store.endpoints[i + 1]), c = point(matrix, store.endpoints[i + 2], store.endpoints[i + 3]), p1 = point(matrix, store.primitiveMeta[i], store.primitiveMeta[i + 1]);
+        // Keep transformed coordinates in double precision until every output
+        // (especially the expanded bounds) is computed, then round each once.
+        const x0 = matrix[0] * store.endpoints[i] + matrix[2] * store.endpoints[i + 1] + matrix[4];
+        const y0 = matrix[1] * store.endpoints[i] + matrix[3] * store.endpoints[i + 1] + matrix[5];
+        const cx = matrix[0] * store.endpoints[i + 2] + matrix[2] * store.endpoints[i + 3] + matrix[4];
+        const cy = matrix[1] * store.endpoints[i + 2] + matrix[3] * store.endpoints[i + 3] + matrix[5];
+        const x1 = matrix[0] * store.primitiveMeta[i] + matrix[2] * store.primitiveMeta[i + 1] + matrix[4];
+        const y1 = matrix[1] * store.primitiveMeta[i] + matrix[3] * store.primitiveMeta[i + 1] + matrix[5];
         const flags = Math.floor(store.primitiveMeta[i + 3] / 2), alpha = store.primitiveMeta[i + 3] - flags * 2, half = store.styles[i] * scaleX;
-        endpoints.push(...p0, ...c); primitiveMeta.push(...p1, store.primitiveMeta[i + 2], flags * 2 + rgba[3] * alpha); styles.push(half, rgba[0], rgba[1], rgba[2]);
-        primitiveBounds.push(Math.min(p0[0], c[0], p1[0]) - half, Math.min(p0[1], c[1], p1[1]) - half, Math.max(p0[0], c[0], p1[0]) + half, Math.max(p0[1], c[1], p1[1]) + half); scene.maxHalfWidth = Math.max(scene.maxHalfWidth, half);
+        endpoints.push(x0, y0, cx, cy); primitiveMeta.push(x1, y1, store.primitiveMeta[i + 2], flags * 2 + rgba[3] * alpha); styles.push(half, rgba[0], rgba[1], rgba[2]);
+        primitiveBounds.push(Math.min(x0, cx, x1) - half, Math.min(y0, cy, y1) - half, Math.max(x0, cx, x1) + half, Math.max(y0, cy, y1) + half); scene.maxHalfWidth = Math.max(scene.maxHalfWidth, half);
       }
       appendRun("stroke", first, command.count, clip, condition);
     } else if (command.source === "paths") {
@@ -711,11 +765,11 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.fillPathCount = fillsA.length / 4; scene.fillSegmentCount = segmentsA.length / 4;
   scene.fillPathMetaA = Float32Array.from(fillsA); scene.fillPathMetaB = Float32Array.from(fillsB); scene.fillPathMetaC = Float32Array.from(fillsC);
   scene.fillSegmentsA = Float32Array.from(segmentsA); scene.fillSegmentsB = Float32Array.from(segmentsB);
-  scene.endpoints = Float32Array.from(endpoints); scene.primitiveMeta = Float32Array.from(primitiveMeta); scene.primitiveBounds = Float32Array.from(primitiveBounds); scene.styles = Float32Array.from(styles);
+  scene.endpoints = endpoints.take(); scene.primitiveMeta = primitiveMeta.take(); scene.primitiveBounds = primitiveBounds.take(); scene.styles = styles.take();
   scene.textInstanceA = Float32Array.from(textA); scene.textInstanceB = Float32Array.from(textB); scene.textInstanceC = Float32Array.from(textC);
   scene.textGlyphMetaA = Float32Array.from(glyphMetaA); scene.textGlyphMetaB = Float32Array.from(glyphMetaB); scene.textGlyphSegmentsA = Float32Array.from(glyphA); scene.textGlyphSegmentsB = Float32Array.from(glyphB);
   scene.textInstanceCount = textA.length / 4; scene.textGlyphCount = glyphMetaA.length / 4; scene.textGlyphSegmentCount = glyphA.length / 4; scene.pageTextRanges[1] = scene.textInstanceCount;
-  scene.segmentCount = endpoints.length / 4; scene.sourceSegmentCount = scene.segmentCount; scene.mergedSegmentCount = scene.segmentCount;
+  scene.segmentCount = scene.endpoints.length / 4; scene.sourceSegmentCount = scene.segmentCount; scene.mergedSegmentCount = scene.segmentCount;
   scene.imageLayerSegmentCount = 0;
   scene.clipPaths = clipBuilder.paths;
   if (gradients.length) {

@@ -12,7 +12,6 @@ import {
   createTextSelectionController,
   pdfObjectGenerator,
   prebuildTextLod,
-  prebuildVectorStrokeLodRuntime,
   consumeVectorStrokeLodBuildTiming,
   resetVectorStrokeLodBuildTiming,
   type HeprRendererType,
@@ -33,6 +32,7 @@ import {
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
 import { createThreePdfObject } from "./threePdfObject";
+import { reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
@@ -1199,6 +1199,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   const objectOptions = readThreeObjectOptions();
   let nextObject: HeprThreePdfObject | null = null;
   let targetInstalled = false;
+  let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
 
   setStatus(`Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
   setLoadingProgress(true, "Preparing renderer...");
@@ -1212,7 +1213,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   try {
     const loadStart = performance.now();
     resetVectorStrokeLodBuildTiming();
-    await prebuildVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
+    vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
       yieldIntervalMs: 50,
       shouldCancel: () => controller.signal.aborted,
       onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: "vector-lod" })
@@ -1235,7 +1236,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
         sourceKind: previousObject.sourceKind
       },
       { ...objectOptions, rendererType: backend },
-      controller.signal
+      controller.signal,
+      vectorLodReservation
     );
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
@@ -1306,6 +1308,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
         : `Failed to switch renderer: ${message}`
     );
   } finally {
+    vectorLodReservation?.release();
     if (activeLoadToken === loadToken) {
       sourceLoadController = null;
       setLoadingProgress(false);

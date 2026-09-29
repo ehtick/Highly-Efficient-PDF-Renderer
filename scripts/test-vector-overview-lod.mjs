@@ -6,7 +6,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorStrokeLodRuntime, buildVectorStrokeLodScenes, buildRuntimeTileBuckets,
-    prebuildVectorStrokeLodRuntime, shouldUseVectorStrokeLod } = await import("../src/vectorStrokeLodCore.ts");
+    prebuildVectorStrokeLodRuntime, takePrebuiltVectorStrokeLodRuntime, shouldUseVectorStrokeLod } = await import("../src/vectorStrokeLodCore.ts");
   const { formatVectorStrokeLodStats } = await import("../src/vectorStrokeLodStatsFormat.ts");
   const count = 153_600;
   const scene = { ...createEmptyVectorScene(), segmentCount: count, maxHalfWidth: .06,
@@ -185,6 +185,7 @@ try {
   await assert.rejects(prebuildVectorStrokeLodRuntime(scene, "auto", "webgl", {
     yieldIntervalMs: 1, shouldCancel: () => true
   }), /cancel|abort/i);
+  takePrebuiltVectorStrokeLodRuntime(scene); // Exercise construction, not completed-cache reuse.
   let cancelOverview = false;
   await assert.rejects(prebuildVectorStrokeLodRuntime(scene, "auto", "webgl", {
     yieldIntervalMs: 1,

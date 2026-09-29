@@ -1,11 +1,11 @@
-# HEP container version 1
+# HEP container versions 1 and 2
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-version **1** wraps **scene schema version 9**, recorded in
+versions **1** and **2** wrap **scene schema version 9**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers require scene v9; older HEP files must be regenerated from their
-original PDF. Container repacking preserves section bytes and does not upgrade a
+Readers support both container versions and require scene v9; files using older
+scene schemas must be regenerated from their original PDF. Container repacking preserves section bytes and does not upgrade a
 scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
@@ -21,7 +21,7 @@ The first 32 bytes are:
 | Offset | Type | Value |
 | --- | --- | --- |
 | 0 | 4 bytes | `48 45 50 00` (`HEP\0`) |
-| 4 | uint16 | Container version: `1` |
+| 4 | uint16 | Container version: `1` or `2` |
 | 6 | uint16 | Flags: `0` |
 | 8 | uint32 | Entry count |
 | 12 | uint32 | Chunk count |
@@ -39,7 +39,7 @@ records; its length is divisible by four. Each chunk record is 20 bytes:
 | 4 | uint32 | Stored payload length, excluding external padding |
 | 8 | uint32 | Decoded payload length, including internal alignment gaps |
 | 12 | uint32 | CRC32 of the complete decoded chunk |
-| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE |
+| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE, `2` = DEFLATE with exact vec4 palette (container v2 only) |
 | 17 | 3 bytes | Reserved: all zero |
 
 Each variable-length entry record has this layout:
@@ -85,6 +85,40 @@ per-entry `STORE` overrides are grouped separately from compressed entries.
 CRC32 is the IEEE reflected polynomial `0xedb88320`, initialized and finalized
 with XOR `0xffffffff` (the same convention as ZIP and zlib).
 
+## Exact palette chunks (container v2)
+
+Container v2 adds codec `2`; its header, index, entry names, checksums, and
+logical section bytes are otherwise unchanged. The writer emits v2 only when
+at least one palette chunk is selected. Existing v1 files remain readable;
+files using codec 2 require an updated reader. Scene schema remains v9.
+
+Codec 2 applies zlib-wrapped DEFLATE to a byte palette payload:
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| 0 | uint16 | Palette entry count, from 1 through 256 |
+| 2 | uint16 | Reserved: `0` |
+| 4 | `count × 16` bytes | Exact four-word records, each word little-endian uint32 |
+| after palette | one byte per decoded record | Zero-based palette index |
+
+The original chunk's decoded length must be divisible by 16 and determines
+the number of records; the palette count cannot exceed that number. The inflated
+palette length must equal
+`4 + paletteCount * 16 + decodedLength / 16`; every index must be in range.
+Palette expansion preserves all 128 bits per record, including signed zero
+and NaN payloads. CRC32 and entry offsets refer to the original expanded bytes.
+Decompression is bounded by the declared decoded length before expansion,
+which remains subject to the usual chunk limit.
+
+The writer considers this codec only for standalone
+`textures/stroke-styles.f32` and `textures/stroke-styles.f32cm` sections with at
+most 256 distinct 16-byte records. It selects the palette only
+when its actual compressed payload, padded to four bytes, is smaller than the
+original stored/DEFLATE candidate. Chunk counts, index size, and all other
+sections stay identical, so selecting the palette cannot enlarge the archive.
+Global or per-entry `STORE` retains the original bytes without a palette.
+This codec stores no vector LOD data.
+
 ## Annotation metadata
 
 Scene v9 optionally references `annotations/annotations.json` through
@@ -112,7 +146,7 @@ limited to 64 MiB before decompression; record, coordinate, text and action
 budgets also apply. Invalid metadata fails validation rather than becoming
 interactive UI data. A missing descriptor produces an empty annotation array.
 
-This optional section changes none of the container v1, scene v9 or page v8
+This optional section changes none of the container, scene v9 or page v8
 versions. Existing supported files without metadata remain readable.
 Repacking cannot recover omitted annotations; reconvert the original PDF to
 obtain them.

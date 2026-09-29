@@ -46,6 +46,7 @@ import {
 } from "./textSearch";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
 import type { TextLodMode, TextLodStats } from "./textLodCore";
+import type { VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import {
   shouldUseVectorStrokeLod,
   ThreeVectorLodStrokeLayer,
@@ -3109,7 +3110,8 @@ function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
 export async function createThreePdfObject(
   loadedScene: ThreePdfSceneSource,
   options: HeprThreeObjectOptions = {},
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preparedVectorLod?: VectorStrokeLodRuntimeReservation | null
 ): Promise<HeprThreePdfObject> {
   signal?.throwIfAborted();
   const rendererType = options.rendererType ?? "webgl";
@@ -3139,6 +3141,7 @@ export async function createThreePdfObject(
     }),
     signal
   );
+  let vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null = null;
   try {
     signal?.throwIfAborted();
     applyRendererConfig(nativeRenderer, rendererConfig);
@@ -3189,7 +3192,7 @@ export async function createThreePdfObject(
 
     const triangleStrokeLayer = null;
 
-    const vectorLodStrokeLayer =
+    vectorLodStrokeLayer =
       useVectorLodStrokeLayer
         ? new ThreeVectorLodStrokeLayer(loadedScene.scene, {
           drawPlan,
@@ -3197,7 +3200,7 @@ export async function createThreePdfObject(
           colorCompositing: rendererConfig.threeColorCompositing,
           strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
           vectorOverride: rendererConfig.vectorOverride
-        })
+        }, preparedVectorLod)
         : null;
 
     const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
@@ -3280,6 +3283,8 @@ export async function createThreePdfObject(
 
     return object;
   } catch (error) {
+    // The layer owns a consumed reservation, including failed initialization.
+    try { vectorLodStrokeLayer?.dispose(); } catch { /* Preserve the original error. */ }
     try {
       nativeRenderer.dispose();
     } catch {

@@ -1750,7 +1750,7 @@ async function loadSceneFromHepInternal(
 
       const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
       return {
-        data: raw.slice(0, logicalFloatCount),
+        data: raw.length === logicalFloatCount ? raw : raw.slice(0, logicalFloatCount),
         logicalItemCount
       };
     } finally {

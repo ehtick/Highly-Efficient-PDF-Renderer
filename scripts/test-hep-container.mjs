@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
-import { HepArchive, crc32, hasHepSignature, hasLegacyZipSignature } from "../src/hepContainer.ts";
+import { HepArchive, crc32, hasHepSignature, hasLegacyZipSignature,
+  encodeFloat32Palette, decodeFloat32Palette } from "../src/hepContainer.ts";
 
 // Independent bit-at-a-time CRC and fixture layout do not use the production writer.
 function referenceCrc(bytes) {
@@ -170,12 +171,72 @@ try {
   assert.equal(decompressions, 3);
 } finally { globalThis.DecompressionStream = originalDecompression; }
 
+// Palette chunks preserve logical section bytes and the unchanged v1 index
+// layout. Compare actual padded container size against an independent v1 file.
+const styleName = "textures/stroke-styles.f32";
+const styleWords = new Uint32Array(65_536 * 4);
+for (let index = 0; index < styleWords.length / 4; index++) {
+  const style = Math.floor(index / 64) % 77;
+  styleWords.set([style, 0x80000000, 0x7fc12345, 0x3f800000], index * 4);
+}
+const styleBytes = new Uint8Array(styleWords.buffer);
+const paletteArchive = new HepArchive();
+paletteArchive.file(styleName, styleBytes);
+const paletteFile = await paletteArchive.generateAsync({ type: "uint8array" });
+const paletteView = new DataView(paletteFile.buffer);
+assert.equal(paletteView.getUint16(4, true), 2);
+assert.equal(paletteFile[48], 2);
+assert.equal(paletteView.getUint32(40, true), styleBytes.length, "limits apply to expanded section bytes");
+const ordinaryStyleFile = fixture([[styleName, styleBytes]], { compress: true }).bytes;
+assert(paletteFile.length < ordinaryStyleFile.length, "palette selection must reduce actual container bytes");
+const loadedPalette = await HepArchive.loadAsync(paletteFile);
+assert.deepEqual(await loadedPalette.file(styleName).async("uint8array"), styleBytes);
+const ownedStyle = await loadedPalette.file(styleName).async("uint8array");
+ownedStyle.fill(0);
+assert.deepEqual(await loadedPalette.file(styleName).async("uint8array"), styleBytes,
+  "palette consumers still receive independently owned section data");
+const storedPalette = inflateSync(paletteFile.subarray(paletteView.getUint32(32, true),
+  paletteView.getUint32(32, true) + paletteView.getUint32(36, true)));
+assert.deepEqual(new Uint8Array(decodeFloat32Palette(storedPalette, 65_536).buffer), styleBytes);
+await rejects(edit(paletteFile, b => b.writeUInt16LE(1, 4)), /codec/);
+await rejects(edit(paletteFile, b => { b[48] = 3; }), /codec/);
+await rejects(edit(paletteFile, b => b.writeUInt32LE(styleBytes.length - 1, 40)), /vec4/);
+await assert.rejects(HepArchive.loadAsync(paletteFile, { entryByteLimits: { [styleName]: styleBytes.length - 1 } }), /byte limit/);
+for (const compression of ["STORE", "DEFLATE"]) {
+  const stored = await new HepArchive().file(styleName, styleBytes, { compression: "STORE" })
+    .generateAsync({ type: "uint8array", compression });
+  assert.equal(new DataView(stored.buffer).getUint16(4, true), 1, "STORE keeps the original format");
+  assert.equal(stored[48], 0);
+}
+
+// An uncompressed palette can be smaller while its compressed form is larger.
+// Repeated high-entropy rows deliberately favor DEFLATE of the original bytes.
+let randomState = 0x12345678;
+const rows = new Uint32Array(256 * 4);
+for (let index = 0; index < rows.length; index++) {
+  randomState ^= randomState << 13; randomState ^= randomState >>> 17; randomState ^= randomState << 5;
+  rows[index] = randomState;
+}
+const repeatedRows = new Uint32Array(rows.length * 2);
+repeatedRows.set(rows); repeatedRows.set(rows, rows.length);
+const rowBytes = new Uint8Array(repeatedRows.buffer);
+const candidate = encodeFloat32Palette(new Float32Array(repeatedRows.buffer));
+assert(candidate && candidate.length < rowBytes.length);
+assert(align(deflateSync(candidate).length) >= align(deflateSync(rowBytes).length));
+const declined = await new HepArchive().file(styleName, rowBytes).generateAsync({ type: "uint8array" });
+assert.equal(new DataView(declined.buffer).getUint16(4, true), 1, "reject palettes that lose after compression");
+assert.equal(declined.length, fixture([[styleName, rowBytes]], { compress: true }).bytes.length);
+const otherName = await new HepArchive().file("geometry/bytes", styleBytes).generateAsync({ type: "uint8array" });
+assert.equal(new DataView(otherName.buffer).getUint16(4, true), 1, "only known style sections attempt palette encoding");
+assert.equal(await (await HepArchive.loadAsync(edit(small.bytes, b => b.writeUInt16LE(2, 4)))).file("x").async("string"), "abc",
+  "version 2 retains original codecs");
+
 const two = fixture([["g/a", "abc"], ["g/b", "def"]]);
 const groupedFixture = fixture([["g/a", "abc"], ["g/b", "def"]], { grouped: true });
 const emptyFixture = fixture([["x", ""]]);
 await rejects(Buffer.alloc(0), /header/);
 await rejects(small.bytes.subarray(0, 31), /header/);
-await rejects(edit(small.bytes, b => b.writeUInt16LE(2, 4)), /version/);
+await rejects(edit(small.bytes, b => b.writeUInt16LE(3, 4)), /version/);
 await rejects(edit(small.bytes, b => b.writeUInt16LE(1, 6)), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(1, 24)), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 8)), /too many/);

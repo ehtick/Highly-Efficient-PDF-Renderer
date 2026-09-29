@@ -23,6 +23,7 @@ import {
   type CullingBounds,
   type VectorLodMode,
   type VectorStrokeLodAsyncBuildOptions,
+  type VectorStrokeLodRuntimeReservation,
   type VectorStrokeLodBuildTiming,
   type VectorStrokeLodBuildProgress,
   type VectorStrokeLodStats,
@@ -47,37 +48,49 @@ export class ThreeVectorLodStrokeLayer {
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
   private selectionInitialized = false;
+  private disposed = false;
   private combinedIds: Uint32Array | null;
   private readonly levelOffsets: number[] = [];
 
-  constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
+  constructor(
+    scene: VectorScene,
+    options: VectorStrokeLodLayerOptions,
+    preparedRuntime?: VectorStrokeLodRuntimeReservation | null
+  ) {
     this.scene = scene;
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
-    this.runtime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
-    if (scene.drawRuns) {
-      let count = 0;
-      for (const level of this.runtime.levels) { this.levelOffsets.push(count); count += level.segmentCount; }
-      const combined = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels).scene;
-      const origins = new Uint32Array(count);
-      this.runtime.levels.forEach((level, index) => origins.set(strokePaintOrigins(level.scene)!, this.levelOffsets[index]));
-      const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
-      drawPlan.setStrokeSource(combined, origins);
-      const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
-      this.layers = [layer];
-      this.combinedIds = new Uint32Array(0);
-      layer.setVisible(false); layer.setDrawEnabled(false);
-      this.group.add(layer.mesh);
-    } else {
-      this.combinedIds = null;
-      this.layers = this.runtime.levels.map((level) => {
-        const layer = new ThreeMaterialStrokeLayer(level.scene, options);
-        layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
-        layer.setVisible(false);
-        layer.setDrawEnabled(false);
+    this.layers = [];
+    this.combinedIds = null;
+    this.runtime = preparedRuntime?.take(scene) ?? takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
+    try {
+      if (scene.drawRuns) {
+        let count = 0;
+        for (const level of this.runtime.levels) { this.levelOffsets.push(count); count += level.segmentCount; }
+        const combined = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels).scene;
+        const origins = new Uint32Array(count);
+        this.runtime.levels.forEach((level, index) => origins.set(strokePaintOrigins(level.scene)!, this.levelOffsets[index]));
+        const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
+        drawPlan.setStrokeSource(combined, origins);
+        const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
+        this.layers.push(layer);
+        this.combinedIds = new Uint32Array(0);
+        layer.setVisible(false); layer.setDrawEnabled(false);
         this.group.add(layer.mesh);
-        return layer;
-      });
+      } else {
+        this.combinedIds = null;
+        for (const level of this.runtime.levels) {
+          const layer = new ThreeMaterialStrokeLayer(level.scene, options);
+          this.layers.push(layer);
+          layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
+          layer.setVisible(false);
+          layer.setDrawEnabled(false);
+          this.group.add(layer.mesh);
+        }
+      }
+    } catch (error) {
+      try { this.dispose(); } catch { /* Preserve the original initialization error. */ }
+      throw error;
     }
   }
 
@@ -181,6 +194,9 @@ export class ThreeVectorLodStrokeLayer {
   }
 
   dispose(): void {
+    // A second dispose must not return a runtime that a new layer now owns.
+    if (this.disposed) return;
+    this.disposed = true;
     for (const layer of this.layers) {
       layer.dispose();
     }

@@ -287,16 +287,27 @@ async function testThreeBackendReplacement() {
     };
     let sceneResets = 0;
     let stateReplays = 0;
+    let reservationReleased = 0;
+    let reservationTaken = 0;
+    const reservation = {
+      take: () => { reservationTaken++; },
+      release: () => { reservationReleased++; }
+    };
     Object.assign(host, {
       lastLoadedSource: "original.pdf", lastDownloadablePdf: { label: "original.pdf" },
       lastNativeDrawStats: null, activeThreeRendererBackend: "webgl", lastLoadTimingText: "",
       readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto" }),
       captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
       resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
-      prebuildVectorStrokeLodRuntime: async (sceneData) => assert.equal(sceneData, canonicalScene),
+      reserveVectorStrokeLodRuntime: async (sceneData) => {
+        assert.equal(sceneData, canonicalScene);
+        return reservation;
+      },
       prebuildTextLod: async (sceneData) => assert.equal(sceneData, canonicalScene),
       pdfObjectGenerator: () => assert.fail("Backend switches must reuse the parsed scene"),
-      createThreePdfObject: async (loadedScene, options, signal) => {
+      createThreePdfObject: async (loadedScene, options, signal, prepared) => {
+        assert.equal(prepared, reservation);
+        prepared.take();
         assert.equal(loadedScene.scene, canonicalScene);
         assert.equal(loadedScene.sourceLabel, previous.sourceLabel);
         assert.equal(loadedScene.sourceKind, previous.sourceKind);
@@ -351,6 +362,8 @@ async function testThreeBackendReplacement() {
       vm.runInContext(sourceFunction(source, name), host);
     }
     await host.reloadSourceWithBackend("webgpu");
+    assert.equal(reservationTaken, 1, "Backend construction receives its prepared runtime");
+    assert.equal(reservationReleased, 1, "The reservation is always finalized");
     assert.equal(layerResets, failRenderer ? 0 : 1);
     assert.equal(layerReplays, failRenderer ? 0 : 1, "Replay current PDF layer choices only after the target renderer is ready");
     assert.equal(layerBindings, failed ? 0 : 1, "Only a successfully prepared replacement becomes the panel's current object");

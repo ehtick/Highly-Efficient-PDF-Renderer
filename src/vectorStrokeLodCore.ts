@@ -216,7 +216,9 @@ let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
   levelCount: 0
 };
 
-const prebuiltRuntimeByScene = new WeakMap<VectorScene, VectorStrokeLodRuntime[]>();
+// One idle hierarchy per scene is enough for renderer replacement. Keeping a
+// queue lets every backend switch retain another complete, unused hierarchy.
+const prebuiltRuntimeByScene = new WeakMap<VectorScene, VectorStrokeLodRuntime>();
 
 // Fixed-size chunks avoid repeatedly doubling and copying multi-million-stroke
 // buffers. Finalization releases each chunk as it copies into the exact-sized
@@ -1154,6 +1156,48 @@ export async function prebuildVectorStrokeLodRuntime(
   rendererType: "webgl" | "webgpu",
   options: VectorStrokeLodAsyncBuildOptions = {}
 ): Promise<VectorStrokeLodRuntime | null> {
+  return prepareVectorStrokeLodRuntime(scene, mode, rendererType, options, true);
+}
+
+/** Exclusive preparation for a delayed renderer constructor. @internal */
+export interface VectorStrokeLodRuntimeReservation {
+  take(scene: VectorScene): VectorStrokeLodRuntime;
+  release(): void;
+}
+
+/** Keeps an in-flight viewer's runtime outside the bounded idle cache. @internal */
+export async function reserveVectorStrokeLodRuntime(
+  scene: VectorScene,
+  mode: VectorLodMode,
+  rendererType: "webgl" | "webgpu",
+  options: VectorStrokeLodAsyncBuildOptions = {}
+): Promise<VectorStrokeLodRuntimeReservation | null> {
+  let runtime = await prepareVectorStrokeLodRuntime(scene, mode, rendererType, options, false);
+  if (!runtime) return null;
+  return {
+    take(ownerScene) {
+      if (ownerScene !== scene) throw new Error("Vector LOD reservation belongs to a different scene.");
+      if (!runtime) throw new Error("Vector LOD reservation has already been consumed or released.");
+      const owned = runtime;
+      runtime = null;
+      return owned;
+    },
+    release() {
+      if (!runtime) return;
+      const idle = runtime;
+      runtime = null;
+      storePrebuiltVectorStrokeLodRuntime(scene, idle);
+    }
+  };
+}
+
+async function prepareVectorStrokeLodRuntime(
+  scene: VectorScene,
+  mode: VectorLodMode,
+  rendererType: "webgl" | "webgpu",
+  options: VectorStrokeLodAsyncBuildOptions,
+  cacheResult: boolean
+): Promise<VectorStrokeLodRuntime | null> {
   if (!shouldUseVectorStrokeLod(mode, rendererType, scene.segmentCount)) {
     return null;
   }
@@ -1161,6 +1205,21 @@ export async function prebuildVectorStrokeLodRuntime(
   const scheduler = new VectorStrokeLodYieldScheduler(options);
   const startedAt = nowMs();
   scheduler.report(0, "Preparing Vector LOD");
+  const cached = takePrebuiltVectorStrokeLodRuntime(scene);
+  if (cached) {
+    // Reserve it across the yield: concurrent preparation must not borrow the
+    // same mutable selection state. Cancellation/progress errors leave this
+    // completed hierarchy reusable instead of discarding expensive geometry.
+    let completed = false;
+    try {
+      await scheduler.maybeYield(true, 0.99, "Reusing Vector LOD");
+      scheduler.report(1, "Vector LOD ready");
+      completed = true;
+      return cached;
+    } finally {
+      if (cacheResult || !completed) storePrebuiltVectorStrokeLodRuntimeInternal(scene, cached);
+    }
+  }
   const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
   await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
 
@@ -1189,20 +1248,19 @@ export async function prebuildVectorStrokeLodRuntime(
     levels,
     elapsedMs: nowMs() - startedAt
   });
-  storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
-  scheduler.report(1, "Vector LOD ready");
+  if (cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
+  try {
+    scheduler.report(1, "Vector LOD ready");
+  } catch (error) {
+    if (!cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
+    throw error;
+  }
   return runtime;
 }
 
 export function takePrebuiltVectorStrokeLodRuntime(scene: VectorScene): VectorStrokeLodRuntime | null {
-  const runtimes = prebuiltRuntimeByScene.get(scene);
-  if (!runtimes || runtimes.length <= 0) {
-    return null;
-  }
-  const runtime = runtimes.shift() ?? null;
-  if (runtimes.length <= 0) {
-    prebuiltRuntimeByScene.delete(scene);
-  }
+  const runtime = prebuiltRuntimeByScene.get(scene) ?? null;
+  prebuiltRuntimeByScene.delete(scene);
   return runtime;
 }
 
@@ -1213,12 +1271,7 @@ export function storePrebuiltVectorStrokeLodRuntime(scene: VectorScene, runtime:
 }
 
 function storePrebuiltVectorStrokeLodRuntimeInternal(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
-  const runtimes = prebuiltRuntimeByScene.get(scene);
-  if (runtimes) {
-    runtimes.push(runtime);
-  } else {
-    prebuiltRuntimeByScene.set(scene, [runtime]);
-  }
+  prebuiltRuntimeByScene.set(scene, runtime);
 }
 
 async function buildVectorStrokeLodScenesAsync(

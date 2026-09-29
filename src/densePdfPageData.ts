@@ -193,7 +193,8 @@ export interface DensePdfType3PageData {
 /**
  * Move the dense compiler's GPU-ready arrays into the page-native v7 ABI.
  *
- * No geometry is copied. The compiler must have run with
+ * Root-only geometry is reused; reusable programs are combined in one copy.
+ * The compiler must have run with
  * `output: "display-program"`; otherwise a non-empty page is rejected rather
  * than grouped into a visually incorrect order.
  */
@@ -239,15 +240,9 @@ export function createHeprPageDataFromDense(
       defaultVisible: options.optionalContent.defaultVisible
     };
   }
-  stores.strokes.endpoints = compiled.endpoints;
-  stores.strokes.primitiveMeta = compiled.primitiveMeta;
-  stores.strokes.primitiveBounds = compiled.primitiveBounds;
-  stores.strokes.styles = compiled.styles;
-  stores.paths.fillPathMetaA = compiled.fillPathMetaA;
-  stores.paths.fillPathMetaB = compiled.fillPathMetaB;
-  stores.paths.fillPathMetaC = compiled.fillPathMetaC;
-  stores.paths.fillSegmentsA = compiled.fillSegmentsA;
-  stores.paths.fillSegmentsB = compiled.fillSegmentsB;
+  const geometrySources = [compiled];
+  let strokeOffset = compiled.endpoints.length / 4;
+  let fillOffset = compiled.fillPathMetaA.length / 4;
   const markedTags: string[] = [];
   const markedPropertyNames: Array<string | null> = [];
   const markedMcids: number[] = [];
@@ -292,40 +287,12 @@ export function createHeprPageDataFromDense(
     ) {
       throw new TypeError(`Form XObject /${program.resourceName} has invalid text resources.`);
     }
-    formStrokeOffsets.push(stores.strokes.endpoints.length / 4);
-    formFillOffsets.push(stores.paths.fillPathMetaA.length / 4);
+    formStrokeOffsets.push(strokeOffset);
+    formFillOffsets.push(fillOffset);
     formMarkedContentOffsets.push(appendMarkedContent(formCompiled));
-    const fillSegmentOffset = stores.paths.fillSegmentsA.length / 4;
-    stores.strokes.endpoints = concatFloat32(stores.strokes.endpoints, formCompiled.endpoints);
-    stores.strokes.primitiveMeta = concatFloat32(
-      stores.strokes.primitiveMeta,
-      formCompiled.primitiveMeta
-    );
-    stores.strokes.primitiveBounds = concatFloat32(
-      stores.strokes.primitiveBounds,
-      formCompiled.primitiveBounds
-    );
-    stores.strokes.styles = concatFloat32(stores.strokes.styles, formCompiled.styles);
-    stores.paths.fillPathMetaA = concatFloat32(
-      stores.paths.fillPathMetaA,
-      offsetFillSegmentStarts(formCompiled.fillPathMetaA, fillSegmentOffset)
-    );
-    stores.paths.fillPathMetaB = concatFloat32(
-      stores.paths.fillPathMetaB,
-      formCompiled.fillPathMetaB
-    );
-    stores.paths.fillPathMetaC = concatFloat32(
-      stores.paths.fillPathMetaC,
-      formCompiled.fillPathMetaC
-    );
-    stores.paths.fillSegmentsA = concatFloat32(
-      stores.paths.fillSegmentsA,
-      formCompiled.fillSegmentsA
-    );
-    stores.paths.fillSegmentsB = concatFloat32(
-      stores.paths.fillSegmentsB,
-      formCompiled.fillSegmentsB
-    );
+    geometrySources.push(formCompiled);
+    strokeOffset += formCompiled.endpoints.length / 4;
+    fillOffset += formCompiled.fillPathMetaA.length / 4;
   }
   const type3StrokeOffsets: number[] = [];
   const type3FillOffsets: number[] = [];
@@ -350,25 +317,12 @@ export function createHeprPageDataFromDense(
     ) {
       throw new TypeError(`Type3 CharProc ${program.resourceName} has invalid nested resources.`);
     }
-    type3StrokeOffsets.push(stores.strokes.endpoints.length / 4);
-    type3FillOffsets.push(stores.paths.fillPathMetaA.length / 4);
+    type3StrokeOffsets.push(strokeOffset);
+    type3FillOffsets.push(fillOffset);
     type3MarkedContentOffsets.push(appendMarkedContent(charProc));
-    const fillSegmentOffset = stores.paths.fillSegmentsA.length / 4;
-    stores.strokes.endpoints = concatFloat32(stores.strokes.endpoints, charProc.endpoints);
-    stores.strokes.primitiveMeta = concatFloat32(stores.strokes.primitiveMeta, charProc.primitiveMeta);
-    stores.strokes.primitiveBounds = concatFloat32(
-      stores.strokes.primitiveBounds,
-      charProc.primitiveBounds
-    );
-    stores.strokes.styles = concatFloat32(stores.strokes.styles, charProc.styles);
-    stores.paths.fillPathMetaA = concatFloat32(
-      stores.paths.fillPathMetaA,
-      offsetFillSegmentStarts(charProc.fillPathMetaA, fillSegmentOffset)
-    );
-    stores.paths.fillPathMetaB = concatFloat32(stores.paths.fillPathMetaB, charProc.fillPathMetaB);
-    stores.paths.fillPathMetaC = concatFloat32(stores.paths.fillPathMetaC, charProc.fillPathMetaC);
-    stores.paths.fillSegmentsA = concatFloat32(stores.paths.fillSegmentsA, charProc.fillSegmentsA);
-    stores.paths.fillSegmentsB = concatFloat32(stores.paths.fillSegmentsB, charProc.fillSegmentsB);
+    geometrySources.push(charProc);
+    strokeOffset += charProc.endpoints.length / 4;
+    fillOffset += charProc.fillPathMetaA.length / 4;
   }
   const patternStrokeOffsets: number[] = [];
   const patternFillOffsets: number[] = [];
@@ -393,41 +347,24 @@ export function createHeprPageDataFromDense(
     ) {
       throw new TypeError(`Pattern /${program.resourceName} has invalid nested resources.`);
     }
-    patternStrokeOffsets.push(stores.strokes.endpoints.length / 4);
-    patternFillOffsets.push(stores.paths.fillPathMetaA.length / 4);
+    patternStrokeOffsets.push(strokeOffset);
+    patternFillOffsets.push(fillOffset);
     patternMarkedContentOffsets.push(appendMarkedContent(patternCompiled));
-    const fillSegmentOffset = stores.paths.fillSegmentsA.length / 4;
-    stores.strokes.endpoints = concatFloat32(stores.strokes.endpoints, patternCompiled.endpoints);
-    stores.strokes.primitiveMeta = concatFloat32(
-      stores.strokes.primitiveMeta,
-      patternCompiled.primitiveMeta
-    );
-    stores.strokes.primitiveBounds = concatFloat32(
-      stores.strokes.primitiveBounds,
-      patternCompiled.primitiveBounds
-    );
-    stores.strokes.styles = concatFloat32(stores.strokes.styles, patternCompiled.styles);
-    stores.paths.fillPathMetaA = concatFloat32(
-      stores.paths.fillPathMetaA,
-      offsetFillSegmentStarts(patternCompiled.fillPathMetaA, fillSegmentOffset)
-    );
-    stores.paths.fillPathMetaB = concatFloat32(
-      stores.paths.fillPathMetaB,
-      patternCompiled.fillPathMetaB
-    );
-    stores.paths.fillPathMetaC = concatFloat32(
-      stores.paths.fillPathMetaC,
-      patternCompiled.fillPathMetaC
-    );
-    stores.paths.fillSegmentsA = concatFloat32(
-      stores.paths.fillSegmentsA,
-      patternCompiled.fillSegmentsA
-    );
-    stores.paths.fillSegmentsB = concatFloat32(
-      stores.paths.fillSegmentsB,
-      patternCompiled.fillSegmentsB
-    );
+    geometrySources.push(patternCompiled);
+    strokeOffset += patternCompiled.endpoints.length / 4;
+    fillOffset += patternCompiled.fillPathMetaA.length / 4;
   }
+  // Allocate each packed store once, after validating resource scope metadata.
+  // Prefix offsets retain root / Form / Type3 / pattern paint order.
+  stores.strokes.endpoints = combineDenseGeometry(geometrySources, "endpoints");
+  stores.strokes.primitiveMeta = combineDenseGeometry(geometrySources, "primitiveMeta");
+  stores.strokes.primitiveBounds = combineDenseGeometry(geometrySources, "primitiveBounds");
+  stores.strokes.styles = combineDenseGeometry(geometrySources, "styles");
+  stores.paths.fillPathMetaA = combineDenseGeometry(geometrySources, "fillPathMetaA");
+  stores.paths.fillPathMetaB = combineDenseGeometry(geometrySources, "fillPathMetaB");
+  stores.paths.fillPathMetaC = combineDenseGeometry(geometrySources, "fillPathMetaC");
+  stores.paths.fillSegmentsA = combineDenseGeometry(geometrySources, "fillSegmentsA");
+  stores.paths.fillSegmentsB = combineDenseGeometry(geometrySources, "fillSegmentsB");
   stores.markedContent = {
     tags: Object.freeze(markedTags),
     propertyNames: Object.freeze(markedPropertyNames),
@@ -2449,11 +2386,50 @@ export function createHeprPageDataFromDense(
   };
 }
 
-function offsetFillSegmentStarts(source: Float32Array, segmentOffset: number): Float32Array {
-  if (segmentOffset === 0 || source.length === 0) return source;
-  const result = source.slice();
-  for (let offset = 0; offset < result.length; offset += 4) {
-    result[offset] += segmentOffset;
+type DenseGeometryField =
+  | "endpoints" | "primitiveMeta" | "primitiveBounds" | "styles"
+  | "fillPathMetaA" | "fillPathMetaB" | "fillPathMetaC" | "fillSegmentsA" | "fillSegmentsB";
+
+function combineDenseGeometry(
+  sources: readonly DensePdfCompiledPage[],
+  field: DenseGeometryField
+): Float32Array {
+  if (sources.length === 1) return sources[0][field];
+  const relocateSegments = field === "fillPathMetaA";
+  let length = 0;
+  let nonemptyCount = 0;
+  let singleSource = sources[0][field];
+  let segmentOffset = 0;
+  let needsRelocation = false;
+  for (const source of sources) {
+    const values = source[field];
+    length += values.length;
+    if (values.length > 0) {
+      nonemptyCount += 1;
+      singleSource = values;
+      if (relocateSegments && segmentOffset !== 0) needsRelocation = true;
+    }
+    if (relocateSegments) segmentOffset += source.fillSegmentsA.length / 4;
+  }
+  if (nonemptyCount <= 1 && !needsRelocation) return singleSource;
+
+  const result = new Float32Array(length);
+  let offset = 0;
+  segmentOffset = 0;
+  for (const source of sources) {
+    const values = source[field];
+    if (values.length > 0) {
+      result.set(values, offset);
+      if (relocateSegments && segmentOffset !== 0) {
+        // Only relocate the destination: source programs remain reusable, and
+        // all other components preserve their exact Float32 bit patterns.
+        for (let index = 0; index < values.length; index += 4) {
+          result[offset + index] += segmentOffset;
+        }
+      }
+      offset += values.length;
+    }
+    if (relocateSegments) segmentOffset += source.fillSegmentsA.length / 4;
   }
   return result;
 }

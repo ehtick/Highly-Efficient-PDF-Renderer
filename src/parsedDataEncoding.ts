@@ -72,7 +72,8 @@ export function decodeXorDeltaByteShuffledFloat32(bytes: Uint8Array): Float32Arr
   const floatCount = bytes.length / 4;
   const deltaBytes = unshuffleBytesByWord(bytes, floatCount);
   const deltaWords = new Uint32Array(deltaBytes.buffer);
-  const outWords = new Uint32Array(floatCount);
+  // Unshuffling already produced an owned buffer; reconstruct its words in place.
+  const outWords = deltaWords;
 
   let prev = 0;
   for (let i = 0; i < floatCount; i += 1) {

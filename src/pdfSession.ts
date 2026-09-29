@@ -1399,9 +1399,9 @@ class NativePdfSession implements NativeVectorPdfSession {
         return result;
       } catch (error) {
         signal.throwIfAborted();
-        // Only what streaming cannot compile (inline images, patterns,
-        // shadings) moves to prepared input. Any other failure, including a
-        // caller's resolver, would recur there and is reported once.
+        // A property first used as metadata and later as /OC still needs
+        // lookahead. Other failures, including a caller's resolver, are
+        // reported once rather than retried with prepared input.
         if (!(error instanceof DensePdfStreamingUnsupportedError)) throw error;
         if (reuse) reuse.prepared = undefined;
       }
@@ -1417,10 +1417,9 @@ class NativePdfSession implements NativeVectorPdfSession {
 
   /**
    * Prepare a page whose content streams straight into the compiler. Its
-   * fonts, ExtGStates, marked-content properties, color spaces and XObjects
+   * fonts, ExtGStates, properties, color spaces, XObjects, patterns and shadings
    * load when the content first uses them, so the decoded content is neither
-   * held whole nor scanned for references first. Returns null when the page
-   * names patterns or shadings, which need prepared content.
+   * held whole nor scanned for references first.
    */
   private async prepareStreamedPageResources(
     sourcePageIndex: number,
@@ -1429,16 +1428,6 @@ class NativePdfSession implements NativeVectorPdfSession {
   ): Promise<PreparedNativePageResources | null> {
     const page = this.document.getPage(sourcePageIndex);
     const resources = await loadReferencedPageResourceScope(this.document, page, signal);
-    for (const category of ["Pattern", "Shading"]) {
-      const value = resources.get(category);
-      if (value === undefined || value === null) continue;
-      try {
-        if ((await this.document.resolveDictionary(value, signal)).size !== 0) return null;
-      } catch {
-        signal.throwIfAborted();
-        return null;
-      }
-    }
     const pageInfo = this.info.pages[sourcePageIndex];
     const { pageMatrix, pageBounds } = computePageGeometry(page);
     const streams = await this.document.getPageContentStreams(sourcePageIndex, signal);
@@ -1470,7 +1459,21 @@ class NativePdfSession implements NativeVectorPdfSession {
       appearanceSynthesizer: this.appearanceSynthesizer,
       signal
     });
-    const content = new StreamedPageContent(this.document, streams, signal);
+    let inlineImageCount = 0;
+    const maxInlineImages = Math.min(DEFAULT_NATIVE_INLINE_IMAGE_LIMITS.maxImages,
+      options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage);
+    const content = new StreamedPageContent(this.document, streams, signal, async (bytes, sourceOffset) => {
+      const prepared = prepareNativeInlineImages(bytes, {
+        sourceOffset, signal, limits: inlineImageLimits(this.document, maxInlineImages)
+      });
+      inlineImageCount += prepared.images.length;
+      if (inlineImageCount > maxInlineImages) {
+        throw new PdfError("resource-limit", "Inline image count exceeds the page limit.", {
+          details: { reason: "inline-image-count", count: inlineImageCount, limit: maxInlineImages }
+        });
+      }
+      return bindPreparedInlineImages(prepared, imageResources.registry, imageResources.colorSpaces, signal);
+    });
     return {
       pageInfo, pageMatrix, pageBounds, fontRegistry, fontResources: [],
       imageResources, pageContentSegments: [], extGStates: [], formGraph: EMPTY_NATIVE_FORM_DEFINITION_GRAPH,
@@ -1488,6 +1491,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     prepared: PreparedNativePageResources,
     streamed: NativeStreamedPageResources,
     fontsByName: Map<string, NativeTextFontResource>,
+    vectorShadings: Set<number>,
     signal: AbortSignal,
     timings?: NativeVectorCompileTimings
   ): DensePdfResourceLoader {
@@ -1552,6 +1556,13 @@ class NativePdfSession implements NativeVectorPdfSession {
           }
         }
         streamed.xObjects.add(resourceName);
+      }),
+      shading: (resourceName) => timed("resourceLoadMs", async () => {
+        await imageResources.loadShading(resourceName);
+        for (const index of supportedNativeVectorShadings(imageResources.shadings)) vectorShadings.add(index);
+      }),
+      pattern: (resourceName) => timed("resourceLoadMs", async () => {
+        await imageResources.loadPattern(resourceName);
       })
     };
   }
@@ -1601,7 +1612,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       "content", 0, totalBytes, sourcePageIndex, 0, this.info.byteLength
     ));
     const compileStartedAt = timings ? nativeVectorTimingNow() : 0;
-    const streamedLoadMsBefore = timings ? timings.fontLoadMs + timings.resourceLoadMs : 0;
+    const streamedLoadMsBefore = timings ? timings.fontLoadMs + timings.resourceLoadMs + timings.inlinePreparationMs : 0;
+    const vectorShadings = new Set(supportedNativeVectorShadings(imageResources.shadings));
     let finalizeStartedAt: number | null = null;
     const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
@@ -1620,7 +1632,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       imageOptionalContent: imageResources.optionalContent,
       shadings: imageResources.shadingIndexes,
       ...(output === "vector-scene" ? {
-        vectorShadings: supportedNativeVectorShadings(imageResources.shadings)
+        vectorShadings
       } : {}),
       patterns: imageResources.patternDefinitions,
       patternColorSpaces: imageResources.patternColorSpaces,
@@ -1635,14 +1647,17 @@ class NativePdfSession implements NativeVectorPdfSession {
       ...densePathCompileLimits(this.document, options),
       colorSpaceResolver: imageResources.colorSpaceResolver,
       ...(streamed ? {
-        resourceLoader: this.streamedResourceLoader(prepared, streamed, fontsByName, signal, timings),
+        resourceLoader: this.streamedResourceLoader(prepared, streamed, fontsByName, vectorShadings, signal, timings),
+        inlineImageLoader: (offset, buffered) => streamed.content.prepareInlineRemainder(offset, buffered),
         loadedResources: {
           fonts: streamed.fonts.keys(),
           extGStates: streamed.extGStates.keys(),
           properties: streamed.properties.keys(),
           optionalContentProperties: streamed.optionalContentProperties,
           colorSpaces: streamed.colorSpaces,
-          xObjects: streamed.xObjects
+          xObjects: streamed.xObjects,
+          shadings: imageResources.shadingIndexes.keys(),
+          patterns: imageResources.patternDefinitions.keys()
         }
       } : { totalBytes }),
       signal,
@@ -1666,8 +1681,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       : await compileDensePdfContent(content, { ...compileOptions, output });
     if (streamed) {
       totalBytes = streamed.content.decodedBytes;
-      // Streamed content is never prepared for inline images.
-      if (timings) timings.inlinePreparationSkipped = true;
+      if (timings) timings.inlinePreparationSkipped = !streamed.content.hasInlineImages;
       if (!streamed.graph) {
         await streamed.forms.addAnnotations();
         streamed.graph = streamed.forms.build();
@@ -1681,7 +1695,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       const finalizeSplitAt = finalizeStartedAt ?? compileFinishedAt;
       // Streamed decoding and resource loading happen inside the scan.
       const streamedMs = streamed
-        ? streamed.content.decodeMs + timings.fontLoadMs + timings.resourceLoadMs - streamedLoadMsBefore
+        ? streamed.content.decodeMs + timings.fontLoadMs + timings.resourceLoadMs + timings.inlinePreparationMs - streamedLoadMsBefore
         : 0;
       if (streamed) timings.decodeMs += streamed.content.decodeMs;
       timings.compileScanMs += finalizeSplitAt - compileStartedAt - streamedMs;
@@ -2320,74 +2334,143 @@ const STREAMED_CONTENT_EXPANSION_ESTIMATE = 6;
  */
 class StreamedPageContent {
   readonly estimatedBytes: number;
-
   decodedBytes = 0;
-
   decodeMs = 0;
 
+  private iterator: AsyncIterator<Uint8Array> | undefined;
+  private remainder: Uint8Array = new Uint8Array(0);
+  private preparedRemainder = false;
+  private timings?: NativeVectorCompileTimings;
+  private readonly inlineTails = new Map<number, {
+    end: number; segments: readonly DensePdfContentSegment[];
+  }>();
+
   private readonly document: NativePdfDocument;
-
   private readonly streams: readonly PdfStream[];
-
   private readonly signal: AbortSignal;
+  private readonly prepareInline: (bytes: Uint8Array, offset: number) => Promise<readonly DensePdfContentSegment[]>;
 
-  constructor(document: NativePdfDocument, streams: readonly PdfStream[], signal: AbortSignal) {
+  constructor(
+    document: NativePdfDocument,
+    streams: readonly PdfStream[],
+    signal: AbortSignal,
+    prepareInline: (bytes: Uint8Array, offset: number) => Promise<readonly DensePdfContentSegment[]>
+  ) {
     this.document = document;
     this.streams = streams;
     this.signal = signal;
+    this.prepareInline = prepareInline;
     let encodedBytes = streams.length > 0 ? streams.length - 1 : 0;
     for (const stream of streams) encodedBytes += stream.bytes.length;
     this.estimatedBytes = Math.max(1, encodedBytes * STREAMED_CONTENT_EXPANSION_ESTIMATE);
   }
 
+  get hasInlineImages(): boolean { return this.inlineTails.size > 0; }
+
   estimateTotal(processedBytes: number): number {
     return Math.max(this.estimatedBytes, Math.ceil(processedBytes / 0.95));
   }
 
-  /** Decode the content from the start; each compilation streams it anew. */
-  async *chunks(timings?: NativeVectorCompileTimings): AsyncGenerator<Uint8Array> {
+  private async nextChunk(): Promise<IteratorResult<Uint8Array>> {
+    this.signal.throwIfAborted();
+    if (!this.iterator) return { done: true, value: undefined };
+    const startedAt = this.timings ? nativeVectorTimingNow() : 0;
+    const next = await this.iterator.next();
+    if (this.timings) this.decodeMs += nativeVectorTimingNow() - startedAt;
+    if (!next.done) this.decodedBytes += next.value.length;
+    return next;
+  }
+
+  /** Drain only this stream, starting at the lexer's clean BI boundary. */
+  async prepareInlineRemainder(offset: number, buffered: Uint8Array): Promise<readonly DensePdfContentSegment[]> {
+    this.signal.throwIfAborted();
+    this.preparedRemainder = true;
+    const cached = this.inlineTails.get(offset);
+    if (cached) {
+      await this.iterator?.return?.();
+      this.decodedBytes = cached.end;
+      this.remainder = new Uint8Array(0);
+      return cached.segments;
+    }
+    const chunks = [buffered, this.remainder];
+    let length = buffered.length + this.remainder.length;
+    this.remainder = new Uint8Array(0);
+    for (;;) {
+      const next = await this.nextChunk();
+      if (next.done) break;
+      chunks.push(next.value);
+      length += next.value.length;
+    }
+    this.signal.throwIfAborted();
+    const startedAt = this.timings ? nativeVectorTimingNow() : 0;
+    const bytes = new Uint8Array(length);
+    let cursor = 0;
+    for (const chunk of chunks) { bytes.set(chunk, cursor); cursor += chunk.length; }
+    const segments = await this.prepareInline(bytes, offset);
+    if (this.timings) this.timings.inlinePreparationMs += nativeVectorTimingNow() - startedAt;
+    this.inlineTails.set(offset, { end: this.decodedBytes, segments });
+    return segments;
+  }
+
+  /** A second compilation reuses bound inline tails, fonts and image pixels. */
+  async *chunks(timings?: NativeVectorCompileTimings): AsyncGenerator<DensePdfContentSegment> {
     this.decodedBytes = 0;
     this.decodeMs = 0;
-    const newline = Uint8Array.of(0x0a);
-    let pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
-    let pendingLength = 0;
+    this.timings = timings;
+    let sourceOffset = 0;
     for (let index = 0; index < this.streams.length; index += 1) {
-      const decoded = this.document.decodeStreamChunks(this.streams[index], { signal: this.signal });
-      const iterator = decoded[Symbol.asyncIterator]();
-      let separated = index === 0;
-      while (true) {
-        let chunk: Uint8Array;
-        if (!separated) {
-          chunk = newline;
-          separated = true;
-        } else {
-          const startedAt = timings ? nativeVectorTimingNow() : 0;
-          const next = await iterator.next();
-          if (timings) this.decodeMs += nativeVectorTimingNow() - startedAt;
+      this.preparedRemainder = false;
+      this.iterator = this.document.decodeStreamChunks(this.streams[index], { signal: this.signal })[Symbol.asyncIterator]();
+      let pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
+      let pendingLength = 0;
+      try {
+        while (!this.preparedRemainder) {
+          const next = await this.nextChunk();
           if (next.done) break;
-          chunk = next.value;
-        }
-        this.decodedBytes += chunk.length;
-        // Coalesce small platform chunks; pass large ones through uncopied.
-        let offset = 0;
-        while (offset < chunk.length) {
-          if (pendingLength === 0 && chunk.length - offset >= STREAMED_CONTENT_CHUNK_BYTES) {
-            yield chunk.subarray(offset);
-            break;
+          const chunk = next.value;
+          let offset = 0;
+          while (offset < chunk.length) {
+            // Pass through large decoded chunks without another copy. The
+            // compiler hands back their unconsumed suffix if it reaches BI.
+            if (pendingLength === 0 && chunk.length - offset >= STREAMED_CONTENT_CHUNK_BYTES) {
+              const bytes = chunk.subarray(offset);
+              this.remainder = new Uint8Array(0);
+              yield { kind: "content", bytes, sourceOffset, sourceLength: bytes.length };
+              sourceOffset += bytes.length;
+              break;
+            }
+            const copied = Math.min(pending.length - pendingLength, chunk.length - offset);
+            pending.set(chunk.subarray(offset, offset + copied), pendingLength);
+            pendingLength += copied;
+            offset += copied;
+            if (pendingLength === pending.length) {
+              this.remainder = chunk.subarray(offset);
+              yield { kind: "content", bytes: pending, sourceOffset, sourceLength: pendingLength };
+              sourceOffset += pendingLength;
+              pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
+              pendingLength = 0;
+              if (this.preparedRemainder) break;
+            }
           }
-          const copied = Math.min(STREAMED_CONTENT_CHUNK_BYTES - pendingLength, chunk.length - offset);
-          pending.set(chunk.subarray(offset, offset + copied), pendingLength);
-          pendingLength += copied;
-          offset += copied;
-          if (pendingLength === STREAMED_CONTENT_CHUNK_BYTES) {
-            yield pending;
-            pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
-            pendingLength = 0;
-          }
+          this.remainder = new Uint8Array(0);
         }
+        if (pendingLength > 0) {
+          yield { kind: "content", bytes: pending.subarray(0, pendingLength), sourceOffset, sourceLength: pendingLength };
+        }
+        sourceOffset = this.decodedBytes;
+        // End the stream's last token before advancing to the next decoder.
+        // An incomplete inline image must never consume another stream.
+        if (index + 1 < this.streams.length) {
+          this.decodedBytes += 1;
+          yield { kind: "content", bytes: Uint8Array.of(0x0a), sourceOffset, sourceLength: 1 };
+          sourceOffset = this.decodedBytes;
+        }
+      } finally {
+        await this.iterator.return?.();
+        this.iterator = undefined;
+        this.remainder = new Uint8Array(0);
       }
     }
-    if (pendingLength > 0) yield pending.subarray(0, pendingLength);
   }
 }
 
@@ -2419,6 +2502,8 @@ interface LoadedPageImages {
   loadColorSpace(resourceName: string): Promise<void>;
   /** Load one more page Image XObject into `indexes` and `optionalContent`. */
   loadImage(resourceName: string): Promise<void>;
+  loadShading(resourceName: string): Promise<void>;
+  loadPattern(resourceName: string): Promise<void>;
   assertReferencedCodecsAvailable(
     referencedNames: readonly string[],
     scopedIndexes?: ReadonlyMap<string, number>
@@ -7108,13 +7193,13 @@ async function loadPageImages(
   const patterns = new NativePdfPatternRegistry(document, shadings);
   const extGStates = new NativePdfExtGStateRegistry(document, colors, { onDiagnostic });
   const shadingIndexes = new Map<string, number>();
-  const patternDefinitions = await loadPatternDefinitions(
+  const patternDefinitions = new Map(await loadPatternDefinitions(
     patterns,
     extGStates,
     resources,
     references.patterns,
     signal
-  );
+  ));
   const xObjectReferences = await classifyNativePdfXObjectReferences(
     document,
     resources,
@@ -7156,6 +7241,16 @@ async function loadPageImages(
     patternColorSpaces,
     optionalContent: scopedImages.optionalContent,
     loadColorSpace,
+    async loadShading(resourceName) {
+      if (shadingIndexes.has(resourceName)) return;
+      shadingIndexes.set(resourceName,
+        await shadings.add({ kind: "name", value: resourceName }, resources, signal));
+    },
+    async loadPattern(resourceName) {
+      if (patternDefinitions.has(resourceName)) return;
+      const loaded = await loadPatternDefinitions(patterns, extGStates, resources, [resourceName], signal);
+      for (const [name, definition] of loaded) patternDefinitions.set(name, definition);
+    },
     async loadImage(resourceName) {
       const loaded = await loadScopedImageResources(
         document,

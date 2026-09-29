@@ -63,6 +63,8 @@ export const fastTests = [
   "pdf-session-worker",
   "pdf-node-worker-runtime",
   "native-content-compiler",
+  "native-streamed-content",
+  "pdf-to-hep-progress",
   "native-glyph-hairline",
   "native-vector-page",
   "native-composite-lifetime",

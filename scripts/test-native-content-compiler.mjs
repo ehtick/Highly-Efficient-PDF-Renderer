@@ -35,6 +35,7 @@ const DEFAULT_OPTIONS = Object.freeze({
 
 await testChunkBoundaryLexer();
 await testPreparedInlineImageSegments();
+await testLongDecimalOperands();
 await testPrivatePaintSourceIdentityRange();
 await testCompilationContexts();
 await testVectorSceneOutput();
@@ -101,6 +102,20 @@ async function testChunkBoundaryLexer() {
   assert.equal(actual.operatorCount, 3);
   assert.equal(actual.pathCount, 1);
   assert.equal(actual.sourceSegmentCount, 1);
+}
+
+async function testLongDecimalOperands() {
+  for (const token of ["9007199254740993", "12345678901234567890.123456789", "-0", "+.5", "2.",
+    "0." + "0".repeat(320) + "1", "1." + "0".repeat(350)]) {
+    const values = [];
+    const bytes = encoder.encode(`${token} Tc`);
+    await compile({ async *[Symbol.asyncIterator]() {
+      for (const byte of bytes) yield Uint8Array.of(byte);
+    } }, { textOperatorSink: { applyOperator(operator, operands) {
+      if (operator === "Tc") values.push(operands[0]);
+    } } });
+    assert.equal(values[0], Number(token), `numeric operand ${token.slice(0, 32)} must round correctly`);
+  }
 }
 
 async function testPreparedInlineImageSegments() {

@@ -235,6 +235,8 @@ export interface DensePdfResourceLoader {
   colorSpace(resourceName: string): Promise<void>;
   /** A page Image or Form XObject, before the first `Do` that names it. */
   xObject(resourceName: string): Promise<void>;
+  shading?(resourceName: string): Promise<void>;
+  pattern?(resourceName: string): Promise<void>;
 }
 
 export interface DensePdfLoadedResourceNames {
@@ -244,6 +246,8 @@ export interface DensePdfLoadedResourceNames {
   readonly optionalContentProperties: Iterable<string>;
   readonly colorSpaces: Iterable<string>;
   readonly xObjects: Iterable<string>;
+  readonly shadings?: Iterable<string>;
+  readonly patterns?: Iterable<string>;
 }
 
 export interface DensePdfMarkedContentPropertyDefinition {
@@ -326,12 +330,13 @@ export interface DensePdfContentCompileOptions {
   colorSpaceResolver?: DensePdfColorSpaceResolver;
   /**
    * Streamed content: load each font, ExtGState, marked-content property,
-   * color space and XObject when the content first uses it instead of
-   * resolving every reference before compilation. Content that needs
-   * shadings, patterns or inline images fails and must be compiled from
-   * prepared input.
+   * color space, XObject, pattern and shading on first use.
    */
   resourceLoader?: DensePdfResourceLoader;
+  /** Prepare the current stream from BI onward, preserving this compiler's state. */
+  inlineImageLoader?: (
+    sourceOffset: number, buffered: Uint8Array
+  ) => Promise<readonly DensePdfContentSegment[]>;
   /**
    * Streamed content: resources an earlier compilation of the same content
    * already loaded. Their fonts, ExtGStates and properties must be among the
@@ -746,9 +751,8 @@ export class DensePdfUnsupportedError extends Error {
 }
 
 /**
- * Streamed content reached what only prepared content can compile, such as
- * an inline image, a shading or a pattern. Compile the page from prepared
- * input instead; nothing about the page itself is wrong.
+ * A resource needs page-wide lookahead, or its streaming loader is absent.
+ * Compile from prepared input instead; nothing about the page itself is wrong.
  */
 export class DensePdfStreamingUnsupportedError extends Error {
   readonly operator: string;
@@ -881,7 +885,7 @@ type PdfValue =
   | null;
 
 type StreamedResourceKind =
-  "font" | "extGState" | "property" | "optionalContentProperty" | "colorSpace" | "xObject";
+  "font" | "extGState" | "property" | "optionalContentProperty" | "colorSpace" | "xObject" | "shading" | "pattern";
 
 /**
  * Thrown through the lexer when streamed content first uses a resource that
@@ -897,6 +901,9 @@ class ContentResourceSuspension {
     this.resourceName = resourceName;
   }
 }
+
+/** A lexical BI boundary, before consuming its dictionary or binary payload. */
+class ContentInlineImageSuspension {}
 
 type LexerToken =
   | { kind: "number"; value: number }
@@ -1096,7 +1103,7 @@ async function compileContent(
     }
   };
 
-  for await (const segment of normalizeContentSegments(source)) {
+  const consumeSegment = async (segment: DensePdfContentSegment): Promise<void> => {
     if (segment.kind === "image") {
       // BI…EI is structurally prepared before resource resolution. Flush the
       // lexical boundary without finalizing the long-lived graphics parser,
@@ -1104,7 +1111,7 @@ async function compileContent(
       await feed(EMPTY_CONTENT_BYTES, true);
       compiler.consumeInlineImage(segment);
       processedBytes += segment.sourceLength;
-      continue;
+      return;
     }
     const inputChunk = segment.bytes;
     for (let offset = 0; offset < inputChunk.length; offset += MAX_INPUT_SLICE_BYTES) {
@@ -1113,7 +1120,23 @@ async function compileContent(
         offset,
         Math.min(inputChunk.length, offset + MAX_INPUT_SLICE_BYTES)
       );
-      await feed(slice, false, segment.sourceOffset + offset);
+      try {
+        await feed(slice, false, segment.sourceOffset + offset);
+      } catch (error) {
+        if (!(error instanceof ContentInlineImageSuspension) || !options.inlineImageLoader) throw error;
+        const pending = lexer.takePending();
+        const rest = inputChunk.subarray(offset + slice.length);
+        const buffered = new Uint8Array(pending.bytes.length + rest.length);
+        buffered.set(pending.bytes);
+        buffered.set(rest, pending.bytes.length);
+        const prepared = await options.inlineImageLoader(pending.sourceOffset, buffered);
+        options.signal?.throwIfAborted();
+        // Previous slices may contain the B of a split BI token. Count its
+        // complete span only once, using the exact absolute source position.
+        processedBytes = pending.sourceOffset;
+        for (const replacement of prepared) await consumeSegment(replacement);
+        return;
+      }
       processedBytes += slice.length;
       compiler.compactStrokesIfWorthwhile();
 
@@ -1131,9 +1154,20 @@ async function compileContent(
         lastYieldAt = nowMs();
       }
     }
-  }
+  };
+  for await (const segment of normalizeContentSegments(source)) await consumeSegment(segment);
 
-  await feed(EMPTY_CONTENT_BYTES, true);
+  try {
+    await feed(EMPTY_CONTENT_BYTES, true);
+  } catch (error) {
+    if (!(error instanceof ContentInlineImageSuspension) || !options.inlineImageLoader) throw error;
+    const pending = lexer.takePending();
+    processedBytes = pending.sourceOffset;
+    for (const replacement of await options.inlineImageLoader(pending.sourceOffset, pending.bytes)) {
+      await consumeSegment(replacement);
+    }
+    await feed(EMPTY_CONTENT_BYTES, true);
+  }
   options.signal?.throwIfAborted();
   let lastFinalizeYieldAt = nowMs();
   const finalizeCheckpoint = async (force = false): Promise<void> => {
@@ -1417,7 +1451,9 @@ class DenseContentCompiler {
     property: new Set<string>(),
     optionalContentProperty: new Set<string>(),
     colorSpace: new Set<string>(),
-    xObject: new Set<string>()
+    xObject: new Set<string>(),
+    shading: new Set<string>(),
+    pattern: new Set<string>()
   };
 
   readonly formOptionalContent: ReadonlyMap<string, Readonly<DensePdfOptionalContentDefinition>>;
@@ -1615,6 +1651,8 @@ class DenseContentCompiler {
       for (const name of loaded.optionalContentProperties) this.loadedResources.optionalContentProperty.add(name);
       for (const name of loaded.colorSpaces) this.loadedResources.colorSpace.add(name);
       for (const name of loaded.xObjects) this.loadedResources.xObject.add(name);
+      for (const name of loaded.shadings ?? []) this.loadedResources.shading.add(name);
+      for (const name of loaded.patterns ?? []) this.loadedResources.pattern.add(name);
     }
     this.textSink = options.textOperatorSink;
     this.type3PaintTracked = options.type3PaintMode !== undefined;
@@ -1860,7 +1898,15 @@ class DenseContentCompiler {
         operand = operands[0];
         break;
       case "sh":
+        if (count !== 1) return;
+        if (!this.options.resourceLoader?.shading) {
+          throw new DensePdfStreamingUnsupportedError("Streamed shading needs a resource loader.", operator);
+        }
+        kind = "shading";
+        operand = operands[0];
+        break;
       case "BI":
+        if (this.options.inlineImageLoader) throw new ContentInlineImageSuspension();
         throw new DensePdfStreamingUnsupportedError(
           `Streamed content cannot resolve operator ${operator}; it needs prepared resources.`,
           operator
@@ -1868,10 +1914,12 @@ class DenseContentCompiler {
       case "SCN":
       case "scn":
         if (count > 0 && isPdfName(operands[count - 1])) {
-          throw new DensePdfStreamingUnsupportedError(
-            "Streamed content cannot resolve patterns; they need prepared resources.",
-            operator
-          );
+          if (!this.options.resourceLoader?.pattern) {
+            throw new DensePdfStreamingUnsupportedError("Streamed pattern needs a resource loader.", operator);
+          }
+          kind = "pattern";
+          operand = operands[count - 1];
+          break;
         }
         return;
       default:
@@ -1917,6 +1965,12 @@ class DenseContentCompiler {
         break;
       case "xObject":
         await loader.xObject(resourceName);
+        break;
+      case "shading":
+        await loader.shading!(resourceName);
+        break;
+      case "pattern":
+        await loader.pattern!(resourceName);
         break;
     }
     this.loadedResources[kind].add(resourceName);
@@ -4937,10 +4991,18 @@ class IncrementalPdfLexer {
       offset = this.readTokens(final);
     } catch (error) {
       // Resume at the suspended operator: its operands are already consumed.
-      if (error instanceof ContentResourceSuspension) this.retainFrom(this.wordStart);
+      if (error instanceof ContentResourceSuspension || error instanceof ContentInlineImageSuspension) {
+        this.retainFrom(this.wordStart);
+      }
       throw error;
     }
     this.retainFrom(offset);
+  }
+
+  takePending(): { bytes: Uint8Array; sourceOffset: number } {
+    const pending = { bytes: this.buffer, sourceOffset: this.bufferSourceOffset };
+    this.retainFrom(this.buffer.length);
+    return pending;
   }
 
   private retainFrom(offset: number): void {
@@ -5056,34 +5118,34 @@ class IncrementalPdfLexer {
           if (byte === 0x2d) sign = -1;
           numberOffset += 1;
         }
-        let divideBy = 0;
-        if (numberOffset < bytes.length && bytes[numberOffset] === 0x2e) {
-          divideBy = 10;
+        const integerStart = numberOffset;
+        let value = 0;
+        let digit: number;
+        while (numberOffset < bytes.length && (digit = bytes[numberOffset] - 0x30) >= 0 && digit <= 9) {
+          value = value * 10 + digit;
           numberOffset += 1;
         }
-        let valid = numberOffset < bytes.length &&
-          bytes[numberOffset] >= 0x30 && bytes[numberOffset] <= 0x39;
-        let value = valid ? bytes[numberOffset++] - 0x30 : 0;
-        while (numberOffset < bytes.length) {
-          const numberByte = bytes[numberOffset];
-          if (PDF_BYTE_CLASSES[numberByte] !== PDF_BYTE_REGULAR) break;
-          numberOffset += 1;
-          if (valid && numberByte >= 0x30 && numberByte <= 0x39) {
-            if (divideBy !== 0) divideBy *= 10;
-            value = value * 10 + numberByte - 0x30;
-          } else if (valid && numberByte === 0x2e && divideBy === 0) {
-            divideBy = 1;
-          } else {
-            valid = false;
+        let digits = numberOffset - integerStart;
+        let divideBy = 1;
+        if (bytes[numberOffset] === 0x2e) {
+          const fractionalStart = ++numberOffset;
+          while (numberOffset < bytes.length && (digit = bytes[numberOffset] - 0x30) >= 0 && digit <= 9) {
+            value = value * 10 + digit;
+            divideBy *= 10;
+            numberOffset += 1;
           }
+          digits += numberOffset - fractionalStart;
         }
-        if (numberOffset === bytes.length && !final) {
-          return initialOffset;
-        }
-        if (!valid) {
+        if (numberOffset === bytes.length && !final) return initialOffset;
+        if (digits === 0 || (numberOffset < bytes.length && PDF_BYTE_CLASSES[bytes[numberOffset]] === PDF_BYTE_REGULAR)) {
           throw new DensePdfSyntaxError("Malformed numeric token in PDF content.");
         }
-        const parsed = sign * (divideBy === 0 ? value : value / divideBy);
+        // Integer accumulation is exact for the common short CAD operands.
+        // Longer decimals need correctly rounded conversion, including tiny
+        // fractions whose divisor would overflow before their value does.
+        const parsed = digits <= 15
+          ? sign * (value / divideBy)
+          : Number(internPdfWord(bytes, start, numberOffset));
         if (!Number.isFinite(parsed)) {
           throw new DensePdfSyntaxError("Invalid numeric token in PDF content.");
         }

@@ -423,3 +423,117 @@ brochure −19%, Dublin −14%, SimiValley −19%, layers −22%, and thesis −
 The dense CAD pages above remain slower by up to 7%; the difference is spread
 over per-line ordered-output bookkeeping (paint-run tracking, composite
 validation, paint contexts), not a single hot spot.
+
+## PR review follow-up — 2026-09-29
+
+### Lower Level PDF/HEP parity and fit-all detail
+
+Two separate issues produced the reported counts. The previously tracked HEP
+contained 2,248,621 strokes and no explicit draw runs. The current ordered parser
+and the user-regenerated HEP contain 2,249,884 strokes and 1,341 draw runs. The
+old HEP therefore was not an output of the current parser.
+
+At a 1920 × 1080 viewport, fitting the page with 64 pixels of padding reproduced
+both reported selections exactly: 31,713 strokes from the old HEP and 6,923 from
+the regenerated HEP. For clipped strokes, `primitiveBounds` contains the clip
+window, not the geometry's bounding box. The LOD index incorrectly charged the
+entire clip window to each stroke. Large clips inflated almost every tile's
+occupancy and forced coarse LODs.
+
+The runtime now indexes the stroke's control hull, expanded by its half-width
+and intersected with its clip. Density-adaptive tile edges use the same bounds.
+The shader's clip data stays intact; fully clipped geometry occupies no tiles.
+The corrected selection is **31,339**, close to the previous 31,713 without
+changing LOD budgets or removing source-order correctness.
+
+A fresh Lower Level PDF load matches the regenerated HEP in **every scene
+field**, including typed geometry buffers, text, clip data and draw runs. Both
+produce identical LOD levels, statistics and visible stroke IDs at two viewport
+sizes and three zoom factors. Repeat the read-only check with:
+
+```sh
+node --experimental-strip-types scripts/check-pdf-hep-parity.mjs \
+  'public/examples/pdfs/Lower Level.pdf' \
+  public/examples/heps/Lower_Level-parsed-data.hep
+```
+
+This checks the renderer's input and LOD selection. A browser appearance check
+is still manual, including confirming that fit-all now retains the desired
+amount of detail. No real PDF was exported during this review; the regenerated
+HEPs and manifest are the user's changes.
+
+### Streaming changes
+
+Inline images now suspend at the lexer's `BI` boundary. Only the remainder of
+that content stream is decoded and prepared, then fed back to the same compiler.
+Other streams continue incrementally. Prepared tails and decoded pixels are
+reused during the optional compositing compilation. Decoder iterators close on
+completion, errors and cancellation. Large decoded chunks still pass through
+without a coalescing copy.
+
+Patterns and shadings load on first use, removing the resource-dictionary
+exclusion. The analytic shading capability set updates when a shading loads.
+Resource indices may differ from prepared input; synthetic tests compare both
+lowered scenes and rendered pixels when standalone shadings precede shading
+patterns. The rare metadata-property-then-`/OC` case still requires prepared
+lookahead and can restart; inline-image work no longer causes a restart.
+
+The numeric lexer also accepts long finite decimals correctly. Its old numeric
+accumulator/divisor could overflow even for values such as `1.` followed by
+hundreds of zeros. Short CAD operands keep allocation-free conversion; long
+numbers use correctly rounded numeric conversion after strict PDF token checks.
+
+### Performance findings and decision
+
+The earlier 1–7% table measures production parser time, not the full
+`regenerate:heps` command. Bounded, serial source-loader checks during this review
+excluded module import, file reading, HEP packaging, terminal progress output and
+LOD construction:
+
+| Check | Baseline | Follow-up | Interpretation |
+| --- | ---: | ---: | --- |
+| Lower Level, `origin/main` vs follow-up | 15.089 s | 15.561 s | +3.1%, one cold process per side |
+| War and Peace, `origin/main` vs follow-up | 22.607 s | 22.376 s | −1.0%, one cold process per side |
+| Plan de déneigement, branch HEAD vs follow-up | 2.628 s | 2.463 s | −6.3%; direct page compile, identical scene fingerprint |
+
+These are diagnostic samples, not replacement five-run production medians.
+Earlier measurements overlapping the user's HEP regeneration were discarded.
+Lower Level's scan profile places most work in numeric tokenization, primitive
+emission and duplicate lookup; font/resource loading is negligible. The ordered
+parser also needs paint-context-aware duplicate/containment culling. Accept the
+small measured CAD gap for correct paint order rather than restoring the old
+fixed fill/stroke/text passes. Further per-line work should require repeatable
+production-bundle gains and exact scene regression checks.
+
+The CLI also printed about 5,000 progress-stage changes for War and Peace on
+**both** versions, even when the percentage had not changed. Progress output now
+limits those intermediate updates to four per second while keeping 5% milestones
+and completion immediate. Replaying the measured branch events would print about
+90 updates. This removes avoidable terminal overhead; it is not evidence that
+terminal output caused the reported 40-second regression.
+
+The full 2:10 versus 2:50 batch difference remains **unverified**. Parser-only
+samples do not reproduce a slowdown of that size, and the archive encoder and
+manifest generator did not change on this branch. No claim is made that full
+regeneration is now at least as fast as main. Per `AGENTS.md`, full conversion is
+left to the user. Run `time npm run regenerate:heps` alone, retain its per-file
+timing summary, and compare under the same Node version, terminal and machine
+load. The LOD correction itself needs no HEP regeneration.
+
+### Validation and changed files
+
+Type checking, `git diff --check`, the read-only Lower Level comparison, and 25
+focused test files passed. Tests cover streamed/prepared parity across compressed
+and uncompressed chunk boundaries, multiple streams, inline-image limits and
+cancellation, second-pass resource reuse, gradient pixels, Forms/annotations,
+ordered duplicate/containment culling, numeric edge cases, HEP round-trip LOD
+selection, clipped density indexing, perspective/overview LOD, and CLI progress.
+The existing brochure page-5 appearance/selection regression passed as well.
+
+Implementation files: `src/pdf/nativeContentCompiler.ts`, `src/pdfSession.ts`,
+`src/vectorStrokeLodCore.ts`, and `PDFtoHEP.js`. Regression/check files:
+`scripts/test-native-content-compiler.mjs`, `scripts/test-native-streamed-content.mjs`,
+`scripts/test-vector-stroke-clip-lod.mjs`, `scripts/test-hep-api.mjs`,
+`scripts/test-pdf-to-hep-progress.mjs`, `scripts/check-pdf-hep-parity.mjs`, and
+`scripts/lib/testSuites.mjs`. This document records the evidence and remaining
+manual checks. No commits, history changes, or development servers were used.

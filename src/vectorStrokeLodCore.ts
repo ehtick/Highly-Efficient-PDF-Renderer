@@ -1456,15 +1456,15 @@ async function buildRuntimeSegmentBoundsAsync(
   const minY = new Float32Array(segmentCount);
   const maxX = new Float32Array(segmentCount);
   const maxY = new Float32Array(segmentCount);
+  const ink = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const primitiveBoundsOffset = i * 4;
-    const styleOffset = i * 4;
-    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
-    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
-    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
-    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
-    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+    strokeInkBounds(scene, i, ink);
+    const margin = 0.35;
+    minX[i] = ink.minX - margin;
+    minY[i] = ink.minY - margin;
+    maxX[i] = ink.maxX + margin;
+    maxY[i] = ink.maxY + margin;
 
     if ((i & 8191) === 0) {
       const value = startValue + (endValue - startValue) * (i / Math.max(1, segmentCount));
@@ -1594,13 +1594,13 @@ function createRuntimeTileEdges(
   const binCount = clampInt(tileCount * 16, 256, 4096);
   const bins = new Float64Array(binCount);
   const styleBins = new Map<number, number>();
-  const primitiveBounds = scene.primitiveBounds;
+  const ink = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
   let sampleCount = 0;
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const offset = i * 4;
-    const a = axis === "x" ? primitiveBounds[offset] : primitiveBounds[offset + 1];
-    const b = axis === "x" ? primitiveBounds[offset + 2] : primitiveBounds[offset + 3];
+    strokeInkBounds(scene, i, ink);
+    const a = axis === "x" ? ink.minX : ink.minY;
+    const b = axis === "x" ? ink.maxX : ink.maxY;
     const center = (a + b) * 0.5;
     if (!Number.isFinite(center)) {
       continue;
@@ -1820,6 +1820,34 @@ function boundsIntersectPlanes(planes: Float64Array, minX: number, minY: number,
   return true;
 }
 
+/** primitiveBounds stores a clip window for clipped strokes, not their ink extent. */
+function strokeInkBounds(scene: VectorScene, index: number, out: Bounds): void {
+  const offset = index * 4;
+  const width = Math.max(0, scene.styles[offset] ?? 0);
+  const flags = Math.floor(scene.primitiveMeta[offset + 3] / STROKE_STYLE_FLAG_OFFSET + 1e-6);
+  if ((flags & STROKE_STYLE_FLAG_CLIPPED) === 0) {
+    out.minX = scene.primitiveBounds[offset] - width;
+    out.minY = scene.primitiveBounds[offset + 1] - width;
+    out.maxX = scene.primitiveBounds[offset + 2] + width;
+    out.maxY = scene.primitiveBounds[offset + 3] + width;
+    return;
+  }
+  // The control hull conservatively encloses quadratic curves too. Preserve
+  // the original clip metadata for rendering; tighten only the runtime index.
+  out.minX = Math.max(scene.primitiveBounds[offset],
+    Math.min(scene.endpoints[offset], scene.endpoints[offset + 2], scene.primitiveMeta[offset]) - width);
+  out.minY = Math.max(scene.primitiveBounds[offset + 1],
+    Math.min(scene.endpoints[offset + 1], scene.endpoints[offset + 3], scene.primitiveMeta[offset + 1]) - width);
+  out.maxX = Math.min(scene.primitiveBounds[offset + 2],
+    Math.max(scene.endpoints[offset], scene.endpoints[offset + 2], scene.primitiveMeta[offset]) + width);
+  out.maxY = Math.min(scene.primitiveBounds[offset + 3],
+    Math.max(scene.endpoints[offset + 1], scene.endpoints[offset + 3], scene.primitiveMeta[offset + 1]) + width);
+  if (out.minX > out.maxX || out.minY > out.maxY) {
+    out.minX = out.minY = Infinity;
+    out.maxX = out.maxY = -Infinity;
+  }
+}
+
 function buildRuntimeSegmentBounds(scene: VectorScene, segmentCount: number): {
   minX: Float32Array;
   minY: Float32Array;
@@ -1830,15 +1858,15 @@ function buildRuntimeSegmentBounds(scene: VectorScene, segmentCount: number): {
   const minY = new Float32Array(segmentCount);
   const maxX = new Float32Array(segmentCount);
   const maxY = new Float32Array(segmentCount);
+  const ink = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const primitiveBoundsOffset = i * 4;
-    const styleOffset = i * 4;
-    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
-    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
-    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
-    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
-    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+    strokeInkBounds(scene, i, ink);
+    const margin = 0.35;
+    minX[i] = ink.minX - margin;
+    minY[i] = ink.minY - margin;
+    maxX[i] = ink.maxX + margin;
+    maxY[i] = ink.maxY + margin;
   }
 
   return {minX, minY, maxX, maxY};

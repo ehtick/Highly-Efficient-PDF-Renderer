@@ -37,7 +37,7 @@ import { formatTextLodStats } from "./textLodStatsFormat";
 import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import { RenderPerformanceProfiler, type RenderPerformanceOptions } from "./renderPerformance";
 import { ThreeWebGpuFrameTimer } from "./threeWebGpuFrameTimer";
-import { describeThreePerformanceScene, instrumentThreeWebGlCalls, withThreeRenderPerformance } from "./threeRenderPerformance";
+import { describeThreePerformanceCamera, describeThreePerformanceScene, instrumentThreeWebGlCalls, withThreeRenderPerformance } from "./threeRenderPerformance";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -499,7 +499,7 @@ function renderFrame(now: number = performance.now()): void {
   drawCallMeter.update(drawCalls);
   const zoomText = currentPdfObject ? `${currentPdfObject.getViewState().zoom.toFixed(2)}x` : "-";
   if (zoomValueElement.textContent !== zoomText) zoomValueElement.textContent = zoomText;
-  if (profile) recordCaptureCounters(profile, drawCalls);
+  if (profile) recordCaptureCounters(profile, drawCalls, controlsChanged);
   profile?.beginSection("overlays");
   drawingSelection.onFrame();
   textSelection.updateOverlay();
@@ -937,8 +937,9 @@ const performanceCapture = {
       gpuTimer: activeThreeRendererBackend === "webgpu" ? new ThreeWebGpuFrameTimer(renderer as never) : undefined
     });
     captureContext = {
-      diagnosticsVersion: 2, threeRevision: THREE.REVISION, browser: navigator.userAgent,
+      diagnosticsVersion: 3, threeRevision: THREE.REVISION, browser: navigator.userAgent,
       shaderErrorChecks: activeThreeRendererBackend === "webgl" ? (renderer as THREE.WebGLRenderer).debug.checkShaderErrors : null,
+      initialCamera: describeThreePerformanceCamera(camera, controls.target),
       initialTextLod: currentPdfObject?.getTextLodStats() ? { ...currentPdfObject.getTextLodStats() } : null,
       document: currentPdfObject?.sourceLabel ?? null, sourceKind: currentPdfObject?.sourceKind ?? null,
       scene: currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null,
@@ -990,13 +991,14 @@ if (new URLSearchParams(window.location.search).get("perf") === "1") {
   console.info(performanceCapture.start());
 }
 
-function recordCaptureCounters(profile: RenderPerformanceProfiler, drawCalls: number | null): void {
+function recordCaptureCounters(profile: RenderPerformanceProfiler, drawCalls: number | null, controlsChanged: boolean): void {
   if (drawCalls !== null) profile.add("drawCalls", drawCalls);
   profile.add("three.geometries", renderer.info.memory.geometries);
   profile.add("three.textures", renderer.info.memory.textures);
   const programs = (renderer.info as THREE.WebGLRenderer["info"]).programs;
   if (programs) profile.add("three.programs", programs.length);
-  profile.setFrameContext({ viewportWidth: canvasElement.width, viewportHeight: canvasElement.height });
+  profile.setFrameContext({ ...describeThreePerformanceCamera(camera, controls.target), controlsChanged: controlsChanged ? 1 : 0,
+    viewportWidth: canvasElement.width, viewportHeight: canvasElement.height });
 }
 
 void loadExampleManifest();

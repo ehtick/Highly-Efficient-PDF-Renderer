@@ -1951,7 +1951,11 @@ export class HeprThreePdfObject extends THREE.Group {
       if (strokes !== null) profile.add("renderedSegments", strokes);
       if (text) profile.add("renderedTextInstances", text.rendered);
       const strokeLod = this.getVectorStrokeLodStats(), textLod = this.getTextLodStats();
-      if (strokeLod) profile.add("three.strokeLodLevel", strokeLod.baselineLevelIndex);
+      if (strokeLod) {
+        profile.add("three.strokeLodLevel", strokeLod.baselineLevelIndex);
+        profile.add("three.strokeLodVisibleTiles", strokeLod.visibleTileCount);
+        profile.add("three.strokeLodActiveLevels", strokeLod.activeLevels.length);
+      }
       if (textLod) {
         profile.add("three.textExactClusters", textLod.exactClusters);
         profile.add("three.textCoarseClusters", textLod.coarseClusters);

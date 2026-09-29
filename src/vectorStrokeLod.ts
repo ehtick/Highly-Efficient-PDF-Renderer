@@ -1,5 +1,6 @@
 import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
+import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
@@ -136,15 +137,24 @@ export class ThreeVectorLodStrokeLayer {
     if (!this.group.visible || this.layers.length <= 0) {
       return;
     }
-    const selectionChanged = this.runtime.update(viewState, viewport, cullingBounds);
-    if (selectionChanged || !this.selectionInitialized) {
-      this.updateLevelDraws(viewState, viewport);
-      this.selectionInitialized = true;
-    } else {
-      // Runtime reuse keeps every selected ID valid. Refresh camera uniforms
-      // and any changed paint schedule without repacking/scanning those IDs.
-      for (const layer of this.layers) layer.updateFrameWithUnchangedSelection(viewState, viewport);
-    }
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.strokeLodSelection");
+    let selectionChanged: boolean;
+    try { selectionChanged = this.runtime.update(viewState, viewport, cullingBounds); }
+    finally { profile?.endSection("three.strokeLodSelection"); }
+    profile?.add(selectionChanged ? "three.strokeLodSelections" : "three.strokeLodReuses");
+    profile?.beginSection("three.strokeLodInstances");
+    try {
+      if (selectionChanged || !this.selectionInitialized) {
+        profile?.add("three.strokeLodInstanceUpdates");
+        this.updateLevelDraws(viewState, viewport);
+        this.selectionInitialized = true;
+      } else {
+        // Runtime reuse keeps every selected ID valid. Refresh camera uniforms
+        // and any changed paint schedule without repacking/scanning those IDs.
+        for (const layer of this.layers) layer.updateFrameWithUnchangedSelection(viewState, viewport);
+      }
+    } finally { profile?.endSection("three.strokeLodInstances"); }
   }
 
   estimateVisibleSegmentCount(): number {

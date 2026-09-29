@@ -164,7 +164,14 @@ Arbitrary WebGL local-to-clip projections keep the original global order.
 The draw list is reused until visibility, LOD, or the AA scale bucket changes.
 Stroke paint ranks are computed at scene setup. When selection changes, a
 hierarchical bitmask filters that static order without comparison sorting.
-Unchanged selected IDs reuse their ordered instance list.
+Unchanged selected IDs reuse their ordered instance list. Three's ordered LOD
+batches also assign paint ranks once at setup. On selection changes, a two-level
+bitset orders the selected ranks, and each scheduled paint reads only its selected
+interval. It does not scan all stored LOD representatives to recover a small
+visible subset. This preserves origin ties, per-instance clip roots, OCG
+visibility, replanning and the two passes of legacy Multiply paints. Tilted views
+still recompute LOD selection; sparse batching reduces the subsequent instance
+preparation cost without relaxing the segment budget or changing visible IDs.
 For a planar overview containing every LOD's geometry and every paint bound,
 panning reuses both the LOD selection and the source paint list. Partial views
 can reuse a bounded offscreen margin. Three.js also reuses the selection for a

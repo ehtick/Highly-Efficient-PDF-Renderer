@@ -23,6 +23,8 @@ interface DrawRunRange {
   first: number;
   count: number;
   ids?: Uint32Array;
+  /** First static paint rank of this LOD range. */
+  rankFirst: number;
 }
 
 interface DrawRunEntry {
@@ -57,6 +59,11 @@ export class ThreeVectorDrawRuns {
   private planVersion = -1;
   private readonly origins: Uint32Array | undefined;
   private readonly idsByRun = new Map<number, Uint32Array>();
+  private readonly lodIdToRank: Uint32Array | null = null;
+  private readonly selectedRankBits: Uint32Array | null = null;
+  private readonly selectedRankWords: Uint32Array | null = null;
+  private selectedRanks = new Uint32Array(0);
+  private selectedRankCount = 0;
 
   static create(scene: VectorScene, kind: VectorDrawRun["kind"],
     parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
@@ -84,6 +91,9 @@ export class ThreeVectorDrawRuns {
     this.neighbours = this.visibility.requiresCompositing ? scenePaintRunNeighbours(scene) : null;
     this.plan = plan ?? getThreeVectorDrawPlan(scene);
     if (origins) {
+      this.lodIdToRank = new Uint32Array(source.count);
+      this.selectedRankBits = new Uint32Array(Math.ceil(source.count / 32));
+      this.selectedRankWords = new Uint32Array(Math.ceil(this.selectedRankBits.length / 32));
       const sourceRuns = new Uint32Array(scene.segmentCount);
       scene.drawRuns!.forEach((run, index) => {
         if (run.kind === kind) sourceRuns.fill(index, run.first, run.first + run.count);
@@ -94,9 +104,11 @@ export class ThreeVectorDrawRuns {
         const ids = lists.get(index);
         if (ids) ids.push(id); else lists.set(index, [id]);
       });
+      let rank = 0;
       for (const [index, ids] of lists) {
         ids.sort((a, b) => origins[a] - origins[b] || a - b);
         this.idsByRun.set(index, Uint32Array.from(ids));
+        for (const id of ids) this.lodIdToRank[id] = rank++;
       }
     }
     this.rebuildEntries();
@@ -132,7 +144,50 @@ export class ThreeVectorDrawRuns {
     if (unchanged) return;
     this.visibleIds.fill(0);
     for (let i = 0; i < count; i++) this.visibleIds[selected[i]] = 1;
+    if (this.lodIdToRank) this.updateSelectedRanks(selected, count);
     this.updateEntries();
+  }
+
+  /** Filter the static LOD paint order without scanning every stored level. */
+  private updateSelectedRanks(selected: Float32Array, count: number): void {
+    if (this.selectedRanks.length < count) {
+      this.selectedRanks = new Uint32Array(Math.min(this.visibleIds.length,
+        Math.max(count, this.selectedRanks.length * 2)));
+    }
+    const bits = this.selectedRankBits!, groups = this.selectedRankWords!;
+    for (let index = 0; index < count; index++) {
+      const rank = this.lodIdToRank![selected[index]], word = rank >>> 5;
+      bits[word] |= 1 << (rank & 31);
+      groups[word >>> 5] |= 1 << (word & 31);
+    }
+    // The upper bitset skips invisible ranges; the lower one visits only the
+    // selected IDs in paint order, including ties between LOD representatives.
+    let out = 0;
+    for (let group = 0; group < groups.length; group++) {
+      let words = groups[group];
+      groups[group] = 0;
+      while (words !== 0) {
+        const word = group * 32 + 31 - Math.clz32(words & -words);
+        let selectedBits = bits[word];
+        bits[word] = 0;
+        while (selectedBits !== 0) {
+          this.selectedRanks[out++] = word * 32 + 31 - Math.clz32(selectedBits & -selectedBits);
+          selectedBits = (selectedBits & (selectedBits - 1)) >>> 0;
+        }
+        words = (words & (words - 1)) >>> 0;
+      }
+    }
+    this.selectedRankCount = out;
+  }
+
+  private selectedRankOffset(rank: number): number {
+    let low = 0, high = this.selectedRankCount;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (this.selectedRanks[middle] < rank) low = middle + 1;
+      else high = middle;
+    }
+    return low;
   }
 
   /**
@@ -201,9 +256,10 @@ export class ThreeVectorDrawRuns {
   }
 
   private range(run: VectorDrawRun, index: number, first = run.first, count = run.count): DrawRunRange {
-    const ids = this.idsByRun.get(index);
-    return { run, index, first, count, ids: ids && (first === run.first && count === run.count
-      ? ids : ids.filter(id => this.origins![id] >= first && this.origins![id] < first + count)) };
+    const allIds = this.idsByRun.get(index);
+    const ids = allIds && (first === run.first && count === run.count
+      ? allIds : allIds.filter(id => this.origins![id] >= first && this.origins![id] < first + count));
+    return { run, index, first, count, ids, rankFirst: ids?.length ? this.lodIdToRank![ids[0]] : 0 };
   }
 
   private createEntry(ranges: readonly DrawRunRange[], order: number, pass?: 0 | 1): void {
@@ -286,10 +342,14 @@ export class ThreeVectorDrawRuns {
           ? range.run.optionalContent !== undefined && this.snapshot.conditions[range.run.optionalContent] === 0
           : !this.visibility.isRunVisible(range.run)) continue;
         const clipCode = (range.run.clipIndex ?? -1) + 1;
-        const count = range.ids?.length ?? range.count;
+        const sparse = range.ids !== undefined && this.lodIdToRank !== null;
+        const first = sparse ? this.selectedRankOffset(range.rankFirst) : 0;
+        const end = sparse ? this.selectedRankOffset(range.rankFirst + range.ids!.length) : range.count;
         const ids = entry.idValues, clips = entry.clipValues;
-        for (let item = 0; item < count; item++) {
-          const id = range.ids ? range.ids[item] : range.first + item;
+        profile?.add("three.batchCandidateInstances", end - first);
+        for (let item = first; item < end; item++) {
+          const rangeIndex = sparse ? this.selectedRanks[item] - range.rankFirst : item;
+          const id = range.ids ? range.ids[rangeIndex] : range.first + rangeIndex;
           if (!this.visibleIds[id]) continue;
           if (this.strokeRedundancyEnabled && this.strokeRedundancy && !this.strokeRedundancy.isRetained(id)) continue;
           if (ids[visible] !== id) { ids[visible] = id; changed = true; }

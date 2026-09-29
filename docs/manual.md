@@ -397,16 +397,40 @@ its `gpu.frameMs` is the sum of the frame's render passes, without the gaps
 between them.
 
 The Three example also exposes `heprPerf`. Reports with
-`context.diagnosticsVersion: 2` include the source kind (PDF/HEP), scene
+`context.diagnosticsVersion: 3` include the source kind (PDF/HEP), scene
 geometry/clip/raster counts, transparency-group structure, Three revision,
 browser and shader-error-check setting. These describe the loaded scene, without
 exporting document text, shader source or image pixels.
+
+Version 3 also records `context.initialCamera` and camera values in every retained
+`frameRecords[].context`: position, quaternion, up vector, controls target,
+distance to target, vertical FOV, aspect, near/far planes and camera zoom.
+`cameraTiltDegrees` is measured from the world XY plane's normal (the example's
+PDF plane): 0 is top-down and 90 is edge-on. `controlsChanged` is 1 when
+MapControls moved the camera during that frame, otherwise 0. `cameraZoom` is the
+Three camera's projection zoom; the existing `zoom` and `unitsPerPixel` describe
+the derived PDF view. Snapshots are detached numeric values, so moving the camera
+later does not change earlier records.
 
 Three CPU sections split `render` into `three.sync` (PDF preparation and
 compositing) and the remaining outer host render. Inside `three.sync`,
 `three.schedule`, `three.strokeLod`, `three.textLod`,
 `three.vectorUpdate` and `three.textUpdate` identify camera-dependent work.
+Within `three.vectorUpdate`, `three.strokeLodSelection` measures stroke ID
+selection, including projected tile culling, error/reach checks and any budget
+retry. `three.strokeLodInstances` measures preparing the selected instances or
+refreshing unchanged selections, including any nested batch updates. The earlier
+`three.strokeLod` section only handles LOD visibility/scale setup.
+`three.strokeLodSelections` and `three.strokeLodReuses` count recomputed and reused
+selections per frame; recomputation does not necessarily change the resulting
+IDs. `three.strokeLodInstanceUpdates` counts calls that prepare instance lists,
+not completed GPU uploads. `three.strokeLodVisibleTiles` and
+`three.strokeLodActiveLevels` describe the selected workload.
 `three.batchRebuild` and `three.batchUpdate` are nested within layer updates.
+`three.batchCandidateInstances` counts candidate IDs visited when assembling
+batches, before visibility/redundancy filtering; repeated passes count again.
+Ordered stroke LOD batches visit selected IDs only, so this work follows the
+visible selection rather than the combined size of all stored LOD levels.
 `three.compositor` includes setup, batch lookup/geometry preparation, target
 binding, `three.hostDraw` (host renders that draw paints) and `three.hostPass`
 (host renders of composite passes alone). Consecutive compositor operations
@@ -443,6 +467,29 @@ Wrappers are removed on stop, automatic capture completion, backend replacement
 and disposal. `context.webglCalls` reports which methods could be instrumented.
 Three WebGPU reports phase/counter diagnostics without WebGL-call or GPU-query
 timings.
+
+To compare top-down and tilted performance, open the same region of the same
+document with the same backend, viewport, DPR and LOD settings. Let loading and
+initial camera movement settle before each capture. Save one report top-down
+and a second at the slow tilt; use similar small pans in each, without changing
+the tilt during the capture. Leave per-operation GPU timing off and disable GL
+wrappers for this initial comparison:
+
+```js
+heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240, webglCalls: false });
+// Make similar small pans, then let controls settle. Repeat for each view.
+heprPerf.stop();
+copy(heprPerf.json()); // Chrome/Edge DevTools helper; save each report separately.
+```
+
+The example renders on demand, so a stationary view may produce only a few
+frames. Compare CPU section summaries and sampled GPU time, not just the FPS
+readout. Top-down views can reuse stroke selections; tilted perspective views
+currently recompute them every rendered frame. A similar Draw count can therefore
+have a different CPU cost. High `three.strokeLodSelection` or
+`three.strokeLodInstances` time points to that preparation path; high GPU time
+with low CPU preparation instead calls for investigating the rendering work.
+CPU and GPU spans overlap and must not be added. Send both complete JSON reports.
 
 To investigate the HEP-only Broschuere zoom pause, collect two reports:
 one HEP and one PDF, using a fresh page load for each and the same WebGL backend,

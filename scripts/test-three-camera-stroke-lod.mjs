@@ -7,6 +7,8 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
 } });
 try {
+  const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
+  const { withThreeRenderPerformance } = await import("../src/threeRenderPerformance.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
   const { ThreeVectorLodStrokeLayer, shouldUseVectorStrokeLod } = await import("../src/vectorStrokeLod.ts");
@@ -60,9 +62,9 @@ try {
       // Real controls reproduce the ~6e-17 clip-W slope that an idealized matrix misses.
       const controls = new MapControls(camera, null);
       controls.enableDamping = false; controls.screenSpacePanning = true;
-      const frame = () => {
+      const frame = (profile = null) => {
         controls.update(); camera.updateMatrixWorld(true); object.updateMatrixWorld(true);
-        object.prepareFrameForThreeRenderer(host, camera);
+        withThreeRenderPerformance(profile, () => object.prepareFrameForThreeRenderer(host, camera));
       };
       try {
         frame();
@@ -92,14 +94,36 @@ try {
         }
         assert.equal(selections, 0, "60 real pan frames reuse the initial vector selection");
         lod.layers.forEach((layer, index) => { layer.updateFrameWithVisibleSegmentIds = updates[index]; });
+        const profile = new RenderPerformanceProfiler();
+        profile.start({ gpu: false, maxFrames: 3 });
+        profile.beginFrame(); frame(profile); profile.endFrame();
         // A real tilt keeps budgeted LOD: each tile's limit comes from its own
         // projected scale instead of falling back to exact geometry.
-        camera.position.set(0, 800, 3000); controls.target.set(0, 0, 0); frame();
+        camera.position.set(0, 800, 3000); controls.target.set(0, 0, 0);
+        profile.beginFrame(); frame(profile); profile.endFrame();
         const tilted = object.getVectorStrokeLodStats();
         assert(tilted.baselineLevelIndex > 0 && tilted.activeLevels.some(level => level.index > 0),
           `${backend}/${ordered}: a tilted MapControls view keeps density/overview LOD`);
         assert(object.getRenderedStrokeSegmentCount() > 0 && object.getRenderedStrokeSegmentCount() <= 82_500,
           `${backend}/${ordered}: a tilted view follows the shared soft budget`);
+        const tiltedCount = object.getRenderedStrokeSegmentCount();
+        profile.beginFrame(); frame(profile); profile.endFrame();
+        assert.equal(object.getRenderedStrokeSegmentCount(), tiltedCount);
+        const records = profile.stop().frameRecords;
+        assert.equal(records[0].counters["three.strokeLodReuses"], 1, "top-down frames report selection reuse");
+        assert.equal(records[0].counters["three.strokeLodInstanceUpdates"], 0);
+        for (const record of records.slice(1)) {
+          assert.equal(record.counters["three.strokeLodSelections"], 1,
+            "tilted frames report recomputation, including a stationary camera with the same draw count");
+          assert.equal(record.counters["three.strokeLodInstanceUpdates"], 1);
+          assert.equal(record.counters["three.strokeLodVisibleTiles"], tilted.visibleTileCount);
+          assert.equal(record.counters["three.strokeLodActiveLevels"], tilted.activeLevels.length);
+        }
+        for (const record of records) {
+          assert(record.cpuSectionsMs["three.strokeLodSelection"] >= 0);
+          assert(record.cpuSectionsMs["three.strokeLodInstances"] >= 0);
+        }
+        profile.dispose();
         camera.position.set(0, 0, 3000); frame();
         assert(object.getVectorStrokeLodStats().baselineLevelIndex > 0);
         camera.position.set(0, 0, 10); frame();

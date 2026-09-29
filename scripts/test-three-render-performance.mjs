@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import * as THREE from "three";
 import { RenderPerformanceProfiler } from "../src/renderPerformance.ts";
-import { describeThreePerformanceScene, getThreeRenderPerformance, instrumentThreeWebGlCalls,
+import { describeThreePerformanceCamera, describeThreePerformanceScene, getThreeRenderPerformance, instrumentThreeWebGlCalls,
   withThreeRenderPerformance } from "../src/threeRenderPerformance.ts";
 import { createEmptyVectorScene } from "../src/emptyVectorScene.ts";
 
@@ -96,6 +97,45 @@ profile.start({ gpu: false, maxFrames: 1, maxFrameRecords: 0 });
 profile.beginFrame(); profile.recordEvent("disabled", 999); profile.endFrame();
 assert.equal(profile.frameEvents.length, 0, "aggregate-only capture retains no event data");
 
+// Camera snapshots must survive JSON export per frame, without mutating the
+// camera or retaining references as the user orbits/pans during a capture.
+const camera = new THREE.PerspectiveCamera(55, 16 / 9, .2, 5000);
+const target = new THREE.Vector3(3, 4, 5);
+camera.position.copy(target).add(new THREE.Vector3(0, 0, 10));
+camera.zoom = 2; camera.lookAt(target);
+const topDown = describeThreePerformanceCamera(camera, target);
+assert.equal(topDown.cameraTiltDegrees, 0);
+assert.equal(topDown.cameraDistanceToTarget, 10);
+assert.equal(topDown.cameraPositionZ, 15);
+assert.equal(topDown.cameraTargetY, 4);
+assert.equal(topDown.cameraFovYDegrees, 55);
+assert.equal(topDown.cameraAspect, 16 / 9);
+assert.equal(topDown.cameraNear, .2);
+assert.equal(topDown.cameraFar, 5000);
+assert.equal(topDown.cameraZoom, 2);
+assert.equal(topDown.cameraUpY, 1);
+profile.start({ gpu: false, maxFrames: 2 });
+profile.beginFrame();
+profile.setFrameContext({ ...topDown, controlsChanged: 0 });
+profile.endFrame();
+camera.position.copy(target).add(new THREE.Vector3(0, -Math.sqrt(3) * 5, 5));
+camera.lookAt(target);
+const tiltedCamera = describeThreePerformanceCamera(camera, target);
+assert(Math.abs(tiltedCamera.cameraTiltDegrees - 60) < 1e-10);
+assert(Math.abs(tiltedCamera.cameraDistanceToTarget - 10) < 1e-10);
+assert.equal(tiltedCamera.cameraQuaternionX, camera.quaternion.x);
+assert.equal(tiltedCamera.cameraQuaternionW, camera.quaternion.w);
+profile.beginFrame();
+profile.setFrameContext({ ...tiltedCamera, controlsChanged: 1 });
+profile.setFrameContext({ cameraTiltDegrees: NaN, cameraPositionX: Infinity });
+profile.endFrame();
+camera.position.z = 999; target.y = 999;
+const cameraFrames = JSON.parse(JSON.stringify(profile.getReport())).frameRecords;
+assert.deepEqual(cameraFrames[0].context, { frameGapMs: null, ...topDown, controlsChanged: 0 });
+assert.deepEqual(cameraFrames[1].context, { frameGapMs: null, ...tiltedCamera, controlsChanged: 1 });
+assert.equal(cameraFrames[0].context.cameraPositionZ, 15, "later camera changes do not rewrite captured frames");
+assert.equal(cameraFrames[1].context.cameraTargetY, 4, "control targets are also detached");
+
 const scene = createEmptyVectorScene();
 scene.drawRuns = [{ kind: "fill", first: 0, count: 1 }, { kind: "text", first: 0, count: 1 }];
 scene.clipPaths = [{ edges: new Float32Array(12) }];
@@ -119,8 +159,10 @@ assert.equal(JSON.stringify(description).includes('"data"'), false, "scene diagn
 // The example owns the instrumentation lifetime, including automatic stop and
 // backend/disposal transitions; all three explicitly detach GL wrappers.
 const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
+assert.match(source, /diagnosticsVersion: 3/);
+assert.match(source, /initialCamera: describeThreePerformanceCamera\(camera, controls.target\)/);
 assert.match(source, /withThreeRenderPerformance\(profile/);
 assert.match(source, /profile && !profile.enabled\) \{ captureGlCalls\?\.dispose/);
 assert.equal((source.match(/captureGlCalls\?\.dispose\(\); captureGlCalls = null;/g) ?? []).length, 5);
 profile.dispose();
-console.log("Three capture: scoped GL timing, no added queries, exception/stop cleanup, bounded stall events and scene comparison passed.");
+console.log("Three capture: scoped GL timing, no added queries, exception/stop cleanup, bounded stall events, camera snapshots and scene comparison passed.");

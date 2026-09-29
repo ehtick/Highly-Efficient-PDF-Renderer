@@ -1,5 +1,6 @@
 import type { VectorScene } from "./pdfVectorExtractor";
-import type { RenderPerformanceProfiler } from "./renderPerformance";
+import type { PerspectiveCamera, Vector3 } from "three";
+import type { RenderPerformanceFrameContext, RenderPerformanceProfiler } from "./renderPerformance";
 
 // Rendering is synchronous. Scope diagnostics to the example's host render,
 // including its nested compositor renders, and restore the caller on failure.
@@ -73,6 +74,24 @@ export function instrumentThreeWebGlCalls(gl: WebGL2RenderingContext, profile: R
     for (const restore of restores) restore();
     restores.length = 0;
   } };
+}
+
+/** The example's unparented perspective camera looks at a PDF in world XY.
+ * Copy scalars only, without updating camera/controls state or issuing queries. */
+export function describeThreePerformanceCamera(camera: PerspectiveCamera, target: Vector3): RenderPerformanceFrameContext {
+  const { position, quaternion, up } = camera;
+  const normalZ = 1 - 2 * (quaternion.x * quaternion.x + quaternion.y * quaternion.y);
+  return {
+    cameraPositionX: position.x, cameraPositionY: position.y, cameraPositionZ: position.z,
+    cameraQuaternionX: quaternion.x, cameraQuaternionY: quaternion.y,
+    cameraQuaternionZ: quaternion.z, cameraQuaternionW: quaternion.w,
+    cameraUpX: up.x, cameraUpY: up.y, cameraUpZ: up.z,
+    cameraTargetX: target.x, cameraTargetY: target.y, cameraTargetZ: target.z,
+    cameraDistanceToTarget: position.distanceTo(target),
+    cameraTiltDegrees: Math.acos(Math.min(1, Math.abs(normalZ))) * 180 / Math.PI,
+    cameraFovYDegrees: camera.fov, cameraAspect: camera.aspect, cameraNear: camera.near,
+    cameraFar: camera.far, cameraZoom: camera.zoom
+  };
 }
 
 /** Capture once, outside measured frames. No document text or image data is exported. */

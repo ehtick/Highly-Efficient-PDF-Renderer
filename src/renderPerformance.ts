@@ -41,6 +41,30 @@ export interface ExternalGpuFrameResult {
 }
 
 export interface RenderPerformanceFrameContext {
+  /** Three example camera pose; separate from the derived 2D view below. */
+  cameraPositionX?: number | null;
+  cameraPositionY?: number | null;
+  cameraPositionZ?: number | null;
+  cameraQuaternionX?: number | null;
+  cameraQuaternionY?: number | null;
+  cameraQuaternionZ?: number | null;
+  cameraQuaternionW?: number | null;
+  cameraUpX?: number | null;
+  cameraUpY?: number | null;
+  cameraUpZ?: number | null;
+  cameraTargetX?: number | null;
+  cameraTargetY?: number | null;
+  cameraTargetZ?: number | null;
+  cameraDistanceToTarget?: number | null;
+  /** Angle from the world XY plane normal: 0 is top-down, 90 is edge-on. */
+  cameraTiltDegrees?: number | null;
+  cameraFovYDegrees?: number | null;
+  cameraAspect?: number | null;
+  cameraNear?: number | null;
+  cameraFar?: number | null;
+  cameraZoom?: number | null;
+  /** 1 when MapControls changed the camera this frame, otherwise 0. */
+  controlsChanged?: number | null;
   cameraCenterX?: number | null;
   cameraCenterY?: number | null;
   zoom?: number | null;
@@ -133,7 +157,11 @@ const MAX_PENDING_QUERIES = 8;
 const MAX_METRIC_NAMES = 64;
 const IDLE_GAP_MS = 250;
 const FRAME_CONTEXT_KEYS = ["cameraCenterX", "cameraCenterY", "zoom", "viewportWidth", "viewportHeight",
-  "unitsPerPixel", "schedulePadding", "frameGapMs"] as const;
+  "unitsPerPixel", "schedulePadding", "frameGapMs", "cameraPositionX", "cameraPositionY", "cameraPositionZ",
+  "cameraQuaternionX", "cameraQuaternionY", "cameraQuaternionZ", "cameraQuaternionW",
+  "cameraUpX", "cameraUpY", "cameraUpZ", "cameraTargetX", "cameraTargetY", "cameraTargetZ",
+  "cameraDistanceToTarget", "cameraTiltDegrees", "cameraFovYDegrees", "cameraAspect", "cameraNear", "cameraFar",
+  "cameraZoom", "controlsChanged"] as const;
 const NOTES = [
   "CPU times cover JavaScript and command submission, excluding asynchronous GPU execution.",
   "Frame intervals describe rendered frames, not a continuous FPS benchmark; gaps over 250 ms are omitted.",

@@ -116,8 +116,9 @@ page.scale.setScalar(0.8);
 ```
 
 Page views preserve the initial layout and use the page center as their pivot.
-Requesting them opts into separate per-page rendering resources and draw calls;
-documents that do not use these APIs keep cross-page batching. See the
+Compatible pages keep cross-page batching while moving independently, using a
+shared GPU transform table on both Three.js backends. Paint-order constraints
+automatically use separate page rendering when needed. See the
 [page API](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md#heprthreepdfobject)
 for matrix, ownership, coordinate and HEP compatibility details.
 

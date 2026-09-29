@@ -217,11 +217,30 @@ matrix's linear part. To resume ordinary position/rotation/scale updates, set
 `page.matrixAutoUpdate = true` (a decomposed transform cannot preserve shear).
 
 The first accessor prepares all independent page views asynchronously. Repeated
-calls reuse the same page objects. This opts the document out of cross-page
-batching and adds per-page rendering resources and draw calls. Documents that do
-not call these APIs retain the existing batched path. Native texture fallback
-shares the document's GPU context and copies each rendered page to its own
-canvas. A one-page document returns itself without allocating another view.
+calls reuse the same page objects. Both Three.js backends keep compatible pages
+in shared geometry batches: shaders look up each primitive's page transform,
+and backgrounds use one instanced draw. Moving a page updates a small matrix
+table; camera/document movement uses the shared projection uniform. Geometry
+and primitive ownership stay unchanged. Text LOD uses each page's projection;
+stroke LOD conservatively uses the most magnified visible page.
+
+Batching applies to disjoint projected pages and to opaque, depth-separated
+pages whose paint (including antialiasing) stays inside their background. Pages
+with translucent/intersecting overlaps, different appearance settings or
+primitive overrides, PDF compositing effects, retained replay, or unsupported
+host resources use separate page rendering. Safe layouts automatically rejoin
+the batch. Independent fallback resources are prepared with the page views.
+Images, gradients, clips and paint-order boundaries can still require multiple
+draws; there is no fixed draw-count guarantee.
+
+After rendering, `pdf.getPageBatchingStats()` reports `mode` (`"document"`,
+`"pages-batched"`, or `"pages-separate"`), `pageCount`, and a nullable fallback
+`reason`. Query document rendering/LOD statistics while pages are batched;
+individual page resources are dormant then. Runtime transforms are not saved
+to HEP. Documents that do not call page APIs retain their existing rendering
+path. Native texture fallback shares the document's GPU context and copies each
+rendered page to its own canvas. A one-page document returns itself without
+allocating another view.
 
 The document owns its page views: keep them parented to `pdf` and dispose the
 whole document with `pdf.dispose()`. `getPage` / `getPages` accept `{ signal }`;
@@ -237,8 +256,9 @@ transform as an XY bounding box. `sceneToClientPoint` accepts an optional final
 `pageIndex` to resolve ambiguous original coordinates. Use page methods when
 working directly with page-local primitive IDs. Layer visibility remains shared
 across the document; document appearance setters also apply to every page.
-Query LOD diagnostics on the page views; the document returns `null` for LOD
-statistics once its pages select levels independently.
+While using separate page rendering, query LOD diagnostics on the page views;
+the document returns `null` for their independent LOD statistics. While batched,
+query those statistics on the document.
 
 Newly composed scenes store exact primitive ownership in HEP. Existing HEP files
 without that metadata infer stroke/fill ownership from their original layout and
@@ -249,7 +269,8 @@ approximately. Transforms are runtime presentation state and are not saved by
 | Member | Purpose |
 | --- | --- |
 | `pageCount` | Number of displayed pages. |
-| `getPage(index, options?)` / `getPages(options?)` | Prepare and return independent page objects. |
+| `getPage(index, options?)` / `getPages(options?)` | Prepare and return independent page objects with automatic shared batching. |
+| `getPageBatchingStats()` | Report the current batching mode, page count and fallback reason. |
 | `setPagePosition(index, x, y, z?)` | Set a page center in document-local coordinates; default Z is zero. |
 | `setPageTransform(index, matrix)` | Replace a page's finite affine `THREE.Matrix4`. |
 | `hasSearchableText` | Whether the scene has searchable indexed text. |

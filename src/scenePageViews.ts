@@ -34,6 +34,8 @@ export function validatePagePrimitiveRanges(scene: VectorScene): void {
 
 export interface ScenePageView {
   scene: VectorScene;
+  /** Paint extents without the background, for transformed-page depth safety. */
+  paintBounds: Bounds;
   /** Local primitive index -> canonical document primitive index. */
   primitives: Record<PrimitiveKind, Uint32Array>;
   pageIndex: number;
@@ -238,18 +240,36 @@ export class ScenePageViews {
     });
     if (source.paintGraph) scene.paintGraph = { roots: nodes(source.paintGraph.roots) };
     // Include off-page paints in culling/LOD bounds without moving the page pivot.
-    const include = (bounds: Bounds) => { scene.bounds.minX = Math.min(scene.bounds.minX, bounds.minX); scene.bounds.minY = Math.min(scene.bounds.minY, bounds.minY);
+    const paintBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    const include = (bounds: Bounds) => {
+      paintBounds.minX = Math.min(paintBounds.minX, bounds.minX); paintBounds.minY = Math.min(paintBounds.minY, bounds.minY);
+      paintBounds.maxX = Math.max(paintBounds.maxX, bounds.maxX); paintBounds.maxY = Math.max(paintBounds.maxY, bounds.maxY);
+      scene.bounds.minX = Math.min(scene.bounds.minX, bounds.minX); scene.bounds.minY = Math.min(scene.bounds.minY, bounds.minY);
       scene.bounds.maxX = Math.max(scene.bounds.maxX, bounds.maxX); scene.bounds.maxY = Math.max(scene.bounds.maxY, bounds.maxY); };
     const culler = new VectorDrawRunCuller(scene), box = [0, 0, 0, 0];
     for (let index = 0; index < scene.drawRuns.length; index++) {
+      const kind = scene.drawRuns[index].kind;
+      if (kind === "gradient-fill" || kind === "gradient-stroke") continue;
       culler.getBounds(index, 0, box);
       if (box.every(Number.isFinite) && box[0] <= box[2] && box[1] <= box[3])
         include({ minX: box[0], minY: box[1], maxX: box[2], maxY: box[3] });
     }
+    // The general draw-run culler keeps legacy gradients unbounded. Their
+    // canonical geometry still supplies finite extents for page projections.
+    for (let i = 0; i < scene.gradientFillPathCount * 4; i += 4) include({
+      minX: scene.gradientFillPathMetaA[i + 2], minY: scene.gradientFillPathMetaA[i + 3],
+      maxX: scene.gradientFillPathMetaB[i], maxY: scene.gradientFillPathMetaB[i + 1]
+    });
+    for (let i = 0; i < scene.gradientStrokeSegmentCount * 4; i += 4) {
+      const a = scene.gradientStrokeEndpoints, b = scene.gradientStrokePrimitiveMeta;
+      const margin = Math.SQRT2 * Math.max(0, scene.gradientStrokeStyles[i]);
+      include({ minX: Math.min(a[i], a[i + 2], b[i]) - margin, minY: Math.min(a[i + 1], a[i + 3], b[i + 1]) - margin,
+        maxX: Math.max(a[i], a[i + 2], b[i]) + margin, maxY: Math.max(a[i + 1], a[i + 3], b[i + 1]) + margin });
+    }
     scene.pathCount = scene.fillPathCount + scene.gradientFillPathCount;
     scene.pagePrimitiveRanges = Uint32Array.from(PAGE_PRIMITIVE_KINDS.flatMap(kind => [0, primitives[kind].length]));
     validateVectorDrawRuns(scene); validateScenePaintGraph(scene);
-    return { scene, primitives, pageIndex };
+    return { scene, paintBounds, primitives, pageIndex };
   }
 
   localRef(view: ScenePageView, ref: PrimitiveRef): PrimitiveRef | null {

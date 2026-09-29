@@ -1,6 +1,7 @@
 import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
+import type { TextLodBuildData } from "./textLodCore";
 import type { VectorScene } from "./pdfVectorExtractor";
 
 const plans = new WeakMap<VectorScene, ThreeVectorDrawPlan>();
@@ -24,15 +25,18 @@ export class ThreeVectorDrawPlan {
   private scheduler: VectorPageDrawScheduler | null;
   readonly segments: Uint32Array | null;
   private readonly scene: VectorScene;
+  private readonly independentPageRuns: Uint16Array | null;
   private unitsPerPixel: number | null = null;
   private colorCommutationEnabled = true;
   private textLodEnabled = false;
+  private textLodData: TextLodBuildData | null = null;
   private readonly all: readonly number[];
   private ordered: number[];
   private readonly positionOfRun: Int32Array;
 
-  constructor(scene: VectorScene) {
+  constructor(scene: VectorScene, independentPageRuns: Uint16Array | null = null) {
     this.scene = scene;
+    this.independentPageRuns = independentPageRuns;
     const runs = scene.drawRuns ?? [];
     this.all = Array.from({ length: runs.length }, (_, index) => index);
     this.ordered = [...this.all];
@@ -49,13 +53,22 @@ export class ThreeVectorDrawPlan {
   get positions(): Int32Array { return this.positionOfRun; }
 
   /** True while minification holds the scheduler's coverage margin. */
-  get paintOrderApproximated(): boolean { return !this.textLodEnabled && (this.scheduler?.paintOrderApproximated ?? false); }
+  get paintOrderApproximated(): boolean { return (!this.textLodEnabled || !!this.textLodData) && (this.scheduler?.paintOrderApproximated ?? false); }
 
   /** Coarse text can fill glyph gaps, invalidating exact-geometry commutation. */
   setTextLodEnabled(enabled: boolean): boolean {
     if (this.textLodEnabled === enabled) return false;
     this.textLodEnabled = enabled;
     return this.reschedule();
+  }
+
+  /** Shared page batches include coarse coverage in the same commutation proof. */
+  setTextLodSource(data: TextLodBuildData): void {
+    if (this.textLodData === data) return;
+    this.textLodData = data;
+    this.scheduler?.includeTextLod(data);
+    this.scheduler?.updateScale(this.unitsPerPixel);
+    this.reschedule();
   }
 
   /** Temporary primitive colors invalidate the source-color commutation proof. */
@@ -81,6 +94,7 @@ export class ThreeVectorDrawPlan {
     const canonical = strokeSourceRuns(this.scene);
     const sourceRuns = Uint32Array.from(origins, origin => canonical[origin]);
     this.scheduler = this.createScheduler(strokes, sourceRuns);
+    if (this.textLodData) this.scheduler?.includeTextLod(this.textLodData);
     this.scheduler?.setColorCommutationEnabled(this.colorCommutationEnabled);
     this.scheduler?.updateScale(this.unitsPerPixel);
     this.reschedule();
@@ -91,12 +105,12 @@ export class ThreeVectorDrawPlan {
     // retain their source submissions rather than feeding a non-monotonic span
     // sequence to the scheduler.
     if (this.segments && !graphRunsInOrder(this.scene)) return null;
-    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments);
+    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments, this.independentPageRuns);
   }
 
   private reschedule(): boolean {
     // The scheduler returns its input untouched while no scale is set.
-    const next = this.textLodEnabled ? this.all : this.scheduler?.schedule(this.all) ?? this.all;
+    const next = this.textLodEnabled && !this.textLodData ? this.all : this.scheduler?.schedule(this.all) ?? this.all;
     let same = next.length === this.ordered.length;
     for (let index = 0; same && index < next.length; index++) same = next[index] === this.ordered[index];
     if (same) return false;

@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { CLIPPED_PAINT_QUAD_WGSL, FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { UNBOUNDED_VECTOR_CLIP_BOUNDS } from "./vectorClips";
@@ -41,6 +42,7 @@ interface CommonMaterialOptions extends GradientTextureOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
   vectorOverride: THREE.Vector4;
   primitiveColor: THREE.Vector4;
 }
@@ -421,6 +423,7 @@ export function createThreeWebGpuGradientFillMaterial(
   options: ThreeWebGpuGradientFillMaterialOptions
 ): ThreeWebGpuGradientFillMaterialState {
   const material = createBaseMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   const shapeOnly = TSL.uniform(0);
   registerThreePdfShapeUniform(material, shapeOnly);
   const zoomUniform = TSL.uniform(1);
@@ -442,7 +445,7 @@ export function createThreeWebGpuGradientFillMaterial(
     segments: TSL.textureLoad(options.fillSegmentTextureA)
   }), true);
   const viewportUniform = TSL.uniform(options.viewport);
-  const localToClipUniform = TSL.uniform(options.localToClip);
+  const localToClipUniform = pageProjection.matrix;
   const vertexPack = varyingNode(options.mesh ? TSL.vec4(TSL.attribute("aMeshPosition", "vec2") as never, 1, 0) : callNode(fillVertexPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC,
     clipBounds: TSL.uniform(options.clipBounds ?? new THREE.Vector4().fromArray(UNBOUNDED_VECTOR_CLIP_BOUNDS)), shapeOnly,
@@ -457,6 +460,7 @@ export function createThreeWebGpuGradientFillMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: localToClipUniform
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(fillFragmentFns[options.colorCompositing], {
     local: vertexValue.xy, metaA, metaB, metaC,
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
@@ -481,6 +485,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   options: ThreeWebGpuGradientStrokeMaterialOptions
 ): ThreeWebGpuGradientStrokeMaterialState {
   const material = createBaseMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   const shapeOnly = TSL.uniform(0);
   registerThreePdfShapeUniform(material, shapeOnly);
   const zoomUniform = TSL.uniform(1);
@@ -498,15 +503,16 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const worldPack = varyingNode(callNode(strokeWorldPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), primitiveA, primitiveB, style, primitiveBounds,
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
-    localUnitsPerPixelInput: localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1), shapeOnly
+    localUnitsPerPixelInput: pageProjection.units ?? localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1), shapeOnly
   }));
   const worldValue = worldPack as { xy: unknown; z: unknown };
   material.vertexNode = callNode(strokeClipPositionFn, {
     worldPack,
     viewport: TSL.uniform(options.viewport), cameraCenter: TSL.uniform(options.cameraCenter),
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
-    localToClip: TSL.uniform(options.localToClip)
+    localToClip: pageProjection.matrix
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(strokeFragmentFns[options.colorCompositing], {
     local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds, shapeOnly,
     halfWidthFromVertex: worldValue.z, strokeCurveEnabled: curveUniform,

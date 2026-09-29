@@ -8,10 +8,11 @@ Goal: render HEPR pages as true Three.js objects using Three materials/shaders, 
   Implemented through `getPage` / `getPages` on `HeprThreePdfObject`, with
   position/rotation/quaternion/scale and affine matrix setters. Independent page
   views keep every paint type and interaction on the same page transform and
-  use separate submissions with page-aware depth/order. The default document
-  retains compact instanced backgrounds and cross-page batching. A future shared
-  page-matrix table could retain batching while pages move, but must update
-  content, clips, LOD, picking and overlap scheduling together.
+  use a shared GPU page-matrix table for compatible page batches on both
+  Three.js backends. Content, clips, LOD, picking and overlap scheduling follow
+  the same transforms. Instanced backgrounds supply opaque depth separation;
+  unsafe overlaps, effects and per-page appearance changes automatically use
+  independent submissions. The default document retains its existing path.
 - Avoid HTML-canvas texture bridging for the WebGL path.
 - Maintain feature parity: strokes, fills, text, raster layers, culling, and vector LOD.
 

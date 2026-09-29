@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
@@ -29,6 +30,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
@@ -104,6 +106,7 @@ export class ThreeMaterialTextLayer {
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
     this.vectorClipTexture = createThreeVectorClipTexture(scene);
+    const pageBinding = options.pageTransforms?.instances("text", scene);
     const materialBackend = options.materialBackend ?? "webgl";
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
     const textGlyphCount = Math.max(0, scene.textGlyphCount | 0);
@@ -270,6 +273,7 @@ export class ThreeMaterialTextLayer {
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
+        pageBinding,
         vectorOverride: this.vectorOverrideUniform,
         strokeCurveEnabled: options.strokeCurveEnabled,
         textVectorOnly: options.textVectorOnly
@@ -322,6 +326,7 @@ export class ThreeMaterialTextLayer {
     }
     configureStraightAlphaBlending(material);
 
+    bindRawPageTransform(material, pageBinding);
     initializeThreeVectorClip(material, this.vectorClipTexture);
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;

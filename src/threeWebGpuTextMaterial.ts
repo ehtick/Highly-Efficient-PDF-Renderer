@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
@@ -41,6 +42,7 @@ interface ThreeWebGpuTextMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
   vectorOverride: THREE.Vector4;
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
@@ -337,6 +339,7 @@ export function createThreeWebGpuTextMaterial(
   options: ThreeWebGpuTextMaterialOptions
 ): ThreeWebGpuTextMaterialState {
   const material = new NodeMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
@@ -374,7 +377,7 @@ export function createThreeWebGpuTextMaterial(
   const glyphMetaB = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0), true);
   const rasterRect = varyingNode(TSL.textureLoad(options.textGlyphRasterMetaTexture, glyphCoord, 0), true);
   const viewportUniform = TSL.uniform(options.viewport);
-  const localToClipUniform = TSL.uniform(options.localToClip);
+  const localToClipUniform = pageProjection.matrix;
   const vertexPack = varyingNode(callNode(textVertexPackFn, {
     corner,
     instanceA,
@@ -415,6 +418,7 @@ export function createThreeWebGpuTextMaterial(
     atlasSize: rasterAtlasSizeUniform
   });
 
+  pageProjection.finish(material);
   material.fragmentNode = callNode(textFragmentFns[options.colorCompositing], {
     local: vertexPackValue.zw,
     world: (vertexPack as { xy: unknown }).xy,

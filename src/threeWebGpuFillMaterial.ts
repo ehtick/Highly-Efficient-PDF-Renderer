@@ -1,3 +1,4 @@
+import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
@@ -38,6 +39,7 @@ interface ThreeWebGpuFillMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  pageBinding?: ThreePageBinding;
   vectorOverride: THREE.Vector4;
 }
 
@@ -207,6 +209,7 @@ export function createThreeWebGpuFillMaterial(
   options: ThreeWebGpuFillMaterialOptions
 ): ThreeWebGpuFillMaterialState {
   const material = new NodeMaterial();
+  const pageProjection = pageProjectionNode(options.localToClip, options.pageBinding);
   material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
@@ -242,7 +245,7 @@ export function createThreeWebGpuFillMaterial(
     segments: TSL.textureLoad(options.fillSegmentTextureA)
   }), true);
   const viewportUniform = TSL.uniform(options.viewport);
-  const localToClipUniform = TSL.uniform(options.localToClip);
+  const localToClipUniform = pageProjection.matrix;
   const vertexPack = varyingNode(callNode(fillVertexPackFn, {
     corner,
     metaA,
@@ -264,6 +267,7 @@ export function createThreeWebGpuFillMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: localToClipUniform
   });
+  pageProjection.finish(material);
   material.fragmentNode = callNode(fillFragmentFns[options.colorCompositing], {
     local: vertexPackValue.xy,
     metaA,

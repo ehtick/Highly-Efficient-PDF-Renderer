@@ -47,6 +47,7 @@ export const fastTests = [
   "three-raster-paint-order",
   "three-page-background-batching",
   "three-page-transforms",
+  "three-page-transform-batching",
   "scene-page-views",
   "shared-page-renderer",
   "three-vector-draw-batching",

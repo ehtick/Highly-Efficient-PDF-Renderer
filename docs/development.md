@@ -178,10 +178,24 @@ views replace its rendering and depth rectangle. `scenePageViews.ts` compacts
 page stores and remaps clips, glyphs, gradients, retained replay and paint graphs
 while preserving canonical coordinates and a primitive-ID map. The original
 scene stays immutable. The views share layer visibility and a native fallback
-context (`sharedPageRenderer.ts`), but have separate material resources and
-per-page submissions. Runtime matrices are not persisted in HEP.
+context (`sharedPageRenderer.ts`). Compatible material rendering uses a shared
+batch object and `threePageTransforms.ts`: canonical primitive IDs resolve an
+immutable page-owner texture, then a small mutable matrix/visibility table.
+Backgrounds and raster strips carry instanced page IDs; gradients and individual
+images use constant IDs. GLSL and WGSL share the same tables. Camera/document
+movement updates only the document projection. Text LOD selects per page;
+stroke LOD uses the finest visible page tolerance. Page views' material resources
+stay dormant until needed for fallback. Runtime matrices are not persisted in HEP.
 
-The `three-page-transforms`, `scene-page-views`, and `shared-page-renderer` tests
+`threePageBatchFrame.ts` projects paint extents, including coarse text and AA,
+to prove screen-space independence or opaque depth separation. Only then may
+the scheduler interleave page streams independently of their original layout.
+Compositing, unsafe overlaps, per-page appearance differences, and capability
+limits use independent submissions, and compatible layouts automatically rejoin
+the shared batches. `getPageBatchingStats()` exposes the decision.
+
+The `three-page-transform-batching`, `three-page-transforms`, `scene-page-views`,
+and `shared-page-renderer` tests
 cover both material backends, affine transforms, automatic scene preparation,
 picking, highlights, rollback, cancellation, shared native state, all paint types
 and synthetic HEP ownership round trips. Compositor tests check projected page
@@ -193,8 +207,12 @@ under a transformed document; include overlapping pages at different Z values.
 Check backgrounds, text, images, gradients, clips, search highlights and picking
 at overview and close zoom. Repeat with WebGL and WebGPU hosts, a layered or
 composited document, and a native texture fallback. Confirm layer toggles and
-cleanup, and measure FPS/draw calls separately before and after opting into page
-views. Transparent intersecting pages retain Three's object-level transparency
+cleanup, and measure FPS/draw calls separately before and after accessing page
+views. Confirm `getPageBatchingStats().mode` is `pages-batched` for disjoint pages
+and remains so during animation; move translucent pages into overlap and back
+to verify the separate-rendering transition. Headless tests count content meshes
+and generate shaders; browser FPS and driver shader validation remain manual.
+Transparent intersecting pages retain Three's object-level transparency
 sorting; exact order-independent transparency is not provided.
 
 Adjacent strokes, fills, or text share instanced draws even when their clip roots

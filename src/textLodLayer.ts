@@ -1,3 +1,4 @@
+import type { ThreePageTransforms } from "./threePageTransforms";
 import * as THREE from "three";
 
 import { OrderedTextLodSelection } from "./orderedTextLod";
@@ -40,6 +41,7 @@ const MAX_COMBINED_TEXT_ARRAY_BYTES = 512 * 1024 * 1024;
  */
 export class ThreeTextLodLayer {
   private runtime: TextLodRuntime | null;
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private renderScene: VectorScene | null;
   private combinedPayload: boolean;
   private requiredTextureDimension: number;
@@ -49,7 +51,8 @@ export class ThreeTextLodLayer {
   private selectionApplied = false;
   private orderedSelection: OrderedTextLodSelection | null = null;
 
-  private constructor(scene: VectorScene, mode: TextLodMode) {
+  private constructor(scene: VectorScene, mode: TextLodMode, pageTransforms?: ThreePageTransforms) {
+    this.pageTransforms = pageTransforms;
     this.runtime = null;
     this.renderScene = scene;
     this.combinedPayload = false;
@@ -59,8 +62,8 @@ export class ThreeTextLodLayer {
     }
   }
 
-  static create(scene: VectorScene, mode: TextLodMode): ThreeTextLodLayer {
-    return new ThreeTextLodLayer(scene, mode);
+  static create(scene: VectorScene, mode: TextLodMode, pageTransforms?: ThreePageTransforms): ThreeTextLodLayer {
+    return new ThreeTextLodLayer(scene, mode, pageTransforms);
   }
 
   /** Scene uploaded by the one Three text material. */
@@ -167,6 +170,9 @@ export class ThreeTextLodLayer {
         viewportHeight
       );
     const selection = runtime.update({
+      pageLocalToClip: this.pageTransforms?.projectionElements,
+      pageVisibility: this.pageTransforms?.visibility,
+      pageRevision: this.pageTransforms?.revision,
       localToClip,
       viewportWidth,
       viewportHeight,

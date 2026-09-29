@@ -1,3 +1,4 @@
+import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
@@ -21,6 +22,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
+  pageTransforms?: ThreePageTransforms;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   pageBackground: [number, number, number, number];
@@ -54,6 +56,7 @@ interface RasterLayerSource {
 }
 
 export class ThreeMaterialRasterLayer {
+  private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly visibility: ScenePaintVisibility;
   private snapshot: OptionalContentSnapshot;
   private readonly vectorClipTexture: THREE.DataTexture;
@@ -83,6 +86,7 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.pageTransforms = options.pageTransforms;
     this.appliedRasterLayers = [...scene.rasterLayers];
     this.visibility = new ScenePaintVisibility(scene);
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
@@ -113,6 +117,8 @@ export class ThreeMaterialRasterLayer {
 
     const pageRects = normalizePageRects(scene);
     this.pageBackgroundGeometry = createPageBackgroundGeometry(pageRects);
+    if (this.pageTransforms && this.pageBackgroundGeometry) this.pageBackgroundGeometry.setAttribute("aPageIndex",
+      new THREE.InstancedBufferAttribute(Float32Array.from({ length: pageRects.length / 4 }, (_, i) => i), 1));
     if (this.pageBackgroundGeometry) {
       const entry = this.createEntry(
         this.pageBackgroundTexture,
@@ -400,9 +406,12 @@ export class ThreeMaterialRasterLayer {
     let material: THREE.Material | undefined;
     try {
       geometry = createRasterStripGeometry(batch);
+      const pageBinding = this.pageTransforms ? { table: this.pageTransforms } : undefined;
+      if (this.pageTransforms) geometry.setAttribute("aPageIndex", new THREE.InstancedBufferAttribute(
+        Float32Array.from({ length: batch.count }, (_, i) => this.pageTransforms!.page("raster", batch.first + i).page!), 1));
       let webGpuState: RasterLayerEntry["webGpuState"];
       if (this.materialBackend === "webgpu") {
-        const state = createThreeWebGpuRasterStripMaterial({ texture, colorCompositing: this.colorCompositing,
+        const state = createThreeWebGpuRasterStripMaterial({ pageBinding, texture, colorCompositing: this.colorCompositing,
           viewport: this.viewportUniform, cameraCenter: this.cameraCenterUniform, localToClip: this.localToClipUniform });
         material = state.material;
         webGpuState = state;
@@ -424,6 +433,7 @@ export class ThreeMaterialRasterLayer {
           }
         });
       }
+      bindRawPageTransform(material, pageBinding);
       initializeThreeVectorClip(material, this.vectorClipTexture);
       const clipped = createThreeVectorClipMaterial(material, this.vectorClipIndices[batch.first]);
       if (clipped !== material) material.dispose();
@@ -480,10 +490,13 @@ export class ThreeMaterialRasterLayer {
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
     const instancedPageBackground = geometry.hasAttribute("aPageRect");
+    const pageBinding = this.pageTransforms ? instancedPageBackground ? { table: this.pageTransforms }
+      : this.pageTransforms.page("raster", this.rasterEntries.length) : undefined;
 
     if (this.materialBackend === "webgpu") {
       const state = createThreeWebGpuRasterMaterial({
         instancedPageBackground,
+        pageBinding,
         colorCompositing: this.colorCompositing,
         opacity,
         texture,
@@ -534,6 +547,7 @@ export class ThreeMaterialRasterLayer {
       }
     });
 
+    bindRawPageTransform(material, pageBinding);
     initializeThreeVectorClip(material, this.vectorClipTexture);
     const clippedMaterial = createThreeVectorClipMaterial(material, clipIndex);
     if (clippedMaterial !== material) material.dispose();

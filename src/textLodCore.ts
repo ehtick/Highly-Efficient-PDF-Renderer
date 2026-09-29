@@ -53,6 +53,11 @@ const TEXT_LOD_VISIBILITY_STEP_RATIO = 0.1;
 export const TEXT_LOD_SOFT_EXACT_GLYPH_BUDGET = 200_000;
 
 export interface TextLodSelectionUpdate {
+  /** Shared page batches select each page at its own scale and projection. */
+  pageLocalToClip?: readonly ArrayLike<number>[];
+  pageVisibility?: Uint8Array;
+  /** Increment after changing page projections or visibility; omit to disable reuse. */
+  pageRevision?: number;
   /** Column-major PDF-local-to-clip 4x4 matrix. */
   localToClip: ArrayLike<number>;
   viewportWidth: number;
@@ -149,6 +154,8 @@ export class TextLodRuntime {
   private selectionScratch: Uint32Array = new Uint32Array(0);
   private selectionInitialized = false;
   private lastUpdateValid = false;
+  private lastPageMatrices: TextLodSelectionUpdate["pageLocalToClip"];
+  private lastPageRevision: number | undefined;
   private readonly lastLocalToClip = new Float64Array(16);
   private lastViewportWidth = 0;
   private lastViewportHeight = 0;
@@ -236,7 +243,7 @@ export class TextLodRuntime {
     // page and cluster, and its visibility is the snapped local rectangle alone.
     // The same scale and rectangle therefore reproduce the previous selection,
     // which lets a pan skip the whole pass until it crosses a visibility step.
-    const affine = this.resolveAffineView(update);
+    const affine = !update.pageLocalToClip && this.resolveAffineView(update);
     if (affine && this.selectionInitialized && this.isSameAffineSelection()) {
       this.rememberSelectionUpdate(update);
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
@@ -254,7 +261,8 @@ export class TextLodRuntime {
       : this.resolveVisibilityBounds(update.cullingBounds);
 
     for (const page of data.pages) {
-      if (cullingBounds && !boundsIntersect(page.bounds, cullingBounds)) {
+      const pageMatrix = update.pageLocalToClip?.[page.pageIndex] ?? update.localToClip;
+      if (update.pageVisibility?.[page.pageIndex] === 0 || (cullingBounds && !boundsIntersect(page.bounds, cullingBounds))) {
         if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
           selectionDecisionChanged = true;
         }
@@ -262,7 +270,7 @@ export class TextLodRuntime {
       }
       const pageProjection = affine ? null : analyzePlanarBoundsProjectionInto(
         page.bounds,
-        update.localToClip,
+        pageMatrix,
         this.selectionViewport(update),
         this.pageProjection,
         page.inkHeightDirection,
@@ -343,7 +351,7 @@ export class TextLodRuntime {
         if (decision < 0) {
           const projection = analyzePlanarBoundsProjectionInto(
             cluster.bounds,
-            update.localToClip,
+            pageMatrix,
             this.selectionViewport(update),
             this.clusterProjection,
             cluster.inkHeightDirection,
@@ -632,14 +640,15 @@ export class TextLodRuntime {
   }
 
   private isSameSelectionUpdate(update: TextLodSelectionUpdate): boolean {
-    if (!this.lastUpdateValid || update.localToClip.length < 16) return false;
+    if (!this.lastUpdateValid || update.localToClip.length < 16 || this.lastPageMatrices !== update.pageLocalToClip ||
+        this.lastPageRevision !== update.pageRevision || (update.pageLocalToClip && update.pageRevision === undefined)) return false;
     if (
       Number(update.viewportWidth) !== this.lastViewportWidth ||
       Number(update.viewportHeight) !== this.lastViewportHeight
     ) {
       return false;
     }
-    for (let i = 0; i < 16; i += 1) {
+    if (!update.pageLocalToClip) for (let i = 0; i < 16; i += 1) {
       if (Number(update.localToClip[i]) !== this.lastLocalToClip[i]) return false;
     }
     const bounds = update.cullingBounds;
@@ -654,6 +663,7 @@ export class TextLodRuntime {
   }
 
   private rememberSelectionUpdate(update: TextLodSelectionUpdate): void {
+    this.lastPageMatrices = update.pageLocalToClip; this.lastPageRevision = update.pageRevision;
     if (update.localToClip.length < 16) {
       this.lastUpdateValid = false;
       return;

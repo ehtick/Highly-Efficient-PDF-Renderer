@@ -295,7 +295,6 @@ async function main() {
             fillPathCount: scene.fillPathCount,
             fillSegmentCount: scene.fillSegmentCount,
             pathCount: scene.pathCount,
-            operatorCount: scene.operatorCount,
             imagePaintOpCount: scene.imagePaintOpCount,
             textInstanceCount: scene.textInstanceCount,
             maxHalfWidth: scene.maxHalfWidth,

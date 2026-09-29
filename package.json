@@ -52,10 +52,6 @@
     "./experimental/pdf-worker": {
       "import": "./dist/lib/pdf-worker.js",
       "default": "./dist/lib/pdf-worker.js"
-    },
-    "./experimental/dense-pdf-worker": {
-      "import": "./dist/lib/dense-pdf-worker.js",
-      "default": "./dist/lib/dense-pdf-worker.js"
     }
   },
   "files": [
@@ -78,7 +74,6 @@
     "test:conversion": "node scripts/run-tests.mjs conversion",
     "test:corpus": "node scripts/run-tests.mjs corpus",
     "test:file": "node scripts/run-tests.mjs file",
-    "test:oracle": "npm --prefix oracle test",
     "dev": "vite",
     "build": "tsc && npm run test:file -- scripts/test-persistent-viewer-contract.mjs && vite build",
     "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run build:bundler && npm run test:package",
@@ -91,20 +86,13 @@
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
     "regenerate:heps": "node PDFtoHEP.js --force --output-dir=public/examples/heps public/examples/pdfs && npm run generate-manifest",
-    "benchmark:dense-pdf": "node --max-old-space-size=12288 --experimental-strip-types scripts/benchmark-dense-pdf.mjs",
-    "benchmark:livermore-pdf": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-livermore-fast-path.mjs",
     "benchmark:native-vector-page": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-vector-page.mjs",
-    "benchmark:native-dense-cutover": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-dense-cutover.mjs",
     "benchmark:production-parser": "node --max-old-space-size=12288 --expose-gc scripts/benchmark-production-parser.mjs",
     "score:rooms": "node scripts/score-rooms.mjs",
     "audit:rooms": "node scripts/audit-room-topology.mjs",
     "gold:rooms": "node scripts/room-gold-set.mjs",
     "prepublishOnly": "npm test && npm run build:all",
-    "clean:lib": "node scripts/clean-lib-output.mjs",
-    "oracle:validate": "npm --prefix oracle run validate",
-    "oracle:compare": "npm --prefix oracle run compare --",
-    "oracle:compare:hepr": "npm --prefix oracle run compare:hepr --",
-    "oracle:write": "npm --prefix oracle run write --"
+    "clean:lib": "node scripts/clean-lib-output.mjs"
   },
   "dependencies": {},
   "devDependencies": {

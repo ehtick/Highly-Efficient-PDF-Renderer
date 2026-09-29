@@ -22,13 +22,3 @@ export function formatSceneSegmentAccounting(scene: VectorScene): string {
     ? `${merged}; cull / image-layer breakdown unavailable`
     : `${merged}; culled ${counts.culled.toLocaleString()}; image layers ${counts.imageLayers.toLocaleString()} (still painted)`;
 }
-
-export function describeSceneOperatorCount(scene: VectorScene): string {
-  const kind = scene.operatorCountKind === "native-estimate" ? "native estimate"
-    : scene.operatorCountKind === "mixed" ? "mixed counters" : "legacy / unspecified";
-  return `${scene.operatorCount.toLocaleString()} (${kind}; engine-specific)`;
-}
-
-export const OPERATOR_COUNT_EXPLANATION = "Parser diagnostic only, not a cross-engine workload metric. " +
-  "The native count estimates legacy operator-list units and includes expanded Form occurrences. " +
-  "It is neither a raw PDF operator count nor a GPU draw-call count; older engines count differently.";

@@ -19,7 +19,7 @@ npm run test:file -- scripts/test-scene-statistics.mjs
 The visual suite compiles only physical brochure page 5 (zero-based source
 index 4, printed spread 8–9), plus a tiny original synthetic PDF. It requires
 the tracked brochure at its existing `public/examples/pdfs` path. It does not
-load main or PDF.js, start a browser/server, or regenerate any tracked HEP.
+start a browser/server or regenerate any tracked HEP.
 
 `scripts/fixtures/brochure-page5.json` records the accepted native output:
 
@@ -94,13 +94,11 @@ For the previously measured 15-page brochure totals:
 | Emitted vectors | 8,834 |
 
 The UI no longer labels the last two categories' combined drop as invisible
-culling. `Parser Ops` is explicitly engine-specific: native compatibility
-estimates include expanded Form occurrences and are neither raw PDF operator
-counts nor GPU draw calls. Do not compare that number across engines as
-equivalent work. Compare timings and accepted output instead.
+culling. Compare timings and accepted output across engines, not parser
+counters.
 
-The v6 baseline added image-transfer counts, cull diagnostics and operator
-counter provenance. The current v7 format retains those fields. Missing
+The v6 baseline added image-transfer counts and cull diagnostics. The current
+format retains those fields. Missing
 cull/image breakdown is shown as unavailable, not fabricated zeros; v6 files
 must now be regenerated from their original PDFs.
 Mixed old/new page grids also retain that uncertainty. Tests cover all three

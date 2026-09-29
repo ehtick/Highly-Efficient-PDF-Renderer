@@ -416,9 +416,13 @@ export async function writeHepBlobAtomically(outputPath, blob, overwrite, signal
   }
 }
 
-function createProgressLogger(sourceLabel, fileNumber, fileCount) {
+export function createProgressLogger(sourceLabel, fileNumber, fileCount, {
+  now = () => performance.now(),
+  write = (message) => console.error(message)
+} = {}) {
   let lastStage = "";
   let lastFivePercentBucket = -1;
+  let lastLoggedAt = -Infinity;
 
   return (progress) => {
     const percentage = Math.round(Math.max(0, Math.min(1, Number(progress.value) || 0)) * 100);
@@ -427,9 +431,16 @@ function createProgressLogger(sourceLabel, fileNumber, fileCount) {
     if (stage === lastStage && bucket <= lastFivePercentBucket) {
       return;
     }
+    const timestamp = now();
+    // Each page can cycle through several stages at the same percentage.
+    // Thousands of synchronous terminal writes can dominate book conversion.
+    // Keep percentage milestones and completion immediate, and cap the rest.
+    if (bucket <= lastFivePercentBucket && timestamp - lastLoggedAt < 250 &&
+        !(stage === "complete" && percentage === 100)) return;
     lastStage = stage;
     lastFivePercentBucket = Math.max(lastFivePercentBucket, bucket);
-    console.error(`[${fileNumber}/${fileCount}] ${sourceLabel}: ${percentage}% ${stage}`);
+    lastLoggedAt = timestamp;
+    write(`[${fileNumber}/${fileCount}] ${sourceLabel}: ${percentage}% ${stage}`);
   };
 }
 

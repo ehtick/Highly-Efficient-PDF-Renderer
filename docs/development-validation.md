@@ -14,7 +14,6 @@ No additional test framework is required.
 | `npm run test:browser` | Opt-in Vite middleware and browser-facing checks; may start Vite. |
 | `npm run test:conversion` | Opt-in HEP serialization/conversion tests; some require Vite, corpus files, and built artifacts. |
 | `npm run test:corpus` | Opt-in tests using the PDFs in `public/examples/pdfs`. |
-| `npm run test:oracle` | The separately installed oracle harness. |
 | `npm run test:file -- <path>` | Run one file, forwarding any following arguments to it. |
 
 The shared runner executes each file in a fresh Node process, sequentially,
@@ -68,9 +67,9 @@ does not track a lockfile.
 
 `npm run release-new-version` runs `npm test` and `npm run build:all` before
 bumping the patch version and pushing its tag. The fast suite includes real
-Node worker startup with process-wide flags from CI, covering both the full
-and dense PDF workers. A successful local release command means the tag was
-pushed; check the separate **Publish to npm** workflow for publishing success.
+Node worker startup with process-wide flags from CI, covering the native PDF
+worker. A successful local release command means the tag was pushed; check the
+separate **Publish to npm** workflow for publishing success.
 
 ## Manual checks
 
@@ -87,10 +86,8 @@ Build with `npm run build:all`, then start `npm run preview` yourself.
 4. Follow [parser benchmark](parser-benchmark.md) for production timing/memory
    comparisons. The long corpus and browser gates are separate from `npm test`.
 
-The oracle baseline directory is not populated in this checkout. Generating
-and reviewing corpus baselines remains a manual operation; CI does not create
-or silently accept new visual goldens. No corpus HEP regeneration is needed
-for the loading and cancellation regressions.
+CI does not create or silently accept new visual goldens. No corpus HEP
+regeneration is needed for the loading and cancellation regressions.
 
 ## Deferred work
 

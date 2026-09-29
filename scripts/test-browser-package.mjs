@@ -126,7 +126,7 @@ for (const engine of ["lcms", "qcms"]) {
 assert.ok(assets.some(name => /^roomDetectorWorker-.*\.js$/.test(name)),
   "the package must ship the browser room detector worker");
 for (const name of assets) {
-  if (/^(?:densePdfFastWorker|pdfWorkerEntry|roomDetectorWorker)-.*\.js$/.test(name)) {
+  if (/^(?:pdfWorkerEntry|roomDetectorWorker)-.*\.js$/.test(name)) {
     const source = await readFile(`${libDir}assets/${name}`);
     console.log(`Browser worker entry ${name}: ${size(source)} (lazy helper/CMap chunks excluded).`);
   }

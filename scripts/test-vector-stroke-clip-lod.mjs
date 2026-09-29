@@ -132,4 +132,49 @@ for (const unitsPerPixel of [.01, .4, .8, 1.6, 3.2, 6.4, 12.8, 25.6, 100]) {
   }
 }
 assert.deepEqual(detailScene, original, "LOD preserves the canonical source geometry");
+
+// A clip rectangle is not a stroke's occupied area. Broad page clips used to
+// charge every tile for a few short lines, collapsing fit-all to the coarsest LOD.
+{
+  const { buildRuntimeTileBuckets, createRuntimeTileGrid, VectorStrokeLodRuntime } =
+    await import("../src/vectorStrokeLodCore.ts");
+  const count = 1024;
+  const clipped = { ...scene, segmentCount: count, maxHalfWidth: .1,
+    bounds: { minX: 0, minY: 0, maxX: 1000, maxY: 1000 },
+    endpoints: new Float32Array(count * 4), primitiveMeta: new Float32Array(count * 4),
+    primitiveBounds: new Float32Array(count * 4), styles: new Float32Array(count * 4) };
+  const tightBounds = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    const x = 10 + i % 32 * 30, y = 10 + Math.floor(i / 32) * 30;
+    const curved = i % 3 === 0;
+    clipped.endpoints.set([x, y, x + 2, y + (curved ? 6 : 0)], i * 4);
+    clipped.primitiveMeta.set([x + 2, y, curved ? 1 : 0, 9], i * 4);
+    clipped.primitiveBounds.set([0, 0, 1000, 1000], i * 4);
+    clipped.styles.set([.1, 0, 0, 0], i * 4);
+    tightBounds.set([x, y, x + 2, y + (curved ? 6 : 0)], i * 4);
+  }
+  const unclipped = { ...clipped, primitiveBounds: tightBounds, primitiveMeta: clipped.primitiveMeta.slice() };
+  for (let i = 0; i < count; i++) unclipped.primitiveMeta[i * 4 + 3] = 1;
+  const snapshot = structuredClone(clipped);
+  const grid = createRuntimeTileGrid(clipped.bounds, count, clipped);
+  assert.deepEqual(grid, createRuntimeTileGrid(unclipped.bounds, count, unclipped),
+    "density-adaptive tile edges depend on ink, not the size of its clip");
+  const buckets = buildRuntimeTileBuckets(clipped, grid);
+  assert.deepEqual(buckets, buildRuntimeTileBuckets(unclipped, grid),
+    "short clipped lines and quadratic control hulls occupy only their ink tiles");
+  assert(buckets.tileSegmentIds.length < count * 4, "a page clip must not multiply tile references");
+  const sync = new VectorStrokeLodRuntime(clipped);
+  const async = await prebuildVectorStrokeLodRuntime(clipped, "force", "webgl", { yieldIntervalMs: 1 });
+  for (let level = 0; level < sync.levels.length; level++) {
+    for (const key of ["tileCounts", "tileOffsets", "tileSegmentIds", "segmentMinX", "segmentMinY", "segmentMaxX", "segmentMaxY"]) {
+      assert.deepEqual(async.levels[level][key], sync.levels[level][key], `cooperative clipped ${key} agrees`);
+    }
+  }
+  assert.deepEqual(clipped, snapshot, "runtime bounds never replace the shader's exact clip rectangles");
+  const outside = { ...clipped, primitiveBounds: clipped.primitiveBounds.slice() };
+  for (let i = 0; i < count; i++) outside.primitiveBounds.set([990, 990, 1000, 1000], i * 4);
+  assert.equal(buildRuntimeTileBuckets(outside, grid).tileSegmentIds.length, 0,
+    "fully clipped ink occupies no tile, even after antialiasing margins");
+}
+
 console.log("Vector stroke LOD preserves clips, short details, thin hatch density, async parity and exact source geometry.");

@@ -19,12 +19,10 @@ try {
       openPdfInNodeWorker,
       sanitizeNodePdfWorkerExecArgv
     },
-    { extractPdfPageScenes },
-    { compileDensePdfInWorker }
+    { extractPdfPageScenes }
   ] = await Promise.all([
     import("../src/pdf/workerClient.ts"),
-    import("../src/pdfVectorExtractor.ts"),
-    import("../src/densePdfFastWorkerClient.ts")
+    import("../src/pdfVectorExtractor.ts")
   ]);
   assert.deepEqual(
     sanitizeNodePdfWorkerExecArgv([
@@ -91,9 +89,6 @@ try {
       } finally {
         await flagSession.close();
       }
-      const denseResult = await compileDensePdfInWorker(fixture);
-      assert.equal(denseResult.kind, "success", JSON.stringify(denseResult));
-      assert.equal(denseResult.pages[0].compiled.fillPathCount, 1);
     } finally {
       process.execArgv.splice(0, process.execArgv.length, ...originalExecArgv);
     }
@@ -145,7 +140,6 @@ try {
   const [scene] = await extractPdfPageScenes(
     extractionBytes.buffer,
     {
-      pdfFastPath: "off",
       enableSegmentMerge: false,
       enableInvisibleCull: true,
       onProgress: (event) => extractionProgress.push(event)

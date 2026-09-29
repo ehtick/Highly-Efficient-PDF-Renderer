@@ -66,16 +66,13 @@ async function runController(options) {
   }
 
   const successful = reports.filter((report) => report.outcome === "success");
-  const fallbackRuns = successful.filter((report) => report.pdfJsFallback).length;
-  const failed = successful.length !== reports.length ||
-    (options.failOnPdfJsFallback && fallbackRuns > 0);
+  const failed = successful.length !== reports.length;
   if (successful.length > 0) {
     console.log("\nMedians");
     console.log(`parser engine boundary     ${formatMs(median(successful.map((r) => r.parserMs)))}`);
     console.log(`public pre-LOD boundary    ${formatMs(median(successful.map((r) => r.publicBoundaryMs)))}`);
     console.log(`package module load        ${formatMs(median(successful.map((r) => r.moduleLoadMs)))}`);
     console.log(`sampled peak RSS delta     ${formatBytes(median(successful.map((r) => r.memory.rssDelta)))}`);
-    console.log(`PDF.js fallback runs       ${fallbackRuns}/${successful.length}`);
   }
 
   if (options.jsonPath) {
@@ -199,7 +196,6 @@ async function runChild({ inputPath, entryPath, pages, resultPath }) {
       executionPaths,
       progressStages: [...progressStages].sort(),
       route: classifyRoute(executionPaths),
-      pdfJsFallback: executionPaths.includes("main-thread-fallback"),
       browserWorkerAdapterCount: BrowserWorkerAdapter.createdCount,
       memory: memoryResult,
       runtime: {
@@ -320,13 +316,7 @@ function createMemorySampler() {
 }
 
 function classifyRoute(paths) {
-  if (paths.includes("main-thread-fallback")) return "pdfjs-fallback";
-  if (paths.includes("worker") && paths.includes("dense-vector-worker")) {
-    return "native-full-after-dense";
-  }
-  if (paths.includes("worker")) return "native-full";
-  if (paths.includes("dense-vector-worker")) return "dense";
-  return "unknown";
+  return paths.includes("worker") ? "native-full" : "unknown";
 }
 
 function parseArguments(args) {
@@ -338,7 +328,6 @@ function parseArguments(args) {
     runs: 3,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     jsonPath: undefined,
-    failOnPdfJsFallback: false,
     showHelp: false
   };
   for (let index = 0; index < args.length; index += 1) {
@@ -356,7 +345,6 @@ function parseArguments(args) {
     else if (argument.startsWith("--timeout-ms=")) output.timeoutMs = requireInteger("--timeout-ms", argument.slice(13), 1_000, 3_600_000);
     else if (argument === "--json") output.jsonPath = requireValue(argument, args[++index]);
     else if (argument.startsWith("--json=")) output.jsonPath = requireValue("--json", argument.slice(7));
-    else if (argument === "--fail-on-pdfjs-fallback") output.failOnPdfJsFallback = true;
     else if (argument.startsWith("-")) throw new TypeError(`Unknown option: ${argument}`);
     else if (output.inputPath === null) output.inputPath = argument;
     else throw new TypeError(`Unexpected positional argument: ${argument}`);
@@ -408,7 +396,6 @@ Options:
   --runs N                    Fresh-process runs, 1-20 (default: 3)
   --timeout-ms N              Per-run timeout (default: ${DEFAULT_TIMEOUT_MS})
   --json PATH                 Write machine-readable results
-  --fail-on-pdfjs-fallback    Exit nonzero if main-thread-fallback is observed
   -h, --help                  Show this help
 `);
 }

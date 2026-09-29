@@ -1,18 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
-const blockedMessage = "production parsing must not resolve PDF.js";
-let pdfJsResolveAttempts = 0;
-
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier === "pdfjs-dist" || specifier.startsWith("pdfjs-dist/")) {
-      pdfJsResolveAttempts += 1;
-      throw new Error(blockedMessage);
-    }
     if (
       context.parentURL?.includes("/src/") &&
       /^\.\.?\//.test(specifier) &&
@@ -30,7 +22,6 @@ try {
     import("../src/pdfObjectGenerator.ts")
   ]);
   assert.equal(typeof objectGeneratorModule.loadPdfSceneFromSource, "function");
-  assert.equal(pdfJsResolveAttempts, 0, "public parser imports must not resolve PDF.js");
   assert.deepEqual(
     deriveSceneTextContentFromIndex(createIndexedTextScene(), 0),
     [
@@ -39,93 +30,46 @@ try {
     ]
   );
 
-  const mainSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(
-    mainSource,
-    /(?:from\s+|import\s*\()\s*["']pdfjs-dist/,
-    "the main viewer entry must not eagerly import PDF.js"
-  );
-
-  // Node now launches the real dense worker through worker_threads instead of
-  // consulting globalThis.Worker. Exercise that production boundary with a
-  // valid native-compatible PDF; a browser-Worker stub would no longer prove
-  // that the worker entry and its imports remain dependency-free.
-  const denseProgress = [];
+  // Node launches the native parser through worker_threads instead of
+  // consulting globalThis.Worker. Exercise that production boundary; a
+  // browser-Worker stub would not prove that the worker entry and its imports
+  // remain dependency-free.
+  const vectorProgress = [];
   const scenes = await extractPdfPageScenes(toArrayBuffer(createVectorOptimizationPdf()), {
-    onProgress: (event) => denseProgress.push(event)
+    onProgress: (event) => vectorProgress.push(event)
   });
   assert.equal(scenes.length, 1);
   assert.equal(scenes[0].pageCount, 1);
   assert.ok(
-    denseProgress.some(({ executionPath }) => executionPath === "dense-vector-worker"),
-    "native-compatible parsing must execute in the direct Node dense worker"
+    vectorProgress.some(({ executionPath }) => executionPath === "worker") &&
+      vectorProgress.every(({ executionPath }) => executionPath === undefined || executionPath === "worker"),
+    "every PDF parses in the native Node worker"
   );
-  assert.equal(pdfJsResolveAttempts, 0, "a native success must not resolve PDF.js");
 
-  const formBytes = createSimpleFormPdf();
-  const formBuffer = toArrayBuffer(formBytes);
+  const formBuffer = toArrayBuffer(createSimpleFormPdf());
   const formSnapshot = new Uint8Array(formBuffer).slice();
-  const formProgress = [];
   const nativeFullScenes = await extractPdfPageScenes(formBuffer, {
     enableSegmentMerge: false,
-    enableInvisibleCull: true,
-    onProgress: (event) => formProgress.push(event)
+    enableInvisibleCull: true
   });
   assert.equal(nativeFullScenes.length, 1);
   assert.equal(nativeFullScenes[0].fillPathCount, 1);
-  assert.ok(
-    formProgress.some(({ executionPath }) => executionPath === "dense-vector-worker"),
-    "auto mode must attempt dense compilation first"
-  );
-  assert.ok(
-    formProgress.some(({ executionPath }) => executionPath === "worker"),
-    "a dense rejection must continue in the full native Node worker"
-  );
   assert.deepEqual(
     new Uint8Array(formBuffer),
     formSnapshot,
-    "native fallback parsing must not detach or mutate caller bytes"
-  );
-  assert.equal(
-    pdfJsResolveAttempts,
-    0,
-    "a dense rejection handled by the full native parser must not resolve PDF.js"
-  );
-
-  const forcedNativeProgress = [];
-  const forcedNativeScenes = await extractPdfPageScenes(toArrayBuffer(formBytes), {
-    pdfFastPath: "off",
-    onProgress: (event) => forcedNativeProgress.push(event)
-  });
-  assert.equal(forcedNativeScenes.length, 1);
-  assert.equal(forcedNativeScenes[0].fillPathCount, 1);
-  assert.ok(
-    forcedNativeProgress.every(({ executionPath }) => executionPath !== "dense-vector-worker"),
-    "pdfFastPath=off must skip only the dense worker"
-  );
-  assert.ok(
-    forcedNativeProgress.some(({ executionPath }) => executionPath === "worker"),
-    "pdfFastPath=off must retain the full native Node worker"
-  );
-  assert.equal(
-    pdfJsResolveAttempts,
-    0,
-    "pdfFastPath=off must select the full native parser"
+    "native worker parsing must not detach or mutate caller bytes"
   );
 
   const optimizationBytes = createVectorOptimizationPdf();
   const [unoptimizedScene] = await extractPdfPageScenes(toArrayBuffer(optimizationBytes), {
-    pdfFastPath: "off",
     enableSegmentMerge: false,
     enableInvisibleCull: false
   });
   const [mergeOnlyScene] = await extractPdfPageScenes(toArrayBuffer(optimizationBytes), {
-    pdfFastPath: "off",
     enableSegmentMerge: true,
     enableInvisibleCull: false
   });
   const [cullOnlyScene] = await extractPdfPageScenes(toArrayBuffer(optimizationBytes), {
-    pdfFastPath: "off",
     enableSegmentMerge: false,
     enableInvisibleCull: true
   });
@@ -136,11 +80,9 @@ try {
   assert.equal(mergeOnlyScene.segmentCount, 2);
   assert.equal(cullOnlyScene.mergedSegmentCount, 3, "culling must not implicitly enable merge");
   assert.equal(cullOnlyScene.segmentCount, 1, "culling must remain independently enabled");
-  assert.equal(pdfJsResolveAttempts, 0);
 
   const nativeProgress = [];
   const selectedScenes = await extractPdfPageScenes(toArrayBuffer(createTwoPagePdf()), {
-    pdfFastPath: "off",
     pages: "2",
     onProgress: (event) => nativeProgress.push(event)
   });
@@ -157,15 +99,14 @@ try {
   await assert.rejects(
     extractPdfPageScenes(
       toArrayBuffer(createSimpleFormPdf()),
-      { pdfFastPath: "off" },
+      {},
       abortController.signal
     ),
     (error) => error === abortReason
   );
-  assert.equal(pdfJsResolveAttempts, 0, "cancellation must not resolve PDF.js");
 
   await assert.rejects(
-    extractPdfPageScenes(toArrayBuffer(createUnsupportedFilterPdf()), { pdfFastPath: "off" }),
+    extractPdfPageScenes(toArrayBuffer(createUnsupportedFilterPdf())),
     (error) => {
       assert.equal(error?.name, "PdfError");
       assert.equal(error?.code, "unsupported-filter");
@@ -173,13 +114,8 @@ try {
       return true;
     }
   );
-  assert.equal(
-    pdfJsResolveAttempts,
-    0,
-    "a typed unsupported native construct must propagate without resolving PDF.js"
-  );
 
-  console.log("Native parser dependency boundary passed.");
+  console.log("Native parser boundary passed.");
 } finally {
   hooks.deregister();
 }

@@ -44,8 +44,7 @@ const GEOMETRY_CASES = Object.freeze([
 ]);
 
 // Frozen from PDF.js 6.1.200's public `page.view` and `getViewport()` output.
-// Keeping exact matrices/bounds here preserves the differential contract while
-// allowing this production-facing test to run with no PDF.js installation.
+// Native page geometry must keep matching these exact matrices and bounds.
 const PDFJS_GEOMETRY_GOLDENS = Object.freeze([
   { pageMatrix: [2, 0, 0, 2, -60, -40], pageBounds: [0, 0, 340, 140] },
   { pageMatrix: [0, -2, 2, 0, -40, 400], pageBounds: [0, 0, 140, 340] },
@@ -57,13 +56,6 @@ const PDFJS_GEOMETRY_GOLDENS = Object.freeze([
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (
-      specifier === "pdf-lib" ||
-      specifier === "pdfjs-dist" ||
-      specifier.startsWith("pdfjs-dist/")
-    ) {
-      throw new Error(`Room-overlay matrix test imported forbidden dependency ${specifier}.`);
-    }
     if (
       context.parentURL?.includes("/src/") &&
       /^\.\.?\//.test(specifier) &&
@@ -117,8 +109,6 @@ try {
     new URL("../src/room-overlay-demo.ts", import.meta.url),
     "utf8"
   );
-  assert.doesNotMatch(demoSource, /pdfjs-dist/);
-  assert.doesNotMatch(demoSource, /\bgetDocument\b|\bGlobalWorkerOptions\b|\bbuildPageMatrix\b/);
   assert.match(
     demoSource,
     /const \{ computePageGeometry, openPdf \} = await import\("\.\/pdfSession"\)/

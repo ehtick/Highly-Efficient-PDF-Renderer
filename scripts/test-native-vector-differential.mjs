@@ -4,7 +4,7 @@ import { registerHooks } from "node:module";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
-installPdfJsNodePolyfills();
+installNodeRuntimeCompatibility();
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -39,7 +39,6 @@ try {
   });
   for (const fixture of createFixtures()) {
     const legacyScenes = await extractPdfPageScenes(toArrayBuffer(fixture.bytes), {
-      pdfFastPath: "off",
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       extractTextContent: true
@@ -66,28 +65,6 @@ try {
         assert.ok(nativeScene.textClipRects?.length >= 4, `${fixture.name}: native clip sidecar`);
         assert.ok(nativeScene.textInstanceB.some((_, index) => index % 4 === 3 &&
           nativeScene.textInstanceB[index] > 0), `${fixture.name}: clipped instance reference`);
-
-        const denseProgress = [];
-        const [denseScene] = await extractPdfPageScenes(toArrayBuffer(fixture.bytes), {
-          enableSegmentMerge: false,
-          enableInvisibleCull: false,
-          extractTextContent: true,
-          onProgress: (event) => denseProgress.push(event)
-        });
-        assert.ok(
-          denseProgress.some(({ executionPath }) => executionPath === "dense-vector-worker"),
-          `${fixture.name}: regression must exercise the dense geometry/text merge`
-        );
-        assert.deepEqual(
-          denseScene.textClipRects,
-          nativeScene.textClipRects,
-          `${fixture.name}: dense merge must retain page-space text clips`
-        );
-        assert.deepEqual(
-          denseScene.textInstanceB,
-          nativeScene.textInstanceB,
-          `${fixture.name}: dense merge must retain text clip references`
-        );
       }
     } finally {
       await session.close();
@@ -310,9 +287,8 @@ function assertSceneParity(actual, expected, fixtureName) {
   ]) {
     assertFloatArrayNear(actual[field], expected[field], `${fixtureName}: ${field}`);
   }
-  // PDF.js normalizes device colors through an 8-bit display-color path,
-  // while the native compiler retains the source float. They are visually
-  // equivalent when they differ by no more than one channel quantum.
+  // Device colors are visually equivalent when they differ by no more than
+  // one channel quantum.
   for (const field of ["fillPathMetaB", "fillPathMetaC", "primitiveMeta", "styles"]) {
     assertFloatArrayNear(
       actual[field],
@@ -516,7 +492,7 @@ function toArrayBuffer(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
-function installPdfJsNodePolyfills() {
+function installNodeRuntimeCompatibility() {
   Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));
   Uint8Array.prototype.toHex ??= function toHex() {
     return Buffer.from(this.buffer, this.byteOffset, this.byteLength).toString("hex");

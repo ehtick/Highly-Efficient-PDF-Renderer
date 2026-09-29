@@ -1,6 +1,6 @@
 import { rectangleVectorClip } from "./pdf/nativeVectorClips";
 import { buildNativeRasterPage, buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
-import { lowerRetainedPageToVectorScene } from "./retainedVectorPage";
+import { lowerRetainedPageToVectorScene, type RetainedTextPositions } from "./retainedVectorPage";
 import { attachRetainedTextOptionalContent } from "./retainedOptionalContentText";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
@@ -42,6 +42,8 @@ import {
   type DensePdfMatrix,
   type DensePdfPatternColorSpaceDefinition,
   type DensePdfPatternDefinition,
+  DensePdfStreamingUnsupportedError,
+  type DensePdfResourceLoader,
   type DensePdfResourceReferences,
   type DensePdfTextClip,
   type DensePdfTextOperatorContext
@@ -99,6 +101,7 @@ import {
   type PdfDiagnostic,
   type PdfResourceLimits,
   type PdfSource,
+  type PdfStream,
   type PdfValue
 } from "./pdf/nativePdf";
 import type { NativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
@@ -149,6 +152,7 @@ import { NativePdfAppearanceSynthesizer } from "./pdf/nativeAppearanceSynthesis"
 import {
   buildNativePdfFormDefinitionGraph,
   buildNativePdfResourceFormDefinitionGraph,
+  NativePdfFormGraphBuilder,
   buildNativePdfScopedFormDefinitionGraph,
   classifyNativePdfXObjectReferences,
   type NativePdfFormDefinition,
@@ -487,12 +491,49 @@ class NativePdfSession implements NativeVectorPdfSession {
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
-      return await this.compileVectorPageUnlocked(sourcePageIndex, options, signal);
+      return await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
     } catch (error) {
       throw normalizeAbortError(error, signal);
     } finally {
       operation.abort(new PdfError("aborted", "The PDF vector-page operation ended."));
       release?.();
+    }
+  }
+
+  /**
+   * Toggleable layers also compile content that is hidden by default. When only
+   * that content is unusable, open the page in its default view without layer
+   * controls instead of refusing it, and say why.
+   */
+  private async compileVectorPageWithLayerFallback(
+    sourcePageIndex: number,
+    options: NativeVectorCompileOptions,
+    signal: AbortSignal
+  ): Promise<VectorScene> {
+    try {
+      return await this.compileVectorPageUnlocked(sourcePageIndex, options, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (options.retainOptionalContent === false || this.optionalContent.groupCount === 0 ||
+          !(error instanceof PdfError) || error.code === "resource-limit" || error.code === "aborted") {
+        throw error;
+      }
+      // When the default view fails as well, its error is why the page cannot
+      // open at all.
+      const scene = await this.compileVectorPageUnlocked(
+        sourcePageIndex,
+        { ...options, retainOptionalContent: false },
+        signal
+      );
+      this.appendDiagnostics([{
+        code: "optional-content.default-view-fallback",
+        severity: "warning",
+        pageIndex: sourcePageIndex,
+        message: "PDF layers are unavailable on this page because content hidden by default " +
+          "could not be compiled; the page shows its default view.",
+        details: { code: error.code, reason: error.message }
+      }]);
+      return scene;
     }
   }
 
@@ -778,19 +819,20 @@ class NativePdfSession implements NativeVectorPdfSession {
         optionalContent: buildOptionalContentStore(this.optionalContent),
         limits: densePathCompileLimits(this.document, options)
       });
-      const pageData = text
-        ? {
-            ...densePageData,
-            textIndex: buildInvocationOrderedTextIndex(
-              compiled,
-              compositingPrograms.forms,
-              accumulatedText,
-              allFontResources,
-              maxGlyphs,
-              signal
-            )
-          }
+      const invocationText = text
+        ? buildInvocationOrderedTextIndex(
+            compiled,
+            compositingPrograms.forms,
+            accumulatedText,
+            allFontResources,
+            maxGlyphs,
+            signal
+          )
+        : undefined;
+      const pageData = invocationText
+        ? { ...densePageData, textIndex: invocationText.textIndex }
         : densePageData;
+      if (invocationText?.positions) retainedTextPositions.set(pageData.textIndex, invocationText.positions);
       const commandCount = pageData.displayProgram.groups.reduce(
         (sum, group) => sum + group.commands.length,
         0
@@ -856,6 +898,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       try {
         return await lowerRetainedPageToVectorScene(page, {
           optionalContent: options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined,
+          textPositions: retainedTextPositions.get(page.textIndex),
           signal,
           onDiagnostic: diagnostic => this.appendDiagnostics([diagnostic]),
           maxPrimitives: options.limits?.maxPathsPerPage ?? this.document.limits.maxPathsPerPage,
@@ -1098,7 +1141,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private async buildRetainedRasterScene(page: HeprPageData, options: NativeVectorCompileOptions,
     signal: AbortSignal, reason: Error): Promise<VectorScene> {
     const commandCount = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
-    if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal });
+    if (!commandCount) return lowerRetainedPageToVectorScene(page, { signal, textPositions: retainedTextPositions.get(page.textIndex) });
     const layer = await renderNativeRetainedCommandSpan(page, 0, commandCount, signal,
       { ...this.document.limits, ...options.limits });
     if (!layer) throw new PdfError("invalid-object", "A retained page replay produced no structural raster slot.");
@@ -1340,18 +1383,210 @@ class NativePdfSession implements NativeVectorPdfSession {
     reuse?: NativePagePreparationReuse
   ) {
     signal.throwIfAborted();
+    // A later compilation of the same page streams its content again and
+    // reuses the resources the first one loaded.
+    const streamed = reuse?.prepared?.streamed
+      ? reuse.prepared
+      : output === "vector-scene" && !reuse?.prepared
+        ? await this.prepareStreamedPageResources(sourcePageIndex, options, signal)
+        : null;
+    if (streamed) {
+      try {
+        const result = await this.compilePreparedPage(
+          streamed, sourcePageIndex, options, signal, output, timings, capturePaintSourceIdentities
+        );
+        if (reuse) reuse.prepared = streamed;
+        return result;
+      } catch (error) {
+        signal.throwIfAborted();
+        // A property first used as metadata and later as /OC still needs
+        // lookahead. Other failures, including a caller's resolver, are
+        // reported once rather than retried with prepared input.
+        if (!(error instanceof DensePdfStreamingUnsupportedError)) throw error;
+        if (reuse) reuse.prepared = undefined;
+      }
+    }
     const prepared = reuse?.prepared ?? await this.preparePageResources(
       sourcePageIndex, options, signal, output, timings
     );
     if (reuse) reuse.prepared = prepared;
+    return await this.compilePreparedPage(
+      prepared, sourcePageIndex, options, signal, output, timings, capturePaintSourceIdentities
+    );
+  }
+
+  /**
+   * Prepare a page whose content streams straight into the compiler. Its
+   * fonts, ExtGStates, properties, color spaces, XObjects, patterns and shadings
+   * load when the content first uses them, so the decoded content is neither
+   * held whole nor scanned for references first.
+   */
+  private async prepareStreamedPageResources(
+    sourcePageIndex: number,
+    options: PdfCompileOptions,
+    signal: AbortSignal
+  ): Promise<PreparedNativePageResources | null> {
+    const page = this.document.getPage(sourcePageIndex);
+    const resources = await loadReferencedPageResourceScope(this.document, page, signal);
+    const pageInfo = this.info.pages[sourcePageIndex];
+    const { pageMatrix, pageBounds } = computePageGeometry(page);
+    const streams = await this.document.getPageContentStreams(sourcePageIndex, signal);
+    const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
+    const fontRegistry = new NativePageFontRegistry(
+      this.document,
+      sourcePageIndex,
+      this.missingFontResolver,
+      new NativePdfType3Registry(this.document)
+    );
+    const imageResources = await loadPageImages(
+      this.document,
+      page,
+      resources,
+      EMPTY_RESOURCE_REFERENCES,
+      signal,
+      this.optionalContent,
+      this.imageCodecResolver,
+      { iccTransformResolver: this.iccTransformResolver, iccEngine: this.iccEngine },
+      (diagnostic) => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }]),
+      options.limits,
+      retainOptionalContent
+    );
+    // Forms join the graph as the content first names them; annotation
+    // appearances follow once the content is compiled, as in preparation.
+    const forms = new NativePdfFormGraphBuilder(this.document, this.formRegistry, sourcePageIndex, pageMatrix, {
+      optionalContent: this.optionalContent,
+      retainOptionalContent,
+      appearanceSynthesizer: this.appearanceSynthesizer,
+      signal
+    });
+    let inlineImageCount = 0;
+    const maxInlineImages = Math.min(DEFAULT_NATIVE_INLINE_IMAGE_LIMITS.maxImages,
+      options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage);
+    const content = new StreamedPageContent(this.document, streams, signal, async (bytes, sourceOffset) => {
+      const prepared = prepareNativeInlineImages(bytes, {
+        sourceOffset, signal, limits: inlineImageLimits(this.document, maxInlineImages)
+      });
+      inlineImageCount += prepared.images.length;
+      if (inlineImageCount > maxInlineImages) {
+        throw new PdfError("resource-limit", "Inline image count exceeds the page limit.", {
+          details: { reason: "inline-image-count", count: inlineImageCount, limit: maxInlineImages }
+        });
+      }
+      return bindPreparedInlineImages(prepared, imageResources.registry, imageResources.colorSpaces, signal);
+    });
+    return {
+      pageInfo, pageMatrix, pageBounds, fontRegistry, fontResources: [],
+      imageResources, pageContentSegments: [], extGStates: [], formGraph: EMPTY_NATIVE_FORM_DEFINITION_GRAPH,
+      pageMarkedContentProperties: new Map(), totalBytes: content.estimatedBytes,
+      streamed: {
+        resources, content, forms, formOptionalContent: new Map(),
+        properties: new Map(), optionalContentProperties: new Set(), graph: null,
+        fonts: new Map(), extGStates: new Map(), colorSpaces: new Set(), xObjects: new Set()
+      }
+    };
+  }
+
+  /** Load a streamed page's resources exactly as preparation loads scanned references. */
+  private streamedResourceLoader(
+    prepared: PreparedNativePageResources,
+    streamed: NativeStreamedPageResources,
+    fontsByName: Map<string, NativeTextFontResource>,
+    vectorShadings: Set<number>,
+    signal: AbortSignal,
+    timings?: NativeVectorCompileTimings
+  ): DensePdfResourceLoader {
+    const { resources, properties, optionalContentProperties } = streamed;
+    const { fontRegistry, imageResources } = prepared;
+    const timed = async <T>(phase: "fontLoadMs" | "resourceLoadMs", load: () => Promise<T>): Promise<T> => {
+      const startedAt = timings ? nativeVectorTimingNow() : 0;
+      try {
+        return await load();
+      } finally {
+        if (timings) timings[phase] += nativeVectorTimingNow() - startedAt;
+      }
+    };
+    return {
+      font: (resourceName) => timed("fontLoadMs", async () => {
+        const loaded = await fontRegistry.loadScope(
+          resources, [resourceName], signal, { label: "Page", allowType3: true }
+        );
+        for (const [name, font] of loaded) {
+          fontsByName.set(name, font);
+          streamed.fonts.set(name, font);
+        }
+      }),
+      extGState: (resourceName) => timed("resourceLoadMs", async () => {
+        const [definition] = await loadResourceExtGStates(
+          imageResources.extGStates, resources, [resourceName], signal
+        );
+        streamed.extGStates.set(resourceName, definition);
+        return definition;
+      }),
+      markedContentProperty: (resourceName, optionalContent) => timed("resourceLoadMs", async () => {
+        if (properties.has(resourceName)) {
+          // Preparation resolves a property once, as optional content when
+          // any /OC tag names it; a property already resolved otherwise
+          // cannot become optional content after the fact.
+          if (optionalContent && !optionalContentProperties.has(resourceName)) {
+            throw new DensePdfStreamingUnsupportedError(
+              `Marked-content property /${resourceName} is also named by an /OC tag.`, "BDC");
+          }
+          return properties.get(resourceName);
+        }
+        const loaded = await loadMarkedContentProperties(
+          this.document, this.optionalContent, resources, [resourceName],
+          optionalContent ? [resourceName] : [], signal
+        );
+        properties.set(resourceName, loaded.get(resourceName));
+        if (optionalContent) optionalContentProperties.add(resourceName);
+        return loaded.get(resourceName);
+      }),
+      colorSpace: (resourceName) => timed("resourceLoadMs", async () => {
+        await imageResources.loadColorSpace(resourceName);
+        streamed.colorSpaces.add(resourceName);
+      }),
+      xObject: (resourceName) => timed("resourceLoadMs", async () => {
+        const [reference] = await classifyNativePdfXObjectReferences(this.document, resources, [resourceName], signal);
+        if (reference.kind === "Image") {
+          await imageResources.loadImage(resourceName);
+        } else {
+          const association = streamed.forms.optionalContentOf(await streamed.forms.addPageForm(resourceName));
+          if (association.optionalContentIndex >= 0) {
+            streamed.formOptionalContent.set(resourceName, Object.freeze(association));
+          }
+        }
+        streamed.xObjects.add(resourceName);
+      }),
+      shading: (resourceName) => timed("resourceLoadMs", async () => {
+        await imageResources.loadShading(resourceName);
+        for (const index of supportedNativeVectorShadings(imageResources.shadings)) vectorShadings.add(index);
+      }),
+      pattern: (resourceName) => timed("resourceLoadMs", async () => {
+        await imageResources.loadPattern(resourceName);
+      })
+    };
+  }
+
+  private async compilePreparedPage(
+    prepared: PreparedNativePageResources,
+    sourcePageIndex: number,
+    options: PdfCompileOptions,
+    signal: AbortSignal,
+    output: "display-program" | "vector-scene",
+    timings?: NativeVectorCompileTimings,
+    capturePaintSourceIdentities = false
+  ) {
     const {
       pageInfo, pageMatrix, pageBounds, fontRegistry, fontResources,
-      imageResources, pageContentSegments, extGStates, formGraph,
-      pageMarkedContentProperties, totalBytes
+      imageResources, pageContentSegments, extGStates,
+      pageMarkedContentProperties, streamed
     } = prepared;
-    const pageForms = formGraph.pageForms;
-    const pageFormOptionalContent = formOptionalContentForScope(pageForms, formGraph.definitions);
-    const fontsByName = new Map(fontResources);
+    let { totalBytes, formGraph } = prepared;
+    const pageForms = streamed ? streamed.forms.pageForms : formGraph.pageForms;
+    const pageFormOptionalContent = streamed
+      ? streamed.formOptionalContent
+      : formOptionalContentForScope(pageForms, formGraph.definitions);
+    const fontsByName = new Map(streamed ? streamed.fonts : fontResources);
     const emittedTextRuns: NativeTextDrawRun[] = [];
     const maxGlyphs = options.limits?.maxGlyphsPerPage ?? this.document.limits.maxGlyphsPerPage;
     const textCompiler = new NativeTextCompiler({
@@ -1377,6 +1612,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       "content", 0, totalBytes, sourcePageIndex, 0, this.info.byteLength
     ));
     const compileStartedAt = timings ? nativeVectorTimingNow() : 0;
+    const streamedLoadMsBefore = timings ? timings.fontLoadMs + timings.resourceLoadMs + timings.inlinePreparationMs : 0;
+    const vectorShadings = new Set(supportedNativeVectorShadings(imageResources.shadings));
     let finalizeStartedAt: number | null = null;
     const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
@@ -1390,24 +1627,39 @@ class NativePdfSession implements NativeVectorPdfSession {
         ? { capturePaintSourceIdentities: true }
         : {}),
       textOperatorSink,
-      extGStates,
+      extGStates: streamed ? [...streamed.extGStates.values()] : extGStates,
       imageXObjects: imageResources.indexes,
       imageOptionalContent: imageResources.optionalContent,
       shadings: imageResources.shadingIndexes,
       ...(output === "vector-scene" ? {
-        vectorShadings: supportedNativeVectorShadings(imageResources.shadings)
+        vectorShadings
       } : {}),
       patterns: imageResources.patternDefinitions,
       patternColorSpaces: imageResources.patternColorSpaces,
       formXObjects: pageForms,
       formOptionalContent: pageFormOptionalContent,
-      markedContentProperties: pageMarkedContentProperties,
+      markedContentProperties: streamed
+        ? loadedMarkedContentProperties(streamed.properties)
+        : pageMarkedContentProperties,
       maxMarkedContentDepth: this.document.limits.maxRecursionDepth,
       maxMarkedContent: options.limits?.maxCommandsPerPage ??
         this.document.limits.maxCommandsPerPage,
       ...densePathCompileLimits(this.document, options),
       colorSpaceResolver: imageResources.colorSpaceResolver,
-      totalBytes,
+      ...(streamed ? {
+        resourceLoader: this.streamedResourceLoader(prepared, streamed, fontsByName, vectorShadings, signal, timings),
+        inlineImageLoader: (offset, buffered) => streamed.content.prepareInlineRemainder(offset, buffered),
+        loadedResources: {
+          fonts: streamed.fonts.keys(),
+          extGStates: streamed.extGStates.keys(),
+          properties: streamed.properties.keys(),
+          optionalContentProperties: streamed.optionalContentProperties,
+          colorSpaces: streamed.colorSpaces,
+          xObjects: streamed.xObjects,
+          shadings: imageResources.shadingIndexes.keys(),
+          patterns: imageResources.patternDefinitions.keys()
+        }
+      } : { totalBytes }),
       signal,
       onProgress: (update) => {
         if (timings && update.phase === "finalizing" && finalizeStartedAt === null) {
@@ -1416,20 +1668,37 @@ class NativePdfSession implements NativeVectorPdfSession {
         onProgress?.(progress(
           update.phase === "scanning" ? "content" : "optimize",
           update.processedBytes,
-          update.totalBytes ?? totalBytes,
+          update.totalBytes ?? streamed?.content.estimateTotal(update.processedBytes) ?? totalBytes,
           sourcePageIndex,
           update.processedBytes,
           this.info.byteLength
         ));
       }
     };
+    const content = streamed ? streamed.content.chunks(timings) : pageContentSegments;
     const compiled = output === "vector-scene" && !nativeVectorOrderedPaintEnabled(options)
-      ? await compileGroupedVectorPageContent(pageContentSegments, compileOptions)
-      : await compileDensePdfContent(pageContentSegments, { ...compileOptions, output });
+      ? await compileGroupedVectorPageContent(content, compileOptions)
+      : await compileDensePdfContent(content, { ...compileOptions, output });
+    if (streamed) {
+      totalBytes = streamed.content.decodedBytes;
+      if (timings) timings.inlinePreparationSkipped = !streamed.content.hasInlineImages;
+      if (!streamed.graph) {
+        await streamed.forms.addAnnotations();
+        streamed.graph = streamed.forms.build();
+        this.appendDiagnostics(this.formRegistry.getDiagnostics());
+        this.appendDiagnostics(this.appearanceSynthesizer.getDiagnostics());
+      }
+      formGraph = streamed.graph;
+    }
     if (timings) {
       const compileFinishedAt = nativeVectorTimingNow();
       const finalizeSplitAt = finalizeStartedAt ?? compileFinishedAt;
-      timings.compileScanMs += finalizeSplitAt - compileStartedAt;
+      // Streamed decoding and resource loading happen inside the scan.
+      const streamedMs = streamed
+        ? streamed.content.decodeMs + timings.fontLoadMs + timings.resourceLoadMs + timings.inlinePreparationMs - streamedLoadMsBefore
+        : 0;
+      if (streamed) timings.decodeMs += streamed.content.decodeMs;
+      timings.compileScanMs += finalizeSplitAt - compileStartedAt - streamedMs;
       timings.compileFinalizeMs += compileFinishedAt - finalizeSplitAt;
     }
     return {
@@ -1538,6 +1807,9 @@ class NativePageTextAccumulator {
   private readonly glyphPrefixes: string[] = [];
   private readonly glyphTexts: string[] = [];
   private readonly runSourcesWithDiagnostics = new WeakSet<object>();
+  /** Every run slice of a Form shares its transform store; remap it once. */
+  private readonly transformRemaps = new WeakMap<object, Uint32Array>();
+  private readonly runTexts = new WeakMap<NativeTextCompilation, NativeRunTextIndex>();
   private pendingOccurrenceBoundary = false;
 
   constructor(maxGlyphs: number) {
@@ -1553,24 +1825,7 @@ class NativePageTextAccumulator {
         details: { reason: "page-glyph-count", maxGlyphs: this.maxGlyphs }
       });
     }
-    const transformRemap = new Uint32Array(compilation.transforms.values.length / 6);
-    for (let localIndex = 0; localIndex < transformRemap.length; localIndex += 1) {
-      const offset = localIndex * 6;
-      const matrix = compilation.transforms.values.subarray(offset, offset + 6);
-      const key = Array.from(matrix).join(",");
-      let globalIndex = this.transformKeys.get(key);
-      if (globalIndex === undefined) {
-        globalIndex = this.transforms.length / 6;
-        if (globalIndex >= this.maxTransforms) {
-          throw new PdfError("resource-limit", "Page text exceeds the transform limit.", {
-            details: { reason: "page-text-transform-count", maxTransforms: this.maxTransforms }
-          });
-        }
-        this.transforms.push(...matrix);
-        this.transformKeys.set(key, globalIndex);
-      }
-      transformRemap[localIndex] = globalIndex;
-    }
+    const transformRemap = this.remapTransforms(compilation.transforms);
     for (let index = 0; index < glyphCount; index += 1) {
       this.fontIndices.push(compilation.glyphs.fontIndices[index]);
       this.characterCodes.push(compilation.glyphs.characterCodes[index]);
@@ -1641,6 +1896,36 @@ class NativePageTextAccumulator {
     return glyphOffset;
   }
 
+  /**
+   * Map a transform store into the page store, in local order, on first use.
+   * Later slices of the same compilation reuse the table instead of rekeying
+   * every transform of the Form for each glyph run.
+   */
+  private remapTransforms(transforms: NativeTextCompilation["transforms"]): Uint32Array {
+    const cached = this.transformRemaps.get(transforms);
+    if (cached) return cached;
+    const transformRemap = new Uint32Array(transforms.values.length / 6);
+    for (let localIndex = 0; localIndex < transformRemap.length; localIndex += 1) {
+      const offset = localIndex * 6;
+      const matrix = transforms.values.subarray(offset, offset + 6);
+      const key = Array.from(matrix).join(",");
+      let globalIndex = this.transformKeys.get(key);
+      if (globalIndex === undefined) {
+        globalIndex = this.transforms.length / 6;
+        if (globalIndex >= this.maxTransforms) {
+          throw new PdfError("resource-limit", "Page text exceeds the transform limit.", {
+            details: { reason: "page-text-transform-count", maxTransforms: this.maxTransforms }
+          });
+        }
+        this.transforms.push(...matrix);
+        this.transformKeys.set(key, globalIndex);
+      }
+      transformRemap[localIndex] = globalIndex;
+    }
+    this.transformRemaps.set(transforms, transformRemap);
+    return transformRemap;
+  }
+
   appendRun(compilation: NativeTextCompilation, runIndex: number): number {
     const run = compilation.runs[runIndex];
     if (!run || !Number.isSafeInteger(run.first) || !Number.isSafeInteger(run.count) ||
@@ -1651,7 +1936,98 @@ class NativePageTextAccumulator {
       });
     }
     this.appendDiagnosticsFrom(compilation);
-    return this.append(sliceNativeTextRun(compilation, run, false));
+    let runTexts = this.runTexts.get(compilation);
+    if (!runTexts) {
+      runTexts = indexNativeTextRuns(compilation);
+      this.runTexts.set(compilation, runTexts);
+    }
+    return this.appendRunGlyphs(compilation, run, runTexts, runIndex);
+  }
+
+  /**
+   * Append one glyph run of a larger compilation as if it were its own
+   * compilation: its glyphs, a copy of the run starting at the new glyphs,
+   * and its share of the Unicode text.
+   */
+  private appendRunGlyphs(
+    compilation: NativeTextCompilation,
+    run: Readonly<NativeTextDrawRun>,
+    runTexts: NativeRunTextIndex,
+    runIndex: number
+  ): number {
+    const glyphOffset = this.glyphIds.length;
+    const { first, count } = run;
+    if (count > this.maxGlyphs - glyphOffset) {
+      throw new PdfError("resource-limit", "Page and reusable-program text exceeds the glyph limit.", {
+        details: { reason: "page-glyph-count", maxGlyphs: this.maxGlyphs }
+      });
+    }
+    const glyphs = compilation.glyphs;
+    const total = glyphs.glyphIds.length;
+    const advanceEms = compilation.glyphAdvanceEms?.length === total ? compilation.glyphAdvanceEms : null;
+    const widthEms = compilation.glyphWidthEms?.length === total ? compilation.glyphWidthEms : null;
+    const gapBefore = compilation.glyphGapBefore?.length === total ? compilation.glyphGapBefore : null;
+    const transformRemap = this.remapTransforms(compilation.transforms);
+    for (let index = first; index < first + count; index += 1) {
+      this.fontIndices.push(glyphs.fontIndices[index]);
+      this.characterCodes.push(glyphs.characterCodes[index]);
+      this.glyphIds.push(glyphs.glyphIds[index]);
+      this.transformIndices.push(transformRemap[glyphs.transformIndices[index]]);
+      this.advances.push(glyphs.advances[index * 2], glyphs.advances[index * 2 + 1]);
+      this.flags.push(glyphs.flags[index]);
+      if (advanceEms) {
+        this.glyphAdvanceEms.push(advanceEms[index]);
+      } else {
+        this.hasCompleteGlyphAdvanceEms = false;
+        this.glyphAdvanceEms.push(0);
+      }
+      if (widthEms) {
+        this.glyphWidthEms.push(widthEms[index]);
+      } else {
+        this.hasCompleteGlyphWidthEms = false;
+        this.glyphWidthEms.push(0);
+      }
+      if (gapBefore) {
+        this.glyphGapBefore.push(gapBefore[index]);
+      } else {
+        this.hasCompleteGlyphGapBefore = false;
+        this.glyphGapBefore.push(0);
+      }
+      this.glyphPrefixes.push("");
+      this.glyphTexts.push("");
+    }
+    this.runs.push(Object.freeze({ ...run, first: glyphOffset }));
+    const text = compilation.textIndex.text;
+    const start = runTexts.starts[runIndex];
+    const end = runTexts.starts[runIndex + 1];
+    if (end > start && this.pendingOccurrenceBoundary) {
+      this.pendingOccurrenceBoundary = false;
+      const previous = this.textParts.at(-1)?.at(-1) ?? "";
+      const next = text[runTexts.positions[start]] ?? "";
+      if (previous.length > 0 && next.length > 0 && !/\s/u.test(previous) && !/\s/u.test(next)) {
+        this.textParts.push(" ");
+        this.charGlyphIndices.push(-1);
+      }
+    }
+    let pendingPrefix = "";
+    for (let entry = start; entry < end; entry += 1) {
+      const character = text[runTexts.positions[entry]];
+      const reference = runTexts.references[entry];
+      this.textParts.push(character);
+      if (reference >= 0) {
+        const globalIndex = glyphOffset + reference;
+        this.charGlyphIndices.push(globalIndex);
+        if (pendingPrefix.length > 0) {
+          this.glyphPrefixes[globalIndex] += pendingPrefix;
+          pendingPrefix = "";
+        }
+        this.glyphTexts[globalIndex] += character;
+      } else {
+        this.charGlyphIndices.push(-1);
+        pendingPrefix += character;
+      }
+    }
+    return glyphOffset;
   }
 
   appendDiagnosticsFrom(compilation: NativeTextCompilation): void {
@@ -1731,70 +2107,104 @@ class NativePageTextAccumulator {
   }
 }
 
-function sliceNativeTextRun(
-  compilation: NativeTextCompilation,
-  run: Readonly<NativeTextDrawRun>,
-  includeDiagnostics: boolean
-): NativeTextCompilation {
-  const first = run.first;
-  const end = first + run.count;
-  const text: string[] = [];
-  const references: number[] = [];
-  const pendingText: string[] = [];
-  for (let index = 0; index < compilation.textIndex.text.length; index += 1) {
-    const character = compilation.textIndex.text[index];
-    const reference = compilation.textIndex.charGlyphIndices[index];
-    if (reference === -1) {
-      pendingText.push(character);
-      continue;
+/**
+ * Each glyph run's share of a compilation's Unicode text: entries
+ * `[starts[run], starts[run + 1])` give the text position of a character and
+ * its glyph relative to the run, or -1 for a separator.
+ */
+interface NativeRunTextIndex {
+  readonly starts: Int32Array;
+  readonly positions: Int32Array;
+  readonly references: Int32Array;
+}
+
+/**
+ * Index every glyph run's text in one pass over the Unicode index. Separators
+ * attach to the run of the next non-separator character; any other character
+ * clears them, exactly as a per-run scan would.
+ */
+function indexNativeTextRuns(compilation: NativeTextCompilation): NativeRunTextIndex {
+  const runs = compilation.runs;
+  const glyphRuns = new Int32Array(compilation.glyphs.glyphIds.length).fill(-1);
+  let overlapping = false;
+  for (let runIndex = 0; runIndex < runs.length && !overlapping; runIndex += 1) {
+    const { first, count } = runs[runIndex];
+    for (let glyph = first; glyph < first + count; glyph += 1) {
+      if (glyphRuns[glyph] !== -1) {
+        overlapping = true;
+        break;
+      }
+      glyphRuns[glyph] = runIndex;
     }
-    if (reference <= -2) {
-      throw new PdfError(
-        "unsupported-content",
-        "Standalone fallback text cannot be ordered while flattening a Form XObject.",
-        { details: { reason: "vector-form-fallback-text" } }
-      );
-    }
-    if (reference < first || reference >= end) {
-      pendingText.length = 0;
-      continue;
-    }
-    for (const separator of pendingText) {
-      text.push(separator);
-      references.push(-1);
-    }
-    pendingText.length = 0;
-    text.push(character);
-    references.push(reference - first);
   }
-  return Object.freeze({
-    transforms: compilation.transforms,
-    glyphs: {
-      fontIndices: compilation.glyphs.fontIndices.slice(first, end),
-      characterCodes: compilation.glyphs.characterCodes.slice(first, end),
-      glyphIds: compilation.glyphs.glyphIds.slice(first, end),
-      transformIndices: compilation.glyphs.transformIndices.slice(first, end),
-      advances: compilation.glyphs.advances.slice(first * 2, end * 2),
-      flags: compilation.glyphs.flags.slice(first, end)
-    },
-    textIndex: {
-      version: 1 as const,
-      text: text.join(""),
-      charGlyphIndices: Int32Array.from(references),
-      fallbackQuads: new Float32Array(0)
-    },
-    ...(compilation.glyphAdvanceEms?.length === compilation.glyphs.glyphIds.length ? {
-      glyphAdvanceEms: compilation.glyphAdvanceEms.slice(first, end)
-    } : {}),
-    ...(compilation.glyphWidthEms?.length === compilation.glyphs.glyphIds.length ? {
-      glyphWidthEms: compilation.glyphWidthEms.slice(first, end)
-    } : {}),
-    ...(compilation.glyphGapBefore?.length === compilation.glyphs.glyphIds.length ? {
-      glyphGapBefore: compilation.glyphGapBefore.slice(first, end)
-    } : {}),
-    runs: Object.freeze([{ ...run, first: 0 }]),
-    diagnostics: includeDiagnostics ? compilation.diagnostics : Object.freeze([])
-  });
+  const text = compilation.textIndex.text;
+  const charGlyphIndices = compilation.textIndex.charGlyphIndices;
+  const positions: number[][] = runs.map(() => []);
+  const references: number[][] = runs.map(() => []);
+  if (overlapping) {
+    // Overlapping runs cannot share one pass; scan the text once per run.
+    for (let runIndex = 0; runIndex < runs.length; runIndex += 1) {
+      const first = runs[runIndex].first;
+      const end = first + runs[runIndex].count;
+      const pending: number[] = [];
+      for (let index = 0; index < text.length; index += 1) {
+        const reference = charGlyphIndices[index];
+        if (reference === -1) {
+          pending.push(index);
+          continue;
+        }
+        if (reference <= -2) throw standaloneFallbackTextError();
+        if (reference >= first && reference < end) {
+          for (const separator of pending) {
+            positions[runIndex].push(separator);
+            references[runIndex].push(-1);
+          }
+          positions[runIndex].push(index);
+          references[runIndex].push(reference - first);
+        }
+        pending.length = 0;
+      }
+    }
+  } else {
+    const pending: number[] = [];
+    for (let index = 0; index < text.length; index += 1) {
+      const reference = charGlyphIndices[index];
+      if (reference === -1) {
+        pending.push(index);
+        continue;
+      }
+      if (reference <= -2) throw standaloneFallbackTextError();
+      const runIndex = reference < glyphRuns.length ? glyphRuns[reference] : -1;
+      if (runIndex >= 0) {
+        for (const separator of pending) {
+          positions[runIndex].push(separator);
+          references[runIndex].push(-1);
+        }
+        positions[runIndex].push(index);
+        references[runIndex].push(reference - runs[runIndex].first);
+      }
+      pending.length = 0;
+    }
+  }
+  const starts = new Int32Array(runs.length + 1);
+  for (let runIndex = 0; runIndex < runs.length; runIndex += 1) {
+    starts[runIndex + 1] = starts[runIndex] + positions[runIndex].length;
+  }
+  const flatPositions = new Int32Array(starts[runs.length]);
+  const flatReferences = new Int32Array(starts[runs.length]);
+  for (let runIndex = 0; runIndex < runs.length; runIndex += 1) {
+    flatPositions.set(positions[runIndex], starts[runIndex]);
+    flatReferences.set(references[runIndex], starts[runIndex]);
+  }
+  return { starts, positions: flatPositions, references: flatReferences };
+}
+
+function standaloneFallbackTextError(): PdfError {
+  return new PdfError(
+    "unsupported-content",
+    "Standalone fallback text cannot be ordered while flattening a Form XObject.",
+    { details: { reason: "vector-form-fallback-text" } }
+  );
 }
 
 async function loadResourceExtGStates(
@@ -1865,7 +2275,203 @@ interface PreparedNativePageResources {
   readonly extGStates: readonly DensePdfExtGStateDefinition[];
   readonly formGraph: NativePdfFormDefinitionGraph;
   readonly pageMarkedContentProperties: ReadonlyMap<string, Readonly<DensePdfMarkedContentPropertyDefinition>>;
+  /** Decoded content length; an estimate until streamed content is compiled. */
   readonly totalBytes: number;
+  /** Content decoded while it compiles; its resources load on first use. */
+  readonly streamed?: NativeStreamedPageResources;
+}
+
+interface NativeStreamedPageResources {
+  readonly resources: PdfDictionary;
+  readonly content: StreamedPageContent;
+  /** Page Forms, added on first use; annotations follow compilation. */
+  readonly forms: NativePdfFormGraphBuilder;
+  readonly formOptionalContent: Map<string, { optionalContentIndex: number; defaultVisible: boolean }>;
+  /** Marked-content properties resolved so far, and which of them as optional content. */
+  readonly properties: Map<string, Readonly<DensePdfMarkedContentPropertyDefinition> | undefined>;
+  readonly optionalContentProperties: Set<string>;
+  /** Everything else loaded so far, for a later compilation of the same content. */
+  readonly fonts: Map<string, NativeTextFontResource>;
+  readonly extGStates: Map<string, DensePdfExtGStateDefinition>;
+  readonly colorSpaces: Set<string>;
+  readonly xObjects: Set<string>;
+  /** The completed Form graph, once the first compilation has finished. */
+  graph: NativePdfFormDefinitionGraph | null;
+}
+
+/** Resolved properties of a streamed page, as prepared compilation passes them. */
+function loadedMarkedContentProperties(
+  properties: ReadonlyMap<string, Readonly<DensePdfMarkedContentPropertyDefinition> | undefined>
+): Map<string, Readonly<DensePdfMarkedContentPropertyDefinition>> {
+  const definitions = new Map<string, Readonly<DensePdfMarkedContentPropertyDefinition>>();
+  for (const [name, definition] of properties) if (definition) definitions.set(name, definition);
+  return definitions;
+}
+
+const EMPTY_RESOURCE_REFERENCES: DensePdfResourceReferences = Object.freeze({
+  xObjects: Object.freeze([]),
+  properties: Object.freeze([]),
+  optionalContentProperties: Object.freeze([]),
+  fonts: Object.freeze([]),
+  extGStates: Object.freeze([]),
+  colorSpaces: Object.freeze([]),
+  shadings: Object.freeze([]),
+  patterns: Object.freeze([])
+});
+
+/** Decoded streamed content is handed to the compiler in slices of this size. */
+const STREAMED_CONTENT_CHUNK_BYTES = 256 * 1024;
+/**
+ * Streamed content has no decoded length up front. Progress estimates it from
+ * the encoded length, typical for compressed CAD content, and never reports
+ * more than 95% of an estimate before the content ends.
+ */
+const STREAMED_CONTENT_EXPANSION_ESTIMATE = 6;
+
+/**
+ * A page's content streams decoded on demand, joined by one newline exactly
+ * as prepared content joins them, so source offsets match.
+ */
+class StreamedPageContent {
+  readonly estimatedBytes: number;
+  decodedBytes = 0;
+  decodeMs = 0;
+
+  private iterator: AsyncIterator<Uint8Array> | undefined;
+  private remainder: Uint8Array = new Uint8Array(0);
+  private preparedRemainder = false;
+  private timings?: NativeVectorCompileTimings;
+  private readonly inlineTails = new Map<number, {
+    end: number; segments: readonly DensePdfContentSegment[];
+  }>();
+
+  private readonly document: NativePdfDocument;
+  private readonly streams: readonly PdfStream[];
+  private readonly signal: AbortSignal;
+  private readonly prepareInline: (bytes: Uint8Array, offset: number) => Promise<readonly DensePdfContentSegment[]>;
+
+  constructor(
+    document: NativePdfDocument,
+    streams: readonly PdfStream[],
+    signal: AbortSignal,
+    prepareInline: (bytes: Uint8Array, offset: number) => Promise<readonly DensePdfContentSegment[]>
+  ) {
+    this.document = document;
+    this.streams = streams;
+    this.signal = signal;
+    this.prepareInline = prepareInline;
+    let encodedBytes = streams.length > 0 ? streams.length - 1 : 0;
+    for (const stream of streams) encodedBytes += stream.bytes.length;
+    this.estimatedBytes = Math.max(1, encodedBytes * STREAMED_CONTENT_EXPANSION_ESTIMATE);
+  }
+
+  get hasInlineImages(): boolean { return this.inlineTails.size > 0; }
+
+  estimateTotal(processedBytes: number): number {
+    return Math.max(this.estimatedBytes, Math.ceil(processedBytes / 0.95));
+  }
+
+  private async nextChunk(): Promise<IteratorResult<Uint8Array>> {
+    this.signal.throwIfAborted();
+    if (!this.iterator) return { done: true, value: undefined };
+    const startedAt = this.timings ? nativeVectorTimingNow() : 0;
+    const next = await this.iterator.next();
+    if (this.timings) this.decodeMs += nativeVectorTimingNow() - startedAt;
+    if (!next.done) this.decodedBytes += next.value.length;
+    return next;
+  }
+
+  /** Drain only this stream, starting at the lexer's clean BI boundary. */
+  async prepareInlineRemainder(offset: number, buffered: Uint8Array): Promise<readonly DensePdfContentSegment[]> {
+    this.signal.throwIfAborted();
+    this.preparedRemainder = true;
+    const cached = this.inlineTails.get(offset);
+    if (cached) {
+      await this.iterator?.return?.();
+      this.decodedBytes = cached.end;
+      this.remainder = new Uint8Array(0);
+      return cached.segments;
+    }
+    const chunks = [buffered, this.remainder];
+    let length = buffered.length + this.remainder.length;
+    this.remainder = new Uint8Array(0);
+    for (;;) {
+      const next = await this.nextChunk();
+      if (next.done) break;
+      chunks.push(next.value);
+      length += next.value.length;
+    }
+    this.signal.throwIfAborted();
+    const startedAt = this.timings ? nativeVectorTimingNow() : 0;
+    const bytes = new Uint8Array(length);
+    let cursor = 0;
+    for (const chunk of chunks) { bytes.set(chunk, cursor); cursor += chunk.length; }
+    const segments = await this.prepareInline(bytes, offset);
+    if (this.timings) this.timings.inlinePreparationMs += nativeVectorTimingNow() - startedAt;
+    this.inlineTails.set(offset, { end: this.decodedBytes, segments });
+    return segments;
+  }
+
+  /** A second compilation reuses bound inline tails, fonts and image pixels. */
+  async *chunks(timings?: NativeVectorCompileTimings): AsyncGenerator<DensePdfContentSegment> {
+    this.decodedBytes = 0;
+    this.decodeMs = 0;
+    this.timings = timings;
+    let sourceOffset = 0;
+    for (let index = 0; index < this.streams.length; index += 1) {
+      this.preparedRemainder = false;
+      this.iterator = this.document.decodeStreamChunks(this.streams[index], { signal: this.signal })[Symbol.asyncIterator]();
+      let pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
+      let pendingLength = 0;
+      try {
+        while (!this.preparedRemainder) {
+          const next = await this.nextChunk();
+          if (next.done) break;
+          const chunk = next.value;
+          let offset = 0;
+          while (offset < chunk.length) {
+            // Pass through large decoded chunks without another copy. The
+            // compiler hands back their unconsumed suffix if it reaches BI.
+            if (pendingLength === 0 && chunk.length - offset >= STREAMED_CONTENT_CHUNK_BYTES) {
+              const bytes = chunk.subarray(offset);
+              this.remainder = new Uint8Array(0);
+              yield { kind: "content", bytes, sourceOffset, sourceLength: bytes.length };
+              sourceOffset += bytes.length;
+              break;
+            }
+            const copied = Math.min(pending.length - pendingLength, chunk.length - offset);
+            pending.set(chunk.subarray(offset, offset + copied), pendingLength);
+            pendingLength += copied;
+            offset += copied;
+            if (pendingLength === pending.length) {
+              this.remainder = chunk.subarray(offset);
+              yield { kind: "content", bytes: pending, sourceOffset, sourceLength: pendingLength };
+              sourceOffset += pendingLength;
+              pending = new Uint8Array(STREAMED_CONTENT_CHUNK_BYTES);
+              pendingLength = 0;
+              if (this.preparedRemainder) break;
+            }
+          }
+          this.remainder = new Uint8Array(0);
+        }
+        if (pendingLength > 0) {
+          yield { kind: "content", bytes: pending.subarray(0, pendingLength), sourceOffset, sourceLength: pendingLength };
+        }
+        sourceOffset = this.decodedBytes;
+        // End the stream's last token before advancing to the next decoder.
+        // An incomplete inline image must never consume another stream.
+        if (index + 1 < this.streams.length) {
+          this.decodedBytes += 1;
+          yield { kind: "content", bytes: Uint8Array.of(0x0a), sourceOffset, sourceLength: 1 };
+          sourceOffset = this.decodedBytes;
+        }
+      } finally {
+        await this.iterator.return?.();
+        this.iterator = undefined;
+        this.remainder = new Uint8Array(0);
+      }
+    }
+  }
 }
 
 interface NativePagePreparationReuse {
@@ -1892,6 +2498,12 @@ interface LoadedPageImages {
     string,
     { optionalContentIndex: number; defaultVisible: boolean }
   >;
+  /** Resolve one more page `/ColorSpace` name, as for a scanned reference. */
+  loadColorSpace(resourceName: string): Promise<void>;
+  /** Load one more page Image XObject into `indexes` and `optionalContent`. */
+  loadImage(resourceName: string): Promise<void>;
+  loadShading(resourceName: string): Promise<void>;
+  loadPattern(resourceName: string): Promise<void>;
   assertReferencedCodecsAvailable(
     referencedNames: readonly string[],
     scopedIndexes?: ReadonlyMap<string, number>
@@ -3676,7 +4288,8 @@ function nativeVectorGroupHasSinglePathPaint(compiled: DensePdfCompiledPage): bo
     if (kind !== DENSE_PDF_VECTOR_SCENE_EVENT_FILL && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) return false;
     paints += 1;
   }
-  return paints === 1;
+  // Adjacent compatible paths share an event; count the paint operations.
+  return paints === 1 && (compiled.vectorSceneData?.pathPaintCount ?? paints) === 1;
 }
 
 function nativeVectorFormOccurrenceCacheKey(
@@ -5399,6 +6012,9 @@ function extendType3GlyphBindings(
  * their direct store references; reusable occurrences use page-space fallback
  * quads so repeated invocations never alias selection geometry.
  */
+/** Pen geometry captured with a compiled page's text index, for the retained vector lowering. */
+const retainedTextPositions = new WeakMap<HeprTextIndex, RetainedTextPositions>();
+
 function buildInvocationOrderedTextIndex(
   root: DensePdfCompiledPage,
   forms: DensePdfFormPageData,
@@ -5406,10 +6022,13 @@ function buildInvocationOrderedTextIndex(
   fontResources: readonly NativeTextFontResource[],
   maxGlyphOccurrences: number,
   signal: AbortSignal
-): HeprTextIndex {
+): { textIndex: HeprTextIndex; positions: RetainedTextPositions | undefined } {
   const textParts: string[] = [];
   const references: number[] = [];
   const fallbackQuads: number[] = [];
+  const charOccurrences: number[] = [];
+  const pens: number[] = [];
+  const gapBefore: number[] = [];
   const activePrograms = new Set<number>();
   const compilation = accumulated.compilation;
   const maxTextCodeUnits = Math.min(
@@ -5420,7 +6039,28 @@ function buildInvocationOrderedTextIndex(
   let occurrenceCount = 0;
   let boundaryPending = false;
 
-  const appendCodeUnits = (text: string, reference: number): void => {
+  const glyphCount = compilation.glyphs.glyphIds.length;
+  const widthEms = compilation.glyphWidthEms?.length === glyphCount ? compilation.glyphWidthEms : undefined;
+  const gaps = compilation.glyphGapBefore?.length === glyphCount ? compilation.glyphGapBefore : undefined;
+
+  // The same pen geometry an ordinary vector page derives its word breaks from.
+  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix): number => {
+    const occurrence = gapBefore.length;
+    const offset = compilation.glyphs.transformIndices[glyphIndex] * 6, values = compilation.transforms.values;
+    const matrix = multiplyPdfMatrices(outerTransform, [values[offset], values[offset + 1], values[offset + 2],
+      values[offset + 3], values[offset + 4], values[offset + 5]]);
+    const units = fontResources[compilation.glyphs.fontIndices[glyphIndex]]?.font.unitsPerEm ?? 1000;
+    const vertical = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Vertical) !== 0;
+    const advance = (widthEms?.[glyphIndex] ?? 0) * units;
+    pens.push(matrix[4], matrix[5],
+      matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
+      matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
+      Math.hypot(matrix[2] * units, matrix[3] * units));
+    gapBefore.push(gaps?.[glyphIndex] ?? 0);
+    return occurrence;
+  };
+
+  const appendCodeUnits = (text: string, reference: number, occurrence = -1): void => {
     if (text.length === 0) return;
     if (textLength > maxTextCodeUnits - text.length) {
       throw new PdfError("resource-limit", "Expanded reusable text exceeds the Unicode limit.", {
@@ -5429,7 +6069,10 @@ function buildInvocationOrderedTextIndex(
     }
     textParts.push(text);
     textLength += text.length;
-    for (let index = 0; index < text.length; index += 1) references.push(reference);
+    for (let index = 0; index < text.length; index += 1) {
+      references.push(reference);
+      charOccurrences.push(occurrence);
+    }
   };
 
   const appendBoundaryIfNeeded = (prefix: string, text: string): void => {
@@ -5461,8 +6104,9 @@ function buildInvocationOrderedTextIndex(
       });
     }
     const invisible = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Invisible) !== 0;
+    const occurrence = appendPen(glyphIndex, outerTransform);
     if (directReference && !invisible) {
-      appendCodeUnits(text, glyphIndex);
+      appendCodeUnits(text, glyphIndex, occurrence);
       return true;
     }
     const fallbackIndex = fallbackQuads.length / 4;
@@ -5477,7 +6121,7 @@ function buildInvocationOrderedTextIndex(
       fontResources,
       outerTransform
     ));
-    appendCodeUnits(text, -fallbackIndex - 2);
+    appendCodeUnits(text, -fallbackIndex - 2, occurrence);
     return true;
   };
 
@@ -5573,10 +6217,17 @@ function buildInvocationOrderedTextIndex(
     boundaryPending = appended ? true : previousBoundary;
   }
   return {
-    version: 1,
-    text: textParts.join(""),
-    charGlyphIndices: Int32Array.from(references),
-    fallbackQuads: Float32Array.from(fallbackQuads)
+    textIndex: {
+      version: 1,
+      text: textParts.join(""),
+      charGlyphIndices: Int32Array.from(references),
+      fallbackQuads: Float32Array.from(fallbackQuads)
+    },
+    positions: widthEms ? {
+      charOccurrences: Int32Array.from(charOccurrences),
+      pens: Float32Array.from(pens),
+      gapBefore: Uint8Array.from(gapBefore)
+    } : undefined
   };
 }
 
@@ -6504,12 +7155,12 @@ async function loadPageImages(
   ]) {
     await addColorSpace(resourceName, { kind: "name", value: resourceName });
   }
-  for (const resourceName of references.colorSpaces) {
+  const loadColorSpace = async (resourceName: string): Promise<void> => {
     signal.throwIfAborted();
     if (
       definitions.has(resourceName) || patternColorSpaces.has(resourceName) ||
       definitionFailures.has(resourceName)
-    ) continue;
+    ) return;
     try {
       const pattern = await resolvePatternColorSpaceDefinition(
         document,
@@ -6524,7 +7175,8 @@ async function loadPageImages(
       signal.throwIfAborted();
       definitionFailures.set(resourceName, error);
     }
-  }
+  };
+  for (const resourceName of references.colorSpaces) await loadColorSpace(resourceName);
 
   const codecDecodedByteLimit = Math.min(
     document.limits.maxDecodedStreamBytes,
@@ -6541,13 +7193,13 @@ async function loadPageImages(
   const patterns = new NativePdfPatternRegistry(document, shadings);
   const extGStates = new NativePdfExtGStateRegistry(document, colors, { onDiagnostic });
   const shadingIndexes = new Map<string, number>();
-  const patternDefinitions = await loadPatternDefinitions(
+  const patternDefinitions = new Map(await loadPatternDefinitions(
     patterns,
     extGStates,
     resources,
     references.patterns,
     signal
-  );
+  ));
   const xObjectReferences = await classifyNativePdfXObjectReferences(
     document,
     resources,
@@ -6588,6 +7240,36 @@ async function loadPageImages(
     patternDefinitions,
     patternColorSpaces,
     optionalContent: scopedImages.optionalContent,
+    loadColorSpace,
+    async loadShading(resourceName) {
+      if (shadingIndexes.has(resourceName)) return;
+      shadingIndexes.set(resourceName,
+        await shadings.add({ kind: "name", value: resourceName }, resources, signal));
+    },
+    async loadPattern(resourceName) {
+      if (patternDefinitions.has(resourceName)) return;
+      const loaded = await loadPatternDefinitions(patterns, extGStates, resources, [resourceName], signal);
+      for (const [name, definition] of loaded) patternDefinitions.set(name, definition);
+    },
+    async loadImage(resourceName) {
+      const loaded = await loadScopedImageResources(
+        document,
+        registry,
+        optionalContentRegistry,
+        resources,
+        [resourceName],
+        colorSpaces,
+        page.sourcePageIndex,
+        signal,
+        retainOptionalContent
+      );
+      const indexes = scopedImages.indexes as Map<string, number>;
+      const optionalContent = scopedImages.optionalContent as Map<
+        string, { optionalContentIndex: number; defaultVisible: boolean }
+      >;
+      for (const [name, index] of loaded.indexes) indexes.set(name, index);
+      for (const [name, association] of loaded.optionalContent) optionalContent.set(name, association);
+    },
     colorSpaceResolver(resourceName) {
       const failure = definitionFailures.get(resourceName);
       if (failure !== undefined) throw failure;

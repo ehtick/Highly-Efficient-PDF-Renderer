@@ -4,8 +4,6 @@
 export type PDFLoadStage =
   | "source"
   | "pdf-page"
-  | "pdf-fast-check"
-  | "pdf-fast-decode"
   | "pdf-operators"
   | "pdf-optimize"
   | "pdf-text"
@@ -25,7 +23,6 @@ export type PDFLoadStage =
 /** Where PDF parsing is running. */
 export type PDFLoadExecutionPath =
   | "worker"
-  | "dense-vector-worker"
   | "main-thread";
 
 /**
@@ -269,10 +266,6 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Reading source";
     case "pdf-page":
       return "Processing pages";
-    case "pdf-fast-check":
-      return "Checking fast PDF path";
-    case "pdf-fast-decode":
-      return "Decoding PDF vectors";
     case "pdf-operators":
       return "Scanning operators";
     case "pdf-optimize":

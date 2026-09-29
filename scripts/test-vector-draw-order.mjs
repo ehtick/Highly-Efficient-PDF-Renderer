@@ -31,17 +31,20 @@ try {
   try {
     scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
     assert.equal(scene.textInstanceCount, 1);
-    assert.equal(scene.segmentCount, 3, "a repeated stroke after intervening paint must survive culling");
+    // The page repeats a stroke after an intervening fill. The later copy
+    // repaints the earlier one's pixels above that fill, so only the earlier
+    // copy is removed; the Form's stroke is clipped separately and stays.
+    assert.equal(scene.segmentCount, 2, "a repeated stroke after intervening paint must survive culling");
+    assert.equal(scene.discardedDuplicateCount, 1);
     assert.equal(scene.rasterLayers.length, 1, "only the source image needs pixels");
     assert.deepEqual(scene.drawRuns, [
       { kind: "fill", first: 0, count: 1 },
       { kind: "text", first: 0, count: 1 },
-      { kind: "stroke", first: 2, count: 1, clipIndex: 0 },
+      { kind: "stroke", first: 1, count: 1, clipIndex: 0 },
       { kind: "raster", first: 0, count: 1, clipIndex: 0 },
       { kind: "fill", first: 2, count: 1, clipIndex: 0 },
-      { kind: "stroke", first: 0, count: 1 },
       { kind: "fill", first: 1, count: 1 },
-      { kind: "stroke", first: 1, count: 1 }
+      { kind: "stroke", first: 0, count: 1 }
     ]);
     assert(!session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
   } finally { await session.close(); }
@@ -170,16 +173,17 @@ try {
 
   // Three material batches retain source IDs when the existing culler selects a subset.
   const geometry = new THREE.InstancedBufferGeometry();
-  const ids = new THREE.InstancedBufferAttribute(Float32Array.from([0, 1, 2]), 1);
+  const ids = new THREE.InstancedBufferAttribute(Float32Array.from({ length: scene.segmentCount }, (_, index) => index), 1);
   geometry.setAttribute("aSegmentIndex", ids);
-  geometry.instanceCount = 3;
+  geometry.instanceCount = scene.segmentCount;
   const material = new THREE.RawShaderMaterial();
   const clipTexture = createThreeVectorClipTexture(scene);
   initializeThreeVectorClip(material, clipTexture);
   const mesh = new THREE.Mesh(geometry, material);
   const ordered = ThreeVectorDrawRuns.create(scene, "stroke", mesh, "aSegmentIndex");
   assert.equal(mesh.geometry.instanceCount, 0);
-  assert.deepEqual(mesh.children.map(child => child.geometry.getAttribute("aSegmentIndex").getX(0)), [2, 0, 1]);
+  assert.deepEqual(mesh.children.map(child => child.geometry.getAttribute("aSegmentIndex").getX(0)),
+    scene.drawRuns.filter(run => run.kind === "stroke").map(run => run.first));
   const rasterGroup = new THREE.Group();
   rasterGroup.add(new THREE.Mesh(), new THREE.Mesh());
   applyThreePdfOverlayPaintOrder(scene, rasterGroup, []);
@@ -212,9 +216,12 @@ try {
   ids.setX(0, 1); ids.needsUpdate = true;
   geometry.instanceCount = 1;
   ordered.finishUpdate();
-  assert.deepEqual(mesh.children.map(child => child.geometry.instanceCount), [0, 0, 1]);
+  // Only segment 1 survives culling: only the draw run that owns it draws.
+  const culledCounts = scene.drawRuns.filter(run => run.kind === "stroke")
+    .map(run => run.first <= 1 && 1 < run.first + run.count ? 1 : 0);
+  assert.deepEqual(mesh.children.map(child => child.geometry.instanceCount), culledCounts);
   ordered.beginUpdate(); ordered.finishUpdate();
-  assert.deepEqual(mesh.children.map(child => child.geometry.instanceCount), [0, 0, 1], "unchanged culling is stable");
+  assert.deepEqual(mesh.children.map(child => child.geometry.instanceCount), culledCounts, "unchanged culling is stable");
   ordered.setEnabled(false);
   assert(mesh.children.every(child => !child.visible));
   assert.equal(ordered.getRenderedCount(), 0);

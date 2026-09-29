@@ -35,6 +35,10 @@ try {
         ["raster", "fill", "text", "fill", "text", "fill", "text"],
         "annotation appearances paint after page content in Annots order");
       assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
+      // The hidden-layer annotation's appearance is missing. Toggleable layers
+      // would need it, so the page keeps its default view without them.
+      assert.equal(scene.optionalContent, undefined);
+      assert(session.getDiagnostics().some(d => d.code === "optional-content.default-view-fallback"));
       await assert.rejects(session.compileVectorPage(0, { limits: { maxCommandsPerPage: 2 } }),
         error => error.code === "resource-limit");
       await assert.rejects(session.compileVectorPage(0, { signal: AbortSignal.abort() }));

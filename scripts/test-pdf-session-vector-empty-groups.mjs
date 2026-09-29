@@ -11,6 +11,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
+  const { sceneRequiresPaintCompositing } = await import("../src/scenePaintVisibility.ts");
   const options = { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "empty-group-vectors" }) };
   for (const content of ["", "q\rQ\r", "\0\t% empty group\r\nq% save\nq\fQ Q % trailing comment"]) {
     const session = await openPdf({ kind: "bytes", bytes: fixture({ content }) }, options);
@@ -67,23 +68,36 @@ try {
   }
 
   // More than one paint, a group blending space or internal alpha changes must
-  // preserve group compositing instead of distributing the outer opacity.
-  for (const settings of [
-    { content: "1 0 0 rg 0 0 6 6 re f 2 2 6 6 re f", state: "/ca .5" },
-    { content: "1 0 0 RG 1 w 2 2 6 6 re B", state: "/ca .5" },
-    { content: "1 0 0 rg 0 0 6 6 re f", group: "/CS /DeviceRGB" },
-    { content: "/Inner gs 1 0 0 rg 0 0 6 6 re f", groupResources: "/ExtGState << /Inner << /ca .5 >> >>" }
+  // preserve group compositing instead of distributing the outer opacity. The
+  // group stays a vector paint-graph node that the renderer composites.
+  for (const [settings, outerAlpha, paintAlphas] of [
+    [{ content: "1 0 0 rg 0 0 6 6 re f 2 2 6 6 re f", state: "/ca .5" }, .5, [1]],
+    [{ content: "1 0 0 RG 1 w 2 2 6 6 re B", state: "/ca .5" }, .5, [1]],
+    [{ content: "1 0 0 rg 0 0 6 6 re f", group: "/CS /DeviceRGB" }, 1, [1]],
+    [{ content: "/Inner gs 1 0 0 rg 0 0 6 6 re f", groupResources: "/ExtGState << /Inner << /ca .5 >> >>" }, 1, [1, .5]]
   ]) {
     const session = await openPdf({ kind: "bytes", bytes: fixture(settings) }, options);
     try {
       const scene = await session.compileVectorPage(0, { vectorFallback: "error" });
-      assert.equal(scene.rasterLayers.length, 1, "nontrivial groups retain their bounded composite");
-      assert.equal(scene.fillPathCount, 1, "ordinary page geometry stays vector");
-      assert(!session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
+      assert.equal(scene.rasterLayers.length, 0, "nontrivial groups stay vector");
+      assert(paintGroups(scene).some(group => !group.isolated && group.alpha === outerAlpha),
+        "the transparency group keeps its own compositing node and opacity");
+      const alphas = new Set(Array.from({ length: scene.fillPathCount }, (_, index) => scene.fillPathMetaC[index * 4 + 3]));
+      assert.deepEqual([...alphas].sort(), [...paintAlphas].sort(),
+        "the outer opacity is not distributed onto the group's paints");
+      assert.equal(sceneRequiresPaintCompositing(scene), outerAlpha < 1);
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
     } finally { await session.close(); }
   }
   console.log("empty and single-path transparency groups preserve stamp vectors and group opacity");
 } finally { hooks.deregister(); }
+
+function paintGroups(scene) {
+  const groups = [];
+  const visit = nodes => { for (const node of nodes) if (node.kind === "group") { groups.push(node); visit(node.children); } };
+  visit(scene.paintGraph?.roots ?? []);
+  return groups;
+}
 
 function fixture({ content = "q Q", state = "", group = "", groupResources = "" } = {}) {
   return writeTinyPdf({ objects: [

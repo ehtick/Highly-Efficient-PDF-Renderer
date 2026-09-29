@@ -146,6 +146,69 @@ const SIMPLE_OPERAND_NAME = 1;
 const SIMPLE_OPERAND_NUMBER = 2;
 const SIMPLE_OPERAND_OTHER = 3;
 
+/** End offset of a balanced literal string starting at `(`, or -1. */
+function simpleLiteralStringEnd(bytes: Uint8Array, offset: number, signal?: AbortSignal): number {
+  let depth = 0;
+  for (let index = offset; index < bytes.length; index += 1) {
+    if (((index - offset) & 0xffff) === 0) signal?.throwIfAborted();
+    const byte = bytes[index];
+    if (byte === 0x5c) {
+      index += 1;
+    } else if (byte === 0x28) {
+      depth += 1;
+    } else if (byte === 0x29) {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * End offset of an array starting at `[` that holds only well-formed numbers,
+ * literal strings, and hex strings, or -1 for anything else.
+ */
+function simpleFlatArrayEnd(bytes: Uint8Array, offset: number, signal?: AbortSignal): number {
+  let index = offset + 1;
+  while (index < bytes.length) {
+    if (((index - offset) & 0xffff) === 0) signal?.throwIfAborted();
+    const byte = bytes[index];
+    if (isPdfWhitespace(byte)) {
+      index += 1;
+    } else if (byte === 0x5d) {
+      return index + 1;
+    } else if (byte === 0x28) {
+      index = simpleLiteralStringEnd(bytes, index, signal);
+      if (index < 0) return -1;
+    } else if (byte === 0x3c) {
+      if (index + 1 >= bytes.length || bytes[index + 1] === 0x3c) return -1;
+      let end = index + 1;
+      for (; end < bytes.length && bytes[end] !== 0x3e; end += 1) {
+        if (!isPdfWhitespace(bytes[end]) && hexNibble(bytes[end]) < 0) return -1;
+      }
+      if (end >= bytes.length) return -1;
+      index = end + 1;
+    } else if (isPdfNumberStartByte(byte)) {
+      let end = index;
+      if (bytes[end] === 0x2b || bytes[end] === 0x2d) end += 1;
+      let sawDigit = false;
+      let sawDot = false;
+      for (; end < bytes.length; end += 1) {
+        const tokenByte = bytes[end];
+        if (tokenByte >= 0x30 && tokenByte <= 0x39) sawDigit = true;
+        else if (tokenByte === 0x2e && !sawDot) sawDot = true;
+        else if (isRegularByte(tokenByte)) return -1;
+        else break;
+      }
+      if (!sawDigit || end - index > MAX_FAST_NUMBER_TOKEN_BYTES) return -1;
+      index = end;
+    } else {
+      return -1;
+    }
+  }
+  return -1;
+}
+
 /**
  * Allocation-free hot path for the common single-stream technical-page
  * grammar. It accepts only top-level numbers, names, hex strings, booleans,
@@ -270,9 +333,23 @@ function tryScanSimplePreparedResourceReferences(
       continue;
     }
 
-    // Arrays, dictionaries, literal strings, comments, and unmatched
-    // delimiters are uncommon in dense path streams and stay on the exact
-    // general path rather than growing this FSM's proof surface.
+    // Text and dash patterns use literal strings and flat arrays of numbers
+    // and strings. Neither can name a resource, so each is one opaque operand;
+    // a resource operator given one still falls back below.
+    if (byte === 0x28 || byte === 0x5b) {
+      const end = byte === 0x28
+        ? simpleLiteralStringEnd(bytes, offset, signal)
+        : simpleFlatArrayEnd(bytes, offset, signal);
+      if (end < 0) return null;
+      tokenCount += 1;
+      if (!appendNonNumeric(SIMPLE_OPERAND_OTHER)) return null;
+      offset = end;
+      continue;
+    }
+
+    // Dictionaries, comments, nested or name-bearing arrays, and unmatched
+    // delimiters stay on the exact general path rather than growing this
+    // FSM's proof surface.
     if (isPdfDelimiter(byte)) return null;
 
     if (isPdfNumberStartByte(byte)) {

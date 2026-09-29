@@ -62,7 +62,12 @@ export const fastTests = [
   "pdf-session-hairline-text",
   "pdf-session-worker",
   "pdf-node-worker-runtime",
+  "pdf-load-progress",
   "native-content-compiler",
+  "ordered-stroke-culling",
+  "stroke-coverage-order",
+  "native-streamed-content",
+  "pdf-to-hep-progress",
   "native-glyph-hairline",
   "native-vector-page",
   "native-composite-lifetime",
@@ -125,7 +130,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["dense-pdf-package", "browser-package", "bundler-package"],
+  package: ["browser-package", "bundler-package"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",
@@ -143,8 +148,6 @@ export const explicitSuites = {
   ],
   corpus: [
     "brochure-page14-compositing",
-    "dense-pdf-fast-worker",
-    "native-dense-pdf-document",
     "native-text-content-sidecar",
     "native-visual-regressions",
     "node-pdf-source"
@@ -152,9 +155,8 @@ export const explicitSuites = {
 };
 
 const integrationPatterns = [
-  /^pdf-(?:session(?:-|$)|optional-content-session$|node-worker-runtime$|to-hep-node-dense-worker$)/,
-  /^native-(?:composite-|resource-reuse$|vector-(?:forms|differential|lazy-eligibility)$|parser-boundary$|dense-dependency-boundary$|dense-text-extractor$|retained-text-compiler$|text-clip-index$|jpeg-codec$)/,
-  /^dense-pdf-(?:document|integration)$/,
+  /^pdf-(?:session(?:-|$)|optional-content-session$|node-worker-runtime$)/,
+  /^native-(?:composite-|resource-reuse$|vector-(?:forms|differential|lazy-eligibility)$|parser-boundary$|text-clip-index$|jpeg-codec$)/,
   /^(?:bundled-standard-fonts|hepr-canvas2d-renderer|optional-node-canvas|room-overlay-page-matrix|public-load-cancellation|scene-statistics|retained-vector-page|retained-layer-programs)$/
 ];
 

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 
-import { compileDensePdfContent as compileDense } from "../src/densePdfContentCompiler.ts";
 import { compileDensePdfContent as compileNative } from "../src/pdf/nativeContentCompiler.ts";
 
 const nativeSort = Array.prototype.sort;
@@ -51,17 +50,14 @@ for (let seed = 1; seed <= 30; seed += 1) {
     commands.push(`${width} w ${start} 0 m ${end} 0 l S`);
   }
   const content = new TextEncoder().encode(commands.join("\n"));
-  const dense = await compileDense(content, options);
   const native = await compileNative(content, options);
-  assert.ok(dense.discardedContainedCount > 0, "fixture must exercise containment culling");
-  assertGeometryEqual(native, dense, `parser parity, seed ${seed}`);
+  assert.ok(native.discardedContainedCount > 0, "fixture must exercise containment culling");
   try {
     Array.prototype.sort = insertionSort;
-    assertGeometryEqual(await compileDense(content, options), dense, `dense sort parity, seed ${seed}`);
-    assertGeometryEqual(await compileNative(content, options), native, `native sort parity, seed ${seed}`);
+    assertGeometryEqual(await compileNative(content, options), native, `sort parity, seed ${seed}`);
   } finally {
     Array.prototype.sort = nativeSort;
   }
 }
 
-console.log("Stroke containment ordering is consistent across sorting algorithms and parser paths.");
+console.log("Stroke containment ordering is consistent across sorting algorithms.");

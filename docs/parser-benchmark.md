@@ -6,16 +6,18 @@ checks before comparing the new paint-graph and layer paths against those result
 
 Use the production-bundle benchmark for parser cutover decisions. The older
 `benchmark:native-vector-page` script intentionally calls the TypeScript
-session directly, so it omits worker startup and transfer costs. Likewise,
-`benchmark:native-dense-cutover` is a useful dense-pipeline microbenchmark but
-does not exercise tier routing or detect a PDF.js fallback.
+session directly, so it omits worker startup and transfer costs.
+
+The separate dense-vector route was removed in favor of the single native
+compiler (see the last section). Earlier sections describe that route, its
+tests, and its benchmarks as they were when measured.
 
 Build each checkout first, then run the same benchmark driver against each
 build directory. For example, from the current checkout:
 
 ```sh
 npm run build:lib
-npm run benchmark:production-parser -- "public/examples/pdfs/Level 1.pdf" --runs 5 --json /tmp/hepr-current.json --fail-on-pdfjs-fallback
+npm run benchmark:production-parser -- "public/examples/pdfs/Level 1.pdf" --runs 5 --json /tmp/hepr-current.json
 node --max-old-space-size=12288 --expose-gc scripts/benchmark-production-parser.mjs "public/examples/pdfs/Level 1.pdf" --package-root /path/to/main-worktree --runs 5 --json /tmp/hepr-main.json
 ```
 
@@ -23,9 +25,7 @@ The input file is read before timing. Package import is reported separately.
 Each measured run gets a fresh process and a cold production worker. The
 `parser engine boundary` is the number to compare; the script stops at the
 first vector-LOD event, before LOD generation, upload, renderer construction,
-or viewer work. `main-thread-fallback` is reported explicitly as a PDF.js
-fallback. On the old `main` dense path, PDF.js text processing is part of the
-dense route and therefore correctly remains inside its parser time.
+or viewer work.
 
 For the browser check, build production assets in separate worktrees and serve
 both `dist` directories with the same static server. Use the same browser and
@@ -33,8 +33,8 @@ PDF, reload between runs to clear the in-memory page-scene cache, discard one
 warm-up, and record five `[Page grid] ... parsed ... ms` lines. That log starts
 after source bytes are loaded and ends before vector LOD and GPU upload. Do not
 compare the later `total` line as parser time. Also record the preceding HEPR
-route line and reject a current-build run that reports a native or PDF.js
-fallback unexpectedly.
+route line and reject a current-build run that reports an unexpected native
+fallback.
 
 ## Local validation snapshot — 2026-09-07
 
@@ -73,14 +73,10 @@ Any reuse must remain operation-scoped and preserve resource limits, color
 spaces, masks, cancellation, and returned-pixel ownership. Lowering image
 resolution or changing the viewer is not an acceptable speed optimization.
 
-The temporary PDF.js oracle is an isolated opt-in installation, not a root
-workspace or published runtime dependency. The package test checks root
-dependencies, emitted JavaScript/declarations, worker paths, and native Node
-worker startup. Runtime attribution in `THIRD_PARTY_NOTICES` is intentionally
-retained even though neither PDF library ships as a dependency.
+The package test checks emitted JavaScript/declarations, worker paths, and
+native Node worker startup.
 
-The all-pages routing audit blocks both PDF libraries in the host and parser
-workers and fails on any unsuccessful document:
+The all-pages routing audit fails on any unsuccessful document:
 
 ```sh
 node --max-old-space-size=12288 --experimental-strip-types scripts/audit-native-corpus-routing.mjs --timeout-ms 120000
@@ -231,7 +227,7 @@ The page-7 exact scene fingerprint also matches the pre-change artifact.
 All 15 brochure pages match byte-for-byte with cache/bounded work enabled and
 disabled, including image pixels, text, geometry, and paint order. Image
 surfaces materialized across those passes fell from 35 to 25. This is output
-preservation against the accepted native path, not a new visual-oracle result.
+preservation against the accepted native path, not a new visual-fidelity result.
 
 Reproduce the internal diagnostic comparison without changing public options:
 
@@ -349,8 +345,8 @@ Reproduce using separately built packages and the production driver described
 at the start of this document:
 
 ```sh
-npm run benchmark:production-parser -- public/examples/pdfs/WarAndPeace.pdf --runs 3 --fail-on-pdfjs-fallback
-npm run benchmark:production-parser -- public/examples/pdfs/optimizing_cpp.pdf --runs 3 --fail-on-pdfjs-fallback
+npm run benchmark:production-parser -- public/examples/pdfs/WarAndPeace.pdf --runs 3
+npm run benchmark:production-parser -- public/examples/pdfs/optimizing_cpp.pdf --runs 3
 ```
 
 Validation passed: `npm run build`, `npm run build:lib`, `git diff --check`, and
@@ -385,3 +381,182 @@ between each original PDF load, and compare the `[Page grid] ... parsed ... ms`
 values. Check page appearance at high zoom and search/selection in both books,
 then load their existing HEP files. The user starts any server; no browser,
 server, HEP regeneration, or git-history operation was run during this fix.
+
+## Single native parser — 2026-09-29
+
+The dense-vector route (its worker, compiler, preflight document, and retained
+text compiler) was removed. Every page now goes through the native session
+compiler, which took over the dense route's advantages and keeps paint in
+source order:
+
+- Page content streams into the compiler as it decodes. Fonts, ExtGStates,
+  marked-content properties, color spaces, and XObjects load when the content
+  first uses them, so the decoded content is neither held whole nor scanned
+  for resource names first. Pages with patterns, shadings, or inline images
+  still compile from prepared content.
+- Duplicate strokes are removed in source order: of two identical opaque
+  strokes in one paint context, the earlier goes. Containment culling only
+  lets a later segment, or an earlier one in the same run of one paint, cover
+  a segment.
+- The lexer parses numbers while finding token boundaries, and single-line
+  paths take a direct path even when clipped.
+
+Output order changes where the dense route drew in fixed fill/stroke/text
+passes; duplicate and contained segment counts change slightly on those pages.
+
+Production bundles, `npm run benchmark:production-parser -- <pdf> --runs 5`,
+median parser time and RSS increase, same machine and Node version as above,
+HEAD `f0594ea` (dense route) against this change:
+
+| PDF | HEAD parser | Single parser | Time change | HEAD RSS | Single RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Livermore_L1 | 6,336 ms | 6,387 ms | +0.8% | +281 MiB | +309 MiB |
+| Level 1 | 7,120 ms | 7,509 ms | +5.5% | +584 MiB | +613 MiB |
+| Lower Level | 12,557 ms | 13,440 ms | +7.0% | +620 MiB | +572 MiB |
+| stn_arch | 3,927 ms | 4,126 ms | +5.1% | +401 MiB | +392 MiB |
+| Baldwin Park | 2,079 ms | 2,139 ms | +2.9% | +241 MiB | +248 MiB |
+| Murietta | 2,087 ms | 2,136 ms | +2.3% | +213 MiB | +194 MiB |
+
+Across all 17 example PDFs in the source-level harness (three interleaved
+runs each, minimum), the remaining pages were faster than HEAD, for example the
+brochure −19%, Dublin −14%, SimiValley −19%, layers −22%, and thesis −10%.
+The dense CAD pages above remain slower by up to 7%; the difference is spread
+over per-line ordered-output bookkeeping (paint-run tracking, composite
+validation, paint contexts), not a single hot spot.
+
+## PR review follow-up — 2026-09-29
+
+### Lower Level PDF/HEP parity and fit-all detail
+
+Two separate issues produced the reported counts. The previously tracked HEP
+contained 2,248,621 strokes and no explicit draw runs. The current ordered parser
+and the user-regenerated HEP contain 2,249,884 strokes and 1,341 draw runs. The
+old HEP therefore was not an output of the current parser.
+
+At a 1920 × 1080 viewport, fitting the page with 64 pixels of padding reproduced
+both reported selections exactly: 31,713 strokes from the old HEP and 6,923 from
+the regenerated HEP. For clipped strokes, `primitiveBounds` contains the clip
+window, not the geometry's bounding box. The LOD index incorrectly charged the
+entire clip window to each stroke. Large clips inflated almost every tile's
+occupancy and forced coarse LODs.
+
+The runtime now indexes the stroke's control hull, expanded by its half-width
+and intersected with its clip. Density-adaptive tile edges use the same bounds.
+The shader's clip data stays intact; fully clipped geometry occupies no tiles.
+The corrected selection is **31,339**, close to the previous 31,713 without
+changing LOD budgets or removing source-order correctness.
+
+A fresh Lower Level PDF load matches the regenerated HEP in **every scene
+field**, including typed geometry buffers, text, clip data and draw runs. Both
+produce identical LOD levels, statistics and visible stroke IDs at two viewport
+sizes and three zoom factors. Repeat the read-only check with:
+
+```sh
+node --experimental-strip-types scripts/check-pdf-hep-parity.mjs \
+  'public/examples/pdfs/Lower Level.pdf' \
+  public/examples/heps/Lower_Level-parsed-data.hep
+```
+
+This checks the renderer's input and LOD selection. A browser appearance check
+is still manual, including confirming that fit-all now retains the desired
+amount of detail. No real PDF was exported during this review; the regenerated
+HEPs and manifest are the user's changes.
+
+### Streaming changes
+
+Inline images now suspend at the lexer's `BI` boundary. Only the remainder of
+that content stream is decoded and prepared, then fed back to the same compiler.
+Other streams continue incrementally. Prepared tails and decoded pixels are
+reused during the optional compositing compilation. Decoder iterators close on
+completion, errors and cancellation. Large decoded chunks still pass through
+without a coalescing copy.
+
+Patterns and shadings load on first use, removing the resource-dictionary
+exclusion. The analytic shading capability set updates when a shading loads.
+Resource indices may differ from prepared input; synthetic tests compare both
+lowered scenes and rendered pixels when standalone shadings precede shading
+patterns. The rare metadata-property-then-`/OC` case still requires prepared
+lookahead and can restart; inline-image work no longer causes a restart.
+
+The numeric lexer also accepts long finite decimals correctly. Its old numeric
+accumulator/divisor could overflow even for values such as `1.` followed by
+hundreds of zeros. Short CAD operands keep allocation-free conversion; long
+numbers use correctly rounded numeric conversion after strict PDF token checks.
+
+### Performance findings and decision
+
+The earlier 1–7% table measures production parser time, not the full
+`regenerate:heps` command. Bounded, serial source-loader checks during this review
+excluded module import, file reading, HEP packaging, terminal progress output and
+LOD construction:
+
+| Check | Baseline | Follow-up | Interpretation |
+| --- | ---: | ---: | --- |
+| Lower Level, `origin/main` vs follow-up | 15.089 s | 15.561 s | +3.1%, one cold process per side |
+| War and Peace, `origin/main` vs follow-up | 22.607 s | 22.376 s | −1.0%, one cold process per side |
+| Plan de déneigement, branch HEAD vs follow-up | 2.628 s | 2.463 s | −6.3%; direct page compile, identical scene fingerprint |
+
+These are diagnostic samples, not replacement five-run production medians.
+Earlier measurements overlapping the user's HEP regeneration were discarded.
+Lower Level's scan profile places most work in numeric tokenization, primitive
+emission and duplicate lookup; font/resource loading is negligible. The ordered
+parser also needs paint-context-aware duplicate/containment culling. Accept the
+small measured CAD gap for correct paint order rather than restoring the old
+fixed fill/stroke/text passes. Further per-line work should require repeatable
+production-bundle gains and exact scene regression checks.
+
+The CLI also printed about 5,000 progress-stage changes for War and Peace on
+**both** versions, even when the percentage had not changed. Progress output now
+limits those intermediate updates to four per second while keeping 5% milestones
+and completion immediate. Replaying the measured branch events would print about
+90 updates. This removes avoidable terminal overhead; it is not evidence that
+terminal output caused the reported 40-second regression.
+
+The full 2:10 versus 2:50 batch difference remains **unverified**. Parser-only
+samples do not reproduce a slowdown of that size, and the archive encoder and
+manifest generator did not change on this branch. No claim is made that full
+regeneration is now at least as fast as main. Per `AGENTS.md`, full conversion is
+left to the user. Run `time npm run regenerate:heps` alone, retain its per-file
+timing summary, and compare under the same Node version, terminal and machine
+load. The LOD correction itself needs no HEP regeneration.
+
+### Validation and changed files
+
+Type checking, `git diff --check`, the read-only Lower Level comparison, and 25
+focused test files passed. Tests cover streamed/prepared parity across compressed
+and uncompressed chunk boundaries, multiple streams, inline-image limits and
+cancellation, second-pass resource reuse, gradient pixels, Forms/annotations,
+ordered duplicate/containment culling, numeric edge cases, HEP round-trip LOD
+selection, clipped density indexing, perspective/overview LOD, and CLI progress.
+The existing brochure page-5 appearance/selection regression passed as well.
+
+Implementation files: `src/pdf/nativeContentCompiler.ts`, `src/pdfSession.ts`,
+`src/vectorStrokeLodCore.ts`, and `PDFtoHEP.js`. Regression/check files:
+`scripts/test-native-content-compiler.mjs`, `scripts/test-native-streamed-content.mjs`,
+`scripts/test-vector-stroke-clip-lod.mjs`, `scripts/test-hep-api.mjs`,
+`scripts/test-pdf-to-hep-progress.mjs`, `scripts/check-pdf-hep-parity.mjs`, and
+`scripts/lib/testSuites.mjs`. This document records the evidence and remaining
+manual checks. No commits, history changes, or development servers were used.
+
+### Final small follow-up
+
+The duplicate-stroke hash index reserved two 1,048,576-entry `Uint32Array`s on
+its first insertion: **8 MiB even for a one-stroke page**. It now starts with
+1,024 entries (**8 KiB**) and uses the existing geometric growth. Allocation
+regressions cover both compiler output modes, and 3,000 distinct lines repeated
+in reverse direction verify that lookups survive multiple growth steps.
+
+A serial direct-session Lower Level check measured 18.457 s before and 17.875 s
+after, with the same complete scene fingerprint. This single pair is a check
+against a material CAD regression, not evidence of a repeatable speedup. A
+500,000-stroke synthetic comparison also preserved geometry bytes; its timings
+were slightly slower with the smaller table, so this change is justified by
+small-page allocation savings, not a claim of faster per-line compilation.
+
+`npm test` now includes `ordered-stroke-culling`, `stroke-coverage-order`, and
+`pdf-load-progress`, which had remained outside the explicit fast selection.
+The gradient pixel test now explicitly routes one retained compilation through
+streaming: `compilePage` normally uses prepared input, so the previous pixel
+comparison used the same loader on both sides. The revised test asserts that
+resource numbering actually differs before asserting equal pixels. The separate
+lowered vector-scene comparison already exercised both paths and still passes.

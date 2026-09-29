@@ -234,7 +234,7 @@ async function testDeviceSpacesAndScopedDefaults() {
   assert.deepEqual(
     convertDeviceCmykToSrgb(0, 0.85, 0.9, 0).map((value) => Math.round(value * 255)),
     [255, 76, 41],
-    "the uncalibrated DeviceCMYK fallback remains compatible with the PDF.js oracle"
+    "the uncalibrated DeviceCMYK fallback remains compatible with PDF.js"
   );
   const scratch = [0, 0, 0];
   for (let entry = 0; entry < 256; entry += 1) {

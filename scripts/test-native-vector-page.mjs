@@ -443,7 +443,7 @@ try {
     }),
     (error) => error?.code === "unsupported-content" &&
       error?.details?.reason === "legacy-vector-image-order-overlap",
-    "an overlapping preceding glyph must keep the PDF.js compatibility fallback"
+    "an overlapping preceding glyph must reject the late-image underlay"
   );
 
   for (const { label, matrix, clip } of [

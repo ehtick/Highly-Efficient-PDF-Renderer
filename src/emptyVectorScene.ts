@@ -67,7 +67,6 @@ export function createEmptyVectorScene(): VectorScene {
     pageBounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     maxHalfWidth: 0,
     imagePaintOpCount: 0,
-    operatorCount: 0,
     pathCount: 0,
     discardedTransparentCount: 0,
     discardedDegenerateCount: 0,

@@ -64,10 +64,8 @@ import { createPrimitiveInteractionController } from "./primitiveInteraction";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
 import type { RenderPerformanceOptions, RenderPerformanceProfiler } from "./renderPerformance";
 import {
-  describeSceneOperatorCount,
   formatSceneSegmentAccounting,
-  getSceneSegmentAccounting,
-  OPERATOR_COUNT_EXPLANATION
+  getSceneSegmentAccounting
 } from "./sceneStatistics";
 import type { SearchHighlightSet } from "./rendererTypes";
 import { createDrawCallMeter } from "./drawCallMetrics";
@@ -91,7 +89,6 @@ const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-t
 const runtimeElement = document.querySelector<HTMLDivElement>("#runtime");
 const metricsElement = document.querySelector<HTMLDivElement>("#metrics");
 const metricFileElement = document.querySelector<HTMLSpanElement>("#metric-file");
-const metricOperatorsElement = document.querySelector<HTMLSpanElement>("#metric-operators");
 const metricSourceSegmentsElement = document.querySelector<HTMLSpanElement>("#metric-source-segments");
 const metricMergedSegmentsElement = document.querySelector<HTMLSpanElement>("#metric-merged-segments");
 const metricVisibleSegmentsElement = document.querySelector<HTMLSpanElement>("#metric-visible-segments");
@@ -140,7 +137,6 @@ if (
   !runtimeElement ||
   !metricsElement ||
   !metricFileElement ||
-  !metricOperatorsElement ||
   !metricSourceSegmentsElement ||
   !metricMergedSegmentsElement ||
   !metricVisibleSegmentsElement ||
@@ -196,7 +192,6 @@ const parsingLoaderTextElement = parseLoaderText;
 const runtimeTextElement = runtimeElement;
 const metricsPanelElement = metricsElement;
 const metricFileTextElement = metricFileElement;
-const metricOperatorsTextElement = metricOperatorsElement;
 const metricSourceSegmentsTextElement = metricSourceSegmentsElement;
 const metricMergedSegmentsTextElement = metricMergedSegmentsElement;
 const metricVisibleSegmentsTextElement = metricVisibleSegmentsElement;
@@ -1697,7 +1692,6 @@ function cancelActiveHepExport(): void {
 
 function setMetricPlaceholder(label: string = "-"): void {
   metricFileTextElement.textContent = label;
-  metricOperatorsTextElement.textContent = "-";
   metricSourceSegmentsTextElement.textContent = "-";
   metricMergedSegmentsTextElement.textContent = "-";
   metricVisibleSegmentsTextElement.textContent = "-";
@@ -1748,8 +1742,6 @@ function updateMetricsPanel(
   const rasterSummary = formatRasterLayerSummary(scene);
 
   metricFileTextElement.textContent = label;
-  metricOperatorsTextElement.textContent = describeSceneOperatorCount(scene);
-  metricOperatorsTextElement.title = OPERATOR_COUNT_EXPLANATION;
   metricSourceSegmentsTextElement.textContent = sourceSegments.toLocaleString();
   metricMergedSegmentsTextElement.textContent = `${mergedSegments.toLocaleString()} (${formatPercent(mergeReduction)} reduction)`;
   metricVisibleSegmentsTextElement.textContent =

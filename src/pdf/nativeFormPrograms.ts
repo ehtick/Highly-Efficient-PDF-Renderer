@@ -127,17 +127,169 @@ export async function buildNativePdfFormDefinitionGraph(
   options: NativePdfFormGraphOptions = {}
 ): Promise<NativePdfFormDefinitionGraph> {
   throwIfAborted(options.signal);
-  const byForm = new WeakMap<NativePdfForm, MutableDefinition>();
-  const mutable: MutableDefinition[] = [];
+  const builder = new NativePdfFormGraphBuilder(document, registry, pageIndex, pageMatrix, options);
+  const pageReferences = options.pageResourceReferences ??
+    scanDensePdfResourceReferences(joinContent(pageContent));
+  if (options.pageXObjectReferences) {
+    for (const xObject of options.pageXObjectReferences) {
+      throwIfAborted(options.signal);
+      if (xObject.kind === "Image") continue;
+      await builder.addPageForm(xObject.resourceName);
+    }
+  } else {
+    for (const resourceName of pageReferences.xObjects) {
+      throwIfAborted(options.signal);
+      if (options.pageImageNames?.has(resourceName)) continue;
+      await builder.addPageForm(resourceName);
+    }
+  }
+  await builder.addAnnotations();
+  return builder.build();
+}
 
-  const prepare = async (
+/**
+ * The page Form definition graph built one reference at a time: page Forms in
+ * the order the content first names them, then annotation appearances.
+ * Streamed page content adds each Form when its first `Do` is reached.
+ */
+export class NativePdfFormGraphBuilder {
+  /** Page resource name to page-local Form definition index, as Forms are added. */
+  readonly pageForms = new Map<string, number>();
+
+  private readonly byForm = new WeakMap<NativePdfForm, MutableDefinition>();
+
+  private readonly mutable: MutableDefinition[] = [];
+
+  private readonly annotationPlacements: NativePdfAnnotationProgramPlacement[] = [];
+
+  private readonly document: NativePdfDocument;
+
+  private readonly registry: NativePdfFormAppearanceRegistry;
+
+  private readonly pageIndex: number;
+
+  private readonly pageMatrix: DensePdfMatrix;
+
+  private readonly options: NativePdfFormGraphOptions;
+
+  constructor(
+    document: NativePdfDocument,
+    registry: NativePdfFormAppearanceRegistry,
+    pageIndex: number,
+    pageMatrix: DensePdfMatrix,
+    options: NativePdfFormGraphOptions = {}
+  ) {
+    this.document = document;
+    this.registry = registry;
+    this.pageIndex = pageIndex;
+    this.pageMatrix = pageMatrix;
+    this.options = options;
+  }
+
+  /** Resolve and prepare a Form named by the page's `/XObject` resources. */
+  async addPageForm(resourceName: string): Promise<number> {
+    const existing = this.pageForms.get(resourceName);
+    if (existing !== undefined) return existing;
+    const invocation = await this.registry.resolvePageForm(this.pageIndex, resourceName, this.options.signal);
+    const definitionIndex = await this.prepare(invocation, resourceName);
+    this.pageForms.set(resourceName, definitionIndex);
+    return definitionIndex;
+  }
+
+  /** The prepared definition's optional-content association, as scoped Forms report it. */
+  optionalContentOf(definitionIndex: number): { optionalContentIndex: number; defaultVisible: boolean } {
+    const definition = this.mutable[definitionIndex];
+    if (!definition || definition.optionalContentIndex === undefined || definition.defaultVisible === undefined) {
+      throw new PdfError("invalid-object", "A referenced Form definition was not completely resolved.", {
+        pageIndex: this.pageIndex,
+        details: { reason: "form-definition-incomplete" }
+      });
+    }
+    return { optionalContentIndex: definition.optionalContentIndex, defaultVisible: definition.defaultVisible };
+  }
+
+  async addAnnotations(): Promise<void> {
+    const { options, registry } = this;
+    const annotations = await registry.listPageAnnotations(this.pageIndex, options.signal);
+    for (const annotation of annotations) {
+      throwIfAborted(options.signal);
+      const appearance = options.appearanceSynthesizer
+        ? await resolveNativePdfAnnotationAppearanceWithSynthesis(
+            registry,
+            options.appearanceSynthesizer,
+            annotation,
+            options.signal,
+            options.retainOptionalContent
+          )
+        : await registry.resolveAnnotationAppearance(annotation, options.signal, options.retainOptionalContent);
+      if (!appearance) continue;
+      const resourceName = `${annotation.subtype}#${annotation.annotationIndex}`;
+      const definitionIndex = await this.prepare(appearance.normalAppearance, resourceName);
+      this.annotationPlacements.push(Object.freeze({
+        annotation,
+        appearance,
+        definitionIndex,
+        resourceName,
+        ...computeNativePdfAnnotationPlacement(annotation, appearance.normalAppearance.form, this.pageMatrix)
+      }));
+    }
+  }
+
+  build(): NativePdfFormDefinitionGraph {
+    const { pageIndex } = this;
+    const definitions = this.mutable.map((definition): NativePdfFormDefinition => {
+      if (
+        !definition.content || !definition.preparedContent ||
+        !definition.formResources || !definition.imageResourceNames ||
+        !definition.resourceReferences ||
+        definition.optionalContentIndex === undefined ||
+        definition.defaultVisible === undefined
+      ) {
+        throw new PdfError("invalid-object", "A referenced Form definition was not completely resolved.", {
+          pageIndex,
+          details: { reason: "form-definition-incomplete" }
+        });
+      }
+      return Object.freeze({
+        definitionIndex: definition.definitionIndex,
+        form: definition.invocation.form,
+        resourceName: definition.resourceName,
+        content: definition.content,
+        preparedContent: definition.preparedContent,
+        formResources: definition.formResources,
+        imageResourceNames: definition.imageResourceNames,
+        resources: definition.invocation.form.resources,
+        resourceReferences: definition.resourceReferences,
+        optionalContentIndex: definition.optionalContentIndex,
+        defaultVisible: definition.defaultVisible
+      });
+    });
+    validateAcyclicDefinitions(definitions, pageIndex);
+    validateDefinitionDepth(
+      definitions,
+      [
+        ...this.pageForms.values(),
+        ...this.annotationPlacements.map((placement) => placement.definitionIndex)
+      ],
+      this.registry.formDepthLimit,
+      pageIndex
+    );
+    return Object.freeze({
+      pageForms: this.pageForms,
+      definitions: Object.freeze(definitions),
+      annotationPlacements: Object.freeze([...this.annotationPlacements])
+    });
+  }
+
+  private async prepare(
     invocation: NativePdfFormInvocation,
     resourceName: string
-  ): Promise<number> => {
+  ): Promise<number> {
+    const { document, registry, pageIndex, options } = this;
     throwIfAborted(options.signal);
-    const existing = byForm.get(invocation.form);
+    const existing = this.byForm.get(invocation.form);
     if (existing) return existing.definitionIndex;
-    if (mutable.length >= document.limits.maxCachedObjects) {
+    if (this.mutable.length >= document.limits.maxCachedObjects) {
       throw new PdfError("resource-limit", "Referenced Form definitions exceed the object-cache limit.", {
         pageIndex,
         details: {
@@ -147,12 +299,12 @@ export async function buildNativePdfFormDefinitionGraph(
       });
     }
     const definition: MutableDefinition = {
-      definitionIndex: mutable.length,
+      definitionIndex: this.mutable.length,
       invocation,
       resourceName
     };
-    mutable.push(definition);
-    byForm.set(invocation.form, definition);
+    this.mutable.push(definition);
+    this.byForm.set(invocation.form, definition);
     const association = await resolveFormOptionalContent(
       invocation.form,
       options.optionalContent,
@@ -202,7 +354,7 @@ export async function buildNativePdfFormDefinitionGraph(
       );
       formResources.set(
         xObject.resourceName,
-        await prepare(nested, xObject.resourceName)
+        await this.prepare(nested, xObject.resourceName)
       );
     }
     definition.content = content;
@@ -211,101 +363,7 @@ export async function buildNativePdfFormDefinitionGraph(
     definition.imageResourceNames = Object.freeze(imageResourceNames);
     definition.resourceReferences = resourceReferences;
     return definition.definitionIndex;
-  };
-
-  const pageForms = new Map<string, number>();
-  const pageReferences = options.pageResourceReferences ??
-    scanDensePdfResourceReferences(joinContent(pageContent));
-  if (options.pageXObjectReferences) {
-    for (const xObject of options.pageXObjectReferences) {
-      throwIfAborted(options.signal);
-      if (xObject.kind === "Image") continue;
-      const invocation = await registry.resolvePageForm(
-        pageIndex,
-        xObject.resourceName,
-        options.signal
-      );
-      pageForms.set(
-        xObject.resourceName,
-        await prepare(invocation, xObject.resourceName)
-      );
-    }
-  } else {
-    for (const resourceName of pageReferences.xObjects) {
-      throwIfAborted(options.signal);
-      if (options.pageImageNames?.has(resourceName)) continue;
-      const invocation = await registry.resolvePageForm(pageIndex, resourceName, options.signal);
-      pageForms.set(resourceName, await prepare(invocation, resourceName));
-    }
   }
-
-  const annotationPlacements: NativePdfAnnotationProgramPlacement[] = [];
-  const annotations = await registry.listPageAnnotations(pageIndex, options.signal);
-  for (const annotation of annotations) {
-    throwIfAborted(options.signal);
-    const appearance = options.appearanceSynthesizer
-      ? await resolveNativePdfAnnotationAppearanceWithSynthesis(
-          registry,
-          options.appearanceSynthesizer,
-          annotation,
-          options.signal,
-          options.retainOptionalContent
-        )
-      : await registry.resolveAnnotationAppearance(annotation, options.signal, options.retainOptionalContent);
-    if (!appearance) continue;
-    const resourceName = `${annotation.subtype}#${annotation.annotationIndex}`;
-    const definitionIndex = await prepare(appearance.normalAppearance, resourceName);
-    annotationPlacements.push(Object.freeze({
-      annotation,
-      appearance,
-      definitionIndex,
-      resourceName,
-      ...computeNativePdfAnnotationPlacement(annotation, appearance.normalAppearance.form, pageMatrix)
-    }));
-  }
-
-  const definitions = mutable.map((definition): NativePdfFormDefinition => {
-    if (
-      !definition.content || !definition.preparedContent ||
-      !definition.formResources || !definition.imageResourceNames ||
-      !definition.resourceReferences ||
-      definition.optionalContentIndex === undefined ||
-      definition.defaultVisible === undefined
-    ) {
-      throw new PdfError("invalid-object", "A referenced Form definition was not completely resolved.", {
-        pageIndex,
-        details: { reason: "form-definition-incomplete" }
-      });
-    }
-    return Object.freeze({
-      definitionIndex: definition.definitionIndex,
-      form: definition.invocation.form,
-      resourceName: definition.resourceName,
-      content: definition.content,
-      preparedContent: definition.preparedContent,
-      formResources: definition.formResources,
-      imageResourceNames: definition.imageResourceNames,
-      resources: definition.invocation.form.resources,
-      resourceReferences: definition.resourceReferences,
-      optionalContentIndex: definition.optionalContentIndex,
-      defaultVisible: definition.defaultVisible
-    });
-  });
-  validateAcyclicDefinitions(definitions, pageIndex);
-  validateDefinitionDepth(
-    definitions,
-    [
-      ...pageForms.values(),
-      ...annotationPlacements.map((placement) => placement.definitionIndex)
-    ],
-    registry.formDepthLimit,
-    pageIndex
-  );
-  return Object.freeze({
-    pageForms,
-    definitions: Object.freeze(definitions),
-    annotationPlacements: Object.freeze(annotationPlacements)
-  });
 }
 
 /**

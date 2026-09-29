@@ -8,11 +8,12 @@ import { HeprColorEvaluator } from "./heprColorEvaluator";
 import { buildHeprVectorGradient } from "./retainedVectorGradient";
 import type { GradientSceneData } from "./orderedGradientPaint";
 import type { OptionalContentCondition, SceneOptionalContent } from "./optionalContentData";
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, SceneTextIndex, VectorScene } from "./pdfVectorExtractor";
 import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
+import { NativeTextClipTester } from "./pdf/nativeTextClip";
 import { NativeVectorClipBuilder } from "./pdf/nativeVectorClips";
-import { emitCubicAsQuadratics } from "./pdf/nativeVectorPage";
+import { emitCubicAsQuadratics, VectorPageTextIndexBuilder } from "./pdf/nativeVectorPage";
 import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
 import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
@@ -23,8 +24,23 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 type Color = readonly [number, number, number, number];
 interface Geometry { a: number[]; b: number[]; bounds: Bounds }
+/**
+ * Page-space pen geometry for each glyph occurrence in a page's text index,
+ * captured while compiling. It is never persisted; without it the lowered
+ * index falls back to the parser's raw separators.
+ */
+export interface RetainedTextPositions {
+  /** One entry per text-index code unit: its occurrence, or -1 for a separator. */
+  readonly charOccurrences: Int32Array;
+  /** Five floats per occurrence: pen start x/y, pen end x/y and em height. */
+  readonly pens: Float32Array;
+  /** One flag per occurrence: an explicit TJ word gap precedes it. */
+  readonly gapBefore: Uint8Array;
+}
+
 export interface RetainedVectorPageOptions {
   readonly optionalContent?: SceneOptionalContent;
+  readonly textPositions?: RetainedTextPositions;
   readonly signal: AbortSignal;
   readonly maxPrimitives?: number;
   readonly maxCoordinates?: number;
@@ -78,6 +94,11 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const endpoints: number[] = [], primitiveMeta: number[] = [], primitiveBounds: number[] = [], styles: number[] = [];
   const clipBuilder = new NativeVectorClipBuilder(), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
   const glyphConditions = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
+  // Search references the first instance painting each glyph. A glyph whose
+  // every placement misses its clip chain or the page leaves the index.
+  const glyphInstances = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
+  const glyphReach = new Uint8Array(page.stores.glyphs.glyphIds.length);
+  const glyphClipTester = new NativeTextClipTester();
   let reportedGlyphStrokeComplexity = false, reportedHairlineCurveApproximation = false, reportedHairlineStyleApproximation = false;
   const stack: ScenePaintNode[][] = [scene.paintGraph.roots];
   const knockoutScopes = new WeakSet<ScenePaintNode[]>();
@@ -92,7 +113,9 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
   let count = 0, coordinates = 0, cells = 0, lastYield = performance.now();
-  const fail = (message: string): never => { throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason: "vector-retained-program" } }); };
+  const fail = (message: string, reason = "vector-retained-program"): never => {
+    throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason } });
+  };
   const budget = (added: number): void => {
     signal.throwIfAborted(); coordinates += added;
     if (++count > maximum || coordinates > maxCoordinates) throw new PdfError("resource-limit", "Retained vector expansion exceeds its geometry budget.", { details: { reason: "vector-expansion-limit" } });
@@ -437,6 +460,27 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     const result = Object.values(bounds).every(Number.isFinite) ? bounds : null;
     clipBoundsCache.set(clip, result); return result;
   };
+  /** Conservative outline bounds, or the em box of an empty glyph, against its exact clips and the page. */
+  const glyphReachesPage = (glyph: number, indices: readonly number[], local: PdfMatrix, clip: DensePdfTextClip | null): boolean => {
+    const { fonts, paths } = page.stores, font = page.stores.glyphs.fontIndices[glyph], outline = emptyBounds();
+    for (const path of indices) {
+      include(outline, paths.bounds[path * 4], paths.bounds[path * 4 + 1]);
+      include(outline, paths.bounds[path * 4 + 2], paths.bounds[path * 4 + 3]);
+    }
+    if (!Object.values(outline).every(Number.isFinite) || outline.minX === outline.maxX || outline.minY === outline.maxY) {
+      outline.minX = 0; outline.maxX = fonts.unitsPerEm[font]; outline.minY = fonts.descents[font]; outline.maxY = fonts.ascents[font];
+    }
+    const reach = emptyBounds(), visible = { ...scene.pageBounds };
+    for (const x of [outline.minX, outline.maxX]) for (const y of [outline.minY, outline.maxY]) include(reach, ...point(local, x, y));
+    for (let scope = clip; scope; scope = scope.parent) {
+      const bounds = clipBounds(scope);
+      if (!bounds) continue;
+      visible.minX = Math.max(visible.minX, bounds.minX); visible.minY = Math.max(visible.minY, bounds.minY);
+      visible.maxX = Math.min(visible.maxX, bounds.maxX); visible.maxY = Math.min(visible.maxY, bounds.maxY);
+    }
+    if (reach.maxX < visible.minX || reach.minX > visible.maxX || reach.maxY < visible.minY || reach.minY > visible.maxY) return false;
+    return !clip || !glyphClipTester.isFullyOutside(reach, clip, signal);
+  };
   const patternActive = new Set<number>();
   let draw: (execution: HeprDrawRunExecution, inheritedClip?: DensePdfTextClip | null, inheritedCondition?: number) => Promise<void>;
   const pattern = async (paint: number, g: Geometry, matrix: PdfMatrix, clip: DensePdfTextClip | null, rule: number, condition?: number): Promise<void> => {
@@ -510,7 +554,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       const attach = (node: DensePdfTextClip | null): DensePdfTextClip => node ? { ...node, parent: attach(node.parent) } : inheritedClip;
       clip = attach(clip);
     }
-    if (execution.state.viewTransformFlags) return fail("view-dependent annotation transform.");
+    if (execution.state.viewTransformFlags) return fail("view-dependent annotation transform.", "vector-annotation-view-transform");
     if (command.source === "fill-paths") {
       const store = page.stores.paths, rgba = color(command.paintIndex, execution.state);
       for (let path = command.first; path < command.first + command.count; path++) {
@@ -553,6 +597,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       for (let glyph = command.first; glyph < command.first + command.count; glyph++) {
         glyphConditions[glyph] = condition ?? -1;
         const indices = glyphPaths(glyph), local = multiplyHeprMatrices(matrix, transform(page.stores.glyphs.transformIndices[glyph]));
+        const firstInstance = textA.length / 4;
         if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
         // Modes 2 and 6 fill the glyph as well, so its shape survives an
         // outline this renderer cannot build; modes 1 and 5 have only the stroke.
@@ -561,6 +606,12 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             : multiplyHeprMatrices(matrix, transform(command.strokeTransformIndex)), command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
             clip, condition, command.renderingMode === 2 || command.renderingMode === 6);
         }
+        if (!glyphReachesPage(glyph, indices, local, clip)) {
+          if (glyphReach[glyph] === 0) glyphReach[glyph] = 1;
+          continue;
+        }
+        glyphReach[glyph] = 2;
+        if (glyphInstances[glyph] < 0 && textA.length / 4 > firstInstance) glyphInstances[glyph] = firstInstance;
       }
     } else if (command.source === "gradients") {
       for (let index = command.first; index < command.first + command.count; index++) await gradient(index, matrix, 1, clip, condition);
@@ -677,13 +728,72 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     scene.gradientCount = scene.gradientFillPathCount = gradients.length; scene.gradientFillSegmentCount = gradientSegments;
   }
   if (options.optionalContent) scene.optionalContent = { ...options.optionalContent, conditions };
-  scene.textIndex = buildNativeFallbackTextIndex(source, signal);
-  const index = scene.textIndex.pages[0];
-  if (options.optionalContent) index.optionalContent = Int32Array.from(source.textIndex.charGlyphIndices, glyph => glyph >= 0 ? glyphConditions[glyph] : -1);
+  scene.textIndex = buildRetainedTextIndex(source, glyphInstances, glyphReach,
+    options.optionalContent ? glyphConditions : undefined, options.textPositions, signal);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
   scene.imagePaintOpCount = scene.rasterLayers.length;
   const image = scene.rasterLayers[0];
   if (image) { scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerData = image.data; scene.rasterLayerMatrix = image.matrix; }
   return scene;
+}
+
+/**
+ * Search text for a lowered page. A painted glyph references its first vector
+ * instance, a glyph with no visible placement leaves the index, whitespace is a
+ * separator, and unpainted (OCR) text keeps a fallback quad in character order,
+ * as the HEP char map requires. With pen positions, word breaks are inferred
+ * exactly as on every other vector page; otherwise the parser's raw separators
+ * are kept, never doubled, leading, or trailing.
+ */
+function buildRetainedTextIndex(page: HeprPageData, glyphInstances: Int32Array, glyphReach: Uint8Array,
+  glyphConditions: Int32Array | undefined, positions: RetainedTextPositions | undefined, signal: AbortSignal): SceneTextIndex {
+  const source = page.textIndex, fallback = buildNativeFallbackTextIndex(page, signal).pages[0];
+  const quadOf = (index: number): Float32Array => {
+    const slot = -fallback.charInstance[index] - 2;
+    return fallback.fallbackQuads.subarray(slot * 4, slot * 4 + 4);
+  };
+  if (positions && positions.charOccurrences.length === source.charGlyphIndices.length) {
+    const builder = new VectorPageTextIndexBuilder();
+    for (let index = 0; index < source.charGlyphIndices.length;) {
+      if ((index & 1023) === 0) signal.throwIfAborted();
+      const occurrence = positions.charOccurrences[index];
+      let end = index + 1;
+      // The parser's positioning hints are superseded by the pen geometry.
+      if (occurrence < 0) { index = end; continue; }
+      while (end < source.charGlyphIndices.length && positions.charOccurrences[end] === occurrence) end++;
+      const glyph = source.charGlyphIndices[index], unicode = source.text.slice(index, end), first = index;
+      index = end;
+      if (glyph >= 0 && glyphReach[glyph] === 1) continue;
+      if (positions.gapBefore[occurrence]) builder.appendSeparator();
+      if (unicode.trim().length === 0) { builder.appendSeparator(); continue; }
+      const instance = glyph >= 0 ? glyphInstances[glyph] : -1, pen = occurrence * 5;
+      builder.appendGlyph(unicode, instance, instance >= 0 ? null : quadOf(first),
+        positions.pens[pen], positions.pens[pen + 1], positions.pens[pen + 2], positions.pens[pen + 3],
+        positions.pens[pen + 4], glyph >= 0 ? glyphConditions?.[glyph] ?? -1 : -1);
+    }
+    return { version: 2, pages: [builder.build()] };
+  }
+  const text: string[] = [], references: number[] = [], quads: number[] = [], conditions: number[] = [];
+  let separator: string | null = null;
+  for (let index = 0; index < source.charGlyphIndices.length; index++) {
+    if ((index & 1023) === 0) signal.throwIfAborted();
+    const glyph = source.charGlyphIndices[index];
+    if (glyph >= 0 && glyphReach[glyph] === 1) continue;
+    // A decoded space glyph is a word boundary, not a searchable glyph.
+    if (glyph === -1 || source.text[index].trim().length === 0) {
+      const next = glyph === -1 ? source.text[index] : " ";
+      if (text.length && (next === "\n" || separator === null)) separator = next;
+      continue;
+    }
+    if (separator !== null) { text.push(separator); references.push(-1); conditions.push(-1); separator = null; }
+    text.push(source.text[index]);
+    conditions.push(glyph >= 0 ? glyphConditions?.[glyph] ?? -1 : -1);
+    const instance = glyph >= 0 ? glyphInstances[glyph] : -1;
+    if (instance >= 0) { references.push(instance); continue; }
+    references.push(-2 - quads.length / 4);
+    for (const value of quadOf(index)) quads.push(value);
+  }
+  return { version: 2, pages: [{ text: text.join(""), charInstance: Int32Array.from(references),
+    fallbackQuads: Float32Array.from(quads), ...(glyphConditions ? { optionalContent: Int32Array.from(conditions) } : {}) }] };
 }

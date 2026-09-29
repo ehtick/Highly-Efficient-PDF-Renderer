@@ -1,6 +1,6 @@
 const OUTPUT_ENCODING_HELPER = `
 vec4 heprThreeEncodeOutputColor(vec4 color) {
-  // Scene colors come from PDF.js in display/sRGB space. Raw materials bypass
+  // Scene colors are already in display/sRGB space. Raw materials bypass
   // Three's output-color chunks, so the stored components are the output values.
   return color;
 }

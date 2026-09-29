@@ -352,7 +352,7 @@ async function assertOutsideFormTextIsCulled(openPdf) {
     assert.equal(
       scene.textIndex.pages[0].text,
       "",
-      "off-view Form text matches the established PDF.js search result"
+      "off-view Form text must not be searchable"
     );
   } finally {
     await session.close();

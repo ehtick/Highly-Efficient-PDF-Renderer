@@ -18,7 +18,9 @@ try {
   const builder = await import("../src/hepBuilder.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
-  const { loadSceneFromHep } = await import("../src/hep.ts");
+  const { loadSceneFromHep, prepareSceneForHepRendering } = await import("../src/hep.ts");
+  const { VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
+  await testOrderedLodRoundTrip(builder, loadSceneFromHep, prepareSceneForHepRendering, VectorStrokeLodRuntime);
   assert.equal(builder.buildParsedDataZip, undefined, "the old builder has no compatibility alias");
   const scene = composeVectorScenesInGrid([], 1);
   for (const compression of ["store", "deflate"]) {
@@ -117,5 +119,44 @@ async function testPdfColorOptionForwarding() {
     await assert.rejects(context.buildHepFromPdf(new Uint8Array(), {
       iccEngine, iccTransformResolver, onDiagnostic
     }), error => error === stopBeforeConversion);
+  }
+}
+
+async function testOrderedLodRoundTrip(builder, loadScene, prepareScene, Runtime) {
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const count = 2048;
+  const scene = { ...createEmptyVectorScene(), segmentCount: count, maxHalfWidth: .1,
+    pageCount: 1, pagesPerRow: 1, pageRects: Float32Array.of(0, 0, 100, 100),
+    pageTextRanges: Uint32Array.of(0, 0), bounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
+    pageBounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
+    drawRuns: [{ kind: "stroke", first: 0, count: count / 2 }, { kind: "stroke", first: count / 2, count: count / 2, clipIndex: 0 }],
+    clipPaths: [{ parent: -1, fillRule: 0, edges: Float32Array.of(0, 0, 100, 0, 100, 0, 100, 100, 100, 100, 0, 100, 0, 100, 0, 0) }]
+  };
+  for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) scene[key] = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    const x = i % 32 * 2.8, y = Math.floor(i / 32) * 1.4;
+    scene.endpoints.set([x, y, x + 2.2, y], i * 4);
+    scene.primitiveMeta.set([x + 2.2, y, 0, 9], i * 4);
+    scene.primitiveBounds.set([0, 0, 100, 100], i * 4);
+    scene.styles.set([.1, 0, 0, 0], i * 4);
+  }
+  const pdf = prepareScene(scene);
+  const hep = await loadScene(await (await builder.buildHep(pdf, { compression: "store" })).arrayBuffer());
+  const fields = ["endpoints", "primitiveMeta", "primitiveBounds", "styles", "drawRuns", "clipPaths"];
+  for (const key of fields) assert.deepEqual(hep[key], pdf[key], `HEP preserves ordered ${key}`);
+  const a = new Runtime(pdf), b = new Runtime(hep);
+  assert.deepEqual(a.levels.map(l => [l.tolerance, l.segmentCount]), b.levels.map(l => [l.tolerance, l.segmentCount]));
+  for (const units of [.01, .5, 2, 8]) {
+    for (const runtime of [a, b]) {
+      runtime.updateForLocalUnitsPerPixel(units);
+      runtime.update({ cameraCenterX: 50, cameraCenterY: 50, zoom: 1 / units }, { width: 640, height: 480 });
+    }
+    assert.deepEqual(a.getStats(), b.getStats(), `PDF/HEP choose identical LOD at ${units} units/pixel`);
+    for (let level = 0; level < a.levels.length; level++) {
+      const left = a.levels[level], right = b.levels[level];
+      for (const key of fields.slice(0, 4)) assert.deepEqual(left.scene[key], right.scene[key]);
+      assert.deepEqual(left.visibleSegmentIds.subarray(0, left.visibleSegmentCount),
+        right.visibleSegmentIds.subarray(0, right.visibleSegmentCount));
+    }
   }
 }

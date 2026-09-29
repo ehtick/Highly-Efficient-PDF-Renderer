@@ -21,6 +21,7 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePri
 import { WebGlPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
+import { OrderedTextLodSelection } from "./orderedTextLod";
 import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
@@ -1552,6 +1553,8 @@ export class WebGlFloorplanRenderer {
 
   private textLodRuntime: TextLodRuntime | null = null;
 
+  private orderedTextLod: OrderedTextLodSelection | null = null;
+
   private textLodGpuActive = false;
 
   private selectedTextInstanceIds = new Float32Array(0);
@@ -2506,7 +2509,7 @@ export class WebGlFloorplanRenderer {
     this.pageRects = normalizePageRects(scene);
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
     this.textLodRuntime?.dispose();
-    const textLodBuildResult = scene.drawRuns ? null : this.textLodMode === "auto"
+    const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.textLodRuntime = textLodBuildResult
@@ -2562,6 +2565,8 @@ export class WebGlFloorplanRenderer {
       textLodUploadData = null;
       textTextureStats = this.uploadTextData(scene, null);
     }
+    this.orderedTextLod = scene.drawRuns && textLodUploadData ? new OrderedTextLodSelection(scene, textLodUploadData) : null;
+    if (this.orderedTextLod && textLodUploadData) this.orderedRunCuller?.includeTextLod(textLodUploadData);
     this.sceneStats = {
       gridWidth: this.grid?.gridWidth ?? 0,
       gridHeight: this.grid?.gridHeight ?? 0,
@@ -2898,6 +2903,7 @@ export class WebGlFloorplanRenderer {
     this.visibleTextRanges = [];
     this.textLodRuntime?.dispose();
     this.textLodRuntime = null;
+    this.orderedTextLod = null;
     this.textLodGpuActive = false;
     this.selectedTextInstanceIds = new Float32Array(0);
     this.selectedTextInstanceCount = 0;
@@ -4093,6 +4099,7 @@ export class WebGlFloorplanRenderer {
     // plan is valid with or without transparency groups.
     const plan = this.orderedBatches;
     profile?.beginSection("batchPreparation");
+    if (this.orderedTextLod) this.updateTextLodSelection(width, height, x, y, zoom);
     const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6)) ?? false;
     profile?.endSection("batchPreparation");
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
@@ -4525,6 +4532,7 @@ export class WebGlFloorplanRenderer {
   ): boolean {
     const runtime = this.textLodRuntime;
     if (!runtime || !this.textLodGpuActive || this.textLodMode === "off") {
+      if (this.orderedTextLod) this.orderedBatches?.setTextSelection(null);
       return false;
     }
 
@@ -4543,6 +4551,11 @@ export class WebGlFloorplanRenderer {
       viewportHeight
     });
     this.selectedTextInstanceCount = selection.instanceIds.length;
+    if (this.orderedTextLod) {
+      this.orderedTextLod.update(selection);
+      this.orderedBatches?.setTextSelection(this.orderedTextLod);
+      return true;
+    }
     if (!selection.changed) {
       return true;
     }

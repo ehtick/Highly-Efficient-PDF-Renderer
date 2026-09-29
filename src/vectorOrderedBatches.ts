@@ -1,3 +1,4 @@
+import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
@@ -68,6 +69,8 @@ export class VectorOrderedBatches {
   private initialized = false;
   private dirty = true;
   private orderDirty = false;
+  private textSelection: OrderedTextLodSelection | null = null;
+  private textSelectionRevision = 0;
 
   constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null) {
     this.runtime = runtime;
@@ -134,6 +137,14 @@ export class VectorOrderedBatches {
   }
 
   invalidate(): void { this.dirty = true; }
+
+  setTextSelection(selection: OrderedTextLodSelection | null): void {
+    const revision = selection?.revision ?? 0;
+    if (this.textSelection === selection && this.textSelectionRevision === revision) return;
+    this.textSelection = selection;
+    this.textSelectionRevision = revision;
+    this.orderDirty = true;
+  }
 
   setColorCommutationEnabled(enabled: boolean): void {
     const changed = this.scheduler?.setColorCommutationEnabled(enabled) ?? false;
@@ -242,6 +253,10 @@ export class VectorOrderedBatches {
         while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] === runIndex) cursor++;
         count = cursor - first;
       }
+      if (run.kind === "text" && this.textSelection) {
+        first = this.textSelection.ranges[runIndex * 2];
+        count = this.textSelection.ranges[runIndex * 2 + 1];
+      }
       if (count === 0) continue;
       this.runRanges[runIndex * 2] = first;
       this.runRanges[runIndex * 2 + 1] = count;
@@ -265,7 +280,10 @@ export class VectorOrderedBatches {
     }
     // Schedule paint ranges first, then write selected instances directly in
     // final order. No intermediate instance copy or per-run array views.
-    for (const runIndex of this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints) {
+    // Coarse rectangles can cover gaps between source glyphs. Keep canonical
+    // paint order instead of using a commutation proof over the exact geometry.
+    const order = this.textSelection ? this.visiblePaints : this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints;
+    for (const runIndex of order) {
       const run = this.sourceRuns[runIndex];
       const segment = this.segments ? this.segments[runIndex] : 0;
       const start = this.runRanges[runIndex * 2], count = this.runRanges[runIndex * 2 + 1];
@@ -274,8 +292,11 @@ export class VectorOrderedBatches {
         continue;
       }
       const first = this.instanceCount;
-      const clipCode = this.clipElision?.clipCodes[runIndex] ?? (run.clipIndex ?? -1) + 1;
-      if (run.kind === "stroke" && this.runtime) {
+      const clipCode = run.kind === "text" && this.textSelection
+        ? (run.clipIndex ?? -1) + 1 : this.clipElision?.clipCodes[runIndex] ?? (run.clipIndex ?? -1) + 1;
+      if (run.kind === "text" && this.textSelection) {
+        for (let index = start; index < start + count; index++) this.appendInstance(this.textSelection.instanceIds[index], clipCode);
+      } else if (run.kind === "stroke" && this.runtime) {
         for (let index = start; index < start + count; index++) {
           const id = this.rankToId[this.selectedRanks[index]];
           if (!this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(id, clipCode);

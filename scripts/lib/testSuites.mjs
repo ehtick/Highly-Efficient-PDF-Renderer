@@ -117,6 +117,7 @@ export const fastTests = [
   "native-paint-compositor",
   "native-direct-rendering",
   "text-lod-core",
+  "native-ordered-text-lod",
   "ordered-gradient-paint",
   "gradient-sampling",
   "vector-paint-coverage",

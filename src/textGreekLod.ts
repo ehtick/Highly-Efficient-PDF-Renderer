@@ -1,4 +1,4 @@
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 
 /** Documents below this size retain the exact text path only. */
 export const TEXT_LOD_MIN_TEXT_INSTANCES = 50_000;
@@ -140,6 +140,7 @@ interface BuildContext {
   coarse: Float4Builder;
   pageRunStarts: Uint32Array;
   pageRunCounts: Uint32Array;
+  textPaints: readonly VectorDrawRun[];
 }
 
 export class TextLodBuildCancelledError extends Error {
@@ -350,7 +351,8 @@ function prepareBuildContext(scene: VectorScene): BuildContext | TextLodFallback
     runs: [],
     coarse: new Float4Builder(Math.min(instanceCount, 65_536)),
     pageRunStarts: new Uint32Array(pageCount),
-    pageRunCounts: new Uint32Array(pageCount)
+    pageRunCounts: new Uint32Array(pageCount),
+    textPaints: (scene.drawRuns ?? []).filter(run => run.kind === "text").sort((a, b) => a.first - b.first)
   };
 }
 
@@ -375,12 +377,22 @@ function buildPageRuns(
 
   let index = pageStart;
   while (index < pageEnd) {
-    const first = readGlyphPlacement(context, index);
+    // Coarse rectangles must never combine separate paints: their clip, layer,
+    // blend mode or position relative to another drawing may differ.
+    let low = 0, high = context.textPaints.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1, paint = context.textPaints[middle];
+      if (paint.first + paint.count <= index) low = middle + 1; else high = middle;
+    }
+    const paint = context.textPaints[low];
+    const paintEnd = Math.min(pageEnd, paint ? paint.first + paint.count : pageEnd);
+    const exactPaint = paint?.blendMode !== undefined;
+    const first = exactPaint ? null : readGlyphPlacement(context, index);
     if (!first) {
       const invalidStart = index;
       let invalidBounds: Bounds | null = null;
-      while (index < pageEnd && index - invalidStart < TEXT_LOD_MAX_CLUSTER_GLYPHS) {
-        const placement = readGlyphPlacement(context, index);
+      while (index < paintEnd && index - invalidStart < TEXT_LOD_MAX_CLUSTER_GLYPHS) {
+        const placement = exactPaint ? null : readGlyphPlacement(context, index);
         if (placement) break;
         invalidBounds = unionBounds(invalidBounds, approximateInstanceBounds(scene, index, pageBounds));
         index += 1;
@@ -417,7 +429,7 @@ function buildPageRuns(
     let direction = 0;
     index += 1;
 
-    while (index < pageEnd && index - runStart < TEXT_LOD_MAX_CLUSTER_GLYPHS) {
+    while (index < paintEnd && index - runStart < TEXT_LOD_MAX_CLUSTER_GLYPHS) {
       const next = readGlyphPlacement(context, index);
       if (!next || !sameStyleAndTransform(first, next)) {
         break;

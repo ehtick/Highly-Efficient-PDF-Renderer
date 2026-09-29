@@ -24,6 +24,7 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGra
 import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
+import { OrderedTextLodSelection } from "./orderedTextLod";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 import { packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
@@ -1376,6 +1377,8 @@ export class WebGpuFloorplanRenderer {
 
   private textLodRuntime: TextLodRuntime | null = null;
 
+  private orderedTextLod: OrderedTextLodSelection | null = null;
+
   private textLodGpuActive = false;
 
   private selectedTextInstanceCount = 0;
@@ -2305,6 +2308,7 @@ export class WebGpuFloorplanRenderer {
     this.textInstanceCount = scene.textInstanceCount;
     this.textLodRuntime?.dispose();
     this.textLodRuntime = null;
+    this.orderedTextLod = null;
     this.textLodGpuActive = false;
     this.selectedTextInstanceCount = 0;
     this.useTextInstanceIndirection = false;
@@ -2317,7 +2321,7 @@ export class WebGpuFloorplanRenderer {
 
     const maxTextureSize = this.maxTextureSize();
 
-    const textLodBuildResult = scene.drawRuns ? null : this.textLodMode === "auto"
+    const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.textLodRuntime = textLodBuildResult
@@ -2646,6 +2650,8 @@ export class WebGpuFloorplanRenderer {
     const vectorLodActive = this.rebuildVectorLod(scene);
     this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
 
+    this.orderedTextLod = scene.drawRuns && textLodUploadData ? new OrderedTextLodSelection(scene, textLodUploadData) : null;
+    if (this.orderedTextLod && textLodUploadData) this.orderedRunCuller?.includeTextLod(textLodUploadData);
     this.sceneStats = {
       gridWidth: this.grid?.gridWidth ?? 0,
       gridHeight: this.grid?.gridHeight ?? 0,
@@ -3011,6 +3017,7 @@ export class WebGpuFloorplanRenderer {
 
     this.textLodRuntime?.dispose();
     this.textLodRuntime = null;
+    this.orderedTextLod = null;
     this.textLodGpuActive = false;
     this.selectedTextInstanceCount = 0;
     this.useTextInstanceIndirection = false;
@@ -3899,6 +3906,10 @@ export class WebGpuFloorplanRenderer {
     }
   ): void {
     if (this.scene?.drawRuns) {
+      if (prepareTextLodSelection && this.orderedTextLod) {
+        this.updateTextLodSelection(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+      }
+      // Ordered batches carry both the chosen text ID and its source clip.
       prepareTextLodSelection = false;
       this.useTextInstanceIndirection = false;
     }
@@ -3952,6 +3963,7 @@ export class WebGpuFloorplanRenderer {
     const runtime = this.textLodRuntime;
     if (!runtime || !this.textLodGpuActive || this.textLodMode === "off" || !this.textInstanceIdBuffer) {
       this.selectedTextInstanceCount = 0;
+      if (this.orderedTextLod) this.orderedBatches?.setTextSelection(null);
       return false;
     }
 
@@ -3967,6 +3979,11 @@ export class WebGpuFloorplanRenderer {
       viewportHeight
     });
     this.selectedTextInstanceCount = selection.instanceIds.length;
+    if (this.orderedTextLod) {
+      this.orderedTextLod.update(selection);
+      this.orderedBatches?.setTextSelection(this.orderedTextLod);
+      return true;
+    }
     if (selection.changed && selection.instanceIds.length > 0) {
       this.gpuDevice.queue.writeBuffer(this.textInstanceIdBuffer, 0, selection.instanceIds);
     }

@@ -1,3 +1,4 @@
+import type { TextLodBuildData } from "./textGreekLod";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
 
@@ -94,6 +95,25 @@ export class VectorDrawRunCuller {
         includeStroke(this.bounds, strokes.sourceRuns[index] * 4, strokes.scene, index);
       }
     }
+  }
+
+  /** Coarse text rectangles can extend into gaps in rotated glyph bounds. */
+  includeTextLod(data: TextLodBuildData): void {
+    const paints = (this.scene.drawRuns ?? []).flatMap((run, index) => run.kind === "text"
+      ? [{ run, index }] : []).sort((a, b) => a.run.first - b.run.first);
+    let paint = 0;
+    for (const run of data.runs) {
+      if (run.coarseIndex < 0) continue;
+      while (paint < paints.length && paints[paint].run.first + paints[paint].run.count <= run.exactStart) paint++;
+      if (paint === paints.length) break;
+      const offset = paints[paint].index * 4, b = run.bounds;
+      this.bounds[offset] = Math.min(this.bounds[offset], b.minX);
+      this.bounds[offset + 1] = Math.min(this.bounds[offset + 1], b.minY);
+      this.bounds[offset + 2] = Math.max(this.bounds[offset + 2], b.maxX);
+      this.bounds[offset + 3] = Math.max(this.bounds[offset + 3], b.maxY);
+    }
+    this.padding = NaN;
+    this.guardBounds = null;
   }
 
   /** Conservative geometry hull, before the run's geometric clip is applied. */

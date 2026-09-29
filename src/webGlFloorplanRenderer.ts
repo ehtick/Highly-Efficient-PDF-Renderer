@@ -671,11 +671,10 @@ void main() {
   // Widen the glyph quad by a pixel in glyph space, so stems and dots thinner
   // than a pixel reach every pixel their footprint touches.
   mat2 glyphToWorld = mat2(instanceA.x, instanceA.y, instanceA.z, instanceA.w);
-  vec2 margin = heprCoverageMargin(heprPathToPixel(
-    glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy,
-    uUseLocalToClip, uLocalToClip, uZoom, uViewport) * glyphToWorld);
-  margin = heprBoundCoverageMargin(glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy,
-    margin, glyphToWorld, uUseLocalToClip, uLocalToClip, uViewport);
+  vec2 cornerWorld = glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy;
+  mat2 glyphToPixel = heprPathToPixel(cornerWorld, uUseLocalToClip, uLocalToClip, uZoom, uViewport) * glyphToWorld;
+  vec2 margin = heprCoverageMargin(glyphToPixel);
+  margin = heprBoundCoverageMarginFromPixel(cornerWorld, margin, glyphToWorld, glyphToPixel, uUseLocalToClip, uLocalToClip);
   vec2 local = mix(minBounds - margin, maxBounds + margin, corner01);
 
   vec2 world = vec2(

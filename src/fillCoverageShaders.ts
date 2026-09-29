@@ -416,6 +416,29 @@ vec2 heprBoundCoverageMargin(vec2 world, vec2 margin, mat2 pathToWorld,
   if (!(scale > 0.0)) return vec2(0.0);
   return margin * scale;
 }
+
+// Reuse the glyph-to-pixel Jacobian already used to build the inverse margin.
+// Reprojecting both padding axes would repeat two matrix transforms per vertex.
+float heprPixelCoverageExpansionScale(vec4 pathToPixel, vec2 margin, vec2 relativeDepth) {
+  float relativeW = abs(relativeDepth.x) * margin.x + abs(relativeDepth.y) * margin.y;
+  float pixelX = abs(pathToPixel.x) * margin.x + abs(pathToPixel.z) * margin.y;
+  float pixelY = abs(pathToPixel.y) * margin.x + abs(pathToPixel.w) * margin.y;
+  float demand = max(pixelX, pixelY) + 2.0 * relativeW;
+  if (!(demand < 1e30) || !(relativeW < 1e30)) return 0.0;
+  return min(1.0, min(0.25 / max(relativeW, 1e-30), 2.0 / max(demand, 1e-30)));
+}
+
+vec2 heprBoundCoverageMarginFromPixel(vec2 world, vec2 margin, mat2 pathToWorld, mat2 pathToPixel,
+    float useLocalToClip, mat4 localToClip) {
+  if (useLocalToClip < 0.5) return margin;
+  vec2 depthSlope = vec2(localToClip[0].w, localToClip[1].w);
+  float w = dot(depthSlope, world) + localToClip[3].w;
+  if (!(abs(w) > 1e-6)) return vec2(0.0);
+  vec2 relativeDepth = vec2(dot(depthSlope, pathToWorld[0]), dot(depthSlope, pathToWorld[1])) / w;
+  float scale = heprPixelCoverageExpansionScale(vec4(pathToPixel[0], pathToPixel[1]), margin, relativeDepth);
+  if (!(scale > 0.0)) return vec2(0.0);
+  return margin * scale;
+}
 `;
 
 export const FILL_COVERAGE_VERTEX_WGSL = /* wgsl */ `
@@ -462,6 +485,28 @@ fn heprBoundCoverageMargin(world: vec2<f32>, margin: vec2<f32>, pathToWorld: mat
   let deltaX = localToClip * vec4<f32>(pathToWorld[0] * margin.x, 0.0, 0.0);
   let deltaY = localToClip * vec4<f32>(pathToWorld[1] * margin.y, 0.0, 0.0);
   let scale = heprCoverageExpansionScale(clip, deltaX, deltaY, viewport);
+  if (!(scale > 0.0)) { return vec2<f32>(0.0); }
+  return margin * scale;
+}
+
+// Glyph vertices already have this Jacobian for their inverse pixel footprint.
+fn heprPixelCoverageExpansionScale(pathToPixel: vec4<f32>, margin: vec2<f32>, relativeDepth: vec2<f32>) -> f32 {
+  let relativeW = abs(relativeDepth.x) * margin.x + abs(relativeDepth.y) * margin.y;
+  let pixelX = abs(pathToPixel.x) * margin.x + abs(pathToPixel.z) * margin.y;
+  let pixelY = abs(pathToPixel.y) * margin.x + abs(pathToPixel.w) * margin.y;
+  let demand = max(pixelX, pixelY) + 2.0 * relativeW;
+  if (!(demand < 1e30) || !(relativeW < 1e30)) { return 0.0; }
+  return min(1.0, min(0.25 / max(relativeW, 1e-30), 2.0 / max(demand, 1e-30)));
+}
+
+fn heprBoundCoverageMarginFromPixel(world: vec2<f32>, margin: vec2<f32>, pathToWorld: mat2x2<f32>, pathToPixel: mat2x2<f32>,
+    useLocalToClip: f32, localToClip: mat4x4<f32>) -> vec2<f32> {
+  if (useLocalToClip < 0.5) { return margin; }
+  let depthSlope = vec2<f32>(localToClip[0].w, localToClip[1].w);
+  let w = dot(depthSlope, world) + localToClip[3].w;
+  if (!(abs(w) > 0.000001)) { return vec2<f32>(0.0); }
+  let relativeDepth = vec2<f32>(dot(depthSlope, pathToWorld[0]), dot(depthSlope, pathToWorld[1])) / w;
+  let scale = heprPixelCoverageExpansionScale(vec4<f32>(pathToPixel[0], pathToPixel[1]), margin, relativeDepth);
   if (!(scale > 0.0)) { return vec2<f32>(0.0); }
   return margin * scale;
 }

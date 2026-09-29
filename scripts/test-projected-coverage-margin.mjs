@@ -10,6 +10,10 @@ import { evaluateGlsl, evaluateWgsl } from "./lib/scalarShaderEval.mjs";
 const glsl = FILL_COVERAGE_VERTEX_GLSL.match(/float heprCoverageExpansionScale\([\s\S]*?\n}/)[0];
 const wgsl = FILL_COVERAGE_VERTEX_WGSL.match(/fn heprCoverageExpansionScale\([\s\S]*?\n}/)[0];
 const variants = [evaluateGlsl(glsl).heprCoverageExpansionScale, evaluateWgsl(wgsl).heprCoverageExpansionScale];
+const pixelVariants = [
+  evaluateGlsl(FILL_COVERAGE_VERTEX_GLSL.match(/float heprPixelCoverageExpansionScale\([\s\S]*?\n}/)[0]).heprPixelCoverageExpansionScale,
+  evaluateWgsl(FILL_COVERAGE_VERTEX_WGSL.match(/fn heprPixelCoverageExpansionScale\([\s\S]*?\n}/)[0]).heprPixelCoverageExpansionScale
+];
 const vector = ([x, y, z, w]) => ({ x, y, z, w });
 const viewport = { x: 1600, y: 900 };
 const project = (m, x, y, w = 1) => [m[0] * x + m[4] * y + m[12] * w,
@@ -28,7 +32,8 @@ function inverseMargin(m, world, basis) {
   const [a, b, c, d] = [j[0] * basis[0] + j[2] * basis[1], j[1] * basis[0] + j[3] * basis[1],
     j[0] * basis[2] + j[2] * basis[3], j[1] * basis[2] + j[3] * basis[3]];
   const determinant = Math.abs(a * d - b * c);
-  return determinant > 1e-30 ? [Math.hypot(c, d) / determinant, Math.hypot(a, b) / determinant] : [0, 0];
+  return { pixel: [a, b, c, d],
+    margin: determinant > 1e-30 ? [Math.hypot(c, d) / determinant, Math.hypot(a, b) / determinant] : [0, 0] };
 }
 
 let crossingsWithoutFix = 0, excessivePaddingWithoutFix = 0, checked = 0;
@@ -48,12 +53,19 @@ for (const perspective of [true, false]) {
     for (const offset of [[-2000, -2000], [0, 0], [2000, 2000]]) for (const basis of bases) {
       for (const [x, y] of corners) {
         const world = [basis[0] * x + basis[2] * y + offset[0], basis[1] * x + basis[3] * y + offset[1]];
-        const clip = project(m, ...world), margin = inverseMargin(m, world, basis);
+        const clip = project(m, ...world), { margin, pixel } = inverseMargin(m, world, basis);
         const deltaX = project(m, basis[0] * margin[0], basis[1] * margin[0], 0);
         const deltaY = project(m, basis[2] * margin[1], basis[3] * margin[1], 0);
         const scales = variants.map(fn => fn(vector(clip), vector(deltaX), vector(deltaY), viewport));
         assert.equal(scales[0], scales[1], "GLSL and WGSL limit the same footprint");
-        const scale = scales[0];
+        // The hot glyph path reuses its Jacobian instead of projecting the padding
+        // again. It must preserve the same limiter for rotation, shear and grazing views.
+        const depth = { x: (m[3] * basis[0] + m[7] * basis[1]) / clip[3],
+          y: (m[3] * basis[2] + m[7] * basis[3]) / clip[3] };
+        const pixelScales = pixelVariants.map(fn => fn(vector(pixel), { x: margin[0], y: margin[1] }, depth));
+        assert.equal(pixelScales[0], pixelScales[1], "GLSL and WGSL reuse the same footprint");
+        const scale = pixelScales[0];
+        assert(Math.abs(scale - scales[0]) < 1e-7, "reusing the Jacobian preserves the projected safety bound");
         assert(Number.isFinite(scale) && scale >= 0 && scale <= 1);
         if (degrees === 0 && basis === bases[0]) assert.equal(scale, 1, "ordinary face-on glyph AA is unchanged");
         if (!perspective && degrees === 0 && basis === bases[4]) {
@@ -94,6 +106,13 @@ for (const limit of variants) {
   assert(behind.w + 1000 * scale < 0, "padding cannot bring a hidden point through the eye plane either");
 }
 
+for (const limit of pixelVariants) {
+  const pixel = vector([1, 0, 0, 1]), margin = { x: 1, y: 1 }, depth = { x: 0, y: 0 };
+  assert.equal(limit(pixel, margin, depth), 1, "ordinary glyphs keep their pixel margin");
+  assert.equal(limit(pixel, { x: Infinity, y: 1 }, depth), 0);
+  assert.equal(limit(pixel, margin, { x: NaN, y: 0 }), 0);
+}
+
 // Guard the shipping vertex paths and the clip-quad replacement against
 // accidentally retaining the inverse margin without applying its limiter.
 for (const [source, language] of [[FILL_COVERAGE_VERTEX_GLSL, "GLSL"], [FILL_COVERAGE_VERTEX_WGSL, "WGSL"]]) {
@@ -106,7 +125,13 @@ for (const source of [CLIPPED_PAINT_QUAD_GLSL, CLIPPED_PAINT_QUAD_WGSL]) {
 }
 for (const file of ["webGlFloorplanRenderer.ts", "nativeGradientWebGlShaders.ts", "threeWebGpuTextMaterial.ts", "threeWebGpuFillMaterial.ts"]) {
   const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
-  assert.equal((source.match(/heprBoundCoverageMargin\(/g) ?? []).length, file === "webGlFloorplanRenderer.ts" ? 2 : 1,
-    `${file}: each projected fill/glyph vertex applies the limiter`);
+  assert.equal((source.match(/heprBoundCoverageMargin\(/g) ?? []).length, file === "threeWebGpuTextMaterial.ts" ? 0 : 1,
+    `${file}: projected fills still apply the general limiter`);
+  if (file === "webGlFloorplanRenderer.ts" || file === "threeWebGpuTextMaterial.ts") {
+    assert.equal((source.match(/heprBoundCoverageMarginFromPixel\(/g) ?? []).length, 1,
+      `${file}: glyphs reuse the pixel Jacobian instead of reprojecting padding`);
+    assert.match(source, /heprCoverageMargin\(glyphToPixel\)/);
+    assert.match(source, /heprBoundCoverageMarginFromPixel\(cornerWorld, (?:rawMargin|margin), glyphToWorld, glyphToPixel/);
+  }
 }
-console.log(`Projected AA margins: ${checked} perspective/orthographic cases; old eye-plane crossings reproduced, GLSL/WGSL padding bounded, normal AA preserved.`);
+console.log(`Projected AA margins: ${checked} perspective/orthographic cases; old eye-plane crossings reproduced, cached glyph footprints match full projection, GLSL/WGSL padding bounded, normal AA preserved.`);

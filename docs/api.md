@@ -62,14 +62,15 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
+| `annotationAppearances` | `"render"` | Which annotation appearances become page content: `"render"` all, `"forms"` only form fields (Widgets), `"none"` none. Annotation metadata is extracted in every mode. See [hiding annotation appearances](#hiding-annotation-appearances). |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
 | `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
 | `onDiagnostic` | — | Receive PDF diagnostics, including raster fallback, visual approximation, and ICC warnings with zero-based `pageIndex`. |
 
 Page selections are deduplicated and composed in document order. Invalid selections
-reject with `RangeError`. HEP files preserve their saved page selection and layout;
-PDF parsing options do not reprocess a HEP scene. Search uses the text index and
+reject with `RangeError`. HEP files preserve their saved page selection, layout and
+annotation appearance mode; PDF parsing options do not reprocess a HEP scene. Search uses the text index and
 does not require `extractText: true`.
 
 See [loading option types](../src/pdfObjectGenerator.ts) and
@@ -203,7 +204,9 @@ The object supports normal Three.js transforms. `sceneData` contains its parsed
 | `setLayerVisibilities(changes)` | Atomically validate and apply an array of `{ id, visible }` changes. |
 | `setAllLayerVisibility(visible, layerIds?)` | Show/hide all editable layers, optionally restricted to IDs, respecting locks and radio groups. |
 | `getAllLayerVisibility(layerIds?)` | Read `{ checked, indeterminate, disabled }` for a bulk-toggle control from applied visibility. |
-| `resetLayerVisibility()` | Restore the PDF's original visibility defaults. |
+| `resetLayerVisibility()` | Restore the PDF's original visibility defaults. Annotation visibility is kept. |
+| `getAnnotationLayers()` | List annotations whose compiled appearance can be shown or hidden, as `{ annotationId, visible }`. |
+| `setAnnotationVisibility(annotationIds, visible)` | Show or hide compiled annotation appearances by `SceneAnnotation.id`; metadata and bubbles are unaffected. |
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
@@ -231,11 +234,13 @@ HEPR extracts metadata independently of bubble rendering. Native appearances
 remain page content; missing highlights, underlines, ink and note icons receive
 vector appearances. Unknown missing appearances use a diagnosed outline. Popup
 annotations carry relationships only, without a separate drawable or hotspot.
-Comment text never enters the page's searchable text index.
+Comment text never enters the page's searchable text index. Each compiled
+appearance can be hidden at runtime or left out at load time; see
+[hiding annotation appearances](#hiding-annotation-appearances).
 
 Records preserve source `/Annots` order, including hidden annotations. Their
-`id` is stable within the source document; `sourcePageIndex` and
-`annotationIndex` are zero-based source indexes. `pageIndex` is the composed
+`id` is stable for the source PDF (see [annotation identity](#annotation-identity));
+`sourcePageIndex` and `annotationIndex` are zero-based source indexes. `pageIndex` is the composed
 scene page slot, so selected or reordered pages keep their source identity.
 `bounds`, `quadPoints`, `line`, `vertices` and `inkList` use composed Y-up
 scene coordinates. `pdfGeometry` retains the original PDF coordinates before
@@ -361,14 +366,86 @@ internal target can fit its page if another annotation identifies that page's
 source index. Exact positions and targets on pages without annotations require
 reconversion to include `pdfPages`.
 
+### Annotation identity
+
+`SceneAnnotation.id` comes from the PDF, not from load order:
+`ref:<object>:<generation>` for an annotation stored as its own PDF object
+(nearly all of them), or `page:<sourcePageIndex>:annotation:<annotationIndex>`
+for one written inline in its page's `/Annots` array. The same PDF bytes give
+the same ids in every session, compile path and page selection. HEP files store
+them unchanged, so converting a PDF again keeps them. A page's `/Annots` array
+that repeats a reference uses that annotation once and reports
+`annotation.duplicate-reference`, so `(sourcePageIndex, id)` identifies one
+annotation in a scene. An annotation object listed by several pages keeps its
+id on each page.
+
+Ids are local to one document; store them with your own document identity.
+Incremental saves keep object numbers, and with them the ids. A tool that
+rewrites the whole file (optimizing, linearizing, merging or splitting) can
+renumber objects. For a key that survives such edits, prefer `name` (the PDF
+`/NM` entry, which most authoring tools fill with a unique value and keep), and
+fall back to `id`.
+
+### Hiding annotation appearances
+
+Hosts that draw their own markers over annotations can keep HEPR's compiled
+appearances out of the way, either at load time or at runtime. Annotation
+metadata, `pickSceneAnnotation` and the bubble overlay keep working in both cases.
+
+At load time, `annotationAppearances: "none"` compiles no appearance and
+`"forms"` keeps only form fields (Widgets, which often carry a drawing's title
+block). `buildHep()` takes the same option and `PDFtoHEP.js` takes
+`--annotation-appearances=render|forms|none`. The HEP records the mode, which
+loads as `sceneData.annotationAppearances` (absent means `"render"`). A HEP
+source ignores the loading option; convert the PDF again to change it.
+
+```ts
+const pdf = await pdfObjectGenerator(file, { annotationAppearances: "none" });
+```
+
+At runtime, every compiled appearance has its own annotation layer:
+
+```ts
+const ids = (pdf.sceneData.annotations ?? []).map(annotation => annotation.id);
+await pdf.setAnnotationVisibility(ids, false);
+pdf.getAnnotationLayers(); // [{ annotationId: "ref:12:0", visible: false }, ...]
+```
+
+`setAnnotationVisibility(ids, visible)` accepts any `SceneAnnotation.id` and
+ignores annotations without a compiled appearance, such as popups, most links
+and hidden annotations. Ids missing from the scene reject with a `RangeError`.
+The promise resolves once the change is applied, and `subscribeLayerVisibility`
+listeners are notified. A hidden appearance stops drawing, and `pick()`, search
+and text selection skip it. An appearance inside a PDF layer shows only while
+both are visible.
+
+Annotation layers are not PDF layers. `getLayers()`, `getLayerOrder()`, the bulk
+layer calls and `resetLayerVisibility()` leave them alone, and primitives report
+them as `annotationId` rather than in `optionalContent.layerIds`. In
+`sceneData.optionalContent` an annotation layer is a group with an `annotationId`,
+stored locked and outside the view intent so that readers without annotation
+layers cannot hide it through their layer controls.
+
+`getAnnotationLayers()` omits appearances that cannot be toggled: those on a
+page drawn as a single raster, those beyond the scene's layer limit (reported as
+`annotation.layer-limit`), and all appearances in HEP files converted before
+annotation layers existed. A toggle costs about as much as a PDF layer toggle,
+so use it for user actions rather than per-frame effects.
+
+NoZoom and NoRotate appearances, including most sticky-note icons, keep their
+page geometry and scale with the page instead of forcing the page into a
+raster; `annotation.view-transform-approximated` reports this.
+
 ### Drawing primitives
 
 `pick({ camera, element, clientX, clientY, tolerancePx?, kinds?, signal? })`
 accepts browser `clientX`/`clientY` values directly. Tolerance defaults to four CSS
 pixels and does not require device-pixel-ratio adjustment. The result contains
 `primitive`, the cursor `point` in composed scene coordinates, `closestPoint`,
-`distancePx`, and an optional `segmentIndex` or mesh `triangleIndex`. The last eligible painted primitive
-within tolerance wins. `kinds` filters eligible types, which is useful for a
+`distancePx`, and an optional `segmentIndex` or mesh `triangleIndex`. When the
+primitive paints a compiled annotation appearance, the hit and `getPrimitive(ref)`
+also carry its `annotationId` (a `SceneAnnotation.id`); page content has none. The
+last eligible painted primitive within tolerance wins. `kinds` filters eligible types, which is useful for a
 measurement tool interested only in strokes. This queries canonical geometry,
 not antialiased framebuffer pixels or simplified LOD geometry.
 
@@ -505,7 +582,8 @@ Both a pick hit and its inspected primitive include
 draw-run condition (or is `null`); `layerIds` also includes dependencies inherited
 through groups and masks. These are visibility dependencies, potentially negated
 or involving several layers, rather than an exclusive ownership label. Ungrouped
-content has an empty list. Resolve names through `getLayers()`.
+content has an empty list. Resolve names through `getLayers()`. Annotation layers
+are reported as `annotationId`, never in `layerIds`.
 
 Hidden paints cannot be picked. Hidden hover/selection traces are cleared while
 temporary colors remain available if the paint reappears. Visibility changes
@@ -701,7 +779,8 @@ native color model, including ICC Lab8. Caller-resolver errors, malformed profil
 headers, cancellation, and resource-limit failures still reject.
 
 The `PDFtoHEP.js` CLI accepts `--icc-engine=qcms|lcms|alternate|none` and prints
-fallback warnings. The former `iccFallback` API option and `--icc-fallback` CLI
+fallback warnings. It also accepts `--annotation-appearances=render|forms|none`
+(see [hiding annotation appearances](#hiding-annotation-appearances)). The former `iccFallback` API option and `--icc-fallback` CLI
 flag have been removed; use `iccEngine` alone. Retained page data uses version 8,
 which includes prepared ICC transforms and fallback decisions
 for gradients and compositing. Version 7 retained pages must be regenerated;
@@ -772,6 +851,12 @@ including crop, rotation and UserUnit, before scene placement. Newly compiled
 an empty array for pages without annotations. Optional malformed fields emit
 `annotation.metadata-invalid` diagnostics while preserving usable fields;
 cancellation and resource limits remain enforced.
+
+`compilePage()` and `compilePages()` accept `annotationAppearances` with the same
+meaning as the loading option. In `HeprPageData`, each compiled appearance is an
+`invoke-program` command carrying a marked-content node tagged `Annot`, whose
+`propertyName` is the annotation's `id`; its paint inherits that node, however
+deeply its programs nest.
 
 ```ts
 import { createNodeFilePdfSource, openPdfInNodeWorker } from "@soadzoor/hepr/node";

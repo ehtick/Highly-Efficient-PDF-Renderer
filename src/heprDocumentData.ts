@@ -140,6 +140,8 @@ export const PDF_DIAGNOSTIC_CODES = {
   AppearanceApproximated: "annotation.appearance-approximated",
   AnnotationMetadataInvalid: "annotation.metadata-invalid",
   AnnotationViewTransformApproximated: "annotation.view-transform-approximated",
+  AnnotationDuplicateReference: "annotation.duplicate-reference",
+  AnnotationLayerLimit: "annotation.layer-limit",
   AppearanceStateInferred: "annotation.appearance-state-inferred",
   OptionalContentHidden: "optional-content.hidden",
   ColorProfileFallback: "color.profile-fallback",
@@ -157,6 +159,11 @@ export interface PdfCompileOptions {
   signal?: AbortSignal;
   limits?: Partial<PdfResourceLimits>;
   optimization?: "none" | "safe";
+  /**
+   * Which annotation appearances are compiled into page content. Annotation
+   * metadata is unaffected. Defaults to `"render"`.
+   */
+  annotationAppearances?: import("./annotationData").AnnotationAppearanceMode;
   onProgress?: PdfProgressCallback;
 }
 
@@ -548,6 +555,12 @@ export interface HeprOptionalContentStore {
   /** Default-view visibility; interactive compilation also retains initially hidden commands. */
   defaultVisible: Uint8Array;
 }
+
+/**
+ * Marked-content tag HEPR gives each annotation appearance invocation. Its
+ * node's `propertyName` is the invoked annotation's `PdfAnnotation.id`.
+ */
+export const HEPR_ANNOTATION_MARKED_CONTENT_TAG = "Annot";
 
 export interface HeprMarkedContentStore {
   tags: readonly string[];

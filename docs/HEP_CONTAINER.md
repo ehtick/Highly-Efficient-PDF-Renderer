@@ -128,6 +128,11 @@ Scene v9 optionally references `annotations/annotations.json` through
 { "file": "annotations/annotations.json", "version": 1, "count": 0 }
 ```
 
+An optional `"appearances": "forms"` or `"appearances": "none"` records that
+the file was converted with only form-field appearances, or no annotation
+appearances, compiled into page content. It is absent when every appearance was
+compiled. Readers that predate it ignore it.
+
 The UTF-8 JSON section contains `{ "version": 1, "annotations": [], "pdfPages": [] }` with
 `SceneAnnotation` records as described in [the API reference](api.md#pdf-annotations-and-html-bubbles).
 The optional `pdfPages` array holds `{pageIndex, sourcePageIndex, pdfToScene}`
@@ -276,6 +281,16 @@ stores and retains its primitive indices when layers are toggled.
 `{kind:"label",label,children}`. `radioGroups` lists arrays of mutually exclusive
 group IDs. Runtime visibility belongs to a view and is never written over these
 original definitions or exported defaults.
+
+A group with a nonempty string `annotationId` is an annotation layer rather than
+a PDF layer: it shows or hides the compiled appearance of the annotation with
+that `SceneAnnotation.id`, and its `id` is `annotation:<annotationId>`. The
+annotation's draw runs use its group condition, or an `and` of that condition
+and the PDF layer condition the appearance already had. Annotation layers are
+`defaultVisible`, `locked` and not `usedInView`, and appear in neither `order`
+nor `radioGroups`. Readers without annotation layers therefore treat them as
+fixed, visible layers and cannot hide them through layer controls. A scene
+without PDF layers can carry this object for annotation layers alone.
 
 When searchable characters need visibility associations, `manifest.textIndex`
 adds `optionalContentFile`, naming `text/optional-content.varint`. Its unsigned

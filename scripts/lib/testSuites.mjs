@@ -19,6 +19,7 @@ export const fastTests = [
   "annotation-appearances",
   "annotation-overlay",
   "annotation-links",
+  "annotation-layers",
   "hep-scene-sections",
   "optional-content",
   "retained-page-replay",

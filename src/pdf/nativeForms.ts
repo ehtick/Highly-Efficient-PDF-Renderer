@@ -403,9 +403,21 @@ export class NativePdfFormAppearanceRegistry {
       });
     }
     const annotations: NativePdfAnnotationAppearance[] = [];
+    const references = new Set<string>();
+    let duplicateCount = 0;
     for (let annotationIndex = 0; annotationIndex < resolved.length; annotationIndex += 1) {
       throwIfAborted(signal);
       const rawValue = resolved[annotationIndex];
+      // A repeated reference is one annotation object: painting it twice would
+      // double translucent markups, and two records would share one id.
+      if (isPdfRef(rawValue)) {
+        const key = pdfRefKey(rawValue);
+        if (references.has(key)) {
+          duplicateCount += 1;
+          continue;
+        }
+        references.add(key);
+      }
       const dictionary = await this.document.resolveDictionary(rawValue, signal);
       const type = await this.document.resolveValue(dictionary.get("Type"), signal);
       if (type !== undefined && type !== null && !isPdfName(type, "Annot")) {
@@ -470,6 +482,15 @@ export class NativePdfFormAppearanceRegistry {
         pageResources
       });
       annotations.push(annotation);
+    }
+    if (duplicateCount !== 0) {
+      this.emitDiagnostic({
+        code: "annotation.duplicate-reference",
+        severity: "warning",
+        pageIndex,
+        message: `The page /Annots array repeats ${duplicateCount} annotation reference(s); each annotation is used once.`,
+        details: { duplicateCount }
+      });
     }
     const result = Object.freeze(annotations);
     cache.set(pageIndex, result);

@@ -167,7 +167,7 @@ import {
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
 
-import { placeSceneAnnotation, type PdfAnnotation } from "./annotationData";
+import { placeSceneAnnotation, validateAnnotationAppearanceMode, type PdfAnnotation } from "./annotationData";
 import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
 
 export const computePageGeometry = computeNativePdfPageGeometry;
@@ -476,7 +476,9 @@ class NativePdfSession implements NativeVectorPdfSession {
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
-      return structuredClone(await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal));
+      const annotations = structuredClone(await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal));
+      this.appendDiagnostics(this.formRegistry.getDiagnostics());
+      return annotations;
     } catch (error) { throw normalizeAbortError(error, signal); }
     finally { release?.(); }
   }
@@ -485,6 +487,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: PdfCompileOptions = {}
   ): Promise<HeprPageData> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const operation = new AbortController();
     const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
     let release: (() => void) | null = null;
@@ -503,6 +506,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: NativeVectorCompileOptions = {}
   ): Promise<VectorScene> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const operation = new AbortController();
     const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
     let release: (() => void) | null = null;
@@ -564,6 +568,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       readonly boundCompositeWork?: boolean;
     } = {}
   ): Promise<NativeVectorCompileProfile> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const operation = new AbortController();
     const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
     const timings = createNativeVectorCompileTimings();
@@ -589,6 +594,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   }
 
   compilePages(options: PdfCompilePagesOptions = {}): AsyncIterable<HeprPageData> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const indexes = normalizePageIndexes(
       options.sourcePageIndexes,
       this.info.pageCount
@@ -909,11 +915,18 @@ class NativePdfSession implements NativeVectorPdfSession {
     }
     scene.pdfPages = [{ sourcePageIndex, pageIndex: 0,
       pdfToScene: computePageGeometry(this.document.getPage(sourcePageIndex)).pageMatrix }];
+    // Annotation layers alone can give a page optional content; a membership
+    // index is only valid when the page also retained its PDF layers.
+    const pdfLayers = scene.optionalContent !== undefined && options.retainOptionalContent !== false &&
+      this.optionalContent.groupCount > 0;
     scene.annotations = annotations.map(annotation => {
       const result = placeSceneAnnotation(annotation, 0);
-      if (!scene.optionalContent) delete result.optionalContent;
+      if (!pdfLayers) delete result.optionalContent;
       return result;
     });
+    if (options.annotationAppearances && options.annotationAppearances !== "render") {
+      scene.annotationAppearances = options.annotationAppearances;
+    }
     return scene;
   }
 
@@ -991,7 +1004,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       const vectorRoot = appendNativeVectorAnnotationPaints(
         compiled, formGraph, imageResources.colorSpaceResolver, pageBounds, sourcePageIndex,
         options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage, signal,
-        options.retainOptionalContent !== false ? this.optionalContent : undefined
+        options.retainOptionalContent !== false ? this.optionalContent : undefined,
+        diagnostic => this.appendDiagnostics([diagnostic])
       );
       let vectorCompiled = vectorRoot;
       let selectiveCompositeFormPaintIndices: readonly number[] = [];
@@ -1391,6 +1405,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             optionalContent: this.optionalContent,
             retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
             appearanceSynthesizer: this.appearanceSynthesizer,
+            annotationAppearances: options.annotationAppearances,
             signal
           }
         );
@@ -1497,6 +1512,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       optionalContent: this.optionalContent,
       retainOptionalContent,
       appearanceSynthesizer: this.appearanceSynthesizer,
+      annotationAppearances: options.annotationAppearances,
       signal
     });
     let inlineImageCount = 0;
@@ -2997,8 +3013,11 @@ async function flattenNativeVectorFormOccurrences(
   const sourceClips: (DensePdfTextClip | null)[] = [];
   const sourceBlendModes: number[] = [];
   const sourceOptionalContentIndices: number[] = [];
-  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null, blendMode = 0, condition = -1): void => {
+  const sourceAnnotationIndices: number[] = [];
+  const appendSourceEvent = (kind: number, index: number, clip: DensePdfTextClip | null = null, blendMode = 0, condition = -1,
+    annotation = -1): void => {
     sourceEvents.push(kind, index); sourceClips.push(clip); sourceBlendModes.push(blendMode); sourceOptionalContentIndices.push(condition);
+    sourceAnnotationIndices.push(annotation);
   };
   const glyphRunMeta: number[] = [];
   const glyphFillColors: number[] = [];
@@ -3049,7 +3068,9 @@ async function flattenNativeVectorFormOccurrences(
   const walkOccurrence = async (
     occurrence: NativeVectorCompiledOccurrence,
     inheritedFormPaintOrder: number | null = null,
-    inheritedOptionalContent = -1
+    inheritedOptionalContent = -1,
+    // An annotation appearance owns everything its Form paints, however nested.
+    inheritedAnnotation = -1
   ): Promise<boolean> => {
     signal.throwIfAborted();
     registerOccurrence(occurrence);
@@ -3079,6 +3100,7 @@ async function flattenNativeVectorFormOccurrences(
       const vectorClip = sidecar.sourceClips?.[offset / 2] ?? null;
       const blendMode = sidecar.sourceBlendModes?.[offset / 2] ?? 0;
       const condition = optionalContent.combineMemberships(inheritedOptionalContent, sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1);
+      const annotation = inheritedAnnotation >= 0 ? inheritedAnnotation : sidecar.sourceAnnotationIndices?.[offset / 2] ?? -1;
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
@@ -3118,7 +3140,7 @@ async function flattenNativeVectorFormOccurrences(
         glyphRunClips.push(sidecar.glyphRunClips?.[localIndex] ?? null);
         appendSourceEvent(
           DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
-          glyphRunMeta.length / 3 - 1, vectorClip, blendMode, condition
+          glyphRunMeta.length / 3 - 1, vectorClip, blendMode, condition, annotation
         );
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         if (localIndex >= seenImages.length || seenImages[localIndex] !== 0) {
@@ -3163,7 +3185,7 @@ async function flattenNativeVectorFormOccurrences(
         );
         imageFlags.push(sidecar.imageFlags[localIndex]);
         imageOpacities.push(sidecar.imageOpacities?.[localIndex] ?? 1);
-        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip, blendMode, condition);
+        appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, globalIndex, vectorClip, blendMode, condition, annotation);
         if (occurrence.formDefinitionIndex === -1) rootPackedFormSinceImage = false;
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FORM) {
         if (localIndex >= seenForms.length || seenForms[localIndex] !== 0) {
@@ -3204,13 +3226,13 @@ async function flattenNativeVectorFormOccurrences(
               selectivePaintReasons.add(rejectedRootForms.get(localIndex) ?? "composited-form");
               selectiveCompositeFormPaintIndices.push(localIndex);
               selectiveCompositeFormPaintOrders.push(formPaintOrder);
-              appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder, null, 0, condition);
+              appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder, null, 0, condition, annotation);
             }
             const child = ordered ? children.get(occurrence)![localIndex]
               : await compileOccurrence(paint.definitionIndex, paint);
             if (child) {
               childClipBounds = child.clipBounds;
-              childHasPackedGeometry = await walkOccurrence(child, formPaintOrder, condition);
+              childHasPackedGeometry = await walkOccurrence(child, formPaintOrder, condition, annotation);
             }
           } catch (error) {
             if (occurrence.formDefinitionIndex !== -1 ||
@@ -3270,18 +3292,18 @@ async function flattenNativeVectorFormOccurrences(
           throw invalidVectorFormEvent(pageIndex, "shading", localIndex);
         }
         seenShadings[localIndex] = 1;
-        appendSourceEvent(kind, shadingPaints.length, vectorClip, blendMode, condition);
+        appendSourceEvent(kind, shadingPaints.length, vectorClip, blendMode, condition, annotation);
         const paint = sidecar.shadingPaints![localIndex];
         shadingPaints.push({ ...paint, paintOrder: inheritedFormPaintOrder ?? paint.paintOrder });
       } else if (ordered && kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
-        appendSourceEvent(kind, localIndex);
+        appendSourceEvent(kind, localIndex, null, 0, -1, annotation);
       } else if (ordered && (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ||
           kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE)) {
         const ranges = sidecar.pathPaintRanges;
         if (!ranges || localIndex * 2 + 1 >= ranges.length || !ownerRecordedGeometry) {
           throw invalidVectorFormEvent(pageIndex, "path", localIndex);
         }
-        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip, blendMode, condition);
+        appendSourceEvent(kind, pathPaintRanges.length / 2, vectorClip, blendMode, condition, annotation);
         pathPaintRanges.push(ranges[localIndex * 2] +
           (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? fillBase : strokeBase), ranges[localIndex * 2 + 1]);
       } else {
@@ -3318,9 +3340,11 @@ async function flattenNativeVectorFormOccurrences(
   if (ordered) await preflight(rootOccurrence);
   await walkOccurrence(rootOccurrence);
   const accumulatedText = textAccumulator.build().compilation;
+  const annotationIds = rootCompiled.vectorSceneData?.annotationIds;
   const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
     ...(optionalContent.groupCount > 0 ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
+    ...(annotationIds?.length ? { sourceAnnotationIndices: Int32Array.from(sourceAnnotationIndices), annotationIds } : {}),
     sourceBlendModes: Uint8Array.from(sourceBlendModes),
     ...(ordered ? { pathPaintRanges: Uint32Array.from(pathPaintRanges), sourceClips } : {}),
     glyphRunMeta: Uint32Array.from(glyphRunMeta),
@@ -3503,12 +3527,19 @@ function suppressVectorSelectiveImageSpans(
   }
   const sourceEvents: number[] = [];
   const sourceBlendModes: number[] = [];
+  // Every per-event array keeps its alignment with the surviving events.
+  const sourceOptionalContentIndices: number[] = [];
+  const sourceAnnotationIndices: number[] = [];
+  const sourceClips: (DensePdfTextClip | null)[] = [];
   for (let offset = 0; offset < sidecar.sourceEvents.length; offset += 2) {
     const kind = sidecar.sourceEvents[offset];
     const index = sidecar.sourceEvents[offset + 1];
     if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE && imageSuppressed[index]) continue;
     sourceEvents.push(kind, kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE ? imageMap[index] : index);
     sourceBlendModes.push(sidecar.sourceBlendModes?.[offset / 2] ?? 0);
+    sourceOptionalContentIndices.push(sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1);
+    sourceAnnotationIndices.push(sidecar.sourceAnnotationIndices?.[offset / 2] ?? -1);
+    sourceClips.push(sidecar.sourceClips?.[offset / 2] ?? null);
   }
   const reducedFillBounds = aggregateFloat4Bounds(fillMetaA, fillMetaB, 2, 3, 0, 1);
   const reducedStrokeBounds = aggregateFloat4Bounds(
@@ -3543,6 +3574,9 @@ function suppressVectorSelectiveImageSpans(
         ...sidecar,
         sourceEvents: Uint32Array.from(sourceEvents),
         sourceBlendModes: Uint8Array.from(sourceBlendModes),
+        ...(sidecar.sourceOptionalContentIndices ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
+        ...(sidecar.sourceAnnotationIndices ? { sourceAnnotationIndices: Int32Array.from(sourceAnnotationIndices) } : {}),
+        ...(sidecar.sourceClips ? { sourceClips } : {}),
         imageIndices: Uint32Array.from(imageIndices),
         imageTransforms: Float32Array.from(imageTransforms),
         imageClipBounds: Float32Array.from(imageClipBounds),
@@ -5132,6 +5166,7 @@ async function compileNativeFormPrograms(
       programIndex: await specialize(placement.definitionIndex, defaultState),
       transform: placement.invocationMatrix,
       clipBounds: placement.pageBounds,
+      annotationId: placement.annotation.id,
       optionalContentIndex: (options as NativeVectorCompileOptions).retainOptionalContent === true
         ? optionalContent.combineMemberships(placement.appearance.optionalContentIndex, definition.optionalContentIndex)
         : placement.appearance.optionalContentIndex >= 0 ? placement.appearance.optionalContentIndex : definition.optionalContentIndex,
@@ -7616,13 +7651,18 @@ function appendNativeVectorAnnotationPaints(
   pageIndex: number,
   maxCommands: number,
   signal: AbortSignal,
-  optionalContent?: NativeOptionalContentRegistry
+  optionalContent?: NativeOptionalContentRegistry,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void
 ): DensePdfCompiledPage {
   if (graph.annotationPlacements.length === 0) return compiled;
   const sidecar = compiled.vectorSceneData!;
   const formPaints = [...compiled.formPaints];
   const sourceEvents = Array.from(sidecar.sourceEvents);
   const sourceOptionalContentIndices = Array.from(sidecar.sourceOptionalContentIndices ?? new Int32Array(sidecar.sourceEvents.length / 2).fill(-1));
+  // Each appearance remains addressable, so the scene can give it its own
+  // visibility condition after its Form is flattened.
+  const sourceAnnotationIndices = Array.from(sidecar.sourceAnnotationIndices ?? new Int32Array(sidecar.sourceEvents.length / 2).fill(-1));
+  const annotationIds = [...(sidecar.annotationIds ?? [])];
   const sourceBlendModes = Array.from(sidecar.sourceBlendModes ?? new Uint8Array(sidecar.sourceEvents.length / 2));
   const sourceClips = sidecar.sourceClips ? [...sidecar.sourceClips] : undefined;
   const formPaintOrders = Array.from(sidecar.formPaintOrders ?? []);
@@ -7637,16 +7677,17 @@ function appendNativeVectorAnnotationPaints(
     for (const order of orders ?? []) nextPaintOrder = Math.max(nextPaintOrder, order + 1);
   }
   let annotationCount = 0;
+  let viewTransformCount = 0;
   for (const placement of graph.annotationPlacements) {
     signal.throwIfAborted();
     const definition = graph.definitions[placement.definitionIndex];
     if (!definition || (!optionalContent && !definition.defaultVisible)) continue;
+    // A static scene has no viewer zoom or rotation to counter-transform.
+    // Keep the page geometry, as raster capture does, instead of rasterizing
+    // the whole page for one icon.
     if ((placement.annotation.flags &
         (NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoZoom | NATIVE_PDF_ANNOTATION_VIEW_FLAGS.NoRotate)) !== 0) {
-      throw vectorFormUnsupported(
-        "An annotation appearance requires a view-dependent transform.",
-        pageIndex, "vector-annotation-view-transform", placement.resourceName
-      );
+      viewTransformCount += 1;
     }
     annotationCount += 1;
     if (compiled.operatorCount + annotationCount > maxCommands || nextPaintOrder > 0xffff_ffff) {
@@ -7655,6 +7696,8 @@ function appendNativeVectorAnnotationPaints(
     sourceEvents.push(DENSE_PDF_VECTOR_SCENE_EVENT_FORM, formPaints.length);
     sourceBlendModes.push(0);
     sourceOptionalContentIndices.push(optionalContent?.combineMemberships(placement.appearance.optionalContentIndex, definition.optionalContentIndex) ?? -1);
+    sourceAnnotationIndices.push(annotationIds.length);
+    annotationIds.push(placement.annotation.id);
     sourceClips?.push(null);
     formPaintOrders.push(nextPaintOrder++);
     formPaints.push(Object.freeze({
@@ -7668,6 +7711,11 @@ function appendNativeVectorAnnotationPaints(
     }));
   }
   if (annotationCount === 0) return compiled;
+  if (viewTransformCount !== 0) onDiagnostic?.({
+    code: "annotation.view-transform-approximated", severity: "warning", pageIndex,
+    message: "NoZoom/NoRotate annotation appearances use page geometry and scale with the page.",
+    details: { annotationCount: viewTransformCount }
+  });
   return {
     ...compiled,
     operatorCount: compiled.operatorCount + annotationCount,
@@ -7676,6 +7724,8 @@ function appendNativeVectorAnnotationPaints(
       ...sidecar,
       sourceEvents: Uint32Array.from(sourceEvents),
       ...(optionalContent?.groupCount ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
+      sourceAnnotationIndices: Int32Array.from(sourceAnnotationIndices),
+      annotationIds: Object.freeze(annotationIds),
       sourceBlendModes: Uint8Array.from(sourceBlendModes),
       ...(sourceClips ? { sourceClips } : {}),
       formPaintOrders: Uint32Array.from(formPaintOrders)

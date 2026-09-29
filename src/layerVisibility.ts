@@ -39,6 +39,10 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
       return controller?.getAllLayerVisibility(layerIds) ?? { checked: false, indeterminate: false, disabled: true };
     },
     resetLayerVisibility: () => controller?.resetLayerVisibility() ?? Promise.resolve(),
+    getAnnotationLayers: () => controller?.getAnnotationLayers() ?? [],
+    setAnnotationVisibility(annotationIds: readonly string[], visible: boolean): Promise<void> {
+      return controller?.setAnnotationVisibility(annotationIds, visible) ?? Promise.reject(new Error("No PDF is loaded."));
+    },
     subscribeLayerVisibility(listener: OptionalContentListener): () => void {
       listeners.add(listener);
       return () => { listeners.delete(listener); };

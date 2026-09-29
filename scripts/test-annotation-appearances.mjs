@@ -39,11 +39,15 @@ try {
     const page = await flagged.compilePage(0);
     const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
     assert(commands.some(command => command.kind === "invoke-program" && command.viewTransformFlags !== 0));
-    const scene = await flagged.compileVectorPage(0);
+    // A static scene has no viewer transform to counter: the appearances keep
+    // page geometry as vectors, with a diagnostic, instead of rasterizing the page.
+    const scene = await flagged.compileVectorPage(0, { vectorFallback: "error" });
     assert.equal(scene.annotations.length, 7);
     assert.equal(scene.annotations[3].flags, 24);
-    assert(scene.rasterLayers.length > 0);
+    assert.equal(scene.rasterLayers.length, 0);
+    assert(scene.segmentCount > 0 && scene.fillPathCount > 0);
     assert(flagged.getDiagnostics().some(d => d.code === "annotation.view-transform-approximated"));
+    assert(!flagged.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
     const replay = await renderNativeRetainedCommandSpan(page, 0, commands.length, new AbortController().signal);
     assert(replay.data.some(value => value !== 0));
     assert(commands.some(command => command.kind === "invoke-program" && command.viewTransformFlags !== 0), "raster approximation leaves original flags intact");

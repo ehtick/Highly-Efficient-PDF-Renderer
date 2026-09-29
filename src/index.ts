@@ -230,7 +230,8 @@ export { buildHep } from "./hepBuilder";
 export { createAnnotationOverlay, pickSceneAnnotation } from "./annotationOverlay";
 export type { AnnotationOverlay, AnnotationOverlayOptions, AnnotationOverlayAdapter, AnnotationPoint } from "./annotationOverlay";
 export type { PdfAnnotation, SceneAnnotation, ScenePdfPage, AnnotationGeometry, AnnotationAction,
-  AnnotationDestination, AnnotationField, AnnotationBorder } from "./annotationData";
+  AnnotationDestination, AnnotationField, AnnotationBorder, AnnotationAppearanceMode } from "./annotationData";
+export { annotationLayerId } from "./annotationLayers";
 
 export type {
   PdfIccOptions,
@@ -274,7 +275,7 @@ export type {
 export type { GradientMeshTriangle } from "./gradientMesh";
 export { OptionalContentController } from "./optionalContent";
 export type { OptionalContentLayer, OptionalContentSnapshot, OptionalContentListener, LayerVisibilityChange,
-  LayerVisibilitySummary, OptionalContentControllerOptions, OptionalContentUpdateOptions } from "./optionalContent";
+  LayerVisibilitySummary, OptionalContentControllerOptions, OptionalContentUpdateOptions, AnnotationLayerVisibility } from "./optionalContent";
 export type { SceneOptionalContent, OptionalContentGroup, OptionalContentCondition, OptionalContentOrderNode } from "./optionalContentData";
 export type { ScenePaintGraph, ScenePaintNode, ScenePaintDraw, ScenePaintGroup, ScenePaintMask, ScenePaintRetained } from "./scenePaintGraph";
 export type { SceneRetainedPage } from "./retainedPageData";

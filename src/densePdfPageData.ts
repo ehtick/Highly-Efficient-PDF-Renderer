@@ -16,6 +16,7 @@ import {
   type DensePdfMatrix
 } from "./pdf/nativeContentCompiler";
 import {
+  HEPR_ANNOTATION_MARKED_CONTENT_TAG,
   HEPR_COLOR_SPACE_KIND,
   HEPR_DOCUMENT_DATA_VERSION,
   HEPR_GLYPH_FLAG,
@@ -137,6 +138,8 @@ export interface DensePdfAnnotationProgramInvocation {
   readonly optionalContentIndex: number;
   /** HEPR view-transform bits retained for backend viewport compensation. */
   readonly viewTransformFlags: number;
+  /** `PdfAnnotation.id`, recorded as an `Annot` marked-content node on the invocation. */
+  readonly annotationId?: string;
 }
 
 export interface DensePdfFormPageData {
@@ -365,6 +368,23 @@ export function createHeprPageDataFromDense(
   stores.paths.fillPathMetaC = combineDenseGeometry(geometrySources, "fillPathMetaC");
   stores.paths.fillSegmentsA = combineDenseGeometry(geometrySources, "fillSegmentsA");
   stores.paths.fillSegmentsB = combineDenseGeometry(geometrySources, "fillSegmentsB");
+  // Each annotation appearance is marked with its annotation id, so its paint
+  // stays attributable after the invocation is expanded or replayed.
+  const annotationMarkedContent: number[] = [];
+  for (const annotation of options.forms?.annotations ?? []) {
+    if (annotation.annotationId === undefined) {
+      annotationMarkedContent.push(-1);
+      continue;
+    }
+    if (typeof annotation.annotationId !== "string" || annotation.annotationId.length === 0) {
+      throw new TypeError("An annotation appearance has an invalid annotation id.");
+    }
+    annotationMarkedContent.push(markedTags.length);
+    markedTags.push(HEPR_ANNOTATION_MARKED_CONTENT_TAG);
+    markedPropertyNames.push(annotation.annotationId);
+    markedMcids.push(-1);
+    markedParentIndices.push(-1);
+  }
   stores.markedContent = {
     tags: Object.freeze(markedTags),
     propertyNames: Object.freeze(markedPropertyNames),
@@ -2247,7 +2267,7 @@ export function createHeprPageDataFromDense(
       resourceName: program.resourceName
     });
   }
-  for (const annotation of options.forms?.annotations ?? []) {
+  for (const [annotationIndex, annotation] of (options.forms?.annotations ?? []).entries()) {
     if (
       !Number.isSafeInteger(annotation.programIndex) || annotation.programIndex < 0 ||
       annotation.programIndex >= reusablePrograms.length
@@ -2278,7 +2298,7 @@ export function createHeprPageDataFromDense(
       transformIndex: appendTransform(annotation.transform),
       clipIndex: appendRectClip(annotation.clipBounds),
       optionalContentIndex: annotation.optionalContentIndex,
-      markedContentIndex: -1,
+      markedContentIndex: annotationMarkedContent[annotationIndex],
       sourceOffset: -1,
       sourceLength: -1,
       programIndex: annotation.programIndex,

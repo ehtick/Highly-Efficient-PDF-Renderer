@@ -11,6 +11,8 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
+  const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
+  const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const options = { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "annotation-vectors" }) };
   for (const [rotation, expectedBounds] of [
     [0, [10, 10, 30, 20]], [90, [10, 50, 20, 70]],
@@ -36,8 +38,15 @@ try {
         "annotation appearances paint after page content in Annots order");
       assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
       // The hidden-layer annotation's appearance is missing. Toggleable layers
-      // would need it, so the page keeps its default view without them.
-      assert.equal(scene.optionalContent, undefined);
+      // would need it, so the page keeps its default view without PDF layers.
+      // Each drawn appearance still has its own annotation layer.
+      assert.deepEqual(scene.optionalContent.groups.map(group => group.annotationId), ["ref:5:0", "ref:6:0"]);
+      assert(scene.optionalContent.groups.every(group => group.locked && !group.usedInView));
+      assert.deepEqual(scene.optionalContent.order, [], "annotation layers stay out of the layer order");
+      assert.deepEqual(scene.drawRuns.map(run => run.optionalContent), [undefined, undefined, undefined, 0, 0, 1, 1],
+        "page content is unconditioned; each appearance's fill and text use its own layer");
+      assert(scene.annotations.every(annotation => annotation.optionalContent === undefined),
+        "annotation layers are not PDF layer memberships");
       assert(session.getDiagnostics().some(d => d.code === "optional-content.default-view-fallback"));
       await assert.rejects(session.compileVectorPage(0, { limits: { maxCommandsPerPage: 2 } }),
         error => error.code === "resource-limit");
@@ -85,15 +94,55 @@ try {
     assert(!outlinedAnnotation.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
   } finally { await outlinedAnnotation.close(); }
 
-  for (const flags of [8, 16]) {
+  // A static scene has no viewer transform to counter, so NoZoom/NoRotate
+  // appearances keep page geometry, as rasters do, and say so.
+  for (const flags of [8, 16, 28]) {
     const session = await openPdf({ kind: "bytes", bytes: fixture({ flags }) }, options);
     try {
-      await assert.rejects(session.compileVectorPage(0, { vectorFallback: "error" }),
-        error => error.details?.reason === "vector-annotation-view-transform",
-        "view-dependent annotations must not silently become ordinary page geometry");
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error" });
+      assert.equal(scene.fillPathCount, 3, "the page and both annotations remain vectors");
+      assert.equal(scene.rasterLayers.length, 1, "only the original image stays raster");
+      const approximated = session.getDiagnostics().filter(d => d.code === "annotation.view-transform-approximated");
+      assert.equal(approximated.length, 1);
+      assert.equal(approximated[0].details.annotationCount, 1);
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
     } finally { await session.close(); }
   }
-  console.log("vector annotation placement, visibility, ordering, text and selective compositing passed");
+
+  for (const [annotationAppearances, fills, layers] of [["none", 1, []], ["forms", 1, []], ["render", 3, ["ref:5:0", "ref:6:0"]]]) {
+    const session = await openPdf({ kind: "bytes", bytes: fixture() }, options);
+    try {
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error", annotationAppearances });
+      assert.equal(scene.fillPathCount, fills, `${annotationAppearances}: only the page Form paints without appearances`);
+      const groups = scene.optionalContent?.groups ?? [];
+      assert.deepEqual(groups.filter(group => group.annotationId).map(group => group.annotationId), layers);
+      // Leaving out the hidden-layer annotation's missing appearance also
+      // leaves the PDF layer toggleable instead of falling back to the default view.
+      assert.deepEqual(groups.filter(group => !group.annotationId).map(group => group.name),
+        annotationAppearances === "render" ? [] : ["Hidden annotations"]);
+      assert.equal(scene.annotations.length, 5, "metadata is extracted in every mode");
+      assert.equal(scene.annotationAppearances, annotationAppearances === "render" ? undefined : annotationAppearances);
+      const page = await session.compilePage(0, { annotationAppearances });
+      const tagged = page.stores.markedContent.tags.flatMap((tag, index) => tag === "Annot" ? [page.stores.markedContent.propertyNames[index]] : []);
+      assert.deepEqual(tagged, layers, "display-program appearance invocations carry their annotation id");
+      if (annotationAppearances !== "render") continue;
+      assert.equal(getScenePrimitive(scene, { kind: "fill", index: 0 }).annotationId, undefined, "page content has no annotation");
+      assert.equal(getScenePrimitive(scene, { kind: "fill", index: 1 }).annotationId, "ref:5:0");
+      assert.equal(getScenePrimitive(scene, { kind: "fill", index: 2 }).annotationId, "ref:6:0");
+      // The retained lowering attributes the same appearances through their marked content.
+      const retained = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      assert.deepEqual(retained.optionalContent.groups.map(group => group.annotationId), layers);
+      const owners = retained.drawRuns.flatMap(run => run.optionalContent === undefined ? []
+        : [retained.optionalContent.conditions[run.optionalContent].groupId]);
+      assert.deepEqual([...new Set(owners)], ["annotation:ref:5:0", "annotation:ref:6:0"]);
+    } finally { await session.close(); }
+  }
+  const invalid = await openPdf({ kind: "bytes", bytes: fixture() }, options);
+  try {
+    await assert.rejects(invalid.compileVectorPage(0, { annotationAppearances: "hidden" }), RangeError);
+    assert.throws(() => invalid.compilePages({ annotationAppearances: "hidden" }), RangeError);
+  } finally { await invalid.close(); }
+  console.log("vector annotation placement, visibility, ordering, text, view flags, appearance modes, layers and selective compositing passed");
 } finally { hooks.deregister(); }
 
 function fillBounds(scene, index) {

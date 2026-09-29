@@ -1,6 +1,8 @@
 import type { VectorScene } from "./pdfVectorExtractor";
-import type { OptionalContentGroup, OptionalContentOrderNode, SceneOptionalContent } from "./optionalContentData";
+import { MAX_OPTIONAL_CONTENT_CONDITIONS, MAX_OPTIONAL_CONTENT_GROUPS, type OptionalContentGroup, type OptionalContentOrderNode,
+  type SceneOptionalContent } from "./optionalContentData";
 import { waitForLoad } from "./loadCancellation";
+import { isAnnotationLayer } from "./annotationLayers";
 
 export interface LayerVisibilityChange { readonly id: string; readonly visible: boolean }
 export interface LayerVisibilitySummary {
@@ -9,6 +11,8 @@ export interface LayerVisibilitySummary {
   readonly disabled: boolean;
 }
 export interface OptionalContentLayer extends OptionalContentGroup { readonly visible: boolean }
+/** Runtime visibility of one compiled annotation appearance. */
+export interface AnnotationLayerVisibility { readonly annotationId: string; readonly visible: boolean }
 /** A detached visibility snapshot. Treat its condition bytes as read-only. */
 export interface OptionalContentSnapshot {
   readonly revision: number;
@@ -27,8 +31,8 @@ export interface OptionalContentControllerOptions {
   readonly onChange?: OptionalContentListener;
 }
 
-const MAX_GROUPS = 100_000;
-const MAX_CONDITIONS = 1_000_000;
+const MAX_GROUPS = MAX_OPTIONAL_CONTENT_GROUPS;
+const MAX_CONDITIONS = MAX_OPTIONAL_CONTENT_CONDITIONS;
 const MAX_DEPTH = 64;
 const MAX_OPERANDS = 1_000_000;
 
@@ -46,7 +50,8 @@ export function validateSceneOptionalContent(value: unknown): asserts value is S
   for (const group of value.groups) {
     if (!record(group) || typeof group.id !== "string" || !group.id || ids.has(group.id) ||
         typeof group.name !== "string" || typeof group.defaultVisible !== "boolean" ||
-        typeof group.locked !== "boolean" || typeof group.usedInView !== "boolean") invalid("invalid or duplicate layer");
+        typeof group.locked !== "boolean" || typeof group.usedInView !== "boolean" ||
+        (group.annotationId !== undefined && (typeof group.annotationId !== "string" || !group.annotationId))) invalid("invalid or duplicate layer");
     ids.add(group.id);
   }
   const conditions = value.conditions;
@@ -198,18 +203,31 @@ export function createDefaultOptionalContentSnapshot(scene: VectorScene): Option
   return snapshot(scene.optionalContent, new Map(scene.optionalContent?.groups.map(group => [group.id, group.defaultVisible])), 0);
 }
 
-/** All OCGs referenced by a condition, including negated groups and nested memberships. */
+const annotationLayerIds = new WeakMap<SceneOptionalContent, ReadonlyMap<string, string>>();
+/** Annotation layer id to annotation id, for scenes compiled with annotation layers. */
+export function getAnnotationLayerIds(data: SceneOptionalContent | undefined): ReadonlyMap<string, string> {
+  if (!data) return new Map();
+  let ids = annotationLayerIds.get(data);
+  if (!ids) {
+    ids = new Map(data.groups.filter(isAnnotationLayer).map(group => [group.id, group.annotationId!]));
+    annotationLayerIds.set(data, ids);
+  }
+  return ids;
+}
+
+/** All OCGs referenced by a condition, including negated groups and nested memberships. Annotation layers are not OCGs. */
 export function getOptionalContentGroupIds(data: SceneOptionalContent | undefined, condition?: number): string[] {
   if (condition === undefined) return [];
   if (!data || !Number.isSafeInteger(condition) || condition < 0 || condition >= data.conditions.length) {
     throw new RangeError("Optional-content condition is outside the scene.");
   }
+  const annotationLayers = getAnnotationLayerIds(data);
   const visited = new Set<number>(), groups = new Set<string>();
   const visit = (index: number): void => {
     if (visited.has(index)) return;
     visited.add(index);
     const item = data.conditions[index];
-    if (item.kind === "group") groups.add(item.groupId);
+    if (item.kind === "group") { if (!annotationLayers.has(item.groupId)) groups.add(item.groupId); }
     else if (item.kind === "not") visit(item.operand);
     else if (item.kind === "and" || item.kind === "or") for (const child of item.operands) visit(child);
   };
@@ -217,10 +235,17 @@ export function getOptionalContentGroupIds(data: SceneOptionalContent | undefine
   return [...groups];
 }
 
-/** Per-view layer state; source definitions and default visibility remain unchanged. */
+/**
+ * Per-view layer state; source definitions and default visibility remain unchanged.
+ * PDF layers and HEPR annotation layers share one condition table but separate APIs.
+ */
 export class OptionalContentController {
   private readonly data: SceneOptionalContent | undefined;
+  /** PDF layers only. */
   private readonly groups: Map<string, OptionalContentGroup>;
+  /** Annotation id to its annotation layer id. */
+  private readonly annotationLayers: Map<string, string>;
+  private readonly annotationIds: ReadonlySet<string>;
   private readonly listeners = new Set<OptionalContentListener>();
   private readonly options: OptionalContentControllerOptions;
   private current: OptionalContentSnapshot;
@@ -232,7 +257,9 @@ export class OptionalContentController {
   constructor(scene: VectorScene, options: OptionalContentControllerOptions = {}) {
     this.current = createDefaultOptionalContentSnapshot(scene);
     this.data = scene.optionalContent;
-    this.groups = new Map(this.data?.groups.map(group => [group.id, group]));
+    this.groups = new Map(this.data?.groups.filter(group => !isAnnotationLayer(group)).map(group => [group.id, group]));
+    this.annotationLayers = new Map([...getAnnotationLayerIds(this.data)].map(([layerId, annotationId]) => [annotationId, layerId]));
+    this.annotationIds = new Set(scene.annotations?.map(annotation => annotation.id));
     this.requested = new Map(this.current.layers.map(layer => [layer.id, layer.visible]));
     this.options = options;
     if (options.onChange) this.listeners.add(options.onChange);
@@ -253,7 +280,33 @@ export class OptionalContentController {
     return this.setLayerVisibilities([{ id, visible }], options);
   }
   resetLayerVisibility(options: OptionalContentUpdateOptions = {}): Promise<void> {
-    return this.update(new Map([...this.groups.values()].map(group => [group.id, group.defaultVisible])), options);
+    // Annotation visibility is the host's own state and survives a layer reset.
+    const next = new Map(this.requested);
+    for (const group of this.groups.values()) next.set(group.id, group.defaultVisible);
+    return this.update(next, options);
+  }
+  /** Annotations whose compiled appearance has its own runtime layer. */
+  getAnnotationLayers(): AnnotationLayerVisibility[] {
+    const applied = new Map(this.current.layers.map(layer => [layer.id, layer.visible]));
+    return [...this.annotationLayers].map(([annotationId, layerId]) => ({ annotationId, visible: applied.get(layerId) === true }));
+  }
+  /**
+   * Show or hide compiled annotation appearances. Metadata, bubbles and
+   * annotation picking are unaffected. Annotations without an appearance
+   * layer (popups, links, hidden or omitted appearances) are accepted and
+   * ignored; ids not in the scene are rejected.
+   */
+  async setAnnotationVisibility(annotationIds: readonly string[], visible: boolean, options: OptionalContentUpdateOptions = {}): Promise<void> {
+    this.assertLive(); options.signal?.throwIfAborted();
+    if (!Array.isArray(annotationIds)) throw new TypeError("Annotation IDs must be an array.");
+    if (typeof visible !== "boolean") throw new TypeError("Annotation visibility must be boolean.");
+    const next = new Map(this.requested);
+    for (const annotationId of annotationIds) {
+      const layerId = this.annotationLayers.get(annotationId);
+      if (layerId !== undefined) next.set(layerId, visible);
+      else if (!this.annotationIds.has(annotationId)) throw new RangeError(`Unknown annotation: ${annotationId}`);
+    }
+    await this.update(next, options);
   }
   async setLayerVisibilities(changes: readonly LayerVisibilityChange[], options: OptionalContentUpdateOptions = {}): Promise<void> {
     this.assertLive(); options.signal?.throwIfAborted();

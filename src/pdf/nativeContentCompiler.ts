@@ -576,6 +576,13 @@ export interface DensePdfVectorSceneData {
    */
   readonly sourceEvents: Uint32Array;
   readonly sourceOptionalContentIndices?: Int32Array;
+  /**
+   * One `annotationIds` index per source event whose paint belongs to an
+   * annotation appearance, otherwise -1. Absent when no event has one.
+   */
+  readonly sourceAnnotationIndices?: Int32Array;
+  /** The `PdfAnnotation.id` addressed by each `sourceAnnotationIndices` value. */
+  readonly annotationIds?: readonly string[];
   /** Glyph triples: page glyph start, glyph count, and PDF rendering mode. */
   readonly glyphRunMeta: Uint32Array;
   /** One sRGB nonstroking RGBA tuple per glyph triple. */

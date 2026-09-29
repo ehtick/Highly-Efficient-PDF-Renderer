@@ -1,9 +1,11 @@
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
 import { placeSceneAnnotation } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
+import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8,
+  type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
-  type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionState } from "./heprDisplayExecutor";
+  type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionIndexScope, type HeprExecutionState } from "./heprDisplayExecutor";
+import { AnnotationLayerBuilder } from "./annotationLayers";
 import { visitHeprPath } from "./heprPathGeometry";
 import { HeprFunctionEvaluator } from "./heprFunctionEvaluator";
 import { HeprColorEvaluator } from "./heprColorEvaluator";
@@ -149,6 +151,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const glyphReach = new Uint8Array(page.stores.glyphs.glyphIds.length);
   const glyphClipTester = new NativeTextClipTester();
   let reportedGlyphStrokeComplexity = false, reportedHairlineCurveApproximation = false, reportedHairlineStyleApproximation = false;
+  let reportedViewTransformApproximation = false;
   const stack: ScenePaintNode[][] = [scene.paintGraph.roots];
   const knockoutScopes = new WeakSet<ScenePaintNode[]>();
   const groupScopes = new WeakMap<ScenePaintNode[], ScenePaintGroup>();
@@ -179,7 +182,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const emptyBounds = (): Bounds => ({ minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
   const include = (bounds: Bounds, x: number, y: number): void => { bounds.minX = Math.min(bounds.minX, x); bounds.minY = Math.min(bounds.minY, y); bounds.maxX = Math.max(bounds.maxX, x); bounds.maxY = Math.max(bounds.maxY, y); };
   const append = (target: number[], values: readonly number[]): void => { for (const value of values) target.push(value); };
-  const combine = (state: HeprExecutionState, inherited = -1): number | undefined => {
+  const combineLayers = (state: HeprExecutionState, inherited = -1): number | undefined => {
     const indices = new Set<number>();
     if (inherited >= 0) indices.add(inherited);
     for (let scope = state.optionalContent; scope; scope = scope.parent) if (scope.index >= 0) indices.add(scope.index);
@@ -191,6 +194,25 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (index === undefined) { index = conditions.length; conditions.push({ kind: "and", operands }); conditionKeys.set(key, index); }
     return index;
   };
+  // An appearance's paint inherits its invocation's `Annot` node, however
+  // deeply its programs nest. Only the page's own annotation ids qualify, so
+  // PDF content that happens to use an /Annot tag is not captured.
+  const annotationIds = new Set(source.annotations?.map(annotation => annotation.id) ?? []);
+  const annotationLayers = new AnnotationLayerBuilder(options.optionalContent, conditions);
+  const annotationScopes = new WeakMap<HeprExecutionIndexScope, string | null>();
+  const annotationOf = (scope: HeprExecutionIndexScope | null): string | undefined => {
+    if (!scope || !annotationIds.size) return undefined;
+    let annotation = annotationScopes.get(scope);
+    if (annotation === undefined) {
+      const { tags, propertyNames } = page.stores.markedContent, name = propertyNames[scope.index];
+      annotation = tags[scope.index] === HEPR_ANNOTATION_MARKED_CONTENT_TAG && name !== null && annotationIds.has(name)
+        ? name : annotationOf(scope.parent) ?? null;
+      annotationScopes.set(scope, annotation);
+    }
+    return annotation ?? undefined;
+  };
+  const combine = (state: HeprExecutionState, inherited = -1): number | undefined =>
+    annotationLayers.condition(combineLayers(state, inherited), annotationOf(state.markedContent));
   const color = (index: number, state?: HeprExecutionState): Color => {
     if (index < 0) index = state?.type3PaintIndex ?? -1;
     const paints = page.stores.paints;
@@ -603,7 +625,13 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       const attach = (node: DensePdfTextClip | null): DensePdfTextClip => node ? { ...node, parent: attach(node.parent) } : inheritedClip;
       clip = attach(clip);
     }
-    if (execution.state.viewTransformFlags) return fail("view-dependent annotation transform.", "vector-annotation-view-transform");
+    // A static scene has no viewer zoom or rotation to counter-transform, so
+    // NoZoom/NoRotate appearances keep their page geometry, as rasters do.
+    if (execution.state.viewTransformFlags && !reportedViewTransformApproximation) {
+      reportedViewTransformApproximation = true;
+      options.onDiagnostic?.({ code: "annotation.view-transform-approximated", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+        message: "NoZoom/NoRotate annotation appearances use page geometry and scale with the page." });
+    }
     if (command.source === "fill-paths") {
       const store = page.stores.paths, rgba = color(command.paintIndex, execution.state);
       for (let path = command.first; path < command.first + command.count; path++) {
@@ -783,9 +811,16 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     scene.gradientMeshIndices = Uint32Array.from(gradients.flatMap(part => Array.from(part.gradientMeshIndices ?? [])));
     scene.gradientCount = scene.gradientFillPathCount = gradients.length; scene.gradientFillSegmentCount = gradientSegments;
   }
-  if (options.optionalContent) scene.optionalContent = { ...options.optionalContent, conditions };
+  const optionalContent = annotationLayers.build();
+  if (optionalContent) scene.optionalContent = optionalContent;
+  if (annotationLayers.unavailableCount) options.onDiagnostic?.({ code: "annotation.layer-limit", severity: "warning",
+    pageIndex: page.pageInfo.sourcePageIndex,
+    message: `${annotationLayers.unavailableCount} annotation appearance(s) exceed the layer limit and cannot be hidden individually.`,
+    details: { annotationCount: annotationLayers.unavailableCount } });
+  // Annotation layers alone condition text only when an appearance paints some.
   scene.textIndex = buildRetainedTextIndex(source, glyphInstances, glyphReach,
-    options.optionalContent ? glyphConditions : undefined, options.textPositions, signal);
+    options.optionalContent || (optionalContent && glyphConditions.some(condition => condition >= 0)) ? glyphConditions : undefined,
+    options.textPositions, signal);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
   scene.imagePaintOpCount = scene.rasterLayers.length;
@@ -795,7 +830,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     pdfToScene: computeNativePdfPageGeometry(source.pageInfo).pageMatrix }];
   scene.annotations = source.annotations?.map(annotation => {
     const result = placeSceneAnnotation(annotation, 0);
-    if (!scene.optionalContent) delete result.optionalContent;
+    // Memberships address the page's PDF layers, not its annotation layers.
+    if (!options.optionalContent) delete result.optionalContent;
     return result;
   });
   return scene;

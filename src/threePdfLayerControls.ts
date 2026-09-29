@@ -112,6 +112,7 @@ export function createThreePdfLayerControls(options: ThreePdfLayerControlsOption
           revision = owner.layerVisibilityRevision;
           const changes = owner.getLayers().filter(layer => layer.visible !== layer.defaultVisible)
             .map(({ id, visible }) => ({ id, visible }));
+          const annotations = owner.getAnnotationLayers();
           // PDF defaults can enable several radio alternatives. Reset preserves
           // those authored defaults; an explicit all-layer batch would reject
           // them. Reset on retries also restores choices reverted by the user.
@@ -119,6 +120,12 @@ export function createThreePdfLayerControls(options: ThreePdfLayerControlsOption
           assertCurrent();
           if (changes.length) await waitForLoad(next.setLayerVisibilities(changes), controller.signal);
           assertCurrent();
+          // Hidden annotation appearances are host state and survive the switch too.
+          for (const visible of [true, false]) {
+            const ids = annotations.filter(layer => layer.visible === visible).map(layer => layer.annotationId);
+            if (ids.length) await waitForLoad(next.setAnnotationVisibility(ids, visible), controller.signal);
+            assertCurrent();
+          }
         } while (revision !== owner.layerVisibilityRevision);
       } finally {
         signal?.removeEventListener("abort", abort);

@@ -19,7 +19,7 @@ import type { RendererApi } from "./rendererTypes";
 import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialGradientLayer } from "./threeMaterialGradientLayer";
-import { OptionalContentController, type LayerVisibilityChange, type OptionalContentListener,
+import { OptionalContentController, type AnnotationLayerVisibility, type LayerVisibilityChange, type OptionalContentListener,
   type OptionalContentSnapshot } from "./optionalContent";
 import { isScenePrimitiveVisible } from "./scenePrimitives";
 import { RetainedPageReplay } from "./retainedPageReplay";
@@ -588,6 +588,23 @@ export class HeprThreePdfObject extends THREE.Group {
   getAllLayerVisibility(layerIds?: readonly string[]) { return this.layerVisibility.getAllLayerVisibility(layerIds); }
   resetLayerVisibility(): Promise<void> { return this.layerVisibility.resetLayerVisibility(); }
   subscribeLayerVisibility(listener: OptionalContentListener): () => void { return this.layerVisibility.subscribe(listener); }
+
+  /**
+   * Annotations whose compiled appearance can be shown or hidden at runtime,
+   * with their applied visibility. Empty for HEP files converted before
+   * annotation layers existed, and for pages rendered as a single raster.
+   */
+  getAnnotationLayers(): AnnotationLayerVisibility[] { return this.layerVisibility.getAnnotationLayers(); }
+  /**
+   * Show or hide the compiled appearances of `SceneAnnotation.id`s, for
+   * example while the host draws its own marker. Annotation metadata, bubbles
+   * and `pickSceneAnnotation` keep working; hidden appearances are skipped by
+   * `pick()`, search and selection. Ids without an appearance layer are
+   * ignored; ids missing from `sceneData.annotations` reject with a RangeError.
+   */
+  setAnnotationVisibility(annotationIds: readonly string[], visible: boolean): Promise<void> {
+    return this.layerVisibility.setAnnotationVisibility(annotationIds, visible);
+  }
 
   /** Observe layer preparation; immediately reports the current percentage or null when idle. */
   subscribeLayerVisibilityProgress(listener: (percentage: number | null) => void): () => void {

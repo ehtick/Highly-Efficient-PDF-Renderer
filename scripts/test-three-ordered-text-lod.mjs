@@ -156,6 +156,11 @@ try {
       const tilted = profile.stop();
       assert((tilted.counters["three.batchCandidateInstances"]?.total ?? 0) <= lod.getStats().selectedInstances,
         "selection updates visit selected instances only");
+      camera.position.set(0,-200,20); controls.target.set(0,0,0); frame();
+      assert(lod.getStats().coarseClusters > 0 && lod.getStats().renderedGlyphs > 0,
+        `${backend}: a grazing camera keeps nearby readable glyphs and simplifies distant compressed text`);
+      assert(object.getTextInstanceStats().rendered < count,
+        `${backend}: foreshortening reaches the material instance buffers`);
       camera.position.set(0,0,300); frame();
       assert.equal(lod.getStats().renderedRuns,0,"close zoom restores readable exact glyphs");
       camera.position.set(1_000_000,0,distance); controls.target.set(1_000_000,0,0); frame();

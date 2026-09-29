@@ -210,6 +210,17 @@ fallback. Three also exercises MapControls panning, perspective tilt, lazy
 Off-to-Auto material replacement and temporary text colors. Browser FPS and
 visual checks remain manual.
 
+Text LOD measures glyph height perpendicular to the projected text baseline,
+so steep perspective views can simplify distant text even when it stretches
+sideways on screen. The height bounds cover the complete cluster; nearby
+readable text and camera-plane crossings stay exact. Mixed text orientations
+use conservative direction or maximum-stretch bounds. Affine selection reuse
+includes the projected basis, so rotating an anisotropic view cannot reuse an
+incorrect detail decision. Ordered selection searches paint ranges only when
+leaving the current paint, instead of once per glyph. The
+`text-lod-foreshortening` test checks sampled projection bounds, near/far text,
+orientation changes, and the paint-lookup work budget.
+
 The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
 coarser levels up to a 5-pixel nominal overview tolerance, also past the first
 normal LOD threshold. Planar and tilted views first select within those limits

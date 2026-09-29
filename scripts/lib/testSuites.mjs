@@ -117,6 +117,7 @@ export const fastTests = [
   "native-paint-compositor",
   "native-direct-rendering",
   "text-lod-core",
+  "text-lod-foreshortening",
   "native-ordered-text-lod",
   "three-ordered-text-lod",
   "ordered-gradient-paint",

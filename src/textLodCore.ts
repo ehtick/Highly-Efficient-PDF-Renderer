@@ -169,6 +169,8 @@ export class TextLodRuntime {
   private affineScale = 0;
   private lastAffineValid = false;
   private lastAffineScale = 0;
+  private readonly affineBasis = new Float64Array(4);
+  private readonly lastAffineBasis = new Float64Array(4);
   private readonly lastAffineVisibility = new Float64Array(4);
 
   constructor(result: TextLodBuildResult, mode: TextLodMode = "auto") {
@@ -250,7 +252,6 @@ export class TextLodRuntime {
     const cullingBounds = affine
       ? this.affineVisibility
       : this.resolveVisibilityBounds(update.cullingBounds);
-    const affineScale = this.affineScale;
 
     for (const page of data.pages) {
       if (cullingBounds && !boundsIntersect(page.bounds, cullingBounds)) {
@@ -263,7 +264,9 @@ export class TextLodRuntime {
         page.bounds,
         update.localToClip,
         this.selectionViewport(update),
-        this.pageProjection
+        this.pageProjection,
+        page.inkHeightDirection,
+        page.baselineDirection
       );
       if (pageProjection && pageProjection.stable && !pageProjection.visible) {
         if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
@@ -272,7 +275,7 @@ export class TextLodRuntime {
         continue;
       }
       const pageStable = pageProjection ? pageProjection.stable : true;
-      const pageScale = pageProjection ? pageProjection.maxPixelsPerLocalUnit : affineScale;
+      const pageScale = pageProjection ? pageProjection.maxPixelsPerLocalUnit : this.affineInkHeightScale(page.inkHeightDirection, page.baselineDirection);
 
       // When the conservative scale over the complete page is already below
       // the applicable threshold, every child is safely coarse. This avoids
@@ -325,13 +328,15 @@ export class TextLodRuntime {
         // 1 coarse, 0 exact, -1 undecided until the cluster itself is projected.
         let decision = -1;
         if (!pageProjection) {
-          decision = selectable && isCoarseInkHeight(cluster.maxInkHeight * affineScale, wasCoarse) ? 1 : 0;
+          decision = selectable && isCoarseInkHeight(cluster.maxInkHeight * this.affineInkHeightScale(cluster.inkHeightDirection, cluster.baselineDirection), wasCoarse) ? 1 : 0;
         } else if (pageInsideView) {
           if (!selectable) {
             decision = 0;
           } else if (isCoarseInkHeight(cluster.maxInkHeight * pageProjection.maxPixelsPerLocalUnit, wasCoarse)) {
             decision = 1;
-          } else if (cluster.maxInkHeight * pageProjection.minPixelsPerLocalUnit >= TEXT_LOD_EXACT_ENTER_PX) {
+          } else if ((page.inkHeightDirection || !cluster.inkHeightDirection) &&
+              (page.baselineDirection || !cluster.baselineDirection) &&
+              cluster.maxInkHeight * pageProjection.minPixelsPerLocalUnit >= TEXT_LOD_EXACT_ENTER_PX) {
             decision = 0;
           }
         }
@@ -340,7 +345,9 @@ export class TextLodRuntime {
             cluster.bounds,
             update.localToClip,
             this.selectionViewport(update),
-            this.clusterProjection
+            this.clusterProjection,
+            cluster.inkHeightDirection,
+            cluster.baselineDirection
           );
           if (projection.stable && !projection.visible) {
             if (setClusterValue(this.clusterVisibility, clusterIndex, 0)) {
@@ -438,13 +445,33 @@ export class TextLodRuntime {
     out.maxX = visibility.maxX;
     out.maxY = visibility.maxY;
     this.affineScale = scale;
+    const m = update.localToClip, w = m[15];
+    this.affineBasis[0] = m[0] / w * width * .5;
+    this.affineBasis[1] = m[1] / w * height * .5;
+    this.affineBasis[2] = m[4] / w * width * .5;
+    this.affineBasis[3] = m[5] / w * height * .5;
     return true;
+  }
+
+  private affineInkHeightScale(direction: readonly [number, number] | undefined,
+    baseline: readonly [number, number] | undefined): number {
+    if (!direction) return this.affineScale;
+    const b = this.affineBasis;
+    const vx = b[0] * direction[0] + b[2] * direction[1], vy = b[1] * direction[0] + b[3] * direction[1];
+    if (baseline) {
+      const ux = b[0] * baseline[0] + b[2] * baseline[1], uy = b[1] * baseline[0] + b[3] * baseline[1];
+      const length = Math.hypot(ux, uy);
+      if (length > 0) return Math.abs(ux * vy - uy * vx) / length;
+    }
+    return Math.hypot(vx, vy);
   }
 
   private isSameAffineSelection(): boolean {
     const bounds = this.affineVisibility;
     return this.lastAffineValid &&
       this.affineScale === this.lastAffineScale &&
+      this.affineBasis[0] === this.lastAffineBasis[0] && this.affineBasis[1] === this.lastAffineBasis[1] &&
+      this.affineBasis[2] === this.lastAffineBasis[2] && this.affineBasis[3] === this.lastAffineBasis[3] &&
       bounds.minX === this.lastAffineVisibility[0] &&
       bounds.minY === this.lastAffineVisibility[1] &&
       bounds.maxX === this.lastAffineVisibility[2] &&
@@ -455,6 +482,7 @@ export class TextLodRuntime {
     this.lastAffineValid = affine;
     if (!affine) return;
     this.lastAffineScale = this.affineScale;
+    this.lastAffineBasis.set(this.affineBasis);
     this.lastAffineVisibility[0] = this.affineVisibility.minX;
     this.lastAffineVisibility[1] = this.affineVisibility.minY;
     this.lastAffineVisibility[2] = this.affineVisibility.maxX;

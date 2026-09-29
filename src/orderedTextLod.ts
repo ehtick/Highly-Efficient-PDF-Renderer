@@ -39,9 +39,15 @@ export class OrderedTextLodSelection {
       this.selectedPaints = new Uint32Array(ids.length);
     }
     this.counts.fill(0);
+    // Exact IDs arrive in source order, usually thousands from one paint.
+    // Search only when leaving that paint, rather than once per glyph.
+    let exactPaint = this.paints[0];
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
-      const paint = id < this.exactCount ? this.paintAt(id).index : this.coarsePaints[id - this.exactCount];
+      if (id < this.exactCount && (!exactPaint || id < exactPaint.first || id >= exactPaint.end)) {
+        exactPaint = this.paintAt(id);
+      }
+      const paint = id < this.exactCount ? exactPaint.index : this.coarsePaints[id - this.exactCount];
       this.selectedPaints[i] = paint;
       this.counts[paint]++;
     }

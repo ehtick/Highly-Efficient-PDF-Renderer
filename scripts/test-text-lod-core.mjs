@@ -458,7 +458,7 @@ const expectedTiltIds = [];
 let tiltExact = 0;
 let tiltCoarse = 0;
 for (const cluster of tiltData.clusters) {
-  const projection = analyzePlanarBoundsProjection(cluster.bounds, tiltMatrix, tiltViewport);
+  const projection = analyzePlanarBoundsProjection(cluster.bounds, tiltMatrix, tiltViewport, cluster.inkHeightDirection, cluster.baselineDirection);
   if (projection.stable && !projection.visible) continue;
   const coarse = cluster.eligible && projection.stable &&
     cluster.maxInkHeight * projection.maxPixelsPerLocalUnit <= TEXT_LOD_COARSE_ENTER_PX;

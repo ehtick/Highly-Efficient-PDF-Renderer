@@ -49,6 +49,9 @@ export interface TextLodCluster {
   readonly coarseCount: number;
   readonly bounds: Readonly<Bounds>;
   readonly maxInkHeight: number;
+  /** Unit glyph-height direction when every run agrees; otherwise use maximum stretch. */
+  readonly inkHeightDirection?: readonly [number, number];
+  readonly baselineDirection?: readonly [number, number];
   readonly eligible: boolean;
 }
 
@@ -62,6 +65,8 @@ export interface TextLodPageNode {
   readonly coarseCount: number;
   readonly bounds: Readonly<Bounds>;
   readonly maxInkHeight: number;
+  readonly inkHeightDirection?: readonly [number, number];
+  readonly baselineDirection?: readonly [number, number];
   /** True only when every child cluster has a complete coarse representation. */
   readonly eligible: boolean;
 }
@@ -637,6 +642,8 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
       let bounds: Bounds | null = null;
       let summedArea = 0;
       let maxInkHeight = 0;
+      let inkHeightDirection = runDirection(first, 2);
+      let baselineDirection = runDirection(first, 0);
 
       while (cursor < runEnd) {
         const run = context.runs[cursor];
@@ -656,6 +663,8 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
         exactCount += run.exactCount;
         coarseCountForCluster += run.eligible ? 1 : 0;
         maxInkHeight = Math.max(maxInkHeight, run.maxInkHeight);
+        inkHeightDirection = sharedDirection(inkHeightDirection, runDirection(run, 2));
+        baselineDirection = sharedDirection(baselineDirection, runDirection(run, 0));
         cursor += 1;
       }
 
@@ -669,6 +678,8 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
         coarseCount: coarseCountForCluster,
         bounds: Object.freeze(bounds ?? pageBoundsAt(context.scene, pageIndex)),
         maxInkHeight,
+        inkHeightDirection,
+        baselineDirection,
         eligible
       }));
       clustersSinceYield += 1;
@@ -682,11 +693,15 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
     const exactCount = context.scene.pageTextRanges[pageIndex * 2 + 1];
     let pageCoarseCount = 0;
     let pageMaxInkHeight = 0;
+    let pageInkHeightDirection = clusters[clusterStart]?.inkHeightDirection;
+    let pageBaselineDirection = clusters[clusterStart]?.baselineDirection;
     let pageEligible = clusters.length > clusterStart;
     let pageNodeBounds = pageBoundsAt(context.scene, pageIndex);
     for (let i = clusterStart; i < clusters.length; i += 1) {
       pageCoarseCount += clusters[i].coarseCount;
       pageMaxInkHeight = Math.max(pageMaxInkHeight, clusters[i].maxInkHeight);
+      pageInkHeightDirection = sharedDirection(pageInkHeightDirection, clusters[i].inkHeightDirection);
+      pageBaselineDirection = sharedDirection(pageBaselineDirection, clusters[i].baselineDirection);
       pageEligible &&= clusters[i].eligible;
       pageNodeBounds = unionBounds(pageNodeBounds, clusters[i].bounds);
     }
@@ -699,6 +714,8 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
       coarseCount: pageCoarseCount,
       bounds: Object.freeze(pageNodeBounds),
       maxInkHeight: pageMaxInkHeight,
+      inkHeightDirection: pageInkHeightDirection,
+      baselineDirection: pageBaselineDirection,
       eligible: pageEligible
     }));
     if (clustersSinceYield > 0 || (pageIndex + 1) % 32 === 0) {
@@ -711,6 +728,20 @@ function* buildTextLodHierarchy(context: BuildContext): Generator<number, TextLo
   }
 
   return {clusters, pages};
+}
+
+function runDirection(run: TextLodRun, offset: 0 | 2): readonly [number, number] | undefined {
+  if (!run.eligible) return undefined;
+  const x = run.transform[offset], y = run.transform[offset + 1];
+  const length = Math.hypot(x, y);
+  if (!(length > 0) || !Number.isFinite(length)) return undefined;
+  const sign = x < 0 || (x === 0 && y < 0) ? -1 : 1;
+  return Object.freeze([sign * x / length, sign * y / length]);
+}
+
+function sharedDirection(a: readonly [number, number] | undefined,
+  b: readonly [number, number] | undefined): readonly [number, number] | undefined {
+  return a && b && a[0] === b[0] && a[1] === b[1] ? a : undefined;
 }
 
 function freezeTextLodBuildData(

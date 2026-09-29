@@ -12,11 +12,12 @@ export interface PlanarBoundsProjection {
   visible: boolean;
   /** False when the rectangle reaches/crosses the camera plane or data is invalid. */
   stable: boolean;
-  /** Conservative upper bound on screen pixels per local-space unit. */
+  /** Conservative upper bound on pixels per local unit, along the supplied direction if any. */
   maxPixelsPerLocalUnit: number;
   /**
    * Conservative lower bound on the largest stretch at every point of the
-   * rectangle: no point magnifies less than this in its widest direction.
+   * rectangle: no point magnifies less than this in its widest direction,
+   * or along the supplied direction when one was requested.
    * Zero when unknown. Equal to the maximum for affine views.
    */
   minPixelsPerLocalUnit: number;
@@ -75,14 +76,19 @@ export function createOrthographicLocalToClip(
  * of the local-to-pixel Jacobian. For projective transforms the Jacobian is
  * bounded analytically over the complete rectangle. This can choose exact text
  * more often than necessary, but can never under-estimate readable text merely
- * because only a center point was sampled.
+ * because only a center point was sampled. An optional unit direction measures
+ * stretch along that axis (for example glyph height) instead of the widest axis.
+ * Supplying a baseline too measures height perpendicular to its projected line,
+ * discounting perspective shear along that line.
  */
 export function analyzePlanarBoundsProjection(
   bounds: Bounds,
   localToClip: ArrayLike<number>,
-  viewport: PlanarViewport
+  viewport: PlanarViewport,
+  direction?: readonly [number, number],
+  baseline?: readonly [number, number]
 ): PlanarBoundsProjection {
-  return analyzePlanarBoundsProjectionInto(bounds, localToClip, viewport, createPlanarBoundsProjection());
+  return analyzePlanarBoundsProjectionInto(bounds, localToClip, viewport, createPlanarBoundsProjection(), direction, baseline);
 }
 
 /** A result object suitable for reuse across `analyzePlanarBoundsProjectionInto` calls. */
@@ -110,7 +116,9 @@ export function analyzePlanarBoundsProjectionInto(
   bounds: Bounds,
   localToClip: ArrayLike<number>,
   viewport: PlanarViewport,
-  out: PlanarBoundsProjection
+  out: PlanarBoundsProjection,
+  direction?: readonly [number, number],
+  baseline?: readonly [number, number]
 ): PlanarBoundsProjection {
   const width = Math.max(1, viewport.width);
   const height = Math.max(1, viewport.height);
@@ -197,7 +205,18 @@ export function analyzePlanarBoundsProjectionInto(
   let maxPixelsPerLocalUnit: number;
   let minPixelsPerLocalUnit: number;
   if (affine) {
-    maxPixelsPerLocalUnit = affinePlanarPixelsPerLocalUnit(localToClip, width, height);
+    maxPixelsPerLocalUnit = direction
+      ? Math.hypot((m0 * direction[0] + m4 * direction[1]) * width * .5 / m15,
+        (m1 * direction[0] + m5 * direction[1]) * height * .5 / m15)
+      : affinePlanarPixelsPerLocalUnit(localToClip, width, height);
+    if (direction && baseline) {
+      const ux = (m0 * baseline[0] + m4 * baseline[1]) * width * .5 / m15;
+      const uy = (m1 * baseline[0] + m5 * baseline[1]) * height * .5 / m15;
+      const vx = (m0 * direction[0] + m4 * direction[1]) * width * .5 / m15;
+      const vy = (m1 * direction[0] + m5 * direction[1]) * height * .5 / m15;
+      const length = Math.hypot(ux, uy);
+      if (length > 0) maxPixelsPerLocalUnit = Math.abs(ux * vy - uy * vx) / length;
+    }
     minPixelsPerLocalUnit = maxPixelsPerLocalUnit;
   } else {
     // Each pixel-Jacobian entry is an affine numerator over W^2, for example
@@ -211,6 +230,8 @@ export function analyzePlanarBoundsProjectionInto(
     const halfWidth = width * 0.5;
     const halfHeight = height * 0.5;
     let maxNumeratorSigma = 0;
+    let minBaseX = Infinity, maxBaseX = -Infinity, minBaseY = Infinity, maxBaseY = -Infinity;
+    let maxBaseLength = 0;
     let maxW2 = 0;
     let minA = Number.POSITIVE_INFINITY, maxA = Number.NEGATIVE_INFINITY;
     let minB = Number.POSITIVE_INFINITY, maxB = Number.NEGATIVE_INFINITY;
@@ -222,11 +243,26 @@ export function analyzePlanarBoundsProjectionInto(
       const clipX = m0 * x + m4 * y + m12;
       const clipY = m1 * x + m5 * y + m13;
       const clipW = m3 * x + m7 * y + m15;
-      const a = (m0 * clipW - clipX * m3) * halfWidth;
-      const b = (m1 * clipW - clipY * m3) * halfHeight;
-      const c = (m4 * clipW - clipX * m7) * halfWidth;
-      const d = (m5 * clipW - clipY * m7) * halfHeight;
-      maxNumeratorSigma = Math.max(maxNumeratorSigma, largestSingularValue2x2(a, b, c, d));
+      let a = (m0 * clipW - clipX * m3) * halfWidth;
+      let b = (m1 * clipW - clipY * m3) * halfHeight;
+      let c = (m4 * clipW - clipX * m7) * halfWidth;
+      let d = (m5 * clipW - clipY * m7) * halfHeight;
+      if (direction && baseline) {
+        const ux = a * baseline[0] + c * baseline[1], uy = b * baseline[0] + d * baseline[1];
+        minBaseX = Math.min(minBaseX, ux); maxBaseX = Math.max(maxBaseX, ux);
+        minBaseY = Math.min(minBaseY, uy); maxBaseY = Math.max(maxBaseY, uy);
+        maxBaseLength = Math.max(maxBaseLength, Math.hypot(ux, uy));
+      }
+      if (direction) {
+        // N times a fixed direction is affine too; its norm is convex, so
+        // the same corner/min-W bound applies without a singular-value solve.
+        a = a * direction[0] + c * direction[1];
+        b = b * direction[0] + d * direction[1];
+        c = d = 0;
+        maxNumeratorSigma = Math.max(maxNumeratorSigma, Math.hypot(a, b));
+      } else {
+        maxNumeratorSigma = Math.max(maxNumeratorSigma, largestSingularValue2x2(a, b, c, d));
+      }
       maxW2 = Math.max(maxW2, clipW * clipW);
       minA = Math.min(minA, a); maxA = Math.max(maxA, a);
       minB = Math.min(minB, b); maxB = Math.max(maxB, b);
@@ -241,6 +277,19 @@ export function analyzePlanarBoundsProjectionInto(
       signStableMinAbs(minD, maxD)
     );
     minPixelsPerLocalUnit = maxW2 > 0 ? minNumerator / maxW2 : 0;
+    if (direction && baseline) {
+      // For homography H, det(J) = det(H) / W^3. With J*u = N*u/W^2,
+      // perpendicular height is |det(H) det(u,v)| / (W |N*u|).
+      // Bound W and the baseline numerator over the entire rectangle. The
+      // numerator's component intervals give a safe lower norm even if its
+      // direction turns; a zero bound falls back to the full height vector.
+      const determinant = m0 * (m5 * m15 - m13 * m7) - m4 * (m1 * m15 - m13 * m3) +
+        m12 * (m1 * m7 - m5 * m3);
+      const area = Math.abs(determinant * (baseline[0] * direction[1] - baseline[1] * direction[0])) * halfWidth * halfHeight;
+      const minBaseLength = Math.hypot(signStableMinAbs(minBaseX, maxBaseX), signStableMinAbs(minBaseY, maxBaseY));
+      if (minBaseLength > 0) maxPixelsPerLocalUnit = Math.min(maxPixelsPerLocalUnit, area / (minW * minBaseLength));
+      minPixelsPerLocalUnit = maxBaseLength > 0 ? area / (maxW * maxBaseLength) : 0;
+    }
   }
 
   if (!Number.isFinite(maxPixelsPerLocalUnit)) {

@@ -29,9 +29,9 @@ export {
 /** Automatic clustered selection, or the original exact-only representation. */
 export type TextLodMode = "auto" | "off";
 
-/** Exact-to-coarse transition threshold for a previously exact cluster. */
+/** Exact-to-coarse ink-height threshold in CSS pixels for a previously exact cluster. */
 export const TEXT_LOD_COARSE_ENTER_PX = 0.5;
-/** Coarse-to-exact threshold for a previously coarse cluster. */
+/** Coarse-to-exact ink-height threshold in CSS pixels for a previously coarse cluster. */
 export const TEXT_LOD_EXACT_ENTER_PX = 0.75;
 /**
  * Fraction of the view size used as the visibility quantisation step.
@@ -60,8 +60,11 @@ export interface TextLodSelectionUpdate {
   pageRevision?: number;
   /** Column-major PDF-local-to-clip 4x4 matrix. */
   localToClip: ArrayLike<number>;
+  /** Render viewport dimensions in device pixels. */
   viewportWidth: number;
   viewportHeight: number;
+  /** Device pixels per CSS pixel; defaults to 1 for offscreen rendering. */
+  pixelRatio?: number;
   /** Optional conservative local-space visibility bounds. */
   cullingBounds?: Bounds | null;
 }
@@ -234,6 +237,16 @@ export class TextLodRuntime {
     const data = this.data;
     if (!data || this.resourceFallbackReason) {
       return this.finishUnavailableSelection();
+    }
+    // Retina backing resolution must not turn unreadable overview text into
+    // millions of exact glyphs. Select detail in presentation pixels while
+    // leaving the clip transform and the actual GPU viewport unchanged. Below
+    // DPR 1, keep device-pixel thresholds so reduced resolution stays coarse.
+    const pixelRatio = update.pixelRatio ?? 1;
+    if (Number.isFinite(pixelRatio) && pixelRatio > 1) {
+      update = {...update,
+        viewportWidth: update.viewportWidth / pixelRatio,
+        viewportHeight: update.viewportHeight / pixelRatio};
     }
     if (this.selectionInitialized && this.isSameSelectionUpdate(update)) {
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};

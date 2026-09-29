@@ -187,6 +187,20 @@ try {
     instance.zoom = 1; render();
     assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: readable text returns to exact glyphs`);
     assert(plan.instanceCount > count / 2);
+    instance.canvas.clientWidth = instance.canvas.width / 3;
+    instance.zoom = 1.2; render();
+    assert(plan.instanceCount < count / 10, `${backend}: DPR 3 uses CSS-pixel ink height`);
+    const retinaIds = runtime.getSelectedInstanceIds().slice();
+    const retinaUploads = uploads;
+    render();
+    assert.equal(uploads, retinaUploads, `${backend}: stationary Retina frames do not reupload`);
+    instance.canvas.clientWidth = instance.canvas.width; render();
+    assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: actual canvas presentation scale controls detail`);
+    instance.canvas.clientWidth = instance.canvas.width / 3; render();
+    assert.deepEqual(runtime.getSelectedInstanceIds(), retinaIds);
+    instance.zoom = 3; render();
+    assert.equal(runtime.getStats().renderedRuns, 0, `${backend}: readable Retina text returns to exact glyphs`);
+    instance.zoom = 1;
     runtime.setResourceFallback("resource-capacity"); instance.textLodGpuActive = false; render();
     assert.equal(plan.instanceCount, count + 1, `${backend}: resource fallback retains exact drawing`);
   }

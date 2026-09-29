@@ -151,7 +151,8 @@ export class ThreeTextLodLayer {
     materialLayer: ThreeMaterialTextLayer,
     viewState: ViewState,
     viewport: ViewportPixels,
-    cullingBounds?: CullingBounds | null
+    cullingBounds?: CullingBounds | null,
+    pixelRatio = 1
   ): void {
     const runtime = this.runtime;
     if (!runtime) {
@@ -176,6 +177,7 @@ export class ThreeTextLodLayer {
       localToClip,
       viewportWidth,
       viewportHeight,
+      pixelRatio,
       cullingBounds: cullingBounds ?? undefined
     });
     if (this.orderedSelection) {

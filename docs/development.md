@@ -277,6 +277,14 @@ fallback. Three also exercises MapControls panning, perspective tilt, lazy
 Off-to-Auto material replacement and temporary text colors. Browser FPS and
 visual checks remain manual.
 
+Text LOD's 0.5/0.75 ink-height thresholds use CSS pixels on high-DPI canvases;
+the GPU still renders at full backing resolution. Native rendering uses the
+canvas backing-to-client size ratio, and Three uses the host renderer's pixel
+ratio. Offscreen targets and resolution below DPR 1 retain device-pixel
+thresholds. This prevents DPR alone from expanding unreadable overview text
+into millions of exact glyphs; zooming restores exact detail. The 200,000-glyph
+soft target remains diagnostic, not a cap on readable text.
+
 Text LOD measures glyph height perpendicular to the projected text baseline,
 so steep perspective views can simplify distant text even when it stretches
 sideways on screen. The height bounds cover the complete cluster; nearby

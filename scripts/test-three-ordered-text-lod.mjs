@@ -180,6 +180,31 @@ try {
     } finally { profile.dispose(); object.dispose(); }
   }
   for (const backend of ["webgl", "webgpu"]) {
+    const { object,lod,host,camera,frame } = create(backend,"auto");
+    try {
+      camera.position.z = viewport.height / (2 * .4 * Math.tan(Math.PI / 8));
+      frame();
+      const reference = drawn(object);
+      assert(reference.length < count / 10);
+      host.getDrawingBufferSize = target => target.set(viewport.width * 3,viewport.height * 3);
+      host.getPixelRatio = () => 3;
+      frame();
+      assert.deepEqual(drawn(object),reference, `${backend}: host DPR preserves the selected glyphs and clips`);
+      const uploads = lod.getStats().selectionUploads;
+      frame();
+      assert.equal(lod.getStats().selectionUploads,uploads);
+      host.getRenderTarget = () => ({ viewport: new THREE.Vector4(0,0,viewport.width * 3,viewport.height * 3) });
+      frame();
+      assert.equal(lod.getStats().coarseClusters,0, `${backend}: offscreen targets select detail in their own pixels`);
+      host.getRenderTarget = () => null;
+      frame();
+      assert.deepEqual(drawn(object),reference, `${backend}: returning to the canvas restores presentation scale`);
+      camera.position.z /= 3;
+      frame();
+      assert.equal(lod.getStats().coarseClusters,0, `${backend}: readable Retina text returns to exact glyphs`);
+    } finally { object.dispose(); }
+  }
+  for (const backend of ["webgl", "webgpu"]) {
     const multiply = { ...scene,drawRuns: scene.drawRuns.map((run,i) => i === 0 ? { ...run,blendMode: "Multiply" } : run) };
     const { object,frame } = create(backend,"auto",multiply);
     try {

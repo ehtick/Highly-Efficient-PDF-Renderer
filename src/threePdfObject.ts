@@ -2327,7 +2327,8 @@ export class HeprThreePdfObject extends THREE.Group {
         viewState,
         materialLayerViewport,
         materialCullingBounds,
-        cameraDrivenMaterialPipelineEnabled
+        cameraDrivenMaterialPipelineEnabled,
+        renderer.getRenderTarget?.() ? 1 : renderer.getPixelRatio?.() ?? 1
       );
       profile?.endSection("three.textLod");
       profile?.beginSection("three.textUpdate");
@@ -2969,7 +2970,8 @@ export class HeprThreePdfObject extends THREE.Group {
     viewState: ViewState,
     viewport: ViewportPixels,
     cullingBounds: SceneBounds | null,
-    vectorPipelineActive: boolean
+    vectorPipelineActive: boolean,
+    pixelRatio: number
   ): void {
     if (
       !vectorPipelineActive ||
@@ -2978,7 +2980,7 @@ export class HeprThreePdfObject extends THREE.Group {
     ) {
       return;
     }
-    this.textLodLayer.updateFrame(this.textMaterialLayer, viewState, viewport, cullingBounds);
+    this.textLodLayer.updateFrame(this.textMaterialLayer, viewState, viewport, cullingBounds, pixelRatio);
   }
 
   private estimateLocalUnitsPerPixel(camera: THREE.Camera, viewport: ViewportPixels): number {

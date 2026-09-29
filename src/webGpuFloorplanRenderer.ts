@@ -3970,7 +3970,8 @@ export class WebGpuFloorplanRenderer {
         viewportHeight
       ),
       viewportWidth,
-      viewportHeight
+      viewportHeight,
+      pixelRatio: this.canvas.clientWidth > 0 ? this.canvas.width / this.canvas.clientWidth : 1
     });
     this.selectedTextInstanceCount = selection.instanceIds.length;
     if (this.orderedTextLod) {

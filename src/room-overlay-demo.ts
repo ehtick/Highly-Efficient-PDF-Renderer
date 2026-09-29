@@ -1,3 +1,4 @@
+import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
 import { waitForLoad, yieldForLoad } from "./loadCancellation";
@@ -168,6 +169,7 @@ const tempRoomLabelWorldPosition = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 let currentPdfObject: HeprThreePdfObject | null = null;
+let currentPdfSourceUrl: string | undefined;
 let currentRoomOverlay: RoomOverlay | null = null;
 let currentParsedTsv: ParsedRoomTsv | null = null;
 let currentGeneratedTsv: GeneratedRoomTsv | null = null;
@@ -195,6 +197,14 @@ const drawingSelection = createDrawingSelectionControls({
 });
 
 const annotationBubblesCheckbox = requireElement<HTMLInputElement>("#annotation-bubbles-checkbox");
+const linkNavigation = createThreeLinkNavigation({
+  getCanvas: () => canvas,
+  getPdfObject: () => currentPdfObject,
+  camera,
+  getControls: () => controls,
+  getSourceUrl: () => currentPdfSourceUrl,
+  onCameraChange: () => { updateCameraClipping(true); requestRender(); }
+});
 const annotationOverlay = createAnnotationOverlay({
   getCanvas: () => canvas,
   adapter: {
@@ -204,6 +214,8 @@ const annotationOverlay = createAnnotationOverlay({
     sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvas) ?? null,
     isInteractionSuppressed: () => drawingSelection.isEnabled()
   },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
   enabled: annotationBubblesCheckbox.checked
 });
 annotationBubblesCheckbox.addEventListener("change", () => {
@@ -506,7 +518,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
       kind === "pdf"
         ? new File([bytes], `${baseName}.pdf`, { type: "application/pdf" })
         : new File([bytes], `${baseName}.hep`, { type: "application/x-hep" });
-    await loadSceneSource(file);
+    await loadSceneSource(file, entry.pdfPath);
   } catch (error) {
     if (activeToken !== loadToken || controller.signal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
@@ -534,7 +546,7 @@ function formatFileSize(sizeBytes: number): string {
   return `${rounded} ${units[unitIndex]}`;
 }
 
-async function loadSceneSource(file: File): Promise<boolean> {
+async function loadSceneSource(file: File, sourceUrl?: string): Promise<boolean> {
   const isHep = isHepFile(file);
   const activeToken = ++loadToken;
   sourceLoadController?.abort();
@@ -579,6 +591,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
     clearCurrentPdfObject();
     currentPdfCoordinateTransform = coordinateTransform;
     currentPdfObject = pdfObject;
+    currentPdfSourceUrl = sourceUrl;
     pendingObject = null;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
@@ -1605,6 +1618,7 @@ function disposeDemo(): void {
   layerControls.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
+  linkNavigation.dispose();
   clearCurrentPdfObject();
   renderer.dispose();
 }

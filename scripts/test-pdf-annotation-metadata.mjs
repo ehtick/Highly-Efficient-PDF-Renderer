@@ -68,9 +68,12 @@ try {
     assert.equal(raster.annotations.length, 8);
     const first = await session.compileVectorPage(0);
     const second = await session.compileVectorPage(1);
+    assert.deepEqual(first.pdfPages, raster.pdfPages, "raster fallback retains destination mapping");
+    assert.deepEqual(second.pdfPages, [{ sourcePageIndex: 1, pageIndex: 0, pdfToScene: [1, -0, 0, 1, 0, 0] }]);
     assert.deepEqual(second.annotations, []);
     assert.deepEqual(await session.getPageAnnotations(1), []);
     const composed = composeVectorScenesInGrid([second, first], 2);
+    assert.deepEqual(composed.pdfPages.map(p => [p.sourcePageIndex, p.pageIndex]), [[1, 0], [0, 1]]);
     const placed = composed.annotations.find(a => a.id === reply.id);
     assert.equal(placed.sourcePageIndex, 0);
     assert.equal(placed.pageIndex, 1);

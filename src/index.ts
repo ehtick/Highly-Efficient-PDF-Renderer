@@ -226,7 +226,7 @@ export type {
 export { buildHep } from "./hepBuilder";
 export { createAnnotationOverlay, pickSceneAnnotation } from "./annotationOverlay";
 export type { AnnotationOverlay, AnnotationOverlayOptions, AnnotationOverlayAdapter, AnnotationPoint } from "./annotationOverlay";
-export type { PdfAnnotation, SceneAnnotation, AnnotationGeometry, AnnotationAction,
+export type { PdfAnnotation, SceneAnnotation, ScenePdfPage, AnnotationGeometry, AnnotationAction,
   AnnotationDestination, AnnotationField, AnnotationBorder } from "./annotationData";
 
 export type {

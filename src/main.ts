@@ -1,3 +1,4 @@
+import { createViewerLinkNavigation } from "./viewerLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import "./style.css";
 import "./drawingSelectionControls.css";
@@ -320,6 +321,23 @@ const drawingSelection = createDrawingSelectionControls({
 });
 
 const annotationBubblesCheckbox = document.querySelector<HTMLInputElement>("#annotation-bubbles-checkbox")!;
+const linkNavigation = createViewerLinkNavigation({
+  getCanvas: () => canvasElement,
+  getScene: () => lastParsedScene,
+  getIdentity: () => renderer,
+  getSourceUrl: () => lastDownloadablePdf?.url,
+  beforeNavigate: () => canvasInteractionController.cancelActiveGesture(),
+  getView: () => {
+    if (!renderer) return null;
+    const view = renderer.getViewState();
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    return { centerX: view.cameraCenterX, centerY: view.cameraCenterY, zoom: view.zoom / ratio };
+  },
+  setView: view => {
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    renderer.setViewState({ cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio });
+  }
+});
 const annotationOverlay = createAnnotationOverlay({
   getCanvas: () => canvasElement,
   adapter: {
@@ -329,6 +347,8 @@ const annotationOverlay = createAnnotationOverlay({
     sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
     isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
   },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
   enabled: annotationBubblesCheckbox.checked
 });
 annotationBubblesCheckbox.addEventListener("change", () => {
@@ -604,6 +624,7 @@ window.addEventListener("beforeunload", () => {
   drawCallMeter.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
+  linkNavigation.dispose();
   pdfLayerControls.dispose();
   layerVisibility.dispose();
   activeHepExportController?.abort();
@@ -828,7 +849,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     if (selection.kind === "pdf") {
       await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
         source: { kind: "pdf", bytes, label: selection.sourceName },
-        downloadablePdf: { label: selection.sourceName, bytes },
+        downloadablePdf: { label: selection.sourceName, bytes, url: selection.pdfPath },
         signal,
         preserveView: false
       });

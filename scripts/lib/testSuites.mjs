@@ -17,6 +17,7 @@ export const fastTests = [
   "pdf-annotation-metadata",
   "annotation-appearances",
   "annotation-overlay",
+  "annotation-links",
   "hep-scene-sections",
   "optional-content",
   "retained-page-replay",

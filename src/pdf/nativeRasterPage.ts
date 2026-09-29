@@ -1,3 +1,4 @@
+import { computeNativePdfPageGeometry } from "./nativePageGeometry";
 import { placeSceneAnnotation } from "../annotationData";
 import { createEmptyVectorScene } from "../emptyVectorScene";
 import type { HeprPageData } from "../heprDocumentData";
@@ -26,6 +27,8 @@ export function buildNativeRasterPage(
     rasterLayers: [layer], rasterLayerWidth: layer.width, rasterLayerHeight: layer.height,
     rasterLayerData: layer.data, rasterLayerMatrix: layer.matrix, imagePaintOpCount: 1
   });
+  scene.pdfPages = [{ pageIndex: 0, sourcePageIndex: page.pageInfo.sourcePageIndex,
+    pdfToScene: computeNativePdfPageGeometry(page.pageInfo).pageMatrix }];
   scene.annotations = (page.annotations ?? []).map(annotation => {
     const result = placeSceneAnnotation(annotation, 0);
     delete result.optionalContent;

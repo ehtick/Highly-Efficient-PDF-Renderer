@@ -119,6 +119,9 @@ try {
     enableInvisibleCull: true
   });
   assert.equal(vectorPage.pageCount, 1);
+  assert.equal(vectorPage.pdfPages[0].sourcePageIndex, 0);
+  assert.equal(vectorPage.pdfPages[0].pageIndex, 0);
+  assert.equal(vectorPage.pdfPages[0].pdfToScene.length, 6);
   assert.deepEqual(vectorPage.annotations.map(({ pageIndex, ...rest }) => rest), workerAnnotations);
   assert.equal(vectorPage.fillPathCount, 1);
   assert.ok(vectorPage.fillSegmentsA.byteLength > 0);

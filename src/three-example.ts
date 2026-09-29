@@ -1,3 +1,4 @@
+import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
@@ -307,6 +308,14 @@ const drawingSelection = createDrawingSelectionControls({
   }
 });
 const annotationBubblesCheckbox = document.querySelector<HTMLInputElement>("#annotation-bubbles-checkbox")!;
+const linkNavigation = createThreeLinkNavigation({
+  getCanvas: () => canvasElement,
+  getPdfObject: () => currentPdfObject,
+  camera,
+  getControls: () => controls,
+  getSourceUrl: () => lastDownloadablePdf?.url,
+  onCameraChange: () => { updateCameraClipping(true); requestRender(); }
+});
 const annotationOverlay = createAnnotationOverlay({
   getCanvas: () => canvasElement,
   adapter: {
@@ -316,6 +325,8 @@ const annotationOverlay = createAnnotationOverlay({
     sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement) ?? null,
     isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
   },
+  onActivate: annotation => linkNavigation.activate(annotation),
+  getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
   enabled: annotationBubblesCheckbox.checked
 });
 annotationBubblesCheckbox.addEventListener("change", () => {
@@ -1051,6 +1062,7 @@ function disposeExample(): void {
   layerControls.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
+  linkNavigation.dispose();
   textSelection.dispose();
   controls.dispose();
   disposeCurrentObject();

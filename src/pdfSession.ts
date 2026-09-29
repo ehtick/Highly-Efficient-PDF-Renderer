@@ -907,6 +907,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     if (annotations.length > (options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage)) {
       throw new PdfError("resource-limit", "Annotations exceed the page command limit.", { pageIndex: sourcePageIndex });
     }
+    scene.pdfPages = [{ sourcePageIndex, pageIndex: 0,
+      pdfToScene: computePageGeometry(this.document.getPage(sourcePageIndex)).pageMatrix }];
     scene.annotations = annotations.map(annotation => {
       const result = placeSceneAnnotation(annotation, 0);
       if (!scene.optionalContent) delete result.optionalContent;

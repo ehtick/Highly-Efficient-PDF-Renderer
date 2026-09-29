@@ -94,8 +94,14 @@ Scene v9 optionally references `annotations/annotations.json` through
 { "file": "annotations/annotations.json", "version": 1, "count": 0 }
 ```
 
-The UTF-8 JSON section contains `{ "version": 1, "annotations": [] }` with
+The UTF-8 JSON section contains `{ "version": 1, "annotations": [], "pdfPages": [] }` with
 `SceneAnnotation` records as described in [the API reference](api.md#pdf-annotations-and-html-bubbles).
+The optional `pdfPages` array holds `{pageIndex, sourcePageIndex, pdfToScene}`
+for displayed pages, including pages without annotations. The six-number matrix
+maps original PDF destination coordinates into composed scene coordinates.
+Readers validate unique in-range scene slots, nonnegative integer source indexes,
+and finite, invertible matrices. Older sections without `pdfPages` remain valid;
+this optional addition changes neither section nor scene/container versions.
 It preserves original PDF geometry alongside composed scene geometry, source
 identities, decoded strings, field metadata, relationships, inert actions and
 optional-content condition indexes. It contains no appearance streams.

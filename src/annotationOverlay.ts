@@ -15,6 +15,10 @@ export interface AnnotationOverlayOptions {
   getCanvas(): HTMLCanvasElement | null;
   adapter: AnnotationOverlayAdapter;
   enabled?: boolean;
+  /** Host-controlled activation. Return true to consume the click; only comments can pin when unhandled. */
+  onActivate?(annotation: SceneAnnotation): boolean;
+  /** Optional accessible action button for comments. Link previews have no interactive controls. */
+  getActivationLabel?(annotation: SceneAnnotation): string | null;
   /** Replace only the bubble body. The host retains pinning, positioning and dismissal. */
   renderContent?(annotation: SceneAnnotation, container: HTMLElement): void;
 }
@@ -22,7 +26,7 @@ export interface AnnotationOverlay {
   enable(): void;
   disable(): void;
   isEnabled(): boolean;
-  /** Open a scene annotation programmatically, for example from an accessible list. */
+  /** Open a comment programmatically. Links can only preview while hovered, never pin. */
   show(annotation: SceneAnnotation): void;
   hide(): void;
   /** Call after camera, layer or backend updates; there is no internal animation loop. */
@@ -30,6 +34,11 @@ export interface AnnotationOverlay {
   /** Resets only when the scene identity changes; backend switches keep pinned bubbles. */
   sceneChanged(): void;
   dispose(): void;
+}
+
+function isLink(annotation: SceneAnnotation): boolean {
+  return annotation.subtype === "Link" || annotation.destination !== undefined ||
+    annotation.action?.type === "URI" || annotation.action?.type === "GoTo" || annotation.action?.type === "GoToR";
 }
 
 const defaultVisibility = new WeakMap<VectorScene, OptionalContentSnapshot>();
@@ -157,12 +166,15 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   close.type = "button"; close.textContent = "×"; close.setAttribute("aria-label", "Close annotation");
   close.style.cssText = "position:absolute;top:4px;right:5px;border:0;background:transparent;color:inherit;font:22px system-ui;cursor:pointer;";
   const content = document.createElement("div");
+  const activate = document.createElement("button");
+  activate.type = "button"; activate.hidden = true;
+  activate.style.cssText = "margin-top:10px;padding:5px 9px;border:1px solid #9ca3af;border-radius:4px;background:#fff;color:#1d4ed8;font:inherit;cursor:pointer;";
   // Keep host cursors (text selection, grab/grabbing) intact underneath this
   // temporary override, including inline cursor updates from other controls.
   const cursorAttribute = "data-hepr-annotation-hover";
   const cursorStyle = document.createElement("style");
   cursorStyle.textContent = `canvas[${cursorAttribute}] { cursor: pointer !important; }`;
-  panel.appendChild(close); panel.appendChild(content); panel.appendChild(cursorStyle); document.body.appendChild(panel);
+  panel.appendChild(close); panel.appendChild(content); panel.appendChild(activate); panel.appendChild(cursorStyle); document.body.appendChild(panel);
   const lifetime = new AbortController();
   const eventOptions = { capture: true, signal: lifetime.signal };
   let enabled = options.enabled !== false, disposed = false;
@@ -180,7 +192,10 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     cursorCanvas = canvas;
     cursorCanvas?.setAttribute(cursorAttribute, "");
   }
-  function clearPointer(): void { pointer = null; setPointerCursor(false); }
+  function clearPointer(): void {
+    pointer = null; setPointerCursor(false);
+    if (active && isLink(active)) hide();
+  }
   function hide(): void { active = null; pinned = false; panel.hidden = true; }
   function sceneChanged(): void {
     const next = adapter.getScene();
@@ -194,15 +209,21 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     const minX = Math.max(b.minX, rects[offset]), maxX = Math.min(b.maxX, rects[offset + 2]);
     const minY = Math.max(b.minY, rects[offset + 1]), maxY = Math.min(b.maxY, rects[offset + 3]);
     if (minX > maxX || minY > maxY) { hide(); return; }
-    const anchor = adapter.sceneToClientPoint((minX + maxX) / 2, maxY);
+    const link = isLink(active);
+    if (link && !pointer) { hide(); return; }
+    const anchor = link ? pointer : adapter.sceneToClientPoint((minX + maxX) / 2, maxY);
     const viewport = options.getCanvas()?.getBoundingClientRect();
     if (!anchor || !viewport || anchor.x < viewport.left || anchor.x > viewport.right || anchor.y < viewport.top || anchor.y > viewport.bottom) {
       panel.hidden = true; return;
     }
     panel.hidden = false;
     const width = panel.offsetWidth, height = panel.offsetHeight;
-    const x = Math.max(8, Math.min(anchor.x + 12, window.innerWidth - width - 8));
-    const y = Math.max(8, Math.min(anchor.y + 12, window.innerHeight - height - 8));
+    let x = anchor.x + 12, y = anchor.y + 12;
+    // Flip link previews near viewport edges so they keep an offset from the pointer.
+    if (link && x + width > window.innerWidth - 8) x = anchor.x - width - 12;
+    if (link && y + height > window.innerHeight - 8) y = anchor.y - height - 12;
+    x = Math.max(8, Math.min(x, window.innerWidth - width - 8));
+    y = Math.max(8, Math.min(y, window.innerHeight - height - 8));
     panel.style.left = `${Math.round(x)}px`; panel.style.top = `${Math.round(y)}px`;
   }
   function display(annotation: SceneAnnotation, pin: boolean): void {
@@ -210,7 +231,18 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
       content.replaceChildren();
       (options.renderContent ?? renderDefaultContent)(annotation, content);
     }
-    active = annotation; pinned = pin; position();
+    const link = isLink(annotation);
+    const label = !link && options.onActivate ? options.getActivationLabel?.(annotation) : null;
+    activate.hidden = !label; activate.textContent = label ?? "";
+    close.hidden = link;
+    panel.setAttribute("role", link ? "tooltip" : "dialog");
+    panel.setAttribute("aria-label", link ? "PDF link" : "PDF annotation");
+    panel.style.pointerEvents = link ? "none" : "auto";
+    panel.style.userSelect = link ? "none" : "text";
+    panel.style.webkitUserSelect = link ? "none" : "text";
+    panel.style.paddingRight = link ? "14px" : "36px";
+    panel.style.overflow = link ? "hidden" : "auto";
+    active = annotation; pinned = pin && !link; position();
   }
   function updateHover(): void {
     frame = 0; sceneChanged();
@@ -233,7 +265,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   window.addEventListener("pointerdown", event => {
     sceneChanged();
     clearPointer();
-    if (insidePanel(event)) { pinned = true; return; }
+    if (insidePanel(event)) { if (active && !isLink(active)) pinned = true; else hide(); return; }
     if (event.target !== options.getCanvas()) { hide(); return; }
     pointers.add(event.pointerId);
     if (gesture) { gesture.multiple = true; return; }
@@ -269,23 +301,40 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     sceneChanged();
     if (!scene) return;
     const annotation = pickSceneAnnotation(scene, event.clientX, event.clientY, adapter);
-    if (annotation) display(annotation, true); else hide();
+    if (annotation && !options.onActivate?.(annotation) && !isLink(annotation)) display(annotation, true);
+    else { clearPointer(); hide(); }
   }, eventOptions);
   window.addEventListener("pointercancel", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, eventOptions);
   window.addEventListener("keydown", event => {
+    sceneChanged();
+    if (active && scene && !visible(active, scene, adapter.getOptionalContentVisibility?.())) hide();
     if (event.key === "Escape" && active) { const focused = panel.contains(document.activeElement); clearPointer(); hide(); if (focused) options.getCanvas()?.focus(); }
-    else if (event.key === "Enter" && event.target === options.getCanvas() && active) { pinned = true; close.focus(); }
+    else if (event.key === "Enter" && event.target === options.getCanvas() && active && !suppressed()) {
+      event.preventDefault();
+      const annotation = active;
+      if (options.onActivate?.(annotation) || isLink(annotation)) { clearPointer(); hide(); }
+      else { pinned = true; close.focus(); }
+    }
   }, eventOptions);
   window.addEventListener("blur", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, { signal: lifetime.signal });
   window.addEventListener("resize", onFrame, { signal: lifetime.signal });
   window.addEventListener("scroll", onFrame, eventOptions);
   panel.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });
+  activate.addEventListener("click", () => {
+    sceneChanged();
+    if (active && !isLink(active) && scene && !suppressed() && visible(active, scene, adapter.getOptionalContentVisibility?.()) &&
+      options.onActivate?.(active)) { clearPointer(); hide(); options.getCanvas()?.focus(); }
+  }, { signal: lifetime.signal });
   close.addEventListener("click", () => { clearPointer(); hide(); options.getCanvas()?.focus(); }, { signal: lifetime.signal });
   return {
     enable() { if (!disposed) enabled = true; },
     disable() { enabled = false; setPointerCursor(false); hide(); },
     isEnabled: () => enabled && !disposed,
-    show(annotation) { sceneChanged(); if (!suppressed() && scene?.annotations?.includes(annotation)) display(annotation, true); },
+    show(annotation) {
+      sceneChanged();
+      if (!suppressed() && scene?.annotations?.includes(annotation) &&
+        (!isLink(annotation) || pointer && pickSceneAnnotation(scene, pointer.x, pointer.y, adapter) === annotation)) display(annotation, true);
+    },
     hide() { clearPointer(); hide(); }, onFrame, sceneChanged,
     dispose() { if (disposed) return; disposed = true; clearPointer(); lifetime.abort(); if (frame) window.cancelAnimationFrame(frame); panel.remove(); active = null; }
   };

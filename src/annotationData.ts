@@ -90,6 +90,28 @@ export interface PdfAnnotation {
   destination?: AnnotationDestination;
 }
 
+/** Identifies a displayed page and maps PDF default user space into its scene, including crop and rotation. */
+export interface ScenePdfPage {
+  pageIndex: number;
+  sourcePageIndex: number;
+  pdfToScene: PdfMatrix;
+}
+
+export function validateScenePdfPages(value: unknown, pageCount: number): asserts value is ScenePdfPage[] | undefined {
+  if (value === undefined) return;
+  const fail = (): never => { throw new Error("Invalid PDF page mapping metadata."); };
+  if (!Array.isArray(value) || value.length > pageCount) fail();
+  const slots = new Set<number>();
+  for (const page of value as ScenePdfPage[]) {
+    if (!page || !Number.isSafeInteger(page.pageIndex) || page.pageIndex < 0 || page.pageIndex >= pageCount ||
+      slots.has(page.pageIndex) || !Number.isSafeInteger(page.sourcePageIndex) || page.sourcePageIndex < 0 ||
+      !Array.isArray(page.pdfToScene) || page.pdfToScene.length !== 6 || ![...page.pdfToScene].every(Number.isFinite)) fail();
+    const [a, b, c, d] = page.pdfToScene;
+    if (!Number.isFinite(a * d - b * c) || a * d - b * c === 0) fail();
+    slots.add(page.pageIndex);
+  }
+}
+
 export interface SceneAnnotation extends PdfAnnotation {
   /** Page slot in VectorScene.pageRects, independent of the source PDF index. */
   pageIndex: number;

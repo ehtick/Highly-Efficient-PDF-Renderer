@@ -83,6 +83,7 @@ try {
   assert(startupBindings.every(Boolean), "native example startup bindings exist");
   const startup = vm.createContext({
     createAnnotationOverlay, canvasElement: canvas, renderer: undefined,
+    linkNavigation: { activate: () => false, getActivationLabel: () => null },
     annotationBubblesCheckbox: { checked: true },
     drawingSelection: { isEnabled: () => false },
     textSelection: { getSelectedText: () => "" },
@@ -178,5 +179,99 @@ try {
   overlay.dispose(); overlay.dispose(); assert.equal(document.body.children.length, 0);
   assert.equal(hasPointerCursor(), false, "disposal restores the host cursor");
   event("pointermove"); window.frame(); assert.equal(document.body.children.length, 0);
-  console.log("Annotation overlay: precise picking, safe HTML text, pinning, cursor ownership, gestures, visibility, projection and lifecycle passed.");
+  shift = 0;
+  annotations[1].subtype = "Link";
+  annotations[1].action = { type: "URI", uri: "https://example.com/" };
+  annotations[7].subtype = "Link";
+  annotations[7].destination = { name: "Missing target" };
+  const activations = [];
+  const links = createAnnotationOverlay({ getCanvas: () => canvas, adapter,
+    onActivate: a => { activations.push(a); return a === annotations[1]; },
+    getActivationLabel: () => "Go to destination" });
+  const linkPanel = document.body.children[0];
+  const buttons = linkPanel.children.filter(child => child.type === "button");
+  event("pointermove"); window.frame();
+  assert.equal(linkPanel.attributes.get("role"), "tooltip");
+  assert.equal(linkPanel.style.pointerEvents, "none", "preview cannot intercept link clicks or pointer movement");
+  assert.equal(linkPanel.style.userSelect, "none");
+  assert(buttons.every(button => button.hidden), "link previews have no close or action buttons");
+  assert(!text(linkPanel).includes("Go to destination"));
+  assert.equal(linkPanel.style.left, "32px"); assert.equal(linkPanel.style.top, "32px");
+  event("pointermove", 25, 24); window.frame();
+  assert.equal(linkPanel.style.left, "37px"); assert.equal(linkPanel.style.top, "36px", "preview follows movement within one link");
+  assert.equal(hasPointerCursor(), true);
+  event("pointermove", 200, 100); window.frame();
+  assert.equal(linkPanel.hidden, true, "leaving a link dismisses its preview");
+  event("pointerdown"); event("pointerup");
+  assert.deepEqual(activations, [annotations[1]], "a click invokes the host synchronously");
+  window.frame(); assert.equal(linkPanel.hidden, true, "consumed activation does not pin or reopen the preview");
+  event("pointermove"); window.frame(); canvas.focus();
+  assert.equal(linkPanel.hidden, false);
+  event("keydown", 0, 0, { key: "Enter" });
+  assert.equal(activations.length, 2, "Enter activates the hovered link");
+  assert.equal(document.activeElement, canvas, "link activation never focuses a hidden bubble control");
+  event("pointerdown"); event("pointermove", 100, 20, { buttons: 1 }); event("pointerup", 20, 20);
+  assert.equal(activations.length, 2, "dragging over and back to a link does not activate it");
+  event("pointerdown"); event("pointerdown", 20, 20, { pointerId: 2 }); event("pointerup", 20, 20, { pointerId: 2 }); event("pointerup");
+  assert.equal(activations.length, 2, "multitouch does not activate");
+  suppressed = true; event("pointerdown"); event("pointerup");
+  assert.equal(activations.length, 2, "selection suppression prevents activation");
+  suppressed = false; links.disable(); event("pointerdown"); event("pointerup");
+  assert.equal(activations.length, 2, "disabled helper prevents activation");
+  links.enable();
+  window.innerWidth = 300; window.innerHeight = 200;
+  event("pointermove", 290, 170); window.frame();
+  assert.equal(linkPanel.hidden, false, "unresolved destinations still preview");
+  assert.equal(linkPanel.style.left, "98px"); assert.equal(linkPanel.style.top, "78px", "edge previews flip away from the pointer");
+  assert(buttons.every(button => button.hidden));
+  event("pointerdown", 290, 170); event("pointerup", 290, 170); window.frame();
+  assert.equal(activations.length, 3);
+  assert.equal(linkPanel.hidden, true, "unhandled link clicks cannot pin");
+  event("pointermove", 290, 170); window.frame();
+  event("keydown", 0, 0, { key: "Enter" });
+  assert.equal(activations.length, 4);
+  assert.equal(linkPanel.hidden, true, "unhandled keyboard activation cannot pin");
+  event("pointerdown", 290, 170, { pointerType: "touch" }); event("pointerup", 290, 170, { pointerType: "touch" });
+  assert.equal(activations.length, 5);
+  assert.equal(linkPanel.hidden, true, "unhandled touch activation cannot pin");
+  event("pointerdown", 20, 20, { pointerType: "touch" }); event("pointerup", 20, 20, { pointerType: "touch" });
+  assert.equal(activations.length, 6, "touch still activates valid links directly");
+  event("pointermove", 290, 170); window.frame();
+  links.show(annotations[7]); assert.equal(linkPanel.hidden, false);
+  event("pointermove", 200, 100); window.frame();
+  assert.equal(linkPanel.hidden, true, "show(link) cannot pin a preview");
+  links.show(annotations[7]); assert.equal(linkPanel.hidden, true, "show(link) requires hovering that link");
+  event("pointermove", 290, 170); window.frame();
+  event("pointerout", 290, 170, { relatedTarget: linkPanel });
+  assert.equal(linkPanel.hidden, true, "moving toward a link preview cannot keep it open");
+  event("pointermove"); window.frame();
+  shift = 100; links.onFrame(); window.frame();
+  assert.equal(linkPanel.hidden, true, "camera changes recheck the hovered link");
+  shift = 0; event("pointermove"); window.frame();
+  annotations[1].optionalContent = 0; links.onFrame(); window.frame();
+  assert.equal(linkPanel.attributes.get("role"), "dialog", "hiding a link exposes the comment underneath, not its link preview");
+  delete annotations[1].optionalContent;
+  event("pointermove"); window.frame(); event("keydown", 0, 0, { key: "Escape" }); window.frame();
+  assert.equal(linkPanel.hidden, true, "Escape dismisses a link preview until the next pointer movement");
+  event("pointerdown", 50, 65); event("pointerup", 50, 65);
+  assert.equal(linkPanel.hidden, false, "unhandled comments still pin normally");
+  assert.equal(linkPanel.attributes.get("role"), "dialog");
+  assert.equal(linkPanel.style.pointerEvents, "auto");
+  assert.equal(linkPanel.style.userSelect, "text");
+  assert(buttons.every(button => !button.hidden), "comments retain their controls, including custom actions");
+  const pinnedPosition = [linkPanel.style.left, linkPanel.style.top];
+  event("pointermove", 200, 100); window.frame();
+  assert.equal(linkPanel.hidden, false);
+  assert.deepEqual([linkPanel.style.left, linkPanel.style.top], pinnedPosition, "pinned comments stay anchored to their annotation");
+  links.dispose();
+  const passive = createAnnotationOverlay({ getCanvas: () => canvas, adapter });
+  const passivePanel = document.body.children[0];
+  event("pointerdown"); event("pointerup"); window.frame();
+  assert.equal(passivePanel.hidden, true, "links cannot pin even without an activation handler");
+  event("pointermove"); window.frame();
+  assert.equal(passivePanel.hidden, false);
+  event("keydown", 0, 0, { key: "Enter" });
+  assert.equal(passivePanel.hidden, true);
+  passive.dispose();
+  console.log("Annotation overlay: precise picking, safe HTML text, pinning, pointer-following links, cursor ownership, gestures, visibility, projection and lifecycle passed.");
 } finally { hooks.deregister(); }

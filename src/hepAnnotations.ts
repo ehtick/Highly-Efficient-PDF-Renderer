@@ -1,4 +1,4 @@
-import { validateAnnotations, type SceneAnnotation } from "./annotationData";
+import { validateAnnotations, validateScenePdfPages, type SceneAnnotation } from "./annotationData";
 import type { HepArchive } from "./hepContainer";
 import type { VectorScene } from "./pdfVectorExtractor";
 
@@ -6,12 +6,14 @@ export const HEP_ANNOTATIONS_PATH = "annotations/annotations.json";
 export const MAX_HEP_ANNOTATION_BYTES = 64 * 1024 * 1024;
 
 export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): { file: string; version: 1; count: number } | undefined {
-  if (scene.annotations === undefined) return undefined;
-  validateAnnotations(scene.annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
-  const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations: scene.annotations }));
+  if (scene.annotations === undefined && scene.pdfPages === undefined) return undefined;
+  const annotations = scene.annotations ?? [];
+  validateScenePdfPages(scene.pdfPages, scene.pageCount);
+  validateAnnotations(annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
+  const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations, pdfPages: scene.pdfPages }));
   if (bytes.length > MAX_HEP_ANNOTATION_BYTES) throw new Error("Annotation metadata exceeds the HEP section limit.");
   archive.file(HEP_ANNOTATIONS_PATH, bytes);
-  return { file: HEP_ANNOTATIONS_PATH, version: 1, count: scene.annotations.length };
+  return { file: HEP_ANNOTATIONS_PATH, version: 1, count: annotations.length };
 }
 
 export async function readHepAnnotations(archive: HepArchive, descriptor: unknown, scene: VectorScene,
@@ -32,5 +34,7 @@ export async function readHepAnnotations(archive: HepArchive, descriptor: unknow
     throw new Error("HEP annotations do not match their manifest entry.");
   }
   validateAnnotations(data.annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
+  validateScenePdfPages(data.pdfPages, scene.pageCount);
+  scene.pdfPages = data.pdfPages;
   return data.annotations as SceneAnnotation[];
 }

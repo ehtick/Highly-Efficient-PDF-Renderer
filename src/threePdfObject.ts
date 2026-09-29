@@ -1,3 +1,6 @@
+import { ScenePageViews, type ScenePageView } from "./scenePageViews";
+import { SharedPageRenderer } from "./sharedPageRenderer";
+import { yieldForLoad } from "./loadCancellation";
 import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
 import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
@@ -307,6 +310,155 @@ interface RendererConfig {
  * ```
  */
 export class HeprThreePdfObject extends THREE.Group {
+  private pageViews: { object: HeprThreePdfObject; view: ScenePageView }[] | null = null;
+  private pagePartition: ScenePageViews | null = null;
+  private pagePreparation: Promise<readonly HeprThreePdfObject[]> | null = null;
+  private readonly pagePreparationAbort = new AbortController();
+  private pendingLayerUpdate: Promise<void> | null = null;
+  private pageOwner: HeprThreePdfObject | null = null;
+  private sourcePageSlot: number | null = null;
+
+  /** Zero-based slot in the owning document, or null for a document object. */
+  get pageIndex(): number | null { return this.sourcePageSlot; }
+  /** Number of displayed pages (selected PDF pages or pages stored in a HEP). */
+  get pageCount(): number { return Math.floor(this.sceneData.pageRects.length / 4); }
+
+  /**
+   * Prepare independent page views once, preserving their initial document layout.
+   * Each view is a document-owned THREE.Group with position/rotation/quaternion/
+   * scale/matrix APIs and its own picking, search and highlight methods. Its pivot
+   * is the page center; position is relative to this document's centered origin.
+   * This opts out of cross-page batching; native fallback shares one GPU context.
+   */
+  async getPages(options: { signal?: AbortSignal } = {}): Promise<readonly HeprThreePdfObject[]> {
+    if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
+    options.signal?.throwIfAborted();
+    if (this.pageCount <= 1) return Object.freeze(this.pageCount ? [this] : []);
+    this.pagePreparation ??= this.preparePageViews().catch(error => { this.pagePreparation = null; throw error; });
+    return waitForLoad(this.pagePreparation, options.signal);
+  }
+
+  /** Zero-based displayed page index, independent of the PDF's source page number. */
+  async getPage(index: number, options: { signal?: AbortSignal } = {}): Promise<HeprThreePdfObject> {
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount) throw new RangeError("Invalid page index.");
+    return (await this.getPages(options))[index];
+  }
+
+  /** Set the page center in document-local XYZ coordinates. */
+  async setPagePosition(index: number, x: number, y: number, z = 0): Promise<void> {
+    if (![x, y, z].every(Number.isFinite)) throw new RangeError("Page position must be finite.");
+    const page = await this.getPage(index);
+    page.position.set(x, y, z);
+    if (page.matrixAutoUpdate) page.updateMatrix();
+    else { page.matrix.setPosition(x, y, z); page.matrixWorldNeedsUpdate = true; }
+  }
+
+  /** Replace a page's local affine matrix, including shear. Disables matrixAutoUpdate. */
+  async setPageTransform(index: number, matrix: THREE.Matrix4): Promise<void> {
+    const elements = matrix?.elements;
+    if (!elements || elements.length !== 16 || !elements.every(Number.isFinite) ||
+        elements[3] !== 0 || elements[7] !== 0 || elements[11] !== 0 || elements[15] !== 1)
+      throw new RangeError("Page transform must be a finite affine Matrix4.");
+    const copy = matrix.clone();
+    const page = await this.getPage(index);
+    page.matrix.copy(copy);
+    if (copy.determinant() !== 0) page.matrix.decompose(page.position, page.quaternion, page.scale);
+    else { page.position.setFromMatrixPosition(copy); page.scale.setFromMatrixScale(copy); page.quaternion.identity(); }
+    page.matrixAutoUpdate = false; page.matrixWorldNeedsUpdate = true;
+  }
+
+  private async preparePageViews(): Promise<readonly HeprThreePdfObject[]> {
+    const signal = this.pagePreparationAbort.signal;
+    const partition = new ScenePageViews(this.sceneData);
+    const pool = new SharedPageRenderer(this.renderer, this.renderCanvas);
+    const prepared: { object: HeprThreePdfObject; view: ScenePageView }[] = [];
+    const config = this.rendererConfig;
+    const options: HeprThreeObjectOptions = { rendererType: this.rendererType,
+      vectorLod: config.vectorLodMode, textLod: config.textLodMode, curveStrokes: config.strokeCurveEnabled,
+      vectorOnly: config.textVectorOnly, threeColorCompositing: config.threeColorCompositing,
+      pageBackground: config.pageBackground.slice(0, 3) as [number, number, number], pageBackgroundOpacity: config.pageBackground[3],
+      vectorOverrideColor: config.vectorOverride.slice(0, 3) as [number, number, number], vectorOverrideOpacity: config.vectorOverride[3] };
+    try {
+      for (let index = 0; index < partition.pageCount; index++) {
+        await yieldForLoad(signal);
+        const view = partition.extract(index);
+        const object = await createThreePdfObject({ scene: view.scene, sourceKind: this.sourceKind,
+          sourceLabel: `${this.sourceLabel} — page ${index + 1}` }, options, signal, undefined,
+          canvas => pool.createView(view.scene, canvas));
+        prepared.push({ object, view });
+        object.sourcePageSlot = index; object.pageOwner = this;
+        object.layerVisibility.dispose(); object.layerVisibility = this.layerVisibility;
+        object.position.set(object.sceneCenterX - this.sceneCenterX, object.sceneCenterY - this.sceneCenterY, 0);
+        object.updateMatrix();
+      }
+      let revision: number;
+      do {
+        // A layer update begun on the batched object must commit before views
+        // become visible, otherwise its retained pixels would miss the pages.
+        while (this.pendingLayerUpdate) await waitForLoad(this.pendingLayerUpdate.catch(() => {}), signal);
+        const snapshot = this.layerVisibility.getSnapshot(); revision = snapshot.revision;
+        for (const { object } of prepared) {
+          const replay = await object.retainedReplay?.prepare(snapshot, { signal });
+          if (replay) {
+            const staged = object.rasterMaterialLayer.prepareRasterLayerUpdates(replay.layers);
+            try { signal.throwIfAborted(); staged.commit(); replay.commit(); } finally { staged.dispose(); }
+          }
+        }
+        signal.throwIfAborted();
+      } while (revision !== this.layerVisibility.revision || this.pendingLayerUpdate);
+      // No partially prepared layout is ever exposed. The batched document stays
+      // visible until all page resources are ready, and survives failed setup.
+      const snapshot = this.layerVisibility.getSnapshot();
+      for (const { object } of prepared) {
+        // Settings may have changed while resources were being prepared.
+        object.setVectorLodMode(config.vectorLodMode); object.setTextLodMode(config.textLodMode);
+        object.setStrokeCurveEnabled(config.strokeCurveEnabled);
+        object.setPageBackgroundColor(...config.pageBackground);
+        object.setVectorColorOverride(...config.vectorOverride);
+        object.applyLayerVisibility(snapshot);
+      }
+      this.configureDormantPipeline();
+      this.pageMesh.visible = false;
+      if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
+      if (this.searchHighlightGroup) this.searchHighlightGroup.visible = false;
+      if (this.textSelectionHighlightGroup) this.textSelectionHighlightGroup.visible = false;
+      if (this.primitiveHighlightLayer) this.primitiveHighlightLayer.mesh.visible = false;
+      this.pagePartition = partition; this.pageViews = prepared;
+      for (const { object } of prepared) this.add(object);
+      this.setSearchHighlights(this.searchHighlightMatches, { currentIndex: this.searchHighlightIndex });
+      this.setTextSelectionHighlights(this.textSelectionHighlightRects);
+      this.setSelection(this.primitiveAppearance.getSelection());
+      this.setHover(this.primitiveAppearance.getHover());
+      this.applyPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates());
+      return Object.freeze(prepared.map(page => page.object));
+    } catch (error) {
+      this.pageViews = null; this.pagePartition = null;
+      this.pageMesh.visible = true;
+      if (this.searchHighlightGroup) this.searchHighlightGroup.visible = this.searchHighlightMatches.length > 0;
+      if (this.textSelectionHighlightGroup) this.textSelectionHighlightGroup.visible = this.textSelectionHighlightRects.length > 0;
+      for (const { object } of prepared) { object.removeFromParent(); object.dispose(); }
+      throw error;
+    }
+  }
+
+  private prepareIndependentPages(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    this.updateWorldMatrix(true, true); camera.updateMatrixWorld();
+    const point = new THREE.Vector3();
+    const pages = this.pageViews!.filter(page => page.object.parent === this && page.object.visible && !page.object.isDisposed);
+    pages.sort((a, b) => {
+      const az = point.setFromMatrixPosition(a.object.matrixWorld).applyMatrix4(camera.matrixWorldInverse).z;
+      const bz = point.setFromMatrixPosition(b.object.matrixWorld).applyMatrix4(camera.matrixWorldInverse).z;
+      return az - bz || a.view.pageIndex - b.view.pageIndex;
+    });
+    pages.forEach(({ object }, index) => {
+      object.prepareFrameForThreeRenderer(renderer, camera);
+      const groupOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH + index;
+      object.traverse(child => {
+        if ((child as THREE.Group).isGroup) child.renderOrder = groupOrder;
+      });
+    });
+  }
+
   /** Human-readable source label, usually the file name or URL basename. */
   readonly sourceLabel: string;
 
@@ -352,7 +504,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private threeTextLodResourceFallback = false;
 
   private readonly primitiveAppearance: PrimitiveAppearanceState;
-  private readonly layerVisibility: OptionalContentController;
+  private layerVisibility: OptionalContentController;
   private layerVisibilityProgress: number | null = null;
   private readonly layerVisibilityProgressListeners = new Set<(percentage: number | null) => void>();
   private readonly paintVisibility: ScenePaintVisibility;
@@ -366,6 +518,9 @@ export class HeprThreePdfObject extends THREE.Group {
   private nativePrimitiveColorsReplayed = false;
 
   private textSearcher: SceneTextSearcher | null = null;
+  private searchHighlightMatches: ReadonlyArray<Pick<TextSearchMatch, "bounds"> & Partial<Pick<TextSearchMatch, "highlightBounds" | "pageIndex">>> = [];
+  private searchHighlightIndex = -1;
+  private textSelectionHighlightRects: ReadonlyArray<Bounds> = [];
   private searchHighlightGroup: THREE.Group | null = null;
   private searchHighlightOthersMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
   private searchHighlightCurrentMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
@@ -398,6 +553,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly pagePlane = new THREE.Plane();
   private readonly pagePlanePoint = new THREE.Vector3();
   private readonly pagePlaneNormal = new THREE.Vector3();
+  private readonly pageNormalMatrix = new THREE.Matrix3();
   private readonly pageWorldInverse = new THREE.Matrix4();
   private readonly clipFromWorldMatrix = new THREE.Matrix4();
   private readonly clipFromLocalMatrix = new THREE.Matrix4();
@@ -548,28 +704,43 @@ export class HeprThreePdfObject extends THREE.Group {
       onChange: snapshot => this.applyLayerVisibility(snapshot),
       onProgress: percentage => this.reportLayerVisibilityProgress(percentage),
       prepare: async (snapshot, context) => {
-        const prepared = await this.retainedReplay?.prepare(snapshot, context);
-        if (!prepared) return;
-        context.signal.throwIfAborted();
-        const materials = this.rasterMaterialLayer.prepareRasterLayerUpdates(prepared.layers);
-        const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
-        let native: ReturnType<NonNullable<RendererApi["prepareRasterLayerUpdates"]>> | undefined;
+        const staged: { commit(): void; dispose(): void }[] = [];
+        const release = () => { for (const item of staged) item.dispose(); };
+        context.signal.addEventListener("abort", release, { once: true });
         try {
-          if (!deferred.hasUploadedScene || deferred.hasUploadedScene()) native = this.renderer.prepareRasterLayerUpdates?.(prepared.layers);
-        } catch (error) { materials.dispose(); throw error; }
-        const abort = (): void => { materials.dispose(); native?.dispose(); };
-        context.signal.addEventListener("abort", abort, { once: true });
-        return () => {
-          try {
+          for (const object of this.pageViews?.map(page => page.object) ?? [this]) {
+            const prepared = await object.retainedReplay?.prepare(snapshot, context);
+            if (!prepared) continue;
             context.signal.throwIfAborted();
-            if (!native && (!deferred.hasUploadedScene || deferred.hasUploadedScene())) native = this.renderer.prepareRasterLayerUpdates?.(prepared.layers);
-            native?.commit(); materials.commit(); prepared.commit();
-          } finally { context.signal.removeEventListener("abort", abort); abort(); }
-        };
+            const materials = object.rasterMaterialLayer.prepareRasterLayerUpdates(prepared.layers);
+            const deferred = object.renderer as Partial<DeferredSceneRendererApi>;
+            let native: ReturnType<NonNullable<RendererApi["prepareRasterLayerUpdates"]>> | undefined;
+            try {
+              if (!object.pageViews && (!deferred.hasUploadedScene || deferred.hasUploadedScene())) native = object.renderer.prepareRasterLayerUpdates?.(prepared.layers);
+            } catch (error) { materials.dispose(); throw error; }
+            staged.push({ commit: () => {
+              if (!object.pageViews && !native && (!deferred.hasUploadedScene || deferred.hasUploadedScene())) native = object.renderer.prepareRasterLayerUpdates?.(prepared.layers);
+              native?.commit(); materials.commit(); prepared.commit();
+            }, dispose: () => { materials.dispose(); native?.dispose(); } });
+          }
+          context.signal.throwIfAborted();
+          return () => {
+            try { context.signal.throwIfAborted(); for (const item of staged) item.commit(); }
+            finally { context.signal.removeEventListener("abort", release); release(); }
+          };
+        } catch (error) { context.signal.removeEventListener("abort", release); release(); throw error; }
       }
     });
     this.applyLayerVisibility(this.layerVisibility.getSnapshot());
     this.configureDormantPipeline();
+  }
+
+  private trackLayerUpdate(promise: Promise<void>): Promise<void> {
+    const owner = this.pageOwner ?? this;
+    owner.pendingLayerUpdate = promise;
+    const clear = () => { if (owner.pendingLayerUpdate === promise) owner.pendingLayerUpdate = null; };
+    void promise.then(clear, clear);
+    return promise;
   }
 
   getLayers() { return this.layerVisibility.getLayers(); }
@@ -577,16 +748,16 @@ export class HeprThreePdfObject extends THREE.Group {
   getLayerOrder() { return this.layerVisibility.getOrder(); }
   getOptionalContentVisibility(): OptionalContentSnapshot { return this.layerVisibility.getSnapshot(); }
   setLayerVisibility(layerId: string, visible: boolean): Promise<void> {
-    return this.layerVisibility.setLayerVisibility(layerId, visible);
+    return this.trackLayerUpdate(this.layerVisibility.setLayerVisibility(layerId, visible));
   }
   setLayerVisibilities(changes: readonly LayerVisibilityChange[]): Promise<void> {
-    return this.layerVisibility.setLayerVisibilities(changes);
+    return this.trackLayerUpdate(this.layerVisibility.setLayerVisibilities(changes));
   }
   setAllLayerVisibility(visible: boolean, layerIds?: readonly string[]): Promise<void> {
-    return this.layerVisibility.setAllLayerVisibility(visible, layerIds);
+    return this.trackLayerUpdate(this.layerVisibility.setAllLayerVisibility(visible, layerIds));
   }
   getAllLayerVisibility(layerIds?: readonly string[]) { return this.layerVisibility.getAllLayerVisibility(layerIds); }
-  resetLayerVisibility(): Promise<void> { return this.layerVisibility.resetLayerVisibility(); }
+  resetLayerVisibility(): Promise<void> { return this.trackLayerUpdate(this.layerVisibility.resetLayerVisibility()); }
   subscribeLayerVisibility(listener: OptionalContentListener): () => void { return this.layerVisibility.subscribe(listener); }
 
   /** Observe layer preparation; immediately reports the current percentage or null when idle. */
@@ -611,6 +782,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private applyLayerVisibility(snapshot: OptionalContentSnapshot): void {
+    for (const page of this.pageViews ?? []) page.object.applyLayerVisibility(snapshot);
     this.paintVisibility.setVisibility(snapshot);
     this.strokeMaterialLayer?.setOptionalContentVisibility(snapshot);
     this.vectorLodStrokeLayer?.setOptionalContentVisibility(snapshot);
@@ -628,10 +800,36 @@ export class HeprThreePdfObject extends THREE.Group {
     this.setTextSelectionHighlights(null);
   }
 
+  private pageHits(camera: THREE.Camera, x: number, y: number, element: HTMLElement) {
+    camera.updateMatrixWorld();
+    const hits = [];
+    for (const page of this.pageViews ?? []) {
+      if (!page.object.visible || page.object.isDisposed) continue;
+      const point = page.object.clientToScenePoint(camera, x, y, element);
+      const b = page.view.scene.pageBounds;
+      if (!point || point.x < b.minX || point.x > b.maxX || point.y < b.minY || point.y > b.maxY) continue;
+      const world = new THREE.Vector3(point.x - page.object.sceneCenterX, point.y - page.object.sceneCenterY, 0)
+        .applyMatrix4(page.object.matrixWorld).applyMatrix4(camera.matrixWorldInverse);
+      if (world.z >= 0) continue;
+      hits.push({ page, point, depth: -world.z });
+    }
+    hits.sort((a, b) => a.depth - b.depth || b.page.view.pageIndex - a.page.view.pageIndex);
+    return hits;
+  }
+
   /** Geometric picking against the canonical scene, independent of render LOD. */
   async pick(options: PrimitivePickOptions): Promise<PrimitiveHit | null> {
     if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
     options.signal?.throwIfAborted();
+    if (this.pageViews) {
+      for (const candidate of this.pageHits(options.camera, options.clientX, options.clientY, options.element)) {
+        const hit = await candidate.page.object.pick(options);
+        if (hit) return { ...hit, primitive: { kind: hit.primitive.kind,
+          index: candidate.page.view.primitives[hit.primitive.kind][hit.primitive.index] } };
+        if (candidate.page.object.rendererConfig.pageBackground[3] >= 1) return null;
+      }
+      return null;
+    }
     const { camera, element, clientX, clientY } = options;
     const rect = element.getBoundingClientRect();
     if (clientX < rect.left || clientY < rect.top || clientX >= rect.left + rect.width ||
@@ -701,8 +899,14 @@ export class HeprThreePdfObject extends THREE.Group {
     return getScenePrimitive(this.sceneData, ref);
   }
 
-  setHover(ref: PrimitiveRef | null): void { this.primitiveAppearance.setHover(ref && this.isPrimitiveVisible(ref) ? ref : null); }
+  setHover(ref: PrimitiveRef | null): void {
+    this.primitiveAppearance.setHover(ref && this.isPrimitiveVisible(ref) ? ref : null);
+    for (const { object, view } of this.pageViews ?? []) object.setHover(ref ? this.pagePartition!.localRef(view, ref) : null);
+  }
   setSelection(refs: readonly PrimitiveRef[]): void {
+    for (const { object, view } of this.pageViews ?? []) object.setSelection(refs.flatMap(ref => {
+      const local = this.pagePartition!.localRef(view, ref); return local ? [local] : [];
+    }));
     // Validate the complete batch even when some of its primitives are hidden.
     for (const ref of refs) validatePrimitiveRef(this.sceneData, ref);
     this.primitiveAppearance.setSelection(refs.filter(ref => this.isPrimitiveVisible(ref)));
@@ -714,6 +918,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
   /** Clear temporary interaction state and release the lazily constructed picking index. */
   clearPrimitiveInteraction(): void {
+    for (const page of this.pageViews ?? []) page.object.clearPrimitiveInteraction();
     if (this.isDisposed) return;
     this.primitiveAppearance.clear();
     this.primitivePicker?.dispose();
@@ -722,6 +927,17 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private applyPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[]): void {
+    if (this.pageViews) {
+      for (const { object, view } of this.pageViews) {
+        const local = updates.flatMap(update => { const ref = this.pagePartition!.localRef(view, update.ref);
+          return ref ? [{ ...update, ref }] : []; });
+        for (const update of local) {
+          if (update.color) object.setPrimitiveOverrides([update.ref], { color: update.color });
+          else object.clearPrimitiveOverrides([update.ref]);
+        }
+      }
+      return;
+    }
     if (this.isDisposed) return;
     this.strokeMaterialLayer?.setPrimitiveColorUpdates(updates, this.sceneData);
     this.vectorLodStrokeLayer?.setPrimitiveColorUpdates(updates);
@@ -741,6 +957,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private applyPrimitiveHighlights(highlights: PrimitiveHighlightSet | null): void {
+    if (this.pageViews) return;
     if (this.isDisposed) return;
     if (!highlights) {
       if (this.primitiveHighlightLayer) {
@@ -830,20 +1047,19 @@ export class HeprThreePdfObject extends THREE.Group {
       return [];
     }
     this.textSearcher ??= createSceneTextSearcher(this.sceneData);
-    return this.textSearcher.search(query, { ...options, optionalContent: this.layerVisibility.getSnapshot() }).map((match) => ({
-      ...match,
-      localBounds: {
-        minX: match.bounds.minX - this.sceneCenterX,
-        minY: match.bounds.minY - this.sceneCenterY,
-        maxX: match.bounds.maxX - this.sceneCenterX,
-        maxY: match.bounds.maxY - this.sceneCenterY
-      },
-      localHighlightBounds: getSearchMatchHighlightBounds(match).map((bounds) => ({
-        minX: bounds.minX - this.sceneCenterX,
-        minY: bounds.minY - this.sceneCenterY,
-        maxX: bounds.maxX - this.sceneCenterX,
-        maxY: bounds.maxY - this.sceneCenterY
-      }))
+    const toLocal = (bounds: Bounds, pageIndex: number): Bounds => {
+      const page = this.pageViews?.[pageIndex]?.object;
+      if (!page) return { minX: bounds.minX - this.sceneCenterX, minY: bounds.minY - this.sceneCenterY,
+        maxX: bounds.maxX - this.sceneCenterX, maxY: bounds.maxY - this.sceneCenterY };
+      this.updateWorldMatrix(true, false); page.updateWorldMatrix(true, false);
+      const matrix = this.matrixWorld.clone().invert().multiply(page.matrixWorld).multiply(page.dataToLocalMatrix);
+      const box = new THREE.Box3(new THREE.Vector3(bounds.minX, bounds.minY, 0),
+        new THREE.Vector3(bounds.maxX, bounds.maxY, 0)).applyMatrix4(matrix);
+      return { minX: box.min.x, minY: box.min.y, maxX: box.max.x, maxY: box.max.y };
+    };
+    return this.textSearcher.search(query, { ...options, optionalContent: this.layerVisibility.getSnapshot() }).map(match => ({
+      ...match, localBounds: toLocal(match.bounds, match.pageIndex),
+      localHighlightBounds: getSearchMatchHighlightBounds(match).map(bounds => toLocal(bounds, match.pageIndex))
     }));
   }
 
@@ -858,7 +1074,7 @@ export class HeprThreePdfObject extends THREE.Group {
   setSearchHighlights(
     matches:
       | ReadonlyArray<
-          Pick<TextSearchMatch, "bounds"> & Partial<Pick<TextSearchMatch, "highlightBounds">>
+          Pick<TextSearchMatch, "bounds"> & Partial<Pick<TextSearchMatch, "highlightBounds" | "pageIndex">>
         >
       | null,
     options: { currentIndex?: number } = {}
@@ -867,6 +1083,18 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
     const list = matches ?? [];
+    this.searchHighlightMatches = list;
+    this.searchHighlightIndex = options.currentIndex ?? -1;
+    if (this.pageViews) {
+      for (const { object, view } of this.pageViews) {
+        const selected = list.map((match, index) => ({ match, index })).filter(({ match }) =>
+          (match.pageIndex ?? this.pagePartition!.pageAt((match.bounds.minX + match.bounds.maxX) / 2,
+            (match.bounds.minY + match.bounds.maxY) / 2)) === view.pageIndex);
+        object.setSearchHighlights(selected.map(item => item.match),
+          { currentIndex: selected.findIndex(item => item.index === options.currentIndex) });
+      }
+      return;
+    }
     if (list.length === 0) {
       if (this.searchHighlightGroup) {
         this.searchHighlightGroup.visible = false;
@@ -1007,6 +1235,12 @@ export class HeprThreePdfObject extends THREE.Group {
             maxY: rects[i * 4 + 3]
           }))
         : rects ?? [];
+    this.textSelectionHighlightRects = list;
+    if (this.pageViews) {
+      for (const { object, view } of this.pageViews) object.setTextSelectionHighlights(list.filter(rect =>
+        this.pagePartition!.pageAt((rect.minX + rect.maxX) / 2, (rect.minY + rect.maxY) / 2) === view.pageIndex));
+      return;
+    }
     if (list.length === 0) {
       if (this.textSelectionHighlightGroup) {
         this.textSelectionHighlightGroup.visible = false;
@@ -1081,6 +1315,7 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.isDisposed) {
       return null;
     }
+    if (this.pageViews) return this.pageHits(camera, clientX, clientY, domElement)[0]?.point ?? null;
     const rect = domElement.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return null;
@@ -1112,8 +1347,13 @@ export class HeprThreePdfObject extends THREE.Group {
     camera: THREE.Camera,
     sceneX: number,
     sceneY: number,
-    domElement: HTMLElement
+    domElement: HTMLElement,
+    pageIndex?: number
   ): { x: number; y: number } | null {
+    if (this.pageViews) {
+      const page = this.pageViews[pageIndex ?? this.pagePartition!.pageAt(sceneX, sceneY)];
+      return page?.object.visible ? page.object.sceneToClientPoint(camera, sceneX, sceneY, domElement) : null;
+    }
     if (this.isDisposed) {
       return null;
     }
@@ -1160,7 +1400,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private refreshPagePlaneForPicking(): boolean {
     this.pageMesh.updateWorldMatrix(true, false);
     this.pagePlanePoint.set(0, 0, 0).applyMatrix4(this.pageMesh.matrixWorld);
-    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
+    this.pagePlaneNormal.set(0, 0, 1).applyNormalMatrix(this.pageNormalMatrix.getNormalMatrix(this.pageMesh.matrixWorld));
     if (
       !Number.isFinite(this.pagePlaneNormal.x) ||
       !Number.isFinite(this.pagePlaneNormal.y) ||
@@ -1228,6 +1468,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * inactive.
    */
   getVectorStrokeLodStats(): VectorStrokeLodStats | null {
+    if (this.pageViews) return null; // Query each page for its independent level selection.
     return this.vectorLodStrokeLayer?.getStats() ??
       (this.hasUploadedNativeScene() ? this.renderer.getVectorStrokeLodStats?.() ?? null : null);
   }
@@ -1239,6 +1480,8 @@ export class HeprThreePdfObject extends THREE.Group {
    * not expose a separate stroke count.
    */
   getRenderedStrokeSegmentCount(): number | null {
+    if (this.pageViews) return this.pageViews.reduce((sum, page) => sum +
+      (page.object.visible ? page.object.getRenderedStrokeSegmentCount() ?? 0 : 0), 0);
     if (this.vectorLodStrokeLayer?.group.visible) {
       return this.vectorLodStrokeLayer.getRenderedSegmentCount();
     }
@@ -1267,6 +1510,13 @@ export class HeprThreePdfObject extends THREE.Group {
    * layer is active, or `null` when text is drawn by the native pipeline.
    */
   getTextInstanceStats(): { rendered: number; total: number; mode: "glyphs" | "greeked" | "mixed" } | null {
+    if (this.pageViews) {
+      const stats = this.pageViews.filter(page => page.object.visible).map(page => page.object.getTextInstanceStats());
+      if (stats.some(value => value === null)) return null;
+      const modes = new Set(stats.map(value => value!.mode));
+      return { rendered: stats.reduce((sum, value) => sum + value!.rendered, 0), total: this.sceneData.textInstanceCount,
+        mode: modes.size > 1 ? "mixed" : stats[0]?.mode ?? "glyphs" };
+    }
     if (!this.textMaterialLayer.mesh.visible) {
       return null;
     }
@@ -1283,6 +1533,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
   /** Return clustered text-LOD diagnostics for the active rendering path. */
   getTextLodStats(): TextLodStats | null {
+    if (this.pageViews) return null; // Independent pages have separate LOD levels; query their views.
     if (!this.materialPipelineActive) {
       const nativeStats = this.hasUploadedNativeScene()
         ? this.renderer.getTextLodStats?.() ?? null
@@ -1299,6 +1550,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * within a fraction of a pixel of each other may swap to bound draw calls.
    */
   isPaintOrderApproximated(): boolean {
+    if (this.pageViews) return this.pageViews.some(page => page.object.visible && page.object.isPaintOrderApproximated());
     return this.materialPipelineActive
       ? this.drawPlan?.paintOrderApproximated ?? false
       : this.lastNativeDrawStats?.paintOrderApproximated ?? false;
@@ -1309,6 +1561,14 @@ export class HeprThreePdfObject extends THREE.Group {
    * first native frame.
    */
   getNativeDrawStats(): DrawStats | null {
+    if (this.pageViews) {
+      const stats = this.pageViews.filter(page => page.object.visible).map(page => page.object.getNativeDrawStats());
+      if (!stats.length || stats.some(value => !value)) return null;
+      return { ...stats[0]!, renderedSegments: stats.reduce((sum, value) => sum + value!.renderedSegments, 0),
+        totalSegments: this.sceneData.segmentCount, drawCalls: stats.every(value => value!.drawCalls !== undefined)
+          ? stats.reduce((sum, value) => sum + value!.drawCalls!, 0) : undefined,
+        usedCulling: stats.some(value => value!.usedCulling), paintOrderApproximated: this.isPaintOrderApproximated() };
+    }
     return this.lastNativeDrawStats ? { ...this.lastNativeDrawStats } : null;
   }
 
@@ -1351,6 +1611,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * always use LOD when supported.
    */
   setVectorLodMode(mode: VectorLodMode): void {
+    for (const page of this.pageViews ?? []) page.object.setVectorLodMode(mode);
     if (this.isDisposed) {
       return;
     }
@@ -1376,6 +1637,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
   /** Change clustered text LOD mode; an initially disabled LOD builds lazily on first Auto use. */
   setTextLodMode(mode: TextLodMode): void {
+    for (const page of this.pageViews ?? []) page.object.setTextLodMode(mode);
     if (this.isDisposed) {
       return;
     }
@@ -1410,6 +1672,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * Enable or disable curve-aware stroke rendering where supported.
    */
   setStrokeCurveEnabled(enabled: boolean): void {
+    for (const page of this.pageViews ?? []) page.object.setStrokeCurveEnabled(enabled);
     if (this.isDisposed) {
       return;
     }
@@ -1427,6 +1690,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * All channels are normalized floats in the range 0..1.
    */
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
+    for (const page of this.pageViews ?? []) page.object.setPageBackgroundColor(red, green, blue, alpha);
     if (this.isDisposed) {
       return;
     }
@@ -1442,6 +1706,7 @@ export class HeprThreePdfObject extends THREE.Group {
    * `opacity = 0` preserves source colors; `opacity = 1` fully replaces them.
    */
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
+    for (const page of this.pageViews ?? []) page.object.setVectorColorOverride(red, green, blue, opacity);
     if (this.isDisposed) {
       return;
     }
@@ -1476,11 +1741,15 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.isDisposed) {
       return;
     }
+    this.pagePreparationAbort.abort(new DOMException("PDF object disposed.", "AbortError"));
+    for (const page of this.pageViews ?? []) { page.object.removeFromParent(); page.object.dispose(); }
+    this.pageViews = null; this.pagePartition = null; this.pagePreparation = null;
+    this.searchHighlightMatches = []; this.textSelectionHighlightRects = [];
     this.primitivePicker?.dispose();
     this.primitivePicker = null;
     this.reportPrimitivePreparationProgress(null);
     this.primitivePreparationListeners.clear();
-    this.layerVisibility.dispose();
+    if (!this.pageOwner) this.layerVisibility.dispose();
     this.layerVisibilityProgressListeners.clear();
     this.retainedReplay?.dispose();
     this.isDisposed = true;
@@ -1630,6 +1899,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private refreshSceneRenderHook(): void {
+    if (this.pageOwner && this.parent === this.pageOwner) { this.detachSceneRenderHook(); return; }
     if (this.isDisposed) {
       return;
     }
@@ -1687,6 +1957,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private syncFrame(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    if (this.pageViews && !this.isDisposed) { this.prepareIndependentPages(renderer, camera); return; }
     if (this.isDisposed) {
       return;
     }
@@ -1828,6 +2099,7 @@ export class HeprThreePdfObject extends THREE.Group {
       nativeViewChanged = true;
     }
 
+
     const shouldRenderThreeCameraFrame =
       !cameraDrivenMaterialPipelineEnabled &&
       (
@@ -1963,11 +2235,28 @@ export class HeprThreePdfObject extends THREE.Group {
         profile.add("three.textSelectionUploads", textLod.selectionUploads);
       }
     }
+    if (this.pageOwner) {
+      this.pageMesh.material.depthWrite = this.rendererConfig.pageBackground[3] >= 1;
+      // Keep the depth-only rectangle just behind the shader-projected paints.
+      // Their separately computed matrices can otherwise self-fight at a tilt.
+      this.pageMesh.material.polygonOffset = cameraDrivenMaterialPipelineEnabled;
+      this.pageMesh.material.polygonOffsetFactor = this.pageMesh.material.polygonOffsetUnits = 1;
+      this.pageMesh.material.transparent = !cameraDrivenMaterialPipelineEnabled && this.rendererConfig.pageBackground[3] < 1;
+      for (const root of this.listThreeMaterialObjects()) root.traverse(child => {
+        if (!(child as THREE.Mesh).isMesh) return;
+        const material = (child as THREE.Mesh).material;
+        for (const item of Array.isArray(material) ? material : [material]) {
+          if (item.depthTest !== !usePaintCompositor) { item.depthTest = !usePaintCompositor; item.needsUpdate = true; }
+        }
+      });
+    }
+
     if (usePaintCompositor) {
       if (!this.paintCompositor) {
         this.paintCompositor = new ThreePaintCompositor(this.rendererType);
         this.add(this.paintCompositor.mesh);
       }
+      if (this.pageOwner) this.paintCompositor.setPageDepth(this.clipFromDataMatrix);
       const roots: THREE.Object3D[] = [this.rasterMaterialLayer.group, this.gradientMaterialLayer.group,
         this.fillMaterialLayer.mesh, this.textMaterialLayer.mesh];
       if (this.strokeMaterialLayer) roots.push(this.strokeMaterialLayer.mesh);
@@ -2653,17 +2942,10 @@ export class HeprThreePdfObject extends THREE.Group {
       return null;
     }
 
-    if (cameraType.isOrthographicCamera === true) {
-      const orthographicView = this.deriveAxisAlignedOrthographicViewState(camera as THREE.OrthographicCamera, viewport);
-      if (!orthographicView) {
-        return null;
-      }
-      this.warnedThreeCameraUnsupported = false;
-      return orthographicView;
-    }
-
+    // Plane/frustum intersection handles perspective and orthographic cameras,
+    // including page rotation, nonuniform scale, reflections and shear.
     this.pagePlanePoint.set(0, 0, 0).applyMatrix4(this.pageMesh.matrixWorld);
-    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
+    this.pagePlaneNormal.set(0, 0, 1).applyNormalMatrix(this.pageNormalMatrix.getNormalMatrix(this.pageMesh.matrixWorld));
     if (!Number.isFinite(this.pagePlaneNormal.x) || !Number.isFinite(this.pagePlaneNormal.y) || !Number.isFinite(this.pagePlaneNormal.z)) {
       return null;
     }
@@ -2763,60 +3045,6 @@ export class HeprThreePdfObject extends THREE.Group {
       },
       nativeViewport,
       cullingBounds: this.sceneBounds
-    };
-  }
-
-  private deriveAxisAlignedOrthographicViewState(
-    camera: THREE.OrthographicCamera,
-    viewport: ViewportPixels
-  ): DerivedThreeCameraView | null {
-    const nativeViewport = clampViewportPixels(viewport);
-    this.clipFromWorldMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    this.clipFromLocalMatrix.multiplyMatrices(this.clipFromWorldMatrix, this.pageMesh.matrixWorld);
-
-    this.ndcOrigin.set(0, 0, 0).applyMatrix4(this.clipFromLocalMatrix);
-    this.ndcLocalX.set(1, 0, 0).applyMatrix4(this.clipFromLocalMatrix);
-    this.ndcLocalY.set(0, 1, 0).applyMatrix4(this.clipFromLocalMatrix);
-
-    const sx = this.ndcLocalX.x - this.ndcOrigin.x;
-    const sy = this.ndcLocalY.y - this.ndcOrigin.y;
-    const shearX = this.ndcLocalY.x - this.ndcOrigin.x;
-    const shearY = this.ndcLocalX.y - this.ndcOrigin.y;
-    const minAxisScale = 1e-8;
-    if (!Number.isFinite(sx) || !Number.isFinite(sy) || Math.abs(sx) < minAxisScale || Math.abs(sy) < minAxisScale) {
-      this.warnThreeCameraUnsupported(
-        `[HEPR] Camera-driven orthographic rendering has invalid axis scale (sx=${sx.toExponential(3)}, sy=${sy.toExponential(3)}).`
-      );
-      return null;
-    }
-
-    const maxCrossAxis = 1e-4;
-    if (!Number.isFinite(shearX) || !Number.isFinite(shearY) || Math.abs(shearX) > maxCrossAxis || Math.abs(shearY) > maxCrossAxis) {
-      this.warnThreeCameraUnsupported(
-        `[HEPR] Camera-driven orthographic rendering is skewed (shearX=${shearX.toExponential(3)}, shearY=${shearY.toExponential(3)}).`
-      );
-      return null;
-    }
-
-    const localCenterX = -this.ndcOrigin.x / sx;
-    const localCenterY = -this.ndcOrigin.y / sy;
-    const zoomX = Math.abs(sx) * nativeViewport.width * 0.5;
-    const zoomY = Math.abs(sy) * nativeViewport.height * 0.5;
-    const zoom = Math.max(1e-6, Math.min(zoomX, zoomY));
-    if (!Number.isFinite(localCenterX) || !Number.isFinite(localCenterY) || !Number.isFinite(zoom)) {
-      this.warnThreeCameraUnsupported(
-        `[HEPR] Camera-driven orthographic rendering produced non-finite view values (cx=${localCenterX}, cy=${localCenterY}, zoom=${zoom}).`
-      );
-      return null;
-    }
-
-    return {
-      viewState: {
-        cameraCenterX: localCenterX + this.sceneCenterX,
-        cameraCenterY: localCenterY + this.sceneCenterY,
-        zoom
-      },
-      nativeViewport
     };
   }
 
@@ -3111,7 +3339,8 @@ export async function createThreePdfObject(
   loadedScene: ThreePdfSceneSource,
   options: HeprThreeObjectOptions = {},
   signal?: AbortSignal,
-  preparedVectorLod?: VectorStrokeLodRuntimeReservation | null
+  preparedVectorLod?: VectorStrokeLodRuntimeReservation | null,
+  pageRenderer?: (canvas: HTMLCanvasElement) => RendererApi
 ): Promise<HeprThreePdfObject> {
   signal?.throwIfAborted();
   const rendererType = options.rendererType ?? "webgl";
@@ -3131,7 +3360,7 @@ export async function createThreePdfObject(
       rendererType,
       loadedScene.scene.segmentCount
     );
-  const nativeRenderer = await waitForLoad(
+  const nativeRenderer = pageRenderer ? pageRenderer(renderCanvas) : await waitForLoad(
     createNativeRenderer(rendererType, renderCanvas).then((renderer) => {
       if (signal?.aborted) {
         renderer.dispose();
@@ -3141,6 +3370,7 @@ export async function createThreePdfObject(
     }),
     signal
   );
+  const owned: { dispose(): void }[] = [];
   let vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null = null;
   try {
     signal?.throwIfAborted();
@@ -3159,6 +3389,7 @@ export async function createThreePdfObject(
       colorCompositing: rendererConfig.threeColorCompositing,
       pageBackground: rendererConfig.pageBackground
     });
+    owned.push(rasterMaterialLayer);
 
     const gradientMaterialLayer = new ThreeMaterialGradientLayer(loadedScene.scene, {
       materialBackend,
@@ -3166,6 +3397,7 @@ export async function createThreePdfObject(
       strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
       vectorOverride: rendererConfig.vectorOverride
     });
+    owned.push(gradientMaterialLayer);
     applyThreePdfOverlayPaintOrder(
       loadedScene.scene,
       rasterMaterialLayer.group,
@@ -3178,6 +3410,7 @@ export async function createThreePdfObject(
       colorCompositing: rendererConfig.threeColorCompositing,
       vectorOverride: rendererConfig.vectorOverride
     });
+    owned.push(fillMaterialLayer);
 
     const strokeMaterialLayer =
       !useVectorLodStrokeLayer
@@ -3190,6 +3423,7 @@ export async function createThreePdfObject(
         })
         : null;
 
+    if (strokeMaterialLayer) owned.push(strokeMaterialLayer);
     const triangleStrokeLayer = null;
 
     vectorLodStrokeLayer =
@@ -3203,9 +3437,11 @@ export async function createThreePdfObject(
         }, preparedVectorLod)
         : null;
 
+    if (vectorLodStrokeLayer) owned.push(vectorLodStrokeLayer);
     const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
 
     const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, sceneRequiresPaintCompositing(loadedScene.scene) ? "off" : rendererConfig.textLodMode);
+    owned.push(textLodLayer);
     let textMaterialLayer: ThreeMaterialTextLayer;
     try {
       textMaterialLayer = new ThreeMaterialTextLayer(textLodLayer.getRenderScene(), {
@@ -3234,7 +3470,9 @@ export async function createThreePdfObject(
       textLodLayer.releaseRenderSceneReference();
     }
 
+    owned.push(textMaterialLayer);
     const geometry = new THREE.BufferGeometry();
+    owned.push(geometry);
     const positions = new Float32Array([
       sceneBounds.minX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
       sceneBounds.maxX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
@@ -3253,6 +3491,7 @@ export async function createThreePdfObject(
     geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
     const material = createInvisiblePageMaterial();
+    owned.push(material);
 
     const pageMesh = new THREE.Mesh(geometry, material);
     const object = new HeprThreePdfObject(
@@ -3283,8 +3522,9 @@ export async function createThreePdfObject(
 
     return object;
   } catch (error) {
-    // The layer owns a consumed reservation, including failed initialization.
-    try { vectorLodStrokeLayer?.dispose(); } catch { /* Preserve the original error. */ }
+    for (const resource of owned.reverse()) {
+      try { resource.dispose(); } catch { /* Preserve the original initialization error. */ }
+    }
     try {
       nativeRenderer.dispose();
     } catch {

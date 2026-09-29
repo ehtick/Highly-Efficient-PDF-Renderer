@@ -59,7 +59,9 @@ try {
   // shader is generated. A nearest one compiled the presented surface to a
   // point fetch, which showed up as blocky upscaling whenever the compositor
   // budget scaled its surfaces below the viewport.
-  const present = build(compositor.mesh.material, compositor.mesh.geometry).fragmentShader;
+  const presentation = build(compositor.mesh.material, compositor.mesh.geometry);
+  assert.match(presentation.vertexShader, /heprPagePresentPosition/, "presentation projects independent pages at their own plane depth");
+  const present = presentation.fragmentShader;
   assert.match(present, /textureSample\(/, "the presented surface is filtered, as it is on the GL path");
 
   compositor.dispose();

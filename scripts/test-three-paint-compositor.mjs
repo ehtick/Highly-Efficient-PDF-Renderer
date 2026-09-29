@@ -14,6 +14,22 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ThreePaintCompositor, projectThreePdfCompositeBounds } = await import("../src/threePaintCompositor.ts");
+  for (const backend of ["webgl", "webgpu"]) {
+    const compositor = new ThreePaintCompositor(backend);
+    for (const camera of [new THREE.PerspectiveCamera(50, 1.5, .1, 1000), new THREE.OrthographicCamera(-50,50,50,-50,.1,1000)]) {
+      camera.coordinateSystem = backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem;
+      camera.position.set(20,30,100); camera.lookAt(0,0,0); camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+      const object = new THREE.Object3D(); object.position.set(5,-3,12); object.rotation.set(.3,.2,.5); object.scale.set(-1.5,.7,1); object.updateMatrix();
+      const projection = camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse).multiply(object.matrix);
+      compositor.setPageDepth(projection);
+      for (const [x,y] of [[-10,-10],[8,-6],[5,12]]) {
+        const clip = new THREE.Vector3(x,y,0).applyMatrix4(projection), d=compositor.pageDepth;
+        assert(Math.abs(d.x*clip.x+d.y*clip.y+d.z-clip.z)<1e-10, `${backend}: composited fragments keep the transformed page plane depth`);
+      }
+      assert.equal(compositor.mesh.material.depthTest,true);
+    }
+    compositor.dispose();
+  }
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { setThreePdfShapeOnly } = await import("../src/threePdfShape.ts");

@@ -192,23 +192,72 @@ pdf.rotation.set(rx, ry, rz);
 pdf.scale.set(sx, sy, sz);
 ```
 
-There is currently no `setPagePosition` / `setPageTransform` method or public
-per-page `Object3D` accessor for a composed document. For independently movable
-PDF pages today, load each selected page as a separate object using, for example,
-`pdfObjectGenerator(pdfBytes, { pages: "2" })`, then transform that object.
-`pages` is one-based and only filters PDF inputs; it does not filter HEP inputs.
-Separate objects incur separate loading/rendering resources and draw calls.
-Do not mutate `sceneData.pageRects` or internal background attributes to move a
-page: those changes would not update its content, culling or interaction.
+Use `getPage(index)` or `getPages()` to access independently transformable pages
+from either a PDF or HEP. Indices are **zero-based displayed page slots**, so
+`getPage(0)` is the first loaded page even if the PDF was loaded with `pages: "5-8"`.
+
+```ts
+const page = await pdf.getPage(1); // Second displayed page; a THREE.Group
+page.position.set(100, 50, 20);
+page.rotation.set(0, Math.PI / 6, 0);
+page.scale.set(0.8, 1.2, 1);
+// page.quaternion, translateX/Y/Z, rotateX/Y/Z, and applyMatrix4 also work.
+
+await pdf.setPagePosition(1, 100, 50, 20); // Convenience setter
+await pdf.setPageTransform(1, new THREE.Matrix4().makeRotationY(Math.PI / 4));
+```
+
+Each page's origin is its center. Its initial position preserves the loaded
+layout relative to the document's centered origin. Page transforms compose with
+the document and ancestor transforms. Backgrounds, all paint types, clips,
+highlights, culling and picking follow the same page transform on both Three.js
+backends. `setPageTransform` replaces the local affine matrix (including shear)
+and disables `matrixAutoUpdate`; subsequent `setPagePosition` calls preserve that
+matrix's linear part. To resume ordinary position/rotation/scale updates, set
+`page.matrixAutoUpdate = true` (a decomposed transform cannot preserve shear).
+
+The first accessor prepares all independent page views asynchronously. Repeated
+calls reuse the same page objects. This opts the document out of cross-page
+batching and adds per-page rendering resources and draw calls. Documents that do
+not call these APIs retain the existing batched path. Native texture fallback
+shares the document's GPU context and copies each rendered page to its own
+canvas. A one-page document returns itself without allocating another view.
+
+The document owns its page views: keep them parented to `pdf` and dispose the
+whole document with `pdf.dispose()`. `getPage` / `getPages` accept `{ signal }`;
+cancelling a caller's wait does not cancel preparation shared by other callers.
+Disposing the document aborts preparation and releases all prepared pages.
+`page.pageIndex` identifies its owning document slot (`null` on a document,
+including a one-page document returned as its own page view).
+
+Document-level picking retains canonical document primitive IDs; picking through
+a page returns IDs in that page's compact `sceneData`. Search `bounds` remain in
+original scene coordinates; document `localBounds` reflect the current page
+transform as an XY bounding box. `sceneToClientPoint` accepts an optional final
+`pageIndex` to resolve ambiguous original coordinates. Use page methods when
+working directly with page-local primitive IDs. Layer visibility remains shared
+across the document; document appearance setters also apply to every page.
+Query LOD diagnostics on the page views; the document returns `null` for LOD
+statistics once its pages select levels independently.
+
+Newly composed scenes store exact primitive ownership in HEP. Existing HEP files
+without that metadata infer stroke/fill ownership from their original layout and
+emit a warning; out-of-page or overlapping source content may be assigned
+approximately. Transforms are runtime presentation state and are not saved by
+`buildHep(pdf.sceneData)`. Treat `sceneData` as read-only.
 
 | Member | Purpose |
 | --- | --- |
+| `pageCount` | Number of displayed pages. |
+| `getPage(index, options?)` / `getPages(options?)` | Prepare and return independent page objects. |
+| `setPagePosition(index, x, y, z?)` | Set a page center in document-local coordinates; default Z is zero. |
+| `setPageTransform(index, matrix)` | Replace a page's finite affine `THREE.Matrix4`. |
 | `hasSearchableText` | Whether the scene has searchable indexed text. |
 | `searchText(query, options?)` | Return matches with scene-space and object-local bounds. |
 | `setSearchHighlights(matches, { currentIndex }?)` | Highlight matches and emphasize the active one; `null` clears them. |
 | `setTextSelectionHighlights(rects)` | Draw scene-space `Bounds[]` or packed `Float32Array` selection rectangles; `null` clears them. |
 | `clientToScenePoint(camera, x, y, element)` | Map client CSS pixels to PDF scene coordinates; may return `null`. |
-| `sceneToClientPoint(camera, x, y, element)` | Project PDF scene coordinates to client CSS pixels; may return `null`. |
+| `sceneToClientPoint(camera, x, y, element, pageIndex?)` | Project PDF scene coordinates to client CSS pixels; may return `null`. |
 | `pick(options)` | Asynchronously find a canonical drawing primitive under client coordinates; returns a hit or `null`. |
 | `subscribePrimitivePreparationProgress(listener)` | Observe shared picking preparation (integer 0–100, or `null` when idle/reset/failed); returns an unsubscribe function. |
 | `getPrimitive(ref)` | Read original style and detached scene-space geometry. |

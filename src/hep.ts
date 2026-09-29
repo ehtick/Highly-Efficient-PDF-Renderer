@@ -1,3 +1,4 @@
+import { validatePagePrimitiveRanges } from "./scenePageViews";
 import { writeHepAnnotations, readHepAnnotations } from "./hepAnnotations";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateSceneOptionalContent, validateSceneOptionalContentReferences } from "./optionalContent";
@@ -175,6 +176,7 @@ interface ParsedDataSceneEntry {
   pageBounds?: unknown;
   pageRects?: unknown;
   pageTextRanges?: unknown;
+  pagePrimitiveRanges?: unknown;
   pageCount?: unknown;
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
@@ -243,6 +245,7 @@ export async function buildHepBlobForLayout(
   sceneRasterLayers: RasterLayer[],
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
+  validatePagePrimitiveRanges(scene);
   validateVectorDrawRuns(scene);
   validateSceneOptionalContentReferences(scene);
   validateSceneRetainedPages(scene);
@@ -408,6 +411,7 @@ export async function buildHepBlobForLayout(
       pageBounds: scene.pageBounds,
       pageRects: Array.from(scene.pageRects),
       pageTextRanges: Array.from(scene.pageTextRanges),
+      pagePrimitiveRanges: scene.pagePrimitiveRanges ? Array.from(scene.pagePrimitiveRanges) : undefined,
       pageCount: scene.pageCount,
       pagesPerRow: scene.pagesPerRow,
       maxHalfWidth: scene.maxHalfWidth,
@@ -1330,6 +1334,7 @@ const preparedHepScenes = new WeakSet<VectorScene>();
  * preparation. Cached parser pages remain untouched. No archive is generated.
  */
 export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
+  validatePagePrimitiveRanges(scene);
   validateVectorDrawRuns(scene);
   validateSceneOptionalContentReferences(scene);
   validateSceneRetainedPages(scene);
@@ -2075,6 +2080,14 @@ async function loadSceneFromHepInternal(
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   });
+  if (sceneMeta.pagePrimitiveRanges !== undefined) {
+    const ranges = sceneMeta.pagePrimitiveRanges;
+    if (!Array.isArray(ranges) || ranges.length !== scene.pageRects.length / 4 * 12 ||
+        !ranges.every(value => Number.isSafeInteger(value) && value >= 0 && value <= 0xffffffff))
+      throw new RangeError("Invalid page primitive ranges.");
+    scene.pagePrimitiveRanges = Uint32Array.from(ranges);
+    validatePagePrimitiveRanges(scene);
+  }
   if (sceneMeta.clipPaths !== undefined) {
     const meta = readSceneSectionDescriptor(sceneMeta.clipPaths, SCENE_CLIP_PATHS_PATH, "clip paths");
     const count = readSceneSectionCount(meta, "count", "clip paths");

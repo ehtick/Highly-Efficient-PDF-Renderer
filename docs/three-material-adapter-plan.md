@@ -5,15 +5,13 @@ Goal: render HEPR pages as true Three.js objects using Three materials/shaders, 
 ## Constraints
 - Reuse core shader logic and data encoding where possible.
 - Keep page nodes transformable (`position/rotation/scale`) like regular Three objects.
-  This remains a per-page API requirement: the current `HeprThreePdfObject`
-  transforms the complete composed document, with no per-page setter/accessor.
-  Instanced backgrounds retain canonical page-slot order. A future page transform
-  table must be shared by backgrounds, vector/raster/text content, clips, LOD,
-  culling, paint ordering, picking, annotations and highlights. Recompute overlap
-  scheduling when pages move; previously independent pages may then overlap.
-  The compact rectangle attribute describes base geometry, not that transform.
-  Independent XYZ placement, rotation and scale require a page-to-document matrix
-  before the document-to-clip matrix, including page-aware depth/order handling.
+  Implemented through `getPage` / `getPages` on `HeprThreePdfObject`, with
+  position/rotation/quaternion/scale and affine matrix setters. Independent page
+  views keep every paint type and interaction on the same page transform and
+  use separate submissions with page-aware depth/order. The default document
+  retains compact instanced backgrounds and cross-page batching. A future shared
+  page-matrix table could retain batching while pages move, but must update
+  content, clips, LOD, picking and overlap scheduling together.
 - Avoid HTML-canvas texture bridging for the WebGL path.
 - Maintain feature parity: strokes, fills, text, raster layers, culling, and vector LOD.
 

@@ -439,3 +439,19 @@ stop entry work and cancel both sides of active compression/decompression stream
 Writer progress starts at 0 and finishes at 100; intermediate progress advances
 with processed decoded bytes. This container index does not add page streaming:
 the current scene loader still assembles the document's global scene.
+
+## Optional page primitive ownership
+
+`manifest.scene.pagePrimitiveRanges` is an optional JSON array of unsigned
+32-bit integers. It contains 12 values per displayed page: `[first, count]`
+pairs for strokes, solid fills, text instances, raster layers, gradient fills,
+and gradient stroke runs, in that order. Each pair addresses its corresponding
+canonical primitive store. Per-store ranges are contiguous in page order,
+start at zero and cover the entire store exactly; malformed metadata is rejected.
+New grid compositions record these ranges and HEP round trips preserve them.
+
+This metadata supports independent runtime page transforms without assigning
+out-of-page content to a neighboring page. Files without it remain readable;
+page extraction uses existing text/raster/gradient page metadata and infers
+stroke/fill membership from the original page layout, with a diagnostic. Runtime
+Three.js page matrices are presentation state and are not stored here.

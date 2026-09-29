@@ -104,6 +104,23 @@ Drag to pan and scroll or pinch to zoom. The
 [responsive viewer example](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md#responsive-threejs-viewer)
 adds window resizing and complete viewer cleanup.
 
+Individual pages also expose normal Three.js transforms on both backends:
+
+```js
+const page = await pdf.getPage(0); // Zero-based displayed page index
+page.position.z = 20;
+page.rotation.y = Math.PI / 6;
+page.scale.setScalar(0.8);
+// Also available: getPages(), setPagePosition(index, x, y, z),
+// and setPageTransform(index, matrix4).
+```
+
+Page views preserve the initial layout and use the page center as their pivot.
+Requesting them opts into separate per-page rendering resources and draw calls;
+documents that do not use these APIs keep cross-page batching. See the
+[page API](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md#heprthreepdfobject)
+for matrix, ownership, coordinate and HEP compatibility details.
+
 The same loader accepts `.hep` files, `File`/`Blob` objects, bytes, and base64 data. Select PDF pages with `{ pages: "1-3, 5" }`; report loading progress with `{ onProgress: ({ stage, value }) => console.log(stage, value) }`.
 
 When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. When closing the viewer, also stop its animation loop and dispose its controls and renderer. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) to add search, text selection, and drawing selection.

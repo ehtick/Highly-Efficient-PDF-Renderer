@@ -172,6 +172,31 @@ backend, check the CS-MAP overview, zoom into individual pages, then translate,
 rotate and scale the PDF group under a transformed parent; backgrounds must
 stay aligned with content and contribute one draw call.
 
+Independent page transforms are opt-in through `pdf.getPage(index)` / `getPages()`.
+The original batched object stays visible during preparation; completed page
+views replace its rendering and depth rectangle. `scenePageViews.ts` compacts
+page stores and remaps clips, glyphs, gradients, retained replay and paint graphs
+while preserving canonical coordinates and a primitive-ID map. The original
+scene stays immutable. The views share layer visibility and a native fallback
+context (`sharedPageRenderer.ts`), but have separate material resources and
+per-page submissions. Runtime matrices are not persisted in HEP.
+
+The `three-page-transforms`, `scene-page-views`, and `shared-page-renderer` tests
+cover both material backends, affine transforms, automatic scene preparation,
+picking, highlights, rollback, cancellation, shared native state, all paint types
+and synthetic HEP ownership round trips. Compositor tests check projected page
+depth and generate WGSL without starting a browser.
+
+Manual verification: in an existing Three.js integration, load the CS-MAP HEP and
+call `await pdf.getPages()`. Move, tilt, rotate, reflect and scale individual pages
+under a transformed document; include overlapping pages at different Z values.
+Check backgrounds, text, images, gradients, clips, search highlights and picking
+at overview and close zoom. Repeat with WebGL and WebGPU hosts, a layered or
+composited document, and a native texture fallback. Confirm layer toggles and
+cleanup, and measure FPS/draw calls separately before and after opting into page
+views. Transparent intersecting pages retain Three's object-level transparency
+sorting; exact order-independent transparency is not provided.
+
 Adjacent strokes, fills, or text share instanced draws even when their clip roots
 differ. Spatially independent
 pages also share draws: their paint streams are interleaved by type while keeping

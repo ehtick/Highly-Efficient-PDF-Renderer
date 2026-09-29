@@ -10,6 +10,9 @@ export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): { 
   const annotations = scene.annotations ?? [];
   validateScenePdfPages(scene.pdfPages, scene.pageCount);
   validateAnnotations(annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
+  // Loading an older HEP exposes an empty annotation array; do not grow the
+  // archive with an empty section on every load/export round trip.
+  if (annotations.length === 0 && !scene.pdfPages?.length) return undefined;
   const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations, pdfPages: scene.pdfPages }));
   if (bytes.length > MAX_HEP_ANNOTATION_BYTES) throw new Error("Annotation metadata exceeds the HEP section limit.");
   archive.file(HEP_ANNOTATIONS_PATH, bytes);

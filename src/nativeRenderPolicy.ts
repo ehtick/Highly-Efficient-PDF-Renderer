@@ -4,9 +4,6 @@
  */
 
 const TEXT_HEAVY_INSTANCE_THRESHOLD = 100_000;
-// Source-ordered pages can be expensive without many strokes: their gradients,
-// text and transparency groups all replay on every direct frame.
-export const NATIVE_PAN_CACHE_MIN_PAINTS = 4096;
 
 /**
  * Supersampled vector minification changes the effective coverage filter and
@@ -15,32 +12,10 @@ export const NATIVE_PAN_CACHE_MIN_PAINTS = 4096;
  */
 export const NATIVE_VECTOR_MINIFY_ENABLED = false;
 
-/** A book-like scene that benefits from pan caching even without stroke data. */
+/** A book-like scene excluded from legacy vector minification. */
 export function isNativeTextHeavyStrokeFreeScene(
   textInstanceCount: number,
   strokeSegmentCount: number
 ): boolean {
   return textInstanceCount > TEXT_HEAVY_INSTANCE_THRESHOLD && strokeSegmentCount === 0;
-}
-
-/**
- * Decide whether a native frame may reuse the oversized pan cache.
- *
- * Zoom must render directly: scaling the previous cache postpones both text-LOD
- * selection and glyph-atlas sampling until the damped camera settles, producing
- * a visible late "sharpen" step. Translation-only drag and inertia may still
- * reuse the cache because they do not change the screen-space text scale.
- * Stroke LOD is selected for the full cache coverage at the live zoom whenever
- * it is refreshed, so an active LOD runtime does not prevent translation reuse.
- */
-export function shouldUseNativePanCacheForFrame(
-  sceneEligible: boolean,
-  panInteracting: boolean,
-  cameraAnimating: boolean,
-  zoomAnimating: boolean
-): boolean {
-  if (!sceneEligible || zoomAnimating) {
-    return false;
-  }
-  return panInteracting || cameraAnimating;
 }

@@ -44,11 +44,8 @@ import {
 } from "./nativeGradientWebGlShaders";
 import {
   isNativeTextHeavyStrokeFreeScene,
-  NATIVE_PAN_CACHE_MIN_PAINTS,
-  NATIVE_VECTOR_MINIFY_ENABLED,
-  shouldUseNativePanCacheForFrame
+  NATIVE_VECTOR_MINIFY_ENABLED
 } from "./nativeRenderPolicy";
-import { chooseNativePanCacheSize } from "./nativePanCache";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
@@ -861,32 +858,6 @@ void main() {
 }
 `;
 
-const BLIT_FRAGMENT_SHADER_SOURCE = `#version 300 es
-precision highp float;
-
-uniform sampler2D uCacheTex;
-uniform vec2 uViewportPx;
-uniform vec2 uCacheSizePx;
-uniform vec2 uOffsetPx;
-uniform float uSampleScale;
-
-out vec4 outColor;
-
-void main() {
-  float sampleScale = max(uSampleScale, 1e-6);
-  vec2 centered = gl_FragCoord.xy - 0.5 * uViewportPx;
-  vec2 samplePx = centered * sampleScale + 0.5 * uCacheSizePx + uOffsetPx;
-  vec2 uv = samplePx / uCacheSizePx;
-
-  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
-    outColor = vec4(0.627451, 0.662745, 0.686275, 1.0);
-    return;
-  }
-
-  outColor = texture(uCacheTex, uv);
-}
-`;
-
 const VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 
@@ -1037,10 +1008,6 @@ const HIGHLIGHT_SELECTION_BORDER: readonly number[] = [0.106, 0.365, 0.788, 1];
 const HIGHLIGHT_SELECTION_BORDER_PX = 1;
 const HIGHLIGHT_MIN_SIZE_PX = 2;
 
-const PAN_CACHE_MIN_SEGMENTS = 300_000;
-const PAN_CACHE_ZOOM_EPSILON = 1e-5;
-const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
-const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
@@ -1065,7 +1032,6 @@ export const CORE_FILL_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(FILL_FRAGME
 export const CORE_TEXT_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(TEXT_VERTEX_SHADER_SOURCE);
 export const CORE_TEXT_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(TEXT_FRAGMENT_SHADER_SOURCE);
 export const CORE_BLIT_VERTEX_SHADER_SOURCE = BLIT_VERTEX_SHADER_SOURCE;
-export const CORE_BLIT_FRAGMENT_SHADER_SOURCE = BLIT_FRAGMENT_SHADER_SOURCE;
 export const CORE_VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE;
 export const CORE_RASTER_VERTEX_SHADER_SOURCE = pdfShapeCoverageGlsl(RASTER_VERTEX_SHADER_SOURCE);
 export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = pdfShapeCoverageGlsl(RASTER_FRAGMENT_SHADER_SOURCE);
@@ -1189,12 +1155,6 @@ export interface ProjectedFrameOptions {
 
 /** Options for native view-state updates. */
 export interface ViewStateUpdateOptions {
-  /** Preserve cached pan content where possible. */
-  preservePanCache?: boolean;
-
-  /** Whether the update occurs during an active interaction. */
-  interacting?: boolean;
-
   /**
    * Whether the renderer should schedule a frame of its own. Hosts that drive
    * the camera but present through their own pipeline set this to false: the
@@ -1263,8 +1223,6 @@ export class WebGlFloorplanRenderer {
   private readonly gradientStrokeProgram: WebGLProgram;
 
   private readonly textProgram: WebGLProgram;
-
-  private readonly blitProgram: WebGLProgram;
 
   private readonly vectorCompositeProgram: WebGLProgram;
 
@@ -1476,16 +1434,6 @@ export class WebGlFloorplanRenderer {
 
   private readonly uTextVectorOverride: WebGLUniformLocation;
 
-  private readonly uCacheTex: WebGLUniformLocation;
-
-  private readonly uViewportPx: WebGLUniformLocation;
-
-  private readonly uCacheSizePx: WebGLUniformLocation;
-
-  private readonly uOffsetPx: WebGLUniformLocation;
-
-  private readonly uSampleScale: WebGLUniformLocation;
-
   private readonly uVectorLayerTex: WebGLUniformLocation;
 
   private readonly uVectorLayerViewportPx: WebGLUniformLocation;
@@ -1561,10 +1509,10 @@ export class WebGlFloorplanRenderer {
    * The opacity, soft mask and mask weights (see `paintFoldMaskWeights`) of
    * the folded paint being drawn, if any.
    */
-  private paintFold: { opacity: number; mask: WebGLTexture | null; weights: readonly number[] } | null = null;
+  private paintFold: { opacity: number; mask: WebGLTexture | null; weights: readonly number[]; gradient?: Float32Array } | null = null;
   /** Per program, the fold its uniforms hold; null is the neutral fold. */
   private paintFoldStates?: Map<WebGLProgram, WebGlFloorplanRenderer["paintFold"]>;
-  private readonly paintFoldUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
+  private readonly paintFoldUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private readonly orderedInstanceVaos = new Set<number>();
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
@@ -1762,28 +1710,6 @@ export class WebGlFloorplanRenderer {
 
   private isPanInteracting = false;
 
-  private panCacheTexture: WebGLTexture | null = null;
-
-  private panCacheFramebuffer: WebGLFramebuffer | null = null;
-
-  private panCacheMaxTextureSize = 0;
-
-  private panCacheWidth = 0;
-
-  private panCacheHeight = 0;
-
-  private panCacheValid = false;
-
-  private panCacheCenterX = 0;
-
-  private panCacheCenterY = 0;
-
-  private panCacheZoom = 1;
-
-  private panCacheRenderedSegments = 0;
-
-  private panCacheUsedCulling = false;
-
   private vectorMinifyTexture: WebGLTexture | null = null;
 
   private vectorMinifyFramebuffer: WebGLFramebuffer | null = null;
@@ -1858,7 +1784,6 @@ export class WebGlFloorplanRenderer {
       GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE
     );
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
-    this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, foldable(RASTER_FRAGMENT_SHADER_SOURCE, true));
     this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
@@ -2020,11 +1945,6 @@ export class WebGlFloorplanRenderer {
     this.uTextVectorOnly = this.mustGetUniformLocation(this.textProgram, "uTextVectorOnly");
     this.uTextVectorOverride = this.mustGetUniformLocation(this.textProgram, "uVectorOverride");
 
-    this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
-    this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
-    this.uCacheSizePx = this.mustGetUniformLocation(this.blitProgram, "uCacheSizePx");
-    this.uOffsetPx = this.mustGetUniformLocation(this.blitProgram, "uOffsetPx");
-    this.uSampleScale = this.mustGetUniformLocation(this.blitProgram, "uSampleScale");
 
     this.uVectorLayerTex = this.mustGetUniformLocation(this.vectorCompositeProgram, "uVectorLayerTex");
     this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
@@ -2075,7 +1995,7 @@ export class WebGlFloorplanRenderer {
       [this.segmentProgram, "stroke"], [this.fillProgram, "fill"], [this.gradientFillProgram, "gradientFill"],
       [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
       [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
-      [this.blitProgram, "blit"], [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
+      [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
     return names.find(([candidate]) => candidate === program)?.[1] ?? null;
   }
 
@@ -2212,7 +2132,6 @@ export class WebGlFloorplanRenderer {
       this.destroyVectorLodResources();
       const vectorLodActive = this.rebuildVectorLod(this.scene);
       this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
-      this.destroyPanCacheResources();
       this.destroyVectorMinifyResources();
       this.needsVisibleSetUpdate = true;
       this.requestFrame();
@@ -2236,7 +2155,6 @@ export class WebGlFloorplanRenderer {
     }
     this.textLodRuntime?.setMode(this.primitiveColors?.has("text") ? "off" : nextMode);
     this.selectedTextInstanceCount = 0;
-    this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -2252,7 +2170,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.strokeCurveEnabled = nextEnabled;
-    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -2262,7 +2179,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.rasterRenderingEnabled = nextEnabled;
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2290,7 +2206,6 @@ export class WebGlFloorplanRenderer {
     } else {
       this.destroyRasterLayerTextures();
     }
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2301,7 +2216,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.strokeRenderingEnabled = nextEnabled;
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2312,7 +2226,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.fillRenderingEnabled = nextEnabled;
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2323,7 +2236,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.textRenderingEnabled = nextEnabled;
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2334,7 +2246,6 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.textVectorOnly = nextEnabled;
-    this.panCacheValid = false;
     if (this.textVectorOnly) {
       this.destroyVectorMinifyResources();
     }
@@ -2359,7 +2270,6 @@ export class WebGlFloorplanRenderer {
 
     this.pageBackgroundColor = [nextRed, nextGreen, nextBlue, nextAlpha];
     this.uploadPageBackgroundTexture();
-    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -2413,7 +2323,6 @@ export class WebGlFloorplanRenderer {
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors.has("stroke") &&
       !this.primitiveColors.has("fill") && !this.primitiveColors.has("text"));
     this.orderedBatches?.invalidate();
-    this.panCacheValid = false;
     this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -2437,7 +2346,6 @@ export class WebGlFloorplanRenderer {
 
     this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
     this.vectorOverrideOpacity = nextOpacity;
-    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -2497,8 +2405,6 @@ export class WebGlFloorplanRenderer {
 
     this.canvas.width = nextWidth;
     this.canvas.height = nextHeight;
-
-    this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -2554,7 +2460,7 @@ export class WebGlFloorplanRenderer {
         this.destroyRasterStripBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
         finished = true;
-        this.panCacheValid = false; this.destroyVectorMinifyResources(); this.requestFrame();
+        this.destroyVectorMinifyResources(); this.requestFrame();
       },
       dispose: () => { if (!finished) { finished = true; release(); } }
     };
@@ -2567,7 +2473,6 @@ export class WebGlFloorplanRenderer {
     this.optionalContentVisibility = snapshot;
     this.scenePaintVisibility?.setVisibility(snapshot);
     this.orderedBatches?.invalidate();
-    this.panCacheValid = false;
     this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -2613,7 +2518,6 @@ export class WebGlFloorplanRenderer {
     this.visibleTextRanges = [];
     this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
-    this.panCacheValid = false;
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
     this.destroyRasterLayerTextures();
@@ -2763,21 +2667,6 @@ export class WebGlFloorplanRenderer {
     }
 
     const resolvedZoom = clamp(nextZoom, this.minZoom, this.maxZoom);
-    const stateChanged =
-      Math.abs(this.cameraCenterX - nextCenterX) > 1e-6 ||
-      Math.abs(this.cameraCenterY - nextCenterY) > 1e-6 ||
-      Math.abs(this.zoom - resolvedZoom) > 1e-6;
-    if (!stateChanged && options.preservePanCache === true) {
-      const nextInteracting = options.interacting === true;
-      if (this.isPanInteracting !== nextInteracting) {
-        this.isPanInteracting = nextInteracting;
-        if (!nextInteracting) {
-          this.needsVisibleSetUpdate = true;
-        }
-      }
-      return;
-    }
-
     this.cameraCenterX = nextCenterX;
     this.cameraCenterY = nextCenterY;
     this.zoom = resolvedZoom;
@@ -2786,12 +2675,7 @@ export class WebGlFloorplanRenderer {
     this.targetZoom = resolvedZoom;
     this.lastCameraAnimationTimeMs = 0;
     this.hasZoomAnchor = false;
-    if (options.preservePanCache === true) {
-      this.isPanInteracting = options.interacting === true;
-    } else {
-      this.isPanInteracting = false;
-      this.panCacheValid = false;
-    }
+    this.isPanInteracting = false;
     this.presentedCameraCenterX = this.cameraCenterX;
     this.presentedCameraCenterY = this.cameraCenterY;
     this.presentedZoom = this.zoom;
@@ -2873,7 +2757,6 @@ export class WebGlFloorplanRenderer {
     this.hasZoomAnchor = false;
     this.isPanInteracting = false;
 
-    this.panCacheValid = false;
     this.presentedCameraCenterX = this.cameraCenterX;
     this.presentedCameraCenterY = this.cameraCenterY;
     this.presentedZoom = this.zoom;
@@ -2902,7 +2785,6 @@ export class WebGlFloorplanRenderer {
     this.externalFrameDriver = true;
     this.frameListener = null;
     this.interactionViewportProvider = null;
-    this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
     const gl = this.gl;
@@ -2983,7 +2865,6 @@ export class WebGlFloorplanRenderer {
       this.gradientFillProgram,
       this.gradientStrokeProgram,
       this.textProgram,
-      this.blitProgram,
       this.vectorCompositeProgram,
       this.rasterProgram,
       this.highlightProgram
@@ -3050,7 +2931,6 @@ export class WebGlFloorplanRenderer {
     this.hasCameraInteractionSinceSceneLoad = true;
     const anchorWorld = this.clientToWorld(clientX, clientY);
     const nextZoom = clamp(this.targetZoom * clampedFactor, this.minZoom, this.maxZoom);
-    const zoomTargetChanged = nextZoom !== this.targetZoom;
     this.hasZoomAnchor = true;
     this.zoomAnchorClientX = clientX;
     this.zoomAnchorClientY = clientY;
@@ -3066,12 +2946,6 @@ export class WebGlFloorplanRenderer {
     );
     this.targetCameraCenterX = targetCenter.x;
     this.targetCameraCenterY = targetCenter.y;
-    if (zoomTargetChanged) {
-      // A later pan must not revive pixels rendered with an old hysteretic LOD
-      // selection merely because the zoom eventually returns to this scale.
-      this.panCacheValid = false;
-    }
-
     this.needsVisibleSetUpdate = true;
     this.panVelocityWorldX = 0;
     this.panVelocityWorldY = 0;
@@ -3143,16 +3017,9 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
-    let stats: DrawStats;
-    if (this.shouldUsePanCache(isCameraAnimating)) {
-      profile?.add("panCacheFrames");
-      stats = this.renderWithPanCache();
-    } else {
-      profile?.add("directFrames");
-      stats = this.renderDirectToScreen();
-    }
-    // Drawn last with the live camera so highlights can never lag the scene,
-    // and never bake into the pan cache.
+    profile?.add("directFrames");
+    const stats = this.renderDirectToScreen();
+    // Draw overlays last with the same live camera as the scene.
     profile?.beginSection("overlays");
     this.drawSearchHighlights(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     profile?.endSection("overlays");
@@ -3172,37 +3039,16 @@ export class WebGlFloorplanRenderer {
   }
 
   /**
-   * A book-like scene: enough glyphs to benefit from cached panning even though
-   * it does not meet the ordinary stroke-count threshold. The shared direct
-   * rendering policy keeps its cached and settled coverage scale consistent.
+   * Keep text-heavy pages out of the legacy vector-minification path.
    */
   private isTextHeavyStrokeFreeScene(): boolean {
     return isNativeTextHeavyStrokeFreeScene(this.textInstanceCount, this.segmentCount);
-  }
-
-  private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    const sceneEligible =
-      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
-      (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
-    const zoomAnimating =
-      Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
-    return shouldUseNativePanCacheForFrame(
-      sceneEligible,
-      this.isPanInteracting,
-      isCameraAnimating,
-      zoomAnimating
-    );
   }
 
   private renderDirectToScreen(): DrawStats {
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     const gl = this.gl;
     let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
-    // Keep still/moving appearance consistent on large pan-optimized scenes.
-    // Pan-cache path renders vectors directly; matching that avoids thickness shifts while camera moves.
-    if (this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
-      useVectorMinify = false;
-    }
 
     // WebGL drivers can produce a transient thin/missing first composite frame
     // right after creating the minify target. Warm up with one direct frame.
@@ -3480,106 +3326,6 @@ export class WebGlFloorplanRenderer {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.frameDrawCalls++;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-  }
-
-  private renderWithPanCache(): DrawStats {
-    if (!this.ensurePanCacheResources()) {
-      return this.renderDirectToScreen();
-    }
-
-    let sampleScale = this.panCacheZoom / Math.max(this.zoom, 1e-6);
-    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.panCacheZoom;
-    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.panCacheZoom;
-
-    const halfCacheX = this.panCacheWidth * 0.5 - 2;
-    const halfCacheY = this.panCacheHeight * 0.5 - 2;
-    const halfScaledViewX = this.canvas.width * 0.5 * Math.abs(sampleScale);
-    const halfScaledViewY = this.canvas.height * 0.5 * Math.abs(sampleScale);
-    const coverageX = halfCacheX - halfScaledViewX;
-    const coverageY = halfCacheY - halfScaledViewY;
-
-    const zoomRatio = this.zoom / Math.max(this.panCacheZoom, 1e-6);
-    const zoomOutOfRange = zoomRatio < PAN_CACHE_ZOOM_RATIO_MIN || zoomRatio > PAN_CACHE_ZOOM_RATIO_MAX;
-    const zoomSettled = Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
-    const needsSharpRefresh = zoomSettled && Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
-    const cacheOutOfCoverage =
-      coverageX < 0 ||
-      coverageY < 0 ||
-      Math.abs(offsetPxX) > coverageX ||
-      Math.abs(offsetPxY) > coverageY;
-    const needsCacheRefresh = !this.panCacheValid || zoomOutOfRange || cacheOutOfCoverage || needsSharpRefresh;
-
-    if (needsCacheRefresh) {
-      this.performanceProfiler?.add("panCacheRefreshes");
-      this.panCacheCenterX = this.cameraCenterX;
-      this.panCacheCenterY = this.cameraCenterY;
-      this.panCacheZoom = this.zoom;
-
-      this.updateVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
-      this.needsVisibleSetUpdate = false;
-
-      const gl = this.gl;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.panCacheFramebuffer);
-      gl.viewport(0, 0, this.panCacheWidth, this.panCacheHeight);
-      gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-
-      if (this.scene?.drawRuns) {
-        this.panCacheRenderedSegments = this.drawSourceOrderedContent(
-          this.panCacheWidth, this.panCacheHeight, this.panCacheCenterX, this.panCacheCenterY,
-          this.zoom, this.panCacheFramebuffer
-        );
-      } else {
-        this.drawOrderedGradientPaint(
-          this.panCacheWidth,
-          this.panCacheHeight,
-          this.panCacheCenterX,
-          this.panCacheCenterY
-        );
-        if (this.fillRenderingEnabled) {
-          this.drawFilledPaths(
-            this.panCacheWidth,
-            this.panCacheHeight,
-            this.panCacheCenterX,
-            this.panCacheCenterY
-          );
-        }
-        this.panCacheRenderedSegments = this.strokeRenderingEnabled
-          ? this.drawVisibleSegments(
-            this.panCacheWidth,
-            this.panCacheHeight,
-            this.panCacheCenterX,
-            this.panCacheCenterY
-          )
-          : 0;
-        if (this.textRenderingEnabled) {
-          this.drawTextInstances(
-            this.panCacheWidth,
-            this.panCacheHeight,
-            this.panCacheCenterX,
-            this.panCacheCenterY
-          );
-        }
-      }
-      this.panCacheUsedCulling = this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments;
-      this.panCacheValid = true;
-
-      sampleScale = 1;
-      offsetPxX = 0;
-      offsetPxY = 0;
-    }
-
-    if (!needsCacheRefresh) this.performanceProfiler?.add("panCacheReuses");
-    this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
-
-    return {
-      renderedSegments: this.panCacheRenderedSegments,
-      totalSegments: this.segmentCount,
-      redundantSegments: this.getRedundantSegmentCount(),
-      paintOrderApproximated: this.isPaintOrderApproximated(),
-      usedCulling: this.panCacheUsedCulling,
-      zoom: this.zoom
-    };
   }
 
   private drawOrderedGradientPaint(
@@ -4213,11 +3959,12 @@ export class WebGlFloorplanRenderer {
     gl.useProgram(null);
   }
 
-  private paintFoldLocations(program: WebGLProgram): [WebGLUniformLocation | null, WebGLUniformLocation | null] {
+  private paintFoldLocations(program: WebGLProgram): [WebGLUniformLocation | null, WebGLUniformLocation | null, WebGLUniformLocation | null] {
     let locations = this.paintFoldUniforms.get(program);
     if (!locations) {
       locations = [this.gl.getUniformLocation(program, "uPaintFold"),
-        this.gl.getUniformLocation(program, "uPaintMaskWeights")];
+        this.gl.getUniformLocation(program, "uPaintMaskWeights"),
+        this.gl.getUniformLocation(program, "uPaintMaskGradient")];
       this.paintFoldUniforms.set(program, locations);
     }
     return locations;
@@ -4233,10 +3980,11 @@ export class WebGlFloorplanRenderer {
     const states = this.paintFoldStates ??= new Map();
     if (states.get(program) === fold) return;
     states.set(program, fold);
-    const [location, weights] = this.paintFoldLocations(program);
+    const [location, weights, gradient] = this.paintFoldLocations(program);
     if (!fold?.mask) { this.gl.uniform4f(location, fold?.opacity ?? 1, 0, 0, 0); return; }
     const value = fold.weights;
-    this.gl.uniform4f(location, fold.opacity, 1, value[4], 0);
+    this.gl.uniform4f(location, fold.opacity, fold.gradient ? 2 : 1, value[4], 0);
+    if (fold.gradient) this.gl.uniform4fv(gradient, fold.gradient);
     this.gl.uniform4f(weights, value[0], value[1], value[2], value[3]);
   }
 
@@ -4408,17 +4156,21 @@ export class WebGlFloorplanRenderer {
       // scaled by the chain's opacity and soft mask.
       const folding: WebGlPaintFolding | null = this.paintFoldUnit >= 0 ? {
         canFold: run => this.canFoldPaint(run),
-        draw: (run, opacity, mask, content) => {
+        canFoldMaskPaint: (_run, maskRun) => this.fillRenderingEnabled && this.vectorOverrideOpacity === 0 &&
+          !this.primitiveColors?.gradient("gradient-fill", maskRun.first),
+        draw: (run, opacity, mask, content, gradient) => {
           this.invalidateOrderedState();
           this.paintShapeOnly = false;
-          this.paintFold = { opacity, mask, weights: paintFoldMaskWeights(content) };
+          if (gradient) profile?.add("computedMasks");
+          this.paintFold = { opacity, mask: gradient ? this.gradientLutTexture : mask,
+            weights: paintFoldMaskWeights(content), gradient };
           profile?.add("foldedPaints");
           try {
             draw(run);
           } finally {
             this.paintFold = null;
             // The mask surface may later be drawn into; it must not stay bound.
-            if (mask) this.bindOrderedTexture(this.paintFoldUnit, this.paintFoldNeutralTexture);
+            if (mask || gradient) this.bindOrderedTexture(this.paintFoldUnit, this.paintFoldNeutralTexture);
           }
         }
       } : null;
@@ -4820,109 +4572,6 @@ export class WebGlFloorplanRenderer {
       renderedInstanceCount += range.count;
     }
     return renderedInstanceCount;
-  }
-
-  private blitPanCache(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
-    if (!this.panCacheTexture) {
-      return;
-    }
-
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
-    gl.useProgram(this.blitProgram);
-    gl.bindVertexArray(this.blitVao);
-
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.panCacheTexture);
-
-    gl.uniform1i(this.uCacheTex, 0);
-    gl.uniform2f(this.uViewportPx, this.canvas.width, this.canvas.height);
-    gl.uniform2f(this.uCacheSizePx, this.panCacheWidth, this.panCacheHeight);
-    gl.uniform2f(this.uOffsetPx, offsetPxX, offsetPxY);
-    gl.uniform1f(this.uSampleScale, sampleScale);
-
-    gl.disable(gl.BLEND);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    this.frameDrawCalls++;
-    gl.enable(gl.BLEND);
-  }
-
-  private ensurePanCacheResources(): boolean {
-    const gl = this.gl;
-    // Device limits do not change between frames; querying them can synchronize GL.
-    const maxTextureSize = this.panCacheMaxTextureSize ||
-      (this.panCacheMaxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number);
-    const size = chooseNativePanCacheSize(this.scene, this.canvas.width, this.canvas.height, maxTextureSize);
-    if (!size) return false;
-    const { width: desiredWidth, height: desiredHeight } = size;
-
-    if (
-      this.panCacheTexture &&
-      this.panCacheFramebuffer &&
-      this.panCacheWidth === desiredWidth &&
-      this.panCacheHeight === desiredHeight
-    ) {
-      return true;
-    }
-
-    this.destroyPanCacheResources();
-
-    const texture = gl.createTexture();
-    if (!texture) {
-      return false;
-    }
-
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    configureColorTexture(gl);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, desiredWidth, desiredHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-
-    const framebuffer = gl.createFramebuffer();
-    if (!framebuffer) {
-      gl.deleteTexture(texture);
-      return false;
-    }
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-
-    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      gl.deleteFramebuffer(framebuffer);
-      gl.deleteTexture(texture);
-      return false;
-    }
-
-    this.panCacheTexture = texture;
-    this.panCacheFramebuffer = framebuffer;
-    this.panCacheWidth = desiredWidth;
-    this.panCacheHeight = desiredHeight;
-    this.panCacheValid = false;
-
-    return true;
-  }
-
-  private destroyPanCacheResources(): void {
-    if (this.panCacheFramebuffer) {
-      this.gl.deleteFramebuffer(this.panCacheFramebuffer);
-      this.panCacheFramebuffer = null;
-    }
-
-    if (this.panCacheTexture) {
-      this.gl.deleteTexture(this.panCacheTexture);
-      this.panCacheTexture = null;
-    }
-
-    this.panCacheWidth = 0;
-    this.panCacheHeight = 0;
-    this.panCacheValid = false;
-    this.panCacheRenderedSegments = 0;
-    this.panCacheUsedCulling = false;
   }
 
   private destroyVectorMinifyResources(): void {

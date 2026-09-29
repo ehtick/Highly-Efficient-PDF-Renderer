@@ -309,8 +309,8 @@ const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
-// Dense overview tiles may trade up to four times the normal tolerance for
-// the segment budget. The exact-zoom gate still takes priority over pressure.
+// Prefer overview levels within four times the normal tolerance. Planar views
+// may retain coarser overview geometry when the visible draw list exceeds budget.
 const LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX = 5;
 // Relative to the entire drawing, not a world-space slope threshold. Three's
 // camera controls can introduce ~1e-16 roundoff in an otherwise planar view.
@@ -618,43 +618,65 @@ export class VectorStrokeLodRuntime {
     let maxSelectedTileSegments = 0;
     let maxSelectedTileLevelIndex = screenErrorLevelIndex;
 
-    for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
-      for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
-        const tileIndex = row * this.tileGrid.columns + column;
-        const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
-        let tileBaselineLevelIndex = screenErrorLevelIndex;
-        let tileMaxLevelIndex = maxLevelIndex;
-        let tileTargetSegments = targetSegmentsPerTile;
-        let cullingPlanes: Float64Array | null = null;
-        if (projected) {
-          const unitsPerPixel = this.projectedTileUnitsPerPixel[tileIndex];
-          if (unitsPerPixel < 0 || baselineTileSegments === 0) continue;
-          tileBaselineLevelIndex = this.chooseLevelIndex(unitsPerPixel);
-          tileMaxLevelIndex = Math.max(tileBaselineLevelIndex,
-            this.chooseLevelIndex(unitsPerPixel, LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX, true));
-          while (tileMaxLevelIndex > 0 && !this.tileReachWithinBudget(tileIndex, tileMaxLevelIndex)) tileMaxLevelIndex--;
-          tileBaselineLevelIndex = Math.min(tileBaselineLevelIndex, tileMaxLevelIndex);
-          if (projectedWeightSum > 0) {
-            tileTargetSegments = Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS, Math.round(
-              VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS * this.projectedTileWeights[tileIndex] / projectedWeightSum));
-          }
-          projectedTargetSum += tileTargetSegments;
-          if (this.projectedTilePartial[tileIndex]) cullingPlanes = this.projectedPlanes;
-          baselineLevelIndex = Math.min(baselineLevelIndex, tileBaselineLevelIndex);
-        }
-        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments, tileBaselineLevelIndex, tileMaxLevelIndex);
-        const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
-        if (baselineTileSegments > maxBaselineTileSegments) {
-          maxBaselineTileSegments = baselineTileSegments;
-          maxBaselineTileSelectedSegments = selectedTileSegments;
-          maxBaselineTileSelectedLevelIndex = levelIndex;
-        }
-        if (selectedTileSegments > maxSelectedTileSegments) {
-          maxSelectedTileSegments = selectedTileSegments;
-          maxSelectedTileLevelIndex = levelIndex;
-        }
-        appendTileSegments(this.levels[levelIndex], tileIndex, selectionBounds, cullingPlanes);
+    const canRelaxOverview = !this.forceExact && (!this.useLocalToClip || this.constantClipW) &&
+      this.levels.some(level => level.overview);
+    const softVisibleLimit = VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS * LOD_TILE_SOFT_OVERSHOOT_RATIO;
+    // First keep the normal screen-error limits. A tile exceeding its equal
+    // share does not imply that the whole view is expensive (e.g. sparse hatch
+    // lines crossing many tiles). Only relax quality after actual culled,
+    // deduplicated draw IDs exceed the global soft budget. Stop that probe at
+    // the limit so dense close-ups never build a million-entry exact draw list.
+    for (let pass = 0; pass < 2; pass++) {
+      if (pass > 0) {
+        this.resetLevelDrawLists();
+        maxBaselineTileSegments = 0;
+        maxSelectedTileSegments = 0;
       }
+      let selectedSegmentCount = 0;
+      selectTiles: for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
+        for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
+          const tileIndex = row * this.tileGrid.columns + column;
+          const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
+          let tileBaselineLevelIndex = screenErrorLevelIndex;
+          let tileMaxLevelIndex = maxLevelIndex;
+          let tileTargetSegments = targetSegmentsPerTile;
+          let cullingPlanes: Float64Array | null = null;
+          if (projected) {
+            const unitsPerPixel = this.projectedTileUnitsPerPixel[tileIndex];
+            if (unitsPerPixel < 0 || baselineTileSegments === 0) continue;
+            tileBaselineLevelIndex = this.chooseLevelIndex(unitsPerPixel);
+            tileMaxLevelIndex = Math.max(tileBaselineLevelIndex,
+              this.chooseLevelIndex(unitsPerPixel, LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX, true));
+            while (tileMaxLevelIndex > 0 && !this.tileReachWithinBudget(tileIndex, tileMaxLevelIndex)) tileMaxLevelIndex--;
+            tileBaselineLevelIndex = Math.min(tileBaselineLevelIndex, tileMaxLevelIndex);
+            if (projectedWeightSum > 0) {
+              tileTargetSegments = Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS, Math.round(
+                VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS * this.projectedTileWeights[tileIndex] / projectedWeightSum));
+            }
+            projectedTargetSum += tileTargetSegments;
+            if (this.projectedTilePartial[tileIndex]) cullingPlanes = this.projectedPlanes;
+            baselineLevelIndex = Math.min(baselineLevelIndex, tileBaselineLevelIndex);
+          }
+          const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments, tileBaselineLevelIndex, tileMaxLevelIndex, pass > 0);
+          const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
+          if (baselineTileSegments > maxBaselineTileSegments) {
+            maxBaselineTileSegments = baselineTileSegments;
+            maxBaselineTileSelectedSegments = selectedTileSegments;
+            maxBaselineTileSelectedLevelIndex = levelIndex;
+          }
+          if (selectedTileSegments > maxSelectedTileSegments) {
+            maxSelectedTileSegments = selectedTileSegments;
+            maxSelectedTileLevelIndex = levelIndex;
+          }
+          const level = this.levels[levelIndex];
+          const previousCount = level.visibleSegmentCount;
+          appendTileSegments(level, tileIndex, selectionBounds, cullingPlanes,
+            canRelaxOverview && pass === 0 ? softVisibleLimit + 1 - selectedSegmentCount : Infinity);
+          selectedSegmentCount += level.visibleSegmentCount - previousCount;
+          if (canRelaxOverview && pass === 0 && selectedSegmentCount > softVisibleLimit) break selectTiles;
+        }
+      }
+      if (!canRelaxOverview || selectedSegmentCount <= softVisibleLimit) break;
     }
     if (projected) {
       // Report the nearest visible detail limit and the mean tile share.
@@ -694,11 +716,9 @@ export class VectorStrokeLodRuntime {
     }
   }
 
-  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number, baselineLevelIndex: number, maxLevelIndex: number): number {
-    // Past the normal threshold (baseline 0), budget pressure may still use
-    // an overview level within its 5-pixel limit. Exact geometry is certain
-    // only when no approximation fits that limit.
-    if (this.forceExact || maxLevelIndex <= 0) {
+  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number, baselineLevelIndex: number, maxLevelIndex: number,
+    allowBudgetFallback = false): number {
+    if (this.forceExact) {
       this.tileSelectedLevelIndices[tileIndex] = 0;
       return 0;
     }
@@ -716,11 +736,24 @@ export class VectorStrokeLodRuntime {
         return index;
       }
     }
-    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile, maxLevelIndex);
+    let bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile, maxLevelIndex);
+    const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
+    // A zoom threshold must not replace a usable overview with millions of
+    // strokes. In planar views, relax the quality limit only for explicit
+    // overview levels, stopping at the finest one that fits the soft budget.
+    // Tilted projections retain their per-tile and primitive-reach safeguards.
+    if (allowBudgetFallback &&
+        this.levels[bestIndex].tileCounts[tileIndex] > softOvershootLimit) {
+      for (let index = maxLevelIndex + 1; index < this.levels.length; index++) {
+        if (!this.levels[index].overview) continue;
+        const count = this.levels[index].tileCounts[tileIndex];
+        if (count < this.levels[bestIndex].tileCounts[tileIndex]) bestIndex = index;
+        if (count <= softOvershootLimit) break;
+      }
+    }
     const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
 
     if (previousLevelIndex >= 0 && previousLevelIndex <= maxLevelIndex) {
-      const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
       const previousCount = this.levels[previousLevelIndex].tileCounts[tileIndex];
       if (previousCount <= softOvershootLimit) {
         const bestCount = this.levels[bestIndex].tileCounts[tileIndex];
@@ -1784,12 +1817,14 @@ function appendTileSegments(
   level: RuntimeStrokeTileBuckets,
   tileIndex: number,
   viewBounds: CullingBounds,
-  cullingPlanes: Float64Array | null = null
+  cullingPlanes: Float64Array | null = null,
+  maxAddedSegments = Infinity
 ): void {
   const start = level.tileOffsets[tileIndex];
   const end = start + level.tileCounts[tileIndex];
   let outCount = level.visibleSegmentCount;
-  for (let i = start; i < end; i += 1) {
+  const outLimit = outCount + maxAddedSegments;
+  for (let i = start; i < end && outCount < outLimit; i += 1) {
     const segmentIndex = level.tileSegmentIds[i];
     if (level.segmentMarks[segmentIndex] === level.markToken) {
       continue;

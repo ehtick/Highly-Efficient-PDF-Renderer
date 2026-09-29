@@ -129,7 +129,6 @@ try {
   assert.deepEqual(glClipRoots, scene.drawRuns.map(run => run.clipIndex ?? -1));
   assert.equal(glRenderer.vectorClipIndex, -1);
   assert.equal(glRenderer.shouldUseVectorMinifyPath(), false);
-  assert.equal(glRenderer.shouldUsePanCache(true), false);
   glRenderer.textRenderingEnabled = false;
   calls = [];
   glRenderer.drawSourceOrderedContent(64, 64, 32, 32, 1);

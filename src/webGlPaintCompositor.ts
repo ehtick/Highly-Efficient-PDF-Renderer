@@ -1,3 +1,4 @@
+import { nativeGradientMaskVectors } from "./gradientMaskFold";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
@@ -28,8 +29,9 @@ export interface WebGlPaintCompositorState {
  */
 export interface WebGlPaintFolding {
   canFold(run: VectorDrawRun): boolean;
+  canFoldMaskPaint?(run: VectorDrawRun, maskRun: VectorDrawRun): boolean;
   /** `content` is the soft mask whose rendered content `mask` holds, when it was not converted first. */
-  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null, content?: ScenePaintMask): void;
+  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null, content?: ScenePaintMask, gradient?: Float32Array): void;
 }
 
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
@@ -67,6 +69,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   private height = 0;
   private approximationReported = false;
   private drawSpan: ((runs: readonly VectorDrawRun[], shapeOnly: boolean) => void) | null = null;
+  private scene: VectorScene | null = null;
+  private gradientMask: Float32Array | null = null;
   private folding: WebGlPaintFolding | null = null;
   private project: PdfCompositeProjector | null = null;
   private viewportWidth = 0;
@@ -131,6 +135,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     // Whatever ran since the last render may have rebound these units.
     this.bound.length = 0;
     this.drawSpan = draw; this.folding = folding;
+    this.scene = scene;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     let backdrop: Surface | null = null, result: Surface | null = null;
     try {
@@ -140,15 +145,15 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, backdrop.framebuffer);
       gl.blitFramebuffer(viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,
         0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.LINEAR);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
+      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, result.framebuffer);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.blitFramebuffer(0, 0, this.width, this.height, viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,
         gl.COLOR_BUFFER_BIT, gl.LINEAR);
     } finally {
       if (result) this.release(result);
-      if (backdrop) this.release(backdrop);
-      this.drawSpan = null; this.folding = null; this.project = null;
+      if (backdrop && backdrop !== result) this.release(backdrop);
+      this.drawSpan = null; this.folding = null; this.scene = null; this.gradientMask = null; this.project = null;
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
       gl.clearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
@@ -230,11 +235,18 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     this.drawSpan!(runs, shapeOnly);
   }
   canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
+  canFoldMaskPaint(run: VectorDrawRun, maskRun: VectorDrawRun): boolean {
+    this.gradientMask = null;
+    if (!this.scene || !this.folding?.canFoldMaskPaint?.(run, maskRun)) return false;
+    this.gradientMask = nativeGradientMaskVectors(this.scene, maskRun, run.clipIndex, this.project,
+      this.width, this.height, this.viewportWidth, this.viewportHeight, false);
+    return this.gradientMask !== null;
+  }
   drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined,
-    content?: ScenePaintMask): void {
+    content?: ScenePaintMask, maskRun?: VectorDrawRun): void {
     const gl = this.gl; this.target(destination); gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    this.folding!.draw(run, opacity, mask?.texture ?? null, content);
+    this.folding!.draw(run, opacity, mask?.texture ?? null, content, maskRun ? this.gradientMask! : undefined);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;

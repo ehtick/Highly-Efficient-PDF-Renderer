@@ -118,16 +118,20 @@ Vector LOD simplifies stroke geometry according to the current view, aiming for
 roughly 50,000 visible strokes. Large drawings keep a fine representation and
 additional overview levels. When a tile exceeds its budget, overview levels can
 omit tiny marks and merge nearby lines more aggressively. This trades some
-far-zoom detail and hatch density for performance while keeping vector rendering.
+fine detail and hatch density for performance while keeping vector rendering.
 The HUD labels these selections `(overview)` and shows the total target.
 
 Tiles that fit their budget retain exact or fine geometry. Very dense views can
-still use overview levels when zoomed in, but approximations stay within a
-5-pixel error limit, so close zoom restores exact geometry. Tilted three.js
-cameras choose detail per tile: content near the camera receives more of the
-budget and finer geometry, distant content thins out, and tiles outside the
-view are skipped. The antialiasing filter still fades retained thin strokes
-continuously. The target is soft: limited simplification, clipping, or complex
+retain coarser overview levels when zoomed in: front-facing views prioritize the
+budget over the usual 5-pixel overview error limit only when the whole visible
+draw list exceeds the soft budget. Hatching in affordable views keeps its usual
+detail even when individual tiles exceed their share. Detail returns as the
+visible tiles fit their budget; zoom alone does not force every tiny mark to render.
+Tilted three.js cameras retain the 5-pixel limit and choose detail per tile:
+content near the camera receives more of the budget and finer geometry, distant
+content thins out, and tiles outside the view are skipped. The antialiasing filter
+still fades retained thin strokes continuously. The target is soft: limited
+simplification, clipping, or complex
 compositing can keep a document above it. Set Vector LOD to Off for exact strokes
 at every zoom. Embedded PDF images remain raster layers.
 
@@ -460,13 +464,9 @@ scheduling/LOD, resource uploads, shader/program queries, or another submission
 phase. A browser Performance trace may still be needed for browser-internal
 work such as garbage collection.
 
-Native WebGL also reports `panCacheRefreshes` and `panCacheReuses`. A refresh
-renders the ordered scene into the bounded cache; a reuse frame translates that
-image and draws live highlights without resubmitting the scene paints. Heavy
-source-ordered PDFs can use this path during panning; zooming and settled frames
-render directly. `panCacheFrames` counts attempts to use the cache, including
-frames that fall back to direct rendering when a suitable cache cannot fit.
-Compare refreshes and reuse frames separately when interpreting frame costs.
+Native panning, inertia, zooming and settled frames all render directly using
+the current camera and viewport. Vector LOD and visibility selection remain
+active during movement; no previous pan image is reused.
 
 Native WebGL captures include `gradientFillSubmission` and
 `gradientStrokeSubmission` CPU sections. These sum gradient setup and draw
@@ -625,7 +625,7 @@ const fromScene = await buildHep(pdf.sceneData, {
 The result is an `application/x-hep` `Blob`; save or upload it with a `.hep`
 filename. Exporting a loaded scene reuses its parsed data, including original
 PDF layer defaults, hidden geometry, and retained fallback resources. The original
-PDF is not required to replay those resources after reopening a v7 archive.
+PDF is not required to replay those resources after reopening the HEP file.
 
 By default, `buildHep` uses DEFLATE compression and stores each raster as the
 smaller of WebP or PNG, with raw RGBA as a fallback when encoding is unavailable.
@@ -638,7 +638,7 @@ The builder accepts `signal` and `onProgress`, including raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP container v1 with scene schema v7. Earlier scene schemas
+The loader supports HEP container v1 with scene schema v9. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and

@@ -18,6 +18,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { threeGradientMaskVectors, THREE_GRADIENT_MASK_VECTORS } = await import("../src/threePaintFold.ts");
+  const { nativeGradientMaskVectors } = await import("../src/gradientMaskFold.ts");
   const { sampleSceneGradientChannel } = await import("../src/gradientSampling.ts");
   const { paintFoldMaskWeights } = await import("../src/nativePaintFold.ts");
   const f = values => Float32Array.from(values);
@@ -136,6 +137,25 @@ try {
       assert.ok(checked > 400 && covered > 50, `${name}: the comparison covers the paint (${covered} of ${checked})`);
     }
   }
+
+  // Native camera projections produce the same vectors, including reduced
+  // composite resolution and the opposite fragment Y direction in WebGPU.
+  for (const topDown of [false, true]) for (const scale of [1, 0.5]) {
+    const zoom = 2.3, cx = 45, cy = 32;
+    const project = box => ({ x: (box.minX - cx) * zoom + width / 2,
+      y: (box.minY - cy) * zoom + height / 2,
+      width: (box.maxX - box.minX) * zoom, height: (box.maxY - box.minY) * zoom });
+    const matrix = new THREE.Matrix4().set(2 * zoom / width, 0, 0, -2 * cx * zoom / width,
+      0, 2 * zoom / height, 0, -2 * cy * zoom / height, 0, 0, 1, 0, 0, 0, 0, 1);
+    const native = nativeGradientMaskVectors(makeScene(), maskRun, undefined, project,
+      width * scale, height * scale, width, height, topDown);
+    const three = threeGradientMaskVectors(makeScene(), maskRun, undefined, matrix,
+      width * scale, height * scale, topDown);
+    assert.ok(native && three);
+    native.forEach((value, i) => assert.ok(Math.abs(value - three[i]) < 1e-5, `native projection component ${i}`));
+  }
+  assert.equal(nativeGradientMaskVectors(makeScene(), maskRun, undefined, null, width, height, width, height, false), null,
+    "a native view without an axis-aligned projection keeps its rendered mask");
 
   // An edge through pixel centres is half covered, as the paint's box filter has it.
   const aligned = new THREE.Matrix4().makeScale(2 / width, 2 / height, 1).premultiply(new THREE.Matrix4().makeTranslation(-1, -1, 0));

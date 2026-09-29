@@ -124,6 +124,7 @@ const statusElement = requireElement<HTMLDivElement>("#status");
 const pdfValue = requireElement<HTMLSpanElement>("#pdf-value");
 const tsvValue = requireElement<HTMLSpanElement>("#tsv-value");
 const roomsValue = requireElement<HTMLSpanElement>("#rooms-value");
+const zoomValue = requireElement<HTMLSpanElement>("#zoom-value");
 const drawCallMeter = createDrawCallMeter(requireElement<HTMLSpanElement>("#draw-calls-value"));
 const drawCallCounter = createThreeDrawCallCounter();
 
@@ -1396,6 +1397,8 @@ function renderFrame(): void {
   drawingSelection.onFrame();
   renderer.clear(true, true, true);
   drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
+  const zoomText = currentPdfObject ? `${currentPdfObject.getViewState().zoom.toFixed(2)}x` : "-";
+  if (zoomValue.textContent !== zoomText) zoomValue.textContent = zoomText;
   updateRoomDomLabels();
   if (controlsChanged) {
     requestRender();

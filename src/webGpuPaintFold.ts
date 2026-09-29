@@ -1,8 +1,9 @@
 import { paintFoldMaskWeights } from "./nativePaintFold";
 import type { ScenePaintMask } from "./scenePaintGraph";
+import { GRADIENT_MASK_VECTORS } from "./gradientMaskFold";
 
-/** Bytes of one fold: (opacity, masked, mask bias, 0) and the mask weights. */
-const FOLD_BYTES = 32;
+/** Fold factors and weights, followed by the analytic gradient mask vectors. */
+const FOLD_BYTES = 32 + GRADIENT_MASK_VECTORS * 16;
 
 /**
  * Native WebGPU fold inputs (see `paintFoldFragmentWgsl`): a bind group of a
@@ -32,7 +33,8 @@ export class WebGpuPaintFolds {
       { binding: 0, visibility: fragment, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: FOLD_BYTES } },
       { binding: 1, visibility: fragment, texture: { sampleType: "float" } }
     ] });
-    this.stride = Math.max(256, Number(device.limits?.minUniformBufferOffsetAlignment) || 256);
+    const alignment = Math.max(256, Number(device.limits?.minUniformBufferOffsetAlignment) || 256);
+    this.stride = Math.ceil(FOLD_BYTES / alignment) * alignment;
   }
 
   /** Every frame's folds take fresh slots; buffers outgrown last frame are no longer in flight. */
@@ -45,15 +47,18 @@ export class WebGpuPaintFolds {
   /**
    * Applies a group chain's opacity and mask surface view (or null) to the
    * draws until `end`. `content` is the soft mask whose rendered content the
-   * mask surface holds, when it was not converted first.
+   * mask surface holds, when it was not converted first. With `gradient`,
+   * `mask` is the LUT view and the paint computes the mask at each fragment.
    */
-  begin(opacity: number, mask: any, content?: ScenePaintMask): void {
+  begin(opacity: number, mask: any, content?: ScenePaintMask, gradient?: Float32Array): void {
     const slot = this.nextSlot++;
     this.ensure(slot + 1);
     const offset = slot * this.stride;
     const [red, green, blue, alpha, bias] = paintFoldMaskWeights(content);
-    this.device.queue.writeBuffer(this.buffer, offset,
-      Float32Array.of(opacity, mask ? 1 : 0, bias, 0, red, green, blue, alpha));
+    const values = new Float32Array(FOLD_BYTES / 4);
+    values.set([opacity, gradient ? 2 : mask ? 1 : 0, bias, 0, red, green, blue, alpha]);
+    if (gradient) values.set(gradient, 8);
+    this.device.queue.writeBuffer(this.buffer, offset, values);
     this.current = { offset, mask };
   }
 

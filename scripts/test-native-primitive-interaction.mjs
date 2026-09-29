@@ -71,7 +71,7 @@ try {
       orderedBatches: { invalidate() { invalidations++; }, setColorCommutationEnabled(value) { colorCommutation.push(value); } },
       vectorLodLevels: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
       vectorLodLevelResources: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
-      destroyVectorMinifyResources() {}, requestFrame() { frames++; }, panCacheValid: true
+      destroyVectorMinifyResources() {}, requestFrame() { frames++; }
     });
     writes.length = 0;
     instance.setPrimitiveColorUpdates(updates);
@@ -80,7 +80,6 @@ try {
     assert.equal(frames, 1);
     assert.equal(invalidations, 1);
     assert.deepEqual(colorCommutation, [false], "temporary RGB overrides restore conservative paint ordering");
-    assert.equal(instance.panCacheValid, false);
     const texels = writes.filter(write => write.kind === "texel");
     assert.equal(texels.length, 5, `${backend}: base stroke and ordered LOD prefix are both patched`);
     assert(texels.some(write => write.texture === "combined"));

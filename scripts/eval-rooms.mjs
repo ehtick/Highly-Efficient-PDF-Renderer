@@ -91,7 +91,7 @@ function parseArgs(argv) {
   return args;
 }
 
-// Mirrors roomdet.pdf_tsv_dataset.sanitize_stem so prediction filenames join with npz names.
+// Preserve the filename convention used by existing cached evaluation artifacts.
 function sanitizeStem(stem) {
   const normalized = stem.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
   return normalized || "floorplan";

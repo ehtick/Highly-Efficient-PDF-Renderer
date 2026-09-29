@@ -321,7 +321,37 @@ export function disposeDownload(): void {
 
 To convert without creating a viewer, use `await buildHep(pdfSource)` with a PDF URL, `File`, `Blob`, or bytes. Both forms accept `signal` for cancellation. The result is an `application/x-hep` Blob that the regular loader can open.
 
-HEP exports preserve the PDF's original layer defaults and initially hidden content. Current layer toggles and temporary drawing colors are view settings. V7 archives include self-contained fallback resources; older archives must be regenerated from their PDFs. See the [manual](manual.md) for compression support and Node.js conversion.
+HEP exports preserve the PDF's original layer defaults and initially hidden content. Current layer toggles and temporary drawing colors are view settings. Current archives use scene schema v9 and include self-contained fallback resources; older archives must be regenerated from their PDFs. See the [manual](manual.md) for compression support and Node.js conversion.
+
+## Render your own polylines
+
+Compile host geometry into a `VectorScene` and render it using HEPR's Three.js
+stroke batching and camera-driven LOD, without a PDF. This example assumes you
+already have a Three.js scene, camera, and renderer; frame the camera around the
+input geometry in your application's units.
+
+```ts
+import { buildStrokeScene, createThreePdfObject } from "@soadzoor/hepr/bundler";
+
+const geometry = buildStrokeScene([
+  { points: [[0, 0], [100, 0], [100, 60], [0, 60]], closed: true,
+    color: "#334155", width: 0.5 },
+  { points: new Float32Array([0, 30, 100, 30]), color: "#dc2626", width: 0.25 }
+]);
+const drawing = await createThreePdfObject(geometry, { vectorLod: "auto" });
+
+// HEPR centers the group. Restore the input XY origin for placement in a BIM scene.
+const b = geometry.pageBounds;
+drawing.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, 0);
+scene.add(drawing);
+// Your existing renderer.render(scene, camera) drives LOD automatically.
+// On removal: drawing.removeFromParent(); drawing.dispose();
+```
+
+Coordinates are Y-up and widths use the same units. The builder supports opaque
+solid strokes with round caps/joins; the page background is transparent by
+default. See the [geometry API](api.md#buildstrokescenepolylines-defaults) for
+input validation, defaults, and placement details.
 
 ## Detect rooms in a vector floorplan
 
@@ -341,4 +371,4 @@ try {
 }
 ```
 
-`pageIndexes` contains zero-based positions in the composed scene. Polygons and areas use scene coordinates and squared scene units, so real-world measurements require a drawing scale. Browser detection requires Web Workers; pass `signal` to cancel it. HEP inputs use their searchable text index for labels. This detector does not require training the separate [ML project](../ml/room-detection/README.md).
+`pageIndexes` contains zero-based positions in the composed scene. Polygons and areas use scene coordinates and squared scene units, so real-world measurements require a drawing scale. Browser detection requires Web Workers; pass `signal` to cancel it. HEP inputs use their searchable text index for labels. This deterministic detector requires no trained models or machine-learning runtime.

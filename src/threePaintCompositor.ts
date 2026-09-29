@@ -423,7 +423,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         this.prepare(backdrop, [], backgrounds.map(proxy => proxy.source.material));
         for (const proxy of backgrounds) this.queueProxy(proxy, proxy.source.geometry, false, null);
       }
-      this.output = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
+      this.output = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true);
       this.flush();
       this.flushClear(this.output);
       this.presentationBinding.value = this.output.texture;
@@ -433,7 +433,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.mesh.visible = true;
     } finally {
       if (presented) this.release(presented);
-      if (backdrop) this.release(backdrop);
+      if (backdrop && backdrop !== this.output) this.release(backdrop);
       // Only a failed frame leaves a batch behind; its draws are abandoned.
       this.batch = null;
       this.pendingClears.clear(); this.clearOnRender = null;

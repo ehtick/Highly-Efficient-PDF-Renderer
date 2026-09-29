@@ -1,4 +1,9 @@
+import { GRADIENT_MASK_VECTORS, GRADIENT_MASK_PLANES } from "./gradientMaskFold";
+import { GRADIENT_BACKGROUND_GLSL, GRADIENT_BACKGROUND_WGSL, GRADIENT_PARAMETER_GLSL,
+  GRADIENT_PARAMETER_WGSL } from "./gradientSampling";
 import type { ScenePaintMask } from "./scenePaintGraph";
+
+const PLANE_BASE = 7;
 
 /**
  * The texture unit native WebGL paint programs read a folded paint's soft mask
@@ -24,32 +29,101 @@ export function paintFoldMaskWeights(content?: ScenePaintMask): [number, number,
   return [0.3, 0.59, 0.11, -backdrop, backdrop];
 }
 
+// The paint's own shader may already define the gradient helpers.
+const foldGradientGlsl = (GRADIENT_PARAMETER_GLSL + GRADIENT_BACKGROUND_GLSL).replace(/heprGradient/g, "heprFoldGradient");
+export const foldGradientWgsl = (GRADIENT_PARAMETER_WGSL + GRADIENT_BACKGROUND_WGSL).replace(/heprGradient/g, "heprFoldGradient");
+
 /**
- * Lets a native paint program draw a leaf that its group chain was folded
- * onto (see `ScenePaintCompositorAdapter.drawFolded`). `uPaintFold.x` is the
- * chain's opacity; when `uPaintFold.y` is set, the mask surface's pixel scales
- * it too, weighted by `uPaintMaskWeights` plus `uPaintFold.z` (see
- * `paintFoldMaskWeights`). Straight-alpha paints scale their alpha only,
- * premultiplied ones every channel, so either composites exactly as the
- * group's surface would have. Programs start at (1, 0), which changes nothing.
+ * Applies the fold to a paint shader: alpha for straight-alpha output, all
+ * channels for premultiplied output. `uPaintMask` holds the mask surface, or the gradient colour
+ * table while a gradient mask applies.
  */
-export function paintFoldFragmentGlsl(source: string, premultiplied: boolean): string {
+export function paintFoldFragmentGlsl(source: string, premultiplied = false): string {
   const signature = /void\s+main\s*\(\s*\)/;
   if (!signature.test(source)) throw new Error("Folded paint shader has no main function.");
+  const planes = Array.from({ length: GRADIENT_MASK_PLANES }, (_, index) =>
+    `  coverage *= clamp(0.5 + dot(uPaintMaskGradient[${PLANE_BASE + index}].xyz, p), 0.0, 1.0);`).join("\n");
   return source.replace(signature, "void heprUnfoldedPaint()") + `
 uniform vec4 uPaintFold;
 uniform vec4 uPaintMaskWeights;
+uniform vec4 uPaintMaskGradient[${GRADIENT_MASK_VECTORS}];
 uniform highp sampler2D uPaintMask;
+${foldGradientGlsl}
+vec4 heprFoldGradientMask(vec2 pixel) {
+  vec3 p = vec3(pixel, 1.0);
+  vec3 h = vec3(dot(uPaintMaskGradient[0].xyz, p), dot(uPaintMaskGradient[1].xyz, p), dot(uPaintMaskGradient[2].xyz, p));
+  vec2 q = h.xy / h.z;
+  vec4 a = uPaintMaskGradient[3], ends = uPaintMaskGradient[4], extra = uPaintMaskGradient[5], box = uPaintMaskGradient[6];
+  vec4 color = vec4(0.0);
+  if (a.y < 0.5 || (q.x >= box.x && q.y >= box.y && q.x <= box.z && q.y <= box.w)) {
+    vec2 parameter = heprFoldGradientParameter(a, vec4(0.0, 0.0, ends.xy), vec4(ends.zw, extra.xy), q);
+    if (parameter.y < 0.5) {
+      color = heprFoldGradientBackground(a.w);
+    } else {
+      float x = clamp(parameter.x, 0.0, 1.0) * 1023.0;
+      int x0 = int(floor(x));
+      int row = int(extra.w + 0.5);
+      color = mix(texelFetch(uPaintMask, ivec2(x0, row), 0), texelFetch(uPaintMask, ivec2(min(x0 + 1, 1023), row), 0),
+        x - float(x0));
+    }
+  }
+  float coverage = extra.z;
+${planes}
+  vec3 rgb = clamp(color.rgb, 0.0, 1.0);
+  if (uPaintFold.y > 2.5) rgb = mix(pow((rgb + 0.055) / 1.055, vec3(2.4)), rgb / 12.92, lessThanEqual(rgb, vec3(0.04045)));
+  float alpha = coverage * color.a;
+  return vec4(rgb * alpha, alpha);
+}
 void main() {
   heprUnfoldedPaint();
-  float fold = uPaintFold.x;
-  if (uPaintFold.y > 0.5) {
-    fold *= clamp(dot(texelFetch(uPaintMask, ivec2(gl_FragCoord.xy), 0), uPaintMaskWeights) + uPaintFold.z, 0.0, 1.0);
+  if (uPaintFold.y < 0.5) {
+    ${premultiplied ? "outColor" : "outColor.a"} *= uPaintFold.x;
+    return;
   }
-  ${premultiplied ? "outColor *= fold;" : "outColor.a *= fold;"}
+  vec4 mask = uPaintFold.y < 1.5 ? texelFetch(uPaintMask, ivec2(gl_FragCoord.xy), 0) : heprFoldGradientMask(gl_FragCoord.xy);
+  ${premultiplied ? "outColor" : "outColor.a"} *= uPaintFold.x * clamp(dot(mask, uPaintMaskWeights) + uPaintFold.z, 0.0, 1.0);
 }
 `;
 }
+
+const planeParameters = Array.from({ length: GRADIENT_MASK_VECTORS }, (_, index) => `d${index}: vec4f`).join(", ");
+const planeProducts = Array.from({ length: GRADIENT_MASK_PLANES }, (_, index) =>
+  `    coverage *= clamp(0.5 + dot(d${PLANE_BASE + index}.xyz, p), 0.0, 1.0);`).join("\n");
+export const PAINT_FOLD_SCALE_WGSL = `
+fn heprPaintFoldScale(pixel: vec2f, mask: texture_2d<f32>, fold: vec4f, weights: vec4f, ${planeParameters}) -> f32 {
+  if (fold.y < 0.5) { return fold.x; }
+  var value: vec4f;
+  if (fold.y < 1.5) {
+    // Integer loads do not clamp, and the placeholder is a single texel.
+    let size = vec2<i32>(textureDimensions(mask));
+    value = textureLoad(mask, clamp(vec2<i32>(pixel), vec2<i32>(0), size - vec2<i32>(1)), 0);
+  } else {
+    let p = vec3f(pixel, 1.0);
+    let h = vec3f(dot(d0.xyz, p), dot(d1.xyz, p), dot(d2.xyz, p));
+    let q = h.xy / h.z;
+    var color = vec4f(0.0);
+    if (d3.y < 0.5 || (q.x >= d6.x && q.y >= d6.y && q.x <= d6.z && q.y <= d6.w)) {
+      let parameter = heprFoldGradientParameter(d3, vec4f(0.0, 0.0, d4.xy), vec4f(d4.zw, d5.xy), q);
+      if (parameter.y < 0.5) {
+        color = heprFoldGradientBackground(d3.w);
+      } else {
+        let x = clamp(parameter.x, 0.0, 1.0) * 1023.0;
+        let x0 = i32(floor(x));
+        let row = i32(d5.w + 0.5);
+        color = mix(textureLoad(mask, vec2<i32>(x0, row), 0), textureLoad(mask, vec2<i32>(min(x0 + 1, 1023), row), 0),
+          x - f32(x0));
+      }
+    }
+    var coverage = d5.z;
+${planeProducts}
+    var rgb = clamp(color.rgb, vec3f(0.0), vec3f(1.0));
+    if (fold.y > 2.5) { rgb = select(pow((rgb + 0.055) / 1.055, vec3f(2.4)), rgb / 12.92, rgb <= vec3f(0.04045)); }
+    let alpha = coverage * color.a;
+    value = vec4f(rgb * alpha, alpha);
+  }
+  return fold.x * clamp(dot(value, weights) + fold.z, 0.0, 1.0);
+}
+`;
 
 /**
  * `paintFoldFragmentGlsl` for a straight-alpha WGSL paint pipeline: `fsMain`
@@ -63,18 +137,17 @@ export function paintFoldFragmentWgsl(source: string, group: number): string {
   const match = source.match(signature);
   if (!match) throw new Error("Folded paint shader has no supported fragment entry point.");
   return source.replace(signature, `fn heprUnfoldedPaint(inData: ${match[1]}) -> vec4f`) + `
-struct HeprPaintFold { fold: vec4f, maskWeights: vec4f };
+struct HeprPaintFold { fold: vec4f, maskWeights: vec4f, gradient: array<vec4f, ${GRADIENT_MASK_VECTORS}> };
+${foldGradientWgsl}
+${PAINT_FOLD_SCALE_WGSL}
 @group(${group}) @binding(0) var<uniform> uPaintFold : HeprPaintFold;
 @group(${group}) @binding(1) var uPaintMask : texture_2d<f32>;
 
 @fragment
 fn fsMain(inData: ${match[1]}) -> @location(0) vec4f {
   let color = heprUnfoldedPaint(inData);
-  var fold = uPaintFold.fold.x;
-  if (uPaintFold.fold.y > 0.5) {
-    let mask = textureLoad(uPaintMask, vec2<i32>(inData.position.xy), 0);
-    fold *= clamp(dot(mask, uPaintFold.maskWeights) + uPaintFold.fold.z, 0.0, 1.0);
-  }
+  let fold = heprPaintFoldScale(inData.position.xy, uPaintMask, uPaintFold.fold, uPaintFold.maskWeights,
+    ${Array.from({ length: GRADIENT_MASK_VECTORS }, (_, index) => `uPaintFold.gradient[${index}]`).join(", ")});
   return vec4f(color.rgb, color.a * fold);
 }
 `;

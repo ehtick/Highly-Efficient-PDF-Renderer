@@ -174,7 +174,7 @@ try {
     assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
       "the span costs one host render, and without a knockout it renders no shape at all");
     // Normal groups blend directly, and their effects touch only their projected
-    // rectangle. A root copy is still needed, but there is no per-group copy.
+    // rectangle. The root reuses its private backdrop without a copy.
     spanHost.draws.length = 0;
     const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
       width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
@@ -189,7 +189,7 @@ try {
         "small effects do not clear the full framebuffer");
     } else assert.equal(boundedClears.length, 0, "WebGPU keeps its whole-attachment fast clear");
     const effects = spanHost.draws.filter(draw => !draw.ids);
-    assert.equal(effects.length, 2, "one root copy and one direct source-over pass");
+    assert.equal(effects.length, 1, "only the direct source-over pass remains");
     const blended = effects.find(draw => draw.blending === THREE.CustomBlending);
     assert.ok(blended, "group opacity uses the hardware blending pass");
     assert.equal(blended.blendSrc, THREE.OneFactor, "effect output is premultiplied on both backends");
@@ -201,12 +201,12 @@ try {
     assert.ok(maxX - minX < 30 / 160 && maxY - minY < 30 / 120, "a small effect does not shade the full target");
     assert.ok(minY < 0 && maxY < 0, "clip space counts the shared bottom-left rectangle upwards on both backends");
     assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
-    assert.ok(effects.some(draw => draw.rect.join() === "-1,-1,1,1"), "the root copy covers the whole target");
+    assert.ok(effects.every(draw => draw.rect.join() !== "-1,-1,1,1"), "no full-target root copy remains");
     spanHost.draws.length = 0;
     spanHost.clears.length = 0;
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
       bounds => ({ ...boundedProject(bounds), x: 10000 }));
-    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 1, "offscreen effects skip their composite pass");
+    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 0, "offscreen effects skip their composite pass");
     assert.equal(spanHost.clears.length, 1, "offscreen effects skip clears, keeping only the backdrop clear");
     assert.equal(spanHost.clears[0].scissorTest, false, "a pooled scissor cannot restrict the backdrop clear");
 
@@ -381,6 +381,7 @@ try {
     testProxyReplacement(ThreePaintCompositor, backend);
     await testFolding(ThreePaintCompositor, backend);
     await testGradientMaskFolding(ThreePaintCompositor, backend);
+    await testCompositorOnlyLayers(scene, backend);
 
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
@@ -399,6 +400,94 @@ try {
     "a rectangle crossing the perspective near plane conservatively keeps a full pass");
   console.log("Three PDF compositor state, canonical subsets, shape coverage, folding, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
+
+async function testCompositorOnlyLayers(source, backend) {
+  const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
+  const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
+  const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
+  const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { ThreeMaterialTextLayer } = await import("../src/threeMaterialTextLayer.ts");
+  const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const viewport = { width: 320, height: 240 }, drawPlan = new ThreeVectorDrawPlan(source);
+  const options = { materialBackend: backend, colorCompositing: "display", drawPlan,
+    strokeCurveEnabled: true, textVectorOnly: true, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1] };
+  const stroke = new ThreeMaterialStrokeLayer(source, options);
+  let viewState = { cameraCenterX: 5, cameraCenterY: 5, zoom: 20 };
+  const native = new Proxy({ getViewState: () => viewState, hasUploadedScene: () => false,
+    setViewState: value => { viewState = value; }, getPresentedFrameSerial: () => 0,
+    renderExternalFrame: () => assert.fail("composited materials must not also render through native") },
+  { get: (target, key) => target[key] ?? (() => {}) });
+  const uv = new Float32Array(8);
+  const object = new HeprThreePdfObject({ sourceLabel: "composited-stats", sourceKind: "hep", scene: source }, backend,
+    native, { ...viewport }, null,
+    { vectorLodMode: "off", textLodMode: "off", strokeCurveEnabled: true, textVectorOnly: true,
+      threeColorCompositing: "display", pageBackground: [1, 1, 1, 1], vectorOverride: [0, 0, 0, 0] },
+    0, new ThreeMaterialRasterLayer(source, options), new ThreeMaterialGradientLayer(source, options),
+    new ThreeMaterialFillLayer(source, options), stroke, null, null, null, new ThreeMaterialTextLayer(source, options),
+    null, new THREE.Mesh(new THREE.PlaneGeometry(10, 10), new THREE.MeshBasicMaterial()),
+    uv, new THREE.BufferAttribute(uv, 2), drawPlan);
+  const outer = new THREE.Scene(); outer.add(object);
+  const host = Object.assign(makeRenderer(backend), {
+    isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
+    outputColorSpace: THREE.LinearSRGBColorSpace, capabilities: { maxTextureSize: 16384 },
+    getDrawingBufferSize: target => target.set(viewport.width, viewport.height), getPixelRatio: () => 1
+  });
+  const camera = new THREE.PerspectiveCamera(45, viewport.width / viewport.height, .1, 1000);
+  camera.position.z = 16;
+  const frame = () => {
+    camera.updateMatrixWorld(true); outer.updateMatrixWorld(true);
+    host.draws.length = 0;
+    // Match Three: prepare via the scene hook before gathering visible objects,
+    // then invoke the page callback, which must not prepare the PDF a second time.
+    outer.onBeforeRender(host, outer, camera, host.target);
+    object.handleBeforeRender(host, camera);
+  };
+  const previousDisable = globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR;
+  try {
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = false;
+    frame();
+    const roots = object.listThreeMaterialObjects();
+    assert(roots.every(root => root.parent === null), "compositor source layers stay outside the host scene");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2, "post-render HUD reports composited strokes");
+    assert.equal(object.getTextInstanceStats().rendered, 0, "composited text statistics remain available");
+    assert.equal(object.paintCompositor.mesh.visible, true);
+    // This knockout fixture needs a colour and a shape draw for each stroke.
+    // The source IDs must occur only in those required compositor submissions.
+    assert.deepEqual(host.draws.filter(draw => draw.ids).map(draw => draw.ids), [[0], [0], [1], [1]]);
+    const outerPaints = [];
+    outer.traverseVisible(mesh => { if (mesh.userData.heprDrawRun) outerPaints.push(mesh); });
+    assert.deepEqual(outerPaints, [], "outer presentation cannot submit the source paints again");
+    for (const proxy of object.paintCompositor.proxies.values()) {
+      for (const mesh of proxy.meshes) {
+        assert.equal(mesh.material, proxy.source.material, "compositor proxies reuse source materials");
+      }
+    }
+    let updates = 0;
+    const originalUpdates = roots.map(root => root.updateMatrixWorld);
+    roots.forEach(root => { root.updateMatrixWorld = () => { updates++; }; });
+    try { outer.updateMatrixWorld(true); }
+    finally { roots.forEach((root, i) => { root.updateMatrixWorld = originalUpdates[i]; }); }
+    assert.equal(updates, 0, "outer matrix updates never visit compositor-only layers");
+
+    camera.position.x = 100; frame();
+    assert.equal(object.getRenderedStrokeSegmentCount(), 0, "offscreen composited strokes report zero");
+    camera.position.x = 0; frame();
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2, "panning back restores the count");
+
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = true; frame();
+    assert(roots.every(root => root.parent === object), "direct rendering reattaches its sources");
+    assert.equal(object.paintCompositor.mesh.visible, false, "direct rendering hides the old composite");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2);
+    globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = false; frame();
+    assert(roots.every(root => root.parent === null), "switching back detaches sources again");
+    assert.equal(object.getRenderedStrokeSegmentCount(), 2);
+  } finally {
+    if (previousDisable === undefined) delete globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR;
+    else globalThis.HEPR_DEBUG_DISABLE_COMPOSITOR = previousDisable;
+    outer.remove(object); object.dispose(); host.target.dispose();
+  }
+}
 
 function makeRenderer(backend = "webgpu") {
   return {
@@ -515,16 +604,16 @@ async function testFolding(ThreePaintCompositor, backend) {
   assert.deepEqual(threePaintFoldState(fill.mesh.material), neutral, "the fold is restored after drawing");
   // Folding saves the group's surface, its clear and its composite, and the
   // folded draw converts the mask's content, which saves the mask's pass. What
-  // is left is the backdrop copy and the mask content's own surface.
-  assert.equal(counters["three.compositePasses"]?.total, 1, `${backend}: only the copy needs a pass`);
+  // is left is the mask content's own surface; the backdrop is painted in place.
+  assert.equal(counters["three.compositePasses"]?.total ?? 0, 0, `${backend}: neither root nor mask needs a copy pass`);
   assert.equal(counters["three.clears"]?.total, 2, `${backend}: only the backdrop and the mask content are cleared`);
   // A WebGPU clear is a render pass and submission of its own, so it rides on
-  // the next render into its target. The backdrop is read (copied) before
-  // anything renders into it, so its clear alone is encoded by itself.
+  // the next render into its target. Both backdrop and mask now clear as
+  // their paints load, with no standalone clear submission.
   if (backend === "webgpu") {
-    assert.equal(host.clears.length, 1, "webgpu: only the backdrop, read first, clears on its own");
-    assert.equal(counters["three.clearPasses"]?.total, 1);
-    assert.equal(clearingRenders.length, 1, "webgpu: the mask content's clear happens as its draw loads");
+    assert.equal(host.clears.length, 0, "webgpu: no standalone clear remains");
+    assert.equal(counters["three.clearPasses"]?.total ?? 0, 0);
+    assert.equal(clearingRenders.length, 2, "webgpu: both surfaces clear as their draws load");
   } else {
     assert.equal(host.clears.length, 2, "webgl: scissored clears stay separate calls");
     assert.equal(clearingRenders.length, 0);
@@ -540,7 +629,7 @@ async function testFolding(ThreePaintCompositor, backend) {
 
 // Broschuere's fades: a luminosity mask made of one gradient fill over the
 // page. Given the projection, the folded fill computes that mask itself, so the
-// gradient never renders, no mask surface is taken, and the root copy and the
+// gradient never renders, no mask surface is taken, and the backdrop and the
 // folded draw share one host render.
 async function testGradientMaskFolding(ThreePaintCompositor, backend) {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
@@ -602,7 +691,7 @@ async function testGradientMaskFolding(ThreePaintCompositor, backend) {
   assert.ok(folds[0].mask?.image?.width === 1024 && folds[0].mask.image.data[4] === lut[4],
     "the fold reads the gradient's colour table in place of a mask surface");
   assert.ok(folds[0].gradient?.length === 60, "the fold carries the gradient mask's description");
-  assert.equal(host.call, 1, `${backend}: the root copy and the folded draw share one host render`);
+  assert.equal(host.call, 1, `${backend}: the folded draw needs only one host render`);
   assert.equal(counters["three.hostRenders"]?.total, 1);
   assert.equal(threePaintFoldState(fill.mesh.material).masked, false, "the fold is restored after drawing");
   // Without the projection, the mask renders into a surface as before.

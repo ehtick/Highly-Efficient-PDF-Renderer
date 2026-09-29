@@ -31,7 +31,7 @@ try {
     primitiveHighlights: { draw() { gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 5); return 1; } },
     resolveClientToPixelScale: () => ({ x: 1, y: 1 }),
     updateCameraWithDamping: () => false, updatePanReleaseVelocitySample() {},
-    shouldUsePanCache: () => false, shouldUseVectorMinifyPath: () => false,
+    shouldUseVectorMinifyPath: () => false,
     updateVisibleSet() {}, setAllPagesAndTextVisible() {},
     frameListener(stats) {
       assert.equal(stats.drawCalls, draws.length, "the callback includes every draw, including overlays");
@@ -53,28 +53,16 @@ try {
   renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
   frame(10);
   assert.equal(frames.at(-1).paintOrderApproximated, true, "a held margin reaches the frame listener");
-  renderer.shouldUsePanCache = () => true;
-  draws.length = 0;
-  renderer.renderExternalFrame();
-  assert.equal(frames.at(-1).paintOrderApproximated, true, "including a cached frame");
-  renderer.shouldUsePanCache = () => false;
   draws.length = 0;
   assert.equal(renderer.renderProjectedFrame({ viewportWidth: 100, viewportHeight: 100, localUnitsPerPixel: 1,
     localToClip: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }).paintOrderApproximated, true,
     "and a projected one");
   renderer.orderedBatches = null;
-  renderer.panCacheValid = false;
   frame(10);
   renderer.textRenderingEnabled = false;
   frame(8);
   renderer.textRenderingEnabled = true;
 
-  renderer.shouldUsePanCache = () => true;
-  frame(11); // Cache refresh draws its content and then presents it.
-  frame(5); // Reuse only presents the cache and draws the live overlays.
-  renderer.panCacheValid = false;
-  frame(11);
-  renderer.shouldUsePanCache = () => false;
   renderer.shouldUseVectorMinifyPath = () => true;
   renderer.vectorMinifyTexture = {};
   renderer.vectorMinifyFramebuffer = {};
@@ -133,5 +121,5 @@ try {
 
   renderer.scene = null;
   frame(0);
-  console.log("WebGL draw calls: instancing, per-frame reset, overlays, cached/minified/projected frames, compositing and skipped draws passed");
+  console.log("WebGL draw calls: instancing, per-frame reset, overlays, minified/projected frames, compositing and skipped draws passed");
 } finally { hooks.deregister(); }

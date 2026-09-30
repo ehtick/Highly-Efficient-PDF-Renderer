@@ -1,5 +1,6 @@
 import type { SceneOptionalContent } from "../optionalContentData";
 import { AnnotationLayerBuilder } from "../annotationLayers";
+import { ContentItemRangeBuilder } from "../structureData";
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
@@ -307,6 +308,14 @@ export function buildNativeVectorPage(
   if (sidecar.pathPaintRanges) {
     const runs: NonNullable<VectorScene["drawRuns"]> = [];
     const clipBuilder = new NativeVectorClipBuilder();
+    // Structure content items (MCIDs) are attributed per primitive range,
+    // beside the runs, so tagged objects never split draw runs.
+    const contentItems = sidecar.contentItems ?? [];
+    const itemRanges = new ContentItemRangeBuilder();
+    if (sidecar.sourceContentItems && (sidecar.sourceContentItems.length !== sidecar.sourceEvents.length / 2 ||
+        sidecar.sourceContentItems.some(item => item < -1 || item >= contentItems.length))) {
+      throw invalid("The native VectorScene content items are misaligned.", pageInfo.sourcePageIndex, "vector-content-items");
+    }
     const imageOrder = Array.from(sidecar.imageIndices, (_, i) => i).sort((a, b) =>
       sidecar.imagePaintOrders[a] - sidecar.imagePaintOrders[b] || a - b);
     const imageLayers = new Uint32Array(imageOrder.length);
@@ -317,6 +326,7 @@ export function buildNativeVectorPage(
       const blendMode = sidecar.sourceBlendModes?.[offset / 2] === 1 ? "Multiply" : undefined;
       const condition = conditions.eventConditions?.[offset / 2] ?? -1;
       const optionalContent = condition >= 0 ? condition : undefined;
+      const item = sidecar.sourceContentItems?.[offset / 2] ?? -1;
       const clipIndex = kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT ||
         kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE ? undefined : clipBuilder.add(sidecar.sourceClips?.[offset / 2], signal);
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL || kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) {
@@ -325,6 +335,8 @@ export function buildNativeVectorPage(
         }
         appendVectorDrawRun(runs, kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
           sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode, optionalContent);
+        itemRanges.add(kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
+          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         const first = sidecar.glyphRunMeta[index * 3];
         const end = first + sidecar.glyphRunMeta[index * 3 + 1];
@@ -344,21 +356,32 @@ export function buildNativeVectorPage(
         for (let glyph = first; glyph < end; glyph++) {
           const instance = text.glyphToInstance[glyph];
           if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode, optionalContent);
+          if (instance >= 0) itemRanges.add("text", instance, 1, item);
           const strokeInstance = strokeText.glyphToInstance?.[glyph] ?? -1;
           if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode, optionalContent);
+          if (strokeInstance >= 0) itemRanges.add("text", strokeInstance, 1, item);
           const hairlineFirst = hairlines?.glyphRanges[glyph * 2] ?? 0, hairlineCount = hairlines?.glyphRanges[glyph * 2 + 1] ?? 0;
           if (hairlineCount) appendVectorDrawRun(runs, "stroke", hairlineFirst, hairlineCount, hairlineClipIndex, blendMode, optionalContent);
+          if (hairlineCount) itemRanges.add("stroke", hairlineFirst, hairlineCount, item);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode, optionalContent);
+        itemRanges.add("raster", imageLayers[index], 1, item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
         appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode, optionalContent);
+        itemRanges.add("gradient-fill", index, 1, item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
-          if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1, undefined, undefined, optionalContent);
+          if (rasterLayers[layer].paintOrder !== index) continue;
+          appendVectorDrawRun(runs, "raster", layer, 1, undefined, undefined, optionalContent);
+          itemRanges.add("raster", layer, 1, item);
         }
       }
     }
+    if (!itemRanges.isEmpty) scene.markedContent = {
+      items: contentItems.map(({ mcid, tag }) => ({ pageIndex: 0, sourcePageIndex: pageInfo.sourcePageIndex, mcid, tag })),
+      ranges: itemRanges.build()
+    };
     scene.drawRuns = runs;
     if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
     if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",

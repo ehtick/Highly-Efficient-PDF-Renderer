@@ -550,6 +550,12 @@ export interface DensePdfVectorGlyphStroke {
   readonly dashPhase: number;
 }
 
+/** A marked-content sequence with an MCID (a structure content item). */
+export interface DensePdfVectorContentItem {
+  readonly mcid: number;
+  readonly tag: string;
+}
+
 /**
  * Compact paint metadata for the VectorScene adapter, including ordered draw ranges.
  * Packed fill and stroke geometry remains in `DensePdfCompiledPage` itself.
@@ -583,6 +589,13 @@ export interface DensePdfVectorSceneData {
   readonly sourceAnnotationIndices?: Int32Array;
   /** The `PdfAnnotation.id` addressed by each `sourceAnnotationIndices` value. */
   readonly annotationIds?: readonly string[];
+  /**
+   * One `contentItems` index per source event: the innermost enclosing
+   * marked-content sequence with an MCID, or -1. Absent for untagged content.
+   */
+  readonly sourceContentItems?: Int32Array;
+  /** The page-level structure content items addressed by `sourceContentItems`. */
+  readonly contentItems?: readonly DensePdfVectorContentItem[];
   /** Glyph triples: page glyph start, glyph count, and PDF rendering mode. */
   readonly glyphRunMeta: Uint32Array;
   /** One sRGB nonstroking RGBA tuple per glyph triple. */
@@ -1540,6 +1553,8 @@ class DenseContentCompiler {
 
   readonly vectorSourceEvents: number[] = [];
   readonly vectorSourceOptionalContentIndices: number[] = [];
+  /** Per source event: the enclosing structure content item's marked-content node, or -1. */
+  readonly vectorSourceContentItems: number[] = [];
   readonly vectorShadingPaints: DensePdfVectorShadingPaint[] = [];
   readonly vectorSourceClipIndices: number[] = [];
   readonly vectorSourceBlendModes: number[] = [];
@@ -1591,6 +1606,12 @@ class DenseContentCompiler {
 
   /** Innermost marked-content node and optional content, or -1. */
   private activeMarkedContentIndex = -1;
+
+  /** Innermost enclosing marked-content node with an MCID, or -1. */
+  private activeContentItem = -1;
+
+  /** Per marked-content node: the innermost node with an MCID at or above it, or -1. */
+  private readonly markedContentItems: number[] = [];
 
   private activeOptionalContentIndex = -1;
 
@@ -2044,8 +2065,10 @@ class DenseContentCompiler {
 
     // Uniform opaque, stroke-only pages can retain the established containment
     // optimization. Mixed paints keep every source range stable.
+    // Tagged content keeps its per-item ranges, which compaction would merge.
     const compactOrderedStrokes = this.policy.orderedPaint === true &&
       !this.vectorSourceOptionalContentIndices.some(index => index >= 0) &&
+      !this.vectorSourceContentItems.some(item => item >= 0) &&
       this.vectorSourceEvents.every((value, i) => i % 2 !== 0 ||
         value === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT || value === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) &&
       this.vectorSourceClipIndices.every(index => index === this.vectorSourceClipIndices[0]) &&
@@ -2061,6 +2084,7 @@ class DenseContentCompiler {
       this.vectorSourceBlendModes.length = 0;
       this.vectorSourceEvents.length = 0;
       this.vectorSourceOptionalContentIndices.length = 0;
+      this.vectorSourceContentItems.length = 0;
       this.vectorPathPaintRanges.length = 0;
       const count = strokeResult.endpoints.length / 4;
       if (count > 0) {
@@ -2070,6 +2094,7 @@ class DenseContentCompiler {
         this.vectorSourceClipIndices.push(clipIndex, clipIndex);
         this.vectorSourceBlendModes.push(0, 0);
         this.vectorSourceOptionalContentIndices.push(-1, -1);
+        this.vectorSourceContentItems.push(-1, -1);
       }
     }
     const fillPathMetaA = this.fillPathMetaA.take();
@@ -2118,6 +2143,7 @@ class DenseContentCompiler {
           ...(this.vectorShadingPaints.length ? { shadingPaints: Object.freeze(this.vectorShadingPaints) } : {}),
           sourceEvents: Uint32Array.from(this.vectorSourceEvents),
           ...(this.options.retainOptionalContent ? { sourceOptionalContentIndices: Int32Array.from(this.vectorSourceOptionalContentIndices) } : {}),
+          ...this.vectorContentItemTable(),
           sourceBlendModes: Uint8Array.from(this.vectorSourceBlendModes),
           ...(this.policy.orderedPaint ? {
             pathPaintRanges: Uint32Array.from(this.vectorPathPaintRanges),
@@ -3866,6 +3892,7 @@ class DenseContentCompiler {
     if (kind !== DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) this.strokes.breakRun();
     this.vectorSourceEvents.push(kind, index);
     this.vectorSourceOptionalContentIndices.push(optionalContentIndex);
+    this.vectorSourceContentItems.push(this.activeContentItem);
     this.vectorSourceClipIndices.push(this.state.clipIndex);
     this.vectorSourceBlendModes.push(this.state.blendMode === "Multiply" ? 1 : 0);
   }
@@ -3925,11 +3952,30 @@ class DenseContentCompiler {
         this.vectorSourceEvents[eventOffset + 1] !== rangeOffset / 2 ||
         this.vectorPathPaintRanges[rangeOffset] + this.vectorPathPaintRanges[rangeOffset + 1] !== start) return false;
     const last = eventOffset / 2;
+    // Each structure content item keeps its own range, so its paint stays attributable.
     if (this.vectorSourceOptionalContentIndices[last] !== this.activeOptionalContentIndex ||
+        this.vectorSourceContentItems[last] !== this.activeContentItem ||
         this.vectorSourceClipIndices[last] !== this.state.clipIndex ||
         this.vectorSourceBlendModes[last] !== (this.state.blendMode === "Multiply" ? 1 : 0)) return false;
     this.vectorPathPaintRanges[rangeOffset + 1] += count;
     return true;
+  }
+
+  /** Number the structure content items events reference, in first-use order. */
+  private vectorContentItemTable(): Pick<DensePdfVectorSceneData, "sourceContentItems" | "contentItems"> {
+    const items: DensePdfVectorContentItem[] = [];
+    const indexes = new Map<number, number>();
+    const events = this.vectorSourceContentItems.map((node) => {
+      if (node < 0) return -1;
+      let index = indexes.get(node);
+      if (index === undefined) {
+        index = items.length;
+        indexes.set(node, index);
+        items.push(Object.freeze({ mcid: this.markedContent[node].mcid, tag: this.markedContent[node].tag }));
+      }
+      return index;
+    });
+    return items.length ? { sourceContentItems: Int32Array.from(events), contentItems: Object.freeze(items) } : {};
   }
 
   /** Tag strokes with their paint context; Multiply strokes never merge. */
@@ -4666,6 +4712,7 @@ class DenseContentCompiler {
       mcid,
       parentIndex: parent?.nodeIndex ?? -1
     });
+    this.markedContentItems.push(mcid >= 0 ? nodeIndex : parent ? this.markedContentItems[parent.nodeIndex] : -1);
     this.markedContentStack.push({
       nodeIndex,
       optionalContentIndex: this.combineOptionalContent(parent?.optionalContentIndex ?? -1, optionalContentIndex),
@@ -4701,6 +4748,7 @@ class DenseContentCompiler {
   private syncActiveMarkedContent(): void {
     const active = this.markedContentStack.at(-1);
     this.activeMarkedContentIndex = active?.nodeIndex ?? -1;
+    this.activeContentItem = active ? this.markedContentItems[active.nodeIndex] : -1;
     this.activeOptionalContentIndex = active?.optionalContentIndex ?? -1;
     this.contentVisible = this.options.retainOptionalContent === true || (active?.defaultVisible ?? true);
   }

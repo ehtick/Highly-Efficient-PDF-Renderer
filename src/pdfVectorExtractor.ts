@@ -1,6 +1,7 @@
 import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { placeSceneAnnotation, type AnnotationAppearanceMode, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
+import { composeSceneStructure, type SceneMarkedContent, type StructureElement } from "./structureData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import {
   createLoadProgressReporter,
@@ -108,6 +109,10 @@ export interface VectorScene {
   annotations?: readonly SceneAnnotation[];
   /** Compile-time appearance filter; absent means every appearance was compiled (`"render"`). */
   annotationAppearances?: AnnotationAppearanceMode;
+  /** Which structure content item (MCID) painted each primitive; absent for untagged content. */
+  markedContent?: SceneMarkedContent;
+  /** Structure elements owning `markedContent` items, with their ancestors. */
+  structureElements?: readonly StructureElement[];
   /** Source page identities and PDF-to-scene transforms; absent in older HEP files. */
   pdfPages?: readonly ScenePdfPage[];
   /** Self-contained replay sources for layer-aware composite fallback islands. */
@@ -965,6 +970,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const combinedTextContent: SceneTextItem[] = [];
   const annotations: SceneAnnotation[] = [];
   const pdfPages: ScenePdfPage[] = [];
+  const structurePages: Parameters<typeof composeSceneStructure>[0][number][] = [];
   let hasTextContent = false;
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
@@ -974,6 +980,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
+    structurePages.push({ scene, offsets: { pageRectBase, primitives: {
+      fill: fillPathOffset, stroke: segmentOffset, text: textInstanceOffset, raster: rasterLayers.length,
+      "gradient-fill": gradientFillPathOffset, "gradient-stroke": gradientStrokeRunOffset
+    } } });
     if (pagePrimitiveRanges) {
       validatePagePrimitiveRanges(scene);
       const offsets = [segmentOffset, fillPathOffset, textInstanceOffset, rasterLayers.length, gradientFillPathOffset, gradientStrokeRunOffset];
@@ -1311,9 +1321,14 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
+  const { droppedPages: structureDroppedPages, ...structure } = composeSceneStructure(structurePages);
+  if (structureDroppedPages) onDiagnostic?.({ code: "structure.limit", severity: "warning",
+    message: `${structureDroppedPages} page(s) exceed the scene's structure attribution limit; their content has no MCIDs.`,
+    details: { pageCount: structureDroppedPages } });
   const composedScene: VectorScene = {
     annotations,
     ...(pageScenes[0].annotationAppearances ? { annotationAppearances: pageScenes[0].annotationAppearances } : {}),
+    ...structure,
     pdfPages,
     ...(paintGraph ? { paintGraph } : {}),
     ...(retainedPages.length ? { retainedPages } : {}),

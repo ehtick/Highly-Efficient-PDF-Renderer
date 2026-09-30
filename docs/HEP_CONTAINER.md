@@ -156,6 +156,34 @@ versions. Existing supported files without metadata remain readable.
 Repacking cannot recover omitted annotations; reconvert the original PDF to
 obtain them.
 
+## Structure content
+
+Scene v9 optionally references tagged-PDF attribution through
+`manifest.scene.structure`:
+
+```json
+{ "file": "structure/structure.json", "rangesFile": "structure/content-ranges.varint",
+  "version": 1, "itemCount": 3, "elementCount": 4, "rangeCount": 3 }
+```
+
+`structure/structure.json` contains `{ "version": 1, "items": [], "elements": [] }`
+with the `SceneContentItem` and `StructureElement` records described in
+[the API reference](api.md#tagged-pdf-structure-mcids). An item records one
+marked-content sequence with an MCID: its scene page slot, source page, MCID, tag
+and optional owning `elementId`. Elements include every owner's ancestors.
+
+`structure/content-ranges.varint` assigns primitives to items. For each kind, in
+the order stroke, fill, text, raster, gradient-fill, gradient-stroke, it holds an
+unsigned varint range count followed by one triple per range: the gap from the
+previous range's end, the range length and the item index. Ranges within a kind
+are sorted, non-overlapping and address the canonical primitive stores; unlisted
+primitives belong to no item.
+
+Readers validate the descriptor counts, range bounds against the scene's stores,
+item and element references, and the element, property and text budgets. Older
+readers ignore the descriptor, and files without it carry no attribution. This
+optional section changes none of the container, scene v9 or page v8 versions.
+
 ## Scene draw order
 
 ### Scene structure sections

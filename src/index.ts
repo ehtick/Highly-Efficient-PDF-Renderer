@@ -232,6 +232,7 @@ export type { AnnotationOverlay, AnnotationOverlayOptions, AnnotationOverlayAdap
 export type { PdfAnnotation, SceneAnnotation, ScenePdfPage, AnnotationGeometry, AnnotationAction,
   AnnotationDestination, AnnotationField, AnnotationBorder, AnnotationAppearanceMode } from "./annotationData";
 export { annotationLayerId } from "./annotationLayers";
+export type { SceneContentItem, SceneMarkedContent, StructureElement, StructureUserProperty } from "./structureData";
 
 export type {
   PdfIccOptions,

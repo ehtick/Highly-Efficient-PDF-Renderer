@@ -295,6 +295,7 @@ approximately. Transforms are runtime presentation state and are not saved by
 | `resetLayerVisibility()` | Restore the PDF's original visibility defaults. Annotation visibility is kept. |
 | `getAnnotationLayers()` | List annotations whose compiled appearance can be shown or hidden, as `{ annotationId, visible }`. |
 | `setAnnotationVisibility(annotationIds, visible)` | Show or hide compiled annotation appearances by `SceneAnnotation.id`; metadata and bubbles are unaffected. |
+| `getStructureElement(id)` | Read a detached tagged-PDF structure element, with its user properties, by `markedContent.elementId`. |
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
@@ -532,7 +533,9 @@ pixels and does not require device-pixel-ratio adjustment. The result contains
 `primitive`, the cursor `point` in composed scene coordinates, `closestPoint`,
 `distancePx`, and an optional `segmentIndex` or mesh `triangleIndex`. When the
 primitive paints a compiled annotation appearance, the hit and `getPrimitive(ref)`
-also carry its `annotationId` (a `SceneAnnotation.id`); page content has none. The
+also carry its `annotationId` (a `SceneAnnotation.id`); page content has none. In
+tagged PDFs, `markedContent` identifies the structure content item that painted it
+(see [tagged PDF structure](#tagged-pdf-structure-mcids)). The
 last eligible painted primitive within tolerance wins. `kinds` filters eligible types, which is useful for a
 measurement tool interested only in strokes. This queries canonical geometry,
 not antialiased framebuffer pixels or simplified LOD geometry.
@@ -623,6 +626,45 @@ keeps LOD active. Batch large color changes; Three.js/WebGPU may upload a whole
 modified texture even when only a few colors changed. Use hover traces for
 frequent pointer feedback. Call `clearPrimitiveInteraction()` to release the
 optional interaction resources without disposing the document.
+
+### Tagged PDF structure (MCIDs)
+
+In a tagged PDF, page content is wrapped in marked-content sequences whose MCID
+links it to an element of the document's structure tree (PDF 32000-1 §14.7).
+When a picked or inspected primitive was painted inside such a sequence, the hit
+and `getPrimitive(ref)` carry `markedContent: { pageIndex, sourcePageIndex, mcid,
+tag, elementId? }`. `elementId` is present when the structure tree maps the MCID
+through the page's `/StructParents` entry; pass it to `getStructureElement(id)`:
+
+```ts
+const hit = await pdf.pick({ camera, element: renderer.domElement, clientX, clientY });
+const id = hit?.markedContent?.elementId;
+const element = id ? pdf.getStructureElement(id) : undefined;
+const guid = element?.userProperties?.find(property => property.name === "IfcGuid")?.value;
+```
+
+A `StructureElement` has a document-local `id` (`ref:<object>:<generation>`),
+its structure `type` (`/S`), `standardType` after the role map when it differs,
+and the optional `title`, `alt`, `actualText`, `expansion`, `lang` and
+`elementId` (`/ID`) strings. `userProperties` lists the entries of its
+UserProperties attributes (§14.7.5.4), attribute classes first, as
+`{ name, value, formattedValue?, hidden? }`. Text, number and boolean values keep
+their type; other values are `null`. `parentId` leads to ancestors, such as a
+storey or the document element. `sceneData.structureElements` holds every element
+that owns painted content, plus its ancestors; `sceneData.markedContent` maps
+primitive ranges to content items.
+
+Attribution is resolved when the PDF is compiled and stored in HEP files, so it
+needs no PDF at runtime, and it never splits draw runs. Items painted directly in
+a page's content stream are attributed, together with everything a Form XObject
+paints inside them. MCIDs defined inside a Form XObject's own content resolve
+through that Form's `/StructParents`, which is not supported yet: that paint keeps
+its enclosing page item, if any, and `structure.form-content-items` reports it.
+Pages drawn as a single raster, and HEP files converted before attribution
+existed, carry none. Malformed or oversized structure trees leave `elementId`
+unset and report `structure.invalid`, `structure.limit` or `structure.unavailable`;
+the page still opens. Page objects from `getPage()` report their own page slot;
+the document object reports the composed slot.
 
 ### PDF layers (optional content)
 

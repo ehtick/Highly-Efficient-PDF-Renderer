@@ -2,6 +2,7 @@ import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVecto
 import { retainedRasterBounds } from "./retainedRasterBounds";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { createDefaultOptionalContentSnapshot, getAnnotationLayerIds } from "./optionalContent";
+import { findSceneContentItem, type SceneContentItem } from "./structureData";
 import { sampleSceneGradientChannel } from "./gradientSampling";
 import { getGradientMeshTriangle, gradientMeshTriangleCount, type GradientMeshTriangle } from "./gradientMesh";
 import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions, scenePaintRunAlpha, releaseScenePaintQuery, type ScenePaintSample } from "./scenePaintQuery";
@@ -31,6 +32,8 @@ export interface PrimitiveInfo {
   optionalContent: PrimitiveOptionalContent;
   /** `SceneAnnotation.id` when this primitive paints a compiled annotation appearance. */
   annotationId?: string;
+  /** The structure content item (MCID) that painted this primitive, in tagged content. */
+  markedContent?: SceneContentItem;
   ref: PrimitiveRef;
   kind: PrimitiveKind;
   index: number;
@@ -63,6 +66,8 @@ export interface PrimitiveHit {
   optionalContent: PrimitiveOptionalContent;
   /** `SceneAnnotation.id` when the hit primitive paints a compiled annotation appearance. */
   annotationId?: string;
+  /** The structure content item (MCID) that painted the hit primitive, in tagged content. */
+  markedContent?: SceneContentItem;
   primitive: PrimitiveRef;
   point: PrimitivePoint;
   closestPoint: PrimitivePoint;
@@ -139,8 +144,17 @@ export function getPrimitiveAnnotationId(scene: VectorScene, ref: PrimitiveRef):
   return getPrimitiveConditionFields(scene, ref).annotationId;
 }
 
+/** The structure content item (MCID) that painted a primitive, if any. */
+export function getPrimitiveMarkedContent(scene: VectorScene, ref: PrimitiveRef): SceneContentItem | undefined {
+  validatePrimitiveRef(scene, ref);
+  const item = findSceneContentItem(scene, ref);
+  return item && { ...item };
+}
+
 /** PDF layers and the owning annotation share one condition walk; annotation layers are not PDF layers. */
-function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): { optionalContent: PrimitiveOptionalContent; annotationId?: string } {
+function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
+  optionalContent: PrimitiveOptionalContent; annotationId?: string; markedContent?: SceneContentItem;
+} {
   validatePrimitiveRef(scene, ref);
   const conditionId = primitiveRun(scene, ref)?.optionalContent ?? null;
   const annotationLayers = getAnnotationLayerIds(scene.optionalContent);
@@ -160,7 +174,9 @@ function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): { o
     } else if (condition?.kind === "not") pending.push(condition.operand);
     else if (condition?.kind === "and" || condition?.kind === "or") pending.push(...condition.operands);
   }
-  return { optionalContent: { conditionId, layerIds: [...groups] }, ...(annotationId === undefined ? {} : { annotationId }) };
+  const markedContent = findSceneContentItem(scene, ref);
+  return { optionalContent: { conditionId, layerIds: [...groups] }, ...(annotationId === undefined ? {} : { annotationId }),
+    ...(markedContent ? { markedContent: { ...markedContent } } : {}) };
 }
 
 /** Lookup costs depend on paint runs, rather than the number of stored primitives. */

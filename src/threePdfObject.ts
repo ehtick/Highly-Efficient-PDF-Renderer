@@ -26,7 +26,8 @@ import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialGradientLayer } from "./threeMaterialGradientLayer";
 import { OptionalContentController, type AnnotationLayerVisibility, type LayerVisibilityChange, type OptionalContentListener,
   type OptionalContentSnapshot } from "./optionalContent";
-import { isScenePrimitiveVisible } from "./scenePrimitives";
+import { getPrimitiveMarkedContent, isScenePrimitiveVisible } from "./scenePrimitives";
+import { findStructureElement, type StructureElement } from "./structureData";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
@@ -887,6 +888,16 @@ export class HeprThreePdfObject extends THREE.Group {
     return this.layerVisibility.setAnnotationVisibility(annotationIds, visible);
   }
 
+  /**
+   * A detached structure element by `id`, such as `markedContent.elementId` from
+   * `pick()` or `getPrimitive()`, with its user properties. Follow `parentId`
+   * for ancestors. `undefined` when the scene has no such element.
+   */
+  getStructureElement(id: string): StructureElement | undefined {
+    const element = findStructureElement(this.sceneData, id);
+    return element && structuredClone(element);
+  }
+
   /** Observe layer preparation; immediately reports the current percentage or null when idle. */
   subscribeLayerVisibilityProgress(listener: (percentage: number | null) => void): () => void {
     if (this.isDisposed) throw new Error("PDF object disposed.");
@@ -952,8 +963,13 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.pageViews) {
       for (const candidate of this.pageHits(options.camera, options.clientX, options.clientY, options.element)) {
         const hit = await candidate.page.object.pick(options);
-        if (hit) return { ...hit, primitive: { kind: hit.primitive.kind,
-          index: candidate.page.view.primitives[hit.primitive.kind][hit.primitive.index] } };
+        if (hit) {
+          // The page reports its own slot; the document reports its page slot.
+          const { markedContent: _page, ...rest } = hit;
+          const primitive = { kind: hit.primitive.kind, index: candidate.page.view.primitives[hit.primitive.kind][hit.primitive.index] };
+          const markedContent = getPrimitiveMarkedContent(this.sceneData, primitive);
+          return { ...rest, primitive, ...(markedContent ? { markedContent } : {}) };
+        }
         if (candidate.page.object.rendererConfig.pageBackground[3] >= 1) return null;
       }
       return null;

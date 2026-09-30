@@ -242,15 +242,14 @@ export function createTextLodCombinedPayload(
   const combinedGlyphCount = Math.max(0, scene.textGlyphCount | 0) + 1;
   const sourceSegmentCount = Math.max(0, scene.textGlyphSegmentCount | 0);
   const combinedSegmentCount = sourceSegmentCount + TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT;
+  const glyphs = combinedGlyphStore(scene, combinedGlyphCount, combinedSegmentCount);
   const destinations: TextLodCombinedDestinations = {
     textInstanceA: new Float32Array(combinedInstanceCount * 4),
     textInstanceB: new Float32Array(combinedInstanceCount * 4),
     textInstanceC: new Float32Array(combinedInstanceCount * 4),
-    textGlyphMetaA: new Float32Array(combinedGlyphCount * 4),
-    textGlyphMetaB: new Float32Array(combinedGlyphCount * 4),
-    textGlyphSegmentsA: new Float32Array(combinedSegmentCount * 4),
-    textGlyphSegmentsB: new Float32Array(combinedSegmentCount * 4)
+    ...glyphs
   };
+  // Rewrites identical glyph values into a shared store; instances are new.
   appendTextLodCombinedPayload(scene, data, destinations);
 
   return {
@@ -272,6 +271,29 @@ export function createTextLodCombinedPayload(
     combinedInstanceCount,
     solidGlyphIndex: data.solidGlyphIndex
   };
+}
+
+type CombinedGlyphStore = Pick<TextLodCombinedDestinations, "textGlyphMetaA" | "textGlyphMetaB" | "textGlyphSegmentsA" | "textGlyphSegmentsB">;
+const combinedGlyphStores = new WeakMap<Float32Array, { source: VectorScene; store: CombinedGlyphStore }[]>();
+
+/**
+ * The source glyphs plus the solid glyph. A document and its page views share
+ * one glyph store, so they also share this one and its derived glyph atlas.
+ */
+function combinedGlyphStore(scene: VectorScene, glyphCount: number, segmentCount: number): CombinedGlyphStore {
+  const entries = combinedGlyphStores.get(scene.textGlyphSegmentsA) ?? [];
+  const same = (source: VectorScene) => source.textGlyphMetaA === scene.textGlyphMetaA && source.textGlyphMetaB === scene.textGlyphMetaB &&
+    source.textGlyphSegmentsB === scene.textGlyphSegmentsB && source.textGlyphCount === scene.textGlyphCount &&
+    source.textGlyphSegmentCount === scene.textGlyphSegmentCount;
+  const cached = entries.find(entry => same(entry.source));
+  if (cached) return cached.store;
+  const store: CombinedGlyphStore = {
+    textGlyphMetaA: new Float32Array(glyphCount * 4), textGlyphMetaB: new Float32Array(glyphCount * 4),
+    textGlyphSegmentsA: new Float32Array(segmentCount * 4), textGlyphSegmentsB: new Float32Array(segmentCount * 4)
+  };
+  entries.push({ source: scene, store });
+  combinedGlyphStores.set(scene.textGlyphSegmentsA, entries);
+  return store;
 }
 
 /** Write the combined payload into caller-owned (possibly padded) arrays. */

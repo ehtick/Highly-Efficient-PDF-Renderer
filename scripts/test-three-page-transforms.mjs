@@ -40,7 +40,15 @@ try {
     const bad = new THREE.Matrix4(); bad.elements[3] = 1;
     await assert.rejects(pdf.setPageTransform(0,bad), RangeError);
     pdf.setSearchHighlights(pdf.searchText('page'), { currentIndex: 1 });
+    const progress = [];
+    const stopProgress = pdf.subscribePagePreparationProgress(value => progress.push(value));
     const [pages, second] = await Promise.all([pdf.getPages(), pdf.getPage(1)]);
+    stopProgress();
+    assert.deepEqual(progress, [null, 0, 25, 50, 75, 95, null], 'page preparation reports ordered integer progress and ends idle');
+    const atlas = pdf.textMaterialLayer.textRasterAtlasTexture;
+    let atlasDisposals = 0; atlas.addEventListener('dispose', () => atlasDisposals++);
+    assert(pages.every(page => page.textMaterialLayer.textRasterAtlasTexture === atlas), 'page views share the document glyph atlas');
+    assert.equal(pdf.pageBatch.textMaterialLayer.textRasterAtlasTexture, atlas, 'shared batches reuse the same glyph atlas');
     assert.equal(second, pages[1]); assert.equal(await pdf.getPage(1), second);
     assert.equal(pages.length, 3); assert(Object.isFrozen(pages));
     assert.equal(native.uploads, 0, 'independent Three resources do not upload native geometry');
@@ -66,11 +74,14 @@ try {
     const untouched = pages[0].matrix.clone();
     await pdf.setPagePosition(1, 0, 35, 15);
     second.rotation.set(.3,-.2,.4); second.scale.set(-1.3,.6,2);
-    pages[2].position.set(-40,-25,-10);
+    // Overlapping the first page in its own plane needs page order, which
+    // exercises independent page rendering.
+    pages[2].position.copy(pages[0].position).add(new THREE.Vector3(8,-6,0));
     for (const camera of [new THREE.PerspectiveCamera(50,640/480,.1,1000), new THREE.OrthographicCamera(-100,100,75,-75,.1,1000)]) {
       camera.position.set(0,0,250); camera.lookAt(0,0,0); camera.updateMatrixWorld(true);
       parent.updateMatrixWorld(true);
       hostScene.onBeforeRender(host,hostScene,camera,null);
+      assert.equal(pdf.getPageBatchingStats().reason, 'overlapping-page-paints');
       assert.equal(pdf.pageMesh.visible, false);
       assert.deepEqual(pages[0].matrix.elements,untouched.elements,'moving one page leaves its sibling transform unchanged');
       for (const page of pages) {
@@ -133,6 +144,7 @@ try {
     pdf.prepareFrameForThreeRenderer(host,camera);
     assert(pages.every(page=>!page.pageMesh.material.depthWrite),'translucent page backgrounds do not occlude rear pages with an opaque depth rectangle');
     pdf.dispose(); pdf.dispose();
+    assert.equal(atlasDisposals, 1, 'the shared glyph atlas is released once, with its last text layer');
     assert.equal(native.disposals,1,'only the document disposes the shared native context');
     assert.equal(pdf.pagePreparation,null,'disposal releases the cached page views');
     assert(pages.every(page=>page.isDisposed && page.parent===null));

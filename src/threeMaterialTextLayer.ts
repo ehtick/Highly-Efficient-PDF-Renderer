@@ -17,7 +17,8 @@ import { writeTextGlyphInkDensities } from "./textGreekLod";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import {
   buildTextRasterAtlas,
-  TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
+  TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
+  type TextRasterAtlas
 } from "./textRasterAtlas";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
@@ -71,6 +72,7 @@ export class ThreeMaterialTextLayer {
   private readonly textGlyphSegmentTextureA: THREE.DataTexture;
   private readonly textGlyphSegmentTextureB: THREE.DataTexture;
   private readonly textRasterAtlasTexture: THREE.DataTexture;
+  private readonly glyphResources: SharedGlyphResources;
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
@@ -156,33 +158,20 @@ export class ThreeMaterialTextLayer {
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
     );
-    const glyphMetaB = scene.textGlyphMetaB.slice(0, textGlyphCount * 4);
-    writeTextGlyphInkDensities(textGlyphCount, scene.textGlyphMetaA, glyphMetaB,
-      scene.textGlyphSegmentsA, scene.textGlyphSegmentsB);
+    this.glyphResources = acquireGlyphResources(scene, rasterAtlasGlyphCountFor(scene, options), clampInt(
+      options.maxRasterAtlasTextureSize ?? TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
+      256,
+      TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
+    ));
     this.textGlyphMetaTextureB = createFloatTexture(
-      glyphMetaB,
+      this.glyphResources.glyphMetaB,
       textGlyphCount,
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
     );
 
     const rasterMetaData = new Float32Array(glyphMetaTextureSize.width * glyphMetaTextureSize.height * 4);
-    const rasterAtlasGlyphCount = clampInt(
-      options.rasterAtlasGlyphCount ?? textGlyphCount,
-      0,
-      textGlyphCount
-    );
-    const rasterAtlasScene = rasterAtlasGlyphCount === textGlyphCount
-      ? scene
-      : { ...scene, textGlyphCount: rasterAtlasGlyphCount };
-    const rasterAtlas = buildTextRasterAtlas(
-      rasterAtlasScene,
-      clampInt(
-        options.maxRasterAtlasTextureSize ?? TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
-        256,
-        TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
-      )
-    );
+    const rasterAtlas = this.glyphResources.atlas;
     if (rasterAtlas) {
       rasterMetaData.set(rasterAtlas.glyphUvRects, 0);
     }
@@ -193,30 +182,12 @@ export class ThreeMaterialTextLayer {
       glyphMetaTextureSize.height
     );
 
-    this.textGlyphSegmentTextureA = createFloatTexture(
-      scene.textGlyphSegmentsA,
-      textGlyphSegmentCount,
-      glyphSegmentTextureSize.width,
-      glyphSegmentTextureSize.height
-    );
-    this.textGlyphSegmentTextureB = createFloatTexture(
-      scene.textGlyphSegmentsB,
-      textGlyphSegmentCount,
-      glyphSegmentTextureSize.width,
-      glyphSegmentTextureSize.height
-    );
-
-    if (rasterAtlas) {
-      this.textRasterAtlasTexture = createRasterAtlasTexture(
-        rasterAtlas.alpha,
-        rasterAtlas.width,
-        rasterAtlas.height
-      );
-      this.rasterAtlasSizeUniform = new THREE.Vector2(rasterAtlas.width, rasterAtlas.height);
-    } else {
-      this.textRasterAtlasTexture = createRasterAtlasTexture(new Uint8Array([0]), 1, 1);
-      this.rasterAtlasSizeUniform = new THREE.Vector2(1, 1);
-    }
+    this.textGlyphSegmentTextureA = this.glyphResources.segmentTextureA;
+    this.textGlyphSegmentTextureB = this.glyphResources.segmentTextureB;
+    this.textRasterAtlasTexture = this.glyphResources.atlasTexture;
+    this.rasterAtlasSizeUniform = rasterAtlas
+      ? new THREE.Vector2(rasterAtlas.width, rasterAtlas.height)
+      : new THREE.Vector2(1, 1);
 
     this.textInstanceCount = textInstanceCount;
     const pageLayout = resolvePageLayout(scene, textInstanceCount);
@@ -638,10 +609,72 @@ export class ThreeMaterialTextLayer {
     this.textGlyphMetaTextureA.dispose();
     this.textGlyphMetaTextureB.dispose();
     this.textGlyphRasterMetaTexture.dispose();
-    this.textGlyphSegmentTextureA.dispose();
-    this.textGlyphSegmentTextureB.dispose();
-    this.textRasterAtlasTexture.dispose();
+    releaseGlyphResources(this.glyphResources);
   }
+}
+
+/**
+ * Glyph outlines are font data shared by a document and its page views. Their
+ * raster atlas (canvas rasterization plus mip chain) and segment textures are
+ * built once per glyph store and released with their last text layer.
+ */
+interface SharedGlyphResources {
+  readonly key: GlyphResourceKey;
+  readonly atlas: TextRasterAtlas | null;
+  /** Glyph meta B with ink densities. */
+  readonly glyphMetaB: Float32Array;
+  readonly atlasTexture: THREE.DataTexture;
+  readonly segmentTextureA: THREE.DataTexture;
+  readonly segmentTextureB: THREE.DataTexture;
+  users: number;
+}
+
+interface GlyphResourceKey {
+  metaA: Float32Array; metaB: Float32Array; segmentsA: Float32Array; segmentsB: Float32Array;
+  glyphCount: number; segmentCount: number; rasterAtlasGlyphCount: number; maxAtlasTextureSize: number;
+}
+
+const sharedGlyphResources = new WeakMap<Float32Array, SharedGlyphResources[]>();
+
+function acquireGlyphResources(scene: VectorScene, rasterAtlasGlyphCount: number, maxAtlasTextureSize: number): SharedGlyphResources {
+  const key: GlyphResourceKey = {
+    metaA: scene.textGlyphMetaA, metaB: scene.textGlyphMetaB, segmentsA: scene.textGlyphSegmentsA, segmentsB: scene.textGlyphSegmentsB,
+    glyphCount: Math.max(0, scene.textGlyphCount | 0), segmentCount: Math.max(0, scene.textGlyphSegmentCount | 0),
+    rasterAtlasGlyphCount, maxAtlasTextureSize
+  };
+  const entries = sharedGlyphResources.get(key.segmentsA) ?? [];
+  const existing = entries.find(entry => (Object.keys(key) as (keyof GlyphResourceKey)[]).every(name => entry.key[name] === key[name]));
+  if (existing) {
+    existing.users++;
+    return existing;
+  }
+  const atlas = buildTextRasterAtlas(rasterAtlasGlyphCount === key.glyphCount ? scene : { ...scene, textGlyphCount: rasterAtlasGlyphCount }, maxAtlasTextureSize);
+  const segmentTextureSize = chooseTextureSize(key.segmentCount);
+  const glyphMetaB = key.metaB.slice(0, key.glyphCount * 4);
+  writeTextGlyphInkDensities(key.glyphCount, key.metaA, glyphMetaB, key.segmentsA, key.segmentsB);
+  const entry: SharedGlyphResources = {
+    key, atlas, glyphMetaB, users: 1,
+    atlasTexture: atlas ? createRasterAtlasTexture(atlas.alpha, atlas.width, atlas.height) : createRasterAtlasTexture(new Uint8Array([0]), 1, 1),
+    segmentTextureA: createFloatTexture(key.segmentsA, key.segmentCount, segmentTextureSize.width, segmentTextureSize.height),
+    segmentTextureB: createFloatTexture(key.segmentsB, key.segmentCount, segmentTextureSize.width, segmentTextureSize.height)
+  };
+  entries.push(entry);
+  sharedGlyphResources.set(key.segmentsA, entries);
+  return entry;
+}
+
+function rasterAtlasGlyphCountFor(scene: VectorScene, options: TextLayerOptions): number {
+  const glyphCount = Math.max(0, scene.textGlyphCount | 0);
+  return clampInt(options.rasterAtlasGlyphCount ?? glyphCount, 0, glyphCount);
+}
+
+function releaseGlyphResources(entry: SharedGlyphResources): void {
+  if (--entry.users > 0) return;
+  entry.atlasTexture.dispose(); entry.segmentTextureA.dispose(); entry.segmentTextureB.dispose();
+  const entries = sharedGlyphResources.get(entry.key.segmentsA);
+  const index = entries?.indexOf(entry) ?? -1;
+  if (index >= 0) entries!.splice(index, 1);
+  if (entries && !entries.length) sharedGlyphResources.delete(entry.key.segmentsA);
 }
 
 function chooseTextureSize(count: number): { width: number; height: number } {

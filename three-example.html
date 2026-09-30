@@ -454,10 +454,67 @@
         font-size: 12px;
       }
 
-      #text-search-case[aria-pressed="true"] {
+      #text-search-case[aria-pressed="true"],
+      .page-layout-buttons button[aria-pressed="true"] {
         background: #e8edf5;
         border-color: #e8edf5;
         color: #11161d;
+      }
+
+      .number-row[hidden] {
+        display: none !important;
+      }
+
+      .page-layout-controls {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .page-layout-buttons {
+        display: flex;
+        gap: 6px;
+      }
+
+      .page-layout-progress {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: rgba(232, 237, 245, 0.8);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .page-layout-progress[hidden] {
+        display: none;
+      }
+
+      .page-layout-progress progress {
+        width: 90px;
+        height: 6px;
+        border: none;
+        border-radius: 3px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.14);
+        appearance: none;
+      }
+
+      .page-layout-progress progress::-webkit-progress-bar {
+        background: rgba(255, 255, 255, 0.14);
+      }
+
+      .page-layout-progress progress::-webkit-progress-value {
+        background: #60a5fa;
+      }
+
+      .page-layout-progress progress::-moz-progress-bar {
+        background: #60a5fa;
+      }
+
+      .page-layout-buttons button {
+        padding: 5px 12px;
+        font-size: 13px;
       }
 
       .loader-spinner {
@@ -527,6 +584,21 @@
           <button id="text-search-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
           <button id="text-search-next" type="button" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
           <button id="text-search-case" type="button" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+        </div>
+      </div>
+      <div id="page-layout-row" class="number-row" hidden>
+        <span id="page-layout-label">Page Layout</span>
+        <div class="page-layout-controls">
+          <div class="page-layout-buttons" role="group" aria-labelledby="page-layout-label">
+            <button type="button" data-page-layout="grid" aria-pressed="true">Grid</button>
+            <button type="button" data-page-layout="sphere" aria-pressed="false">Sphere</button>
+            <button type="button" data-page-layout="helix" aria-pressed="false">Helix</button>
+          </div>
+          <span id="page-layout-progress" class="page-layout-progress" role="status" hidden>
+            <span class="loader-spinner" aria-hidden="true"></span>
+            <progress id="page-layout-progress-bar" max="100" value="0" aria-label="Preparing pages"></progress>
+            <span id="page-layout-progress-text">0%</span>
+          </span>
         </div>
       </div>
       <div class="number-row">

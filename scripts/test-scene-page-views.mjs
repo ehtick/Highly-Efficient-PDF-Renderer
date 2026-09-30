@@ -64,6 +64,9 @@ try {
     assert.deepEqual([...scene.textIndex.pages[0].charInstance],[0]);
     assert.equal(scene.textInstanceB[2],0);assert.equal(scene.textInstanceB[3],1);
     assert.equal(scene.textGlyphMetaA[0],0);assert.equal(scene.fillPathMetaA[0],0);
+    for (const key of ['textGlyphMetaA','textGlyphMetaB','textGlyphSegmentsA','textGlyphSegmentsB'])
+      assert.equal(scene[key],source[key],'pages share the immutable document glyph store and its atlas');
+    assert.equal(scene.textGlyphCount,source.textGlyphCount);
     assert.equal(scene.gradientFillPaintMeta[0],0);assert.equal(scene.gradientFillPaintMeta[3],0);
     assert.equal(scene.gradientStrokeRunMetaA[2],0);assert.equal(scene.gradientStrokeRunMetaB[1],0);
     assert.equal(scene.pdfPages[0].sourcePageIndex,page+4);assert.equal(scene.pdfPages[0].pageIndex,0);
@@ -90,10 +93,15 @@ try {
   const restored=await loadSceneFromHep(await blob.arrayBuffer());
   assert.deepEqual(restored.pagePrimitiveRanges,simple.pagePrimitiveRanges);
   assert.deepEqual([...new ScenePageViews(restored).extract(1).primitives.stroke],[1]);
-  const legacy={...source,pagePrimitiveRanges:undefined};let warnings=0;const warn=console.warn;
-  try{console.warn=()=>warnings++;const pages=new ScenePageViews(legacy);
+  const legacy={...source,pagePrimitiveRanges:undefined};const warnings=[];const warn=console.warn;
+  try{console.warn=message=>warnings.push(message);const pages=new ScenePageViews(legacy);
     assert.deepEqual([...pages.extract(0).primitives.stroke],[0]);assert.deepEqual([...pages.extract(1).primitives.fill],[1]);
+    assert.deepEqual(warnings,[],'paint inside its page rectangle is inferred exactly without a warning');
+    // Paint reaching past its nearest page may belong to a neighbor.
+    const bounds=legacy.primitiveBounds.slice();bounds[0]=legacy.pageRects[0]-50;
+    new ScenePageViews({...legacy,primitiveBounds:bounds});
   }finally{console.warn=warn;}
-  assert.equal(warnings,1,'legacy ownership approximation is diagnosed once');
+  assert.equal(warnings.length,1,'ambiguous legacy ownership is diagnosed once');
+  assert.match(warnings[0],/1 stroke\/fill primitive\(s\) reach past their nearest page/);
   console.log('Scene page views: all paint kinds, exact ownership, compact references, clips/graphs, annotations, source preservation and HEP round trip passed.');
 }finally{hooks.deregister();}

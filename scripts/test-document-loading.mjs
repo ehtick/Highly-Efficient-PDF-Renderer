@@ -274,6 +274,20 @@ async function testThreeBackendReplacement() {
     let layerResets = 0;
     let layerBindings = 0;
     const backendChanges = [];
+    const previousPageLayout = { object: previous, layout: "sphere" };
+    const replacementPages = [{ id: "page 1" }, { id: "page 2" }];
+    const arrangedPages = [];
+    replacement.pageCount = replacementPages.length;
+    const pageProgress = [];
+    replacement.subscribePagePreparationProgress = listener => {
+      listener(null); pageProgress.push('subscribed');
+      return () => pageProgress.push('unsubscribed');
+    };
+    replacement.getPages = async ({ signal }) => {
+      assert.equal(signal, host.sourceLoadController.signal);
+      assert.equal(host.currentPdfObject, previous, "Arrange replacement pages before installing the replacement");
+      return replacementPages;
+    };
     replacement.resetLayerVisibility = async () => {
       assert.equal(host.currentPdfObject, previous, "Restore target PDF defaults before installing the replacement");
       layerResets++;
@@ -355,10 +369,22 @@ async function testThreeBackendReplacement() {
       updateLoadingProgress: noop, setLoadingProgress: noop, setLoadControlsEnabled: noop,
       setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
       waitForNextRenderedFrame: async () => {}, formatLoadTiming: () => "timing",
-      updateSceneMetrics: noop, formatBackendLabel: value => value
+      updateSceneMetrics: noop, formatBackendLabel: value => value,
+      activePageLayout: "sphere", pageLayoutView: previousPageLayout, pageLayoutRequest: 0,
+      pageLayoutAnimator: { cancel: noop }, pageLayoutRowElement: { hidden: true }, pageLayoutButtons: [],
+      setPageLayoutProgress: noop,
+      createPageLayoutView: (object, pages) => ({ object, pages, layoutPages: [], layout: "grid", targets: [] }),
+      computeExamplePageLayout: layout => [`${layout} targets`],
+      applyExamplePageLayout: (pages, targets) => {
+        assert.equal(host.currentPdfObject, previous);
+        arrangedPages.push({ pages, targets });
+      }
     });
     vm.createContext(host);
-    for (const name of ["reloadSourceWithBackend", "replacePdfObject", "releasePdfObject", "disposeCurrentObject"]) {
+    for (const name of [
+      "reloadSourceWithBackend", "replacePdfObject", "releasePdfObject", "disposeCurrentObject",
+      "preparePageLayoutReplacement", "resetPageLayout", "syncPageLayoutControls"
+    ]) {
       vm.runInContext(sourceFunction(source, name), host);
     }
     await host.reloadSourceWithBackend("webgpu");
@@ -374,6 +400,12 @@ async function testThreeBackendReplacement() {
     assert.equal(replacement.disposals, failed ? 1 : 0);
     assert.deepEqual(backendChanges, failure === "layers" ? ["webgpu", "webgl"] : ["webgpu"]);
     assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : "webgpu", "A layer replay failure rolls the renderer back with the old document intact");
+    assert.equal(host.activePageLayout, "sphere", "Backend switches keep the page layout");
+    assert.equal(host.pageLayoutView.object, failed ? previous : replacement);
+    assert.equal(host.pageLayoutView.layout, "sphere");
+    assert.deepEqual(arrangedPages, failed ? [] : [{ pages: replacementPages, targets: ["sphere targets"] }]);
+    assert.equal(host.pageLayoutRowElement.hidden, failed, "Multi-page replacements show the page layout controls");
+    assert.deepEqual(pageProgress, failed ? [] : ['subscribed', 'unsubscribed'], "Replacement page preparation reports progress until it settles");
   }
 }
 

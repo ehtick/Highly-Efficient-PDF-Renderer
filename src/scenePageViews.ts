@@ -47,6 +47,7 @@ export class ScenePageViews {
   readonly pageCount: number;
   readonly owners: Record<PrimitiveKind, Uint32Array>;
   private readonly indices: Record<PrimitiveKind, number[][]>;
+  private pageRuns: number[][] | null = null;
   readonly scene: VectorScene;
   constructor(scene: VectorScene) {
     this.scene = scene;
@@ -56,7 +57,7 @@ export class ScenePageViews {
     const counts = scenePrimitiveCounts(scene);
     this.owners = {} as Record<PrimitiveKind, Uint32Array>;
     this.indices = {} as Record<PrimitiveKind, number[][]>;
-    let inferred = false;
+    let uncertain = 0;
     for (const [k, kind] of PAGE_PRIMITIVE_KINDS.entries()) {
       const owners = this.owners[kind] = new Uint32Array(counts[kind]);
       const indices = this.indices[kind] = Array.from({ length: this.pageCount }, () => [] as number[]);
@@ -73,13 +74,16 @@ export class ScenePageViews {
         else if (kind === "gradient-fill") owners[index] = scene.gradientFillPaintMeta[index * 4 + 3];
         else if (kind === "gradient-stroke") owners[index] = scene.gradientStrokeRunMetaB[index * 4 + 1];
         else if (this.pageCount > 1) {
-          inferred = true;
           const i = index * 4;
-          owners[index] = kind === "stroke"
-            ? this.pageAt((scene.primitiveBounds[i] + scene.primitiveBounds[i + 2]) / 2,
-              (scene.primitiveBounds[i + 1] + scene.primitiveBounds[i + 3]) / 2)
-            : this.pageAt((scene.fillPathMetaA[i + 2] + scene.fillPathMetaB[i]) / 2,
-              (scene.fillPathMetaA[i + 3] + scene.fillPathMetaB[i + 1]) / 2);
+          const [minX, minY, maxX, maxY] = kind === "stroke"
+            ? [scene.primitiveBounds[i], scene.primitiveBounds[i + 1], scene.primitiveBounds[i + 2], scene.primitiveBounds[i + 3]]
+            : [scene.fillPathMetaA[i + 2], scene.fillPathMetaA[i + 3], scene.fillPathMetaB[i], scene.fillPathMetaB[i + 1]];
+          const page = owners[index] = this.pageAt((minX + maxX) / 2, (minY + maxY) / 2);
+          // Composed pages do not overlap, so paint inside one page rectangle
+          // belongs to it; only paint reaching past it is ambiguous.
+          const r = scene.pageRects, p = page * 4;
+          if (!(minX >= Math.min(r[p], r[p + 2]) && maxX <= Math.max(r[p], r[p + 2]) &&
+              minY >= Math.min(r[p + 1], r[p + 3]) && maxY <= Math.max(r[p + 1], r[p + 3]))) uncertain++;
         }
       }
       for (let index = 0; index < owners.length; index++) {
@@ -87,7 +91,27 @@ export class ScenePageViews {
         indices[owners[index]].push(index);
       }
     }
-    if (inferred) console.warn("[HEPR] This scene has no exact page primitive ranges. Independent page views infer stroke/fill ownership from the original layout; out-of-page or overlapping content may be assigned approximately.");
+    if (uncertain) console.warn(`[HEPR] This scene has no exact page primitive ranges, so independent page views infer stroke/fill ownership from the original layout. ${uncertain.toLocaleString()} stroke/fill primitive(s) reach past their nearest page and may be assigned approximately. Exporting the HEP again stores exact ownership.`);
+  }
+
+  /** Ascending indices of the draw runs with primitives on a page, found in one pass. */
+  private runsOnPage(pageIndex: number, runs: readonly VectorDrawRun[]): readonly number[] {
+    if (!this.pageRuns) {
+      const pageRuns: number[][] = Array.from({ length: this.pageCount }, () => []);
+      runs.forEach((run, index) => {
+        const owners = this.owners[run.kind];
+        let previous = -1;
+        for (let id = run.first; id < run.first + run.count; id++) {
+          const page = owners[id];
+          if (page === previous) continue;
+          const list = pageRuns[page];
+          if (list[list.length - 1] !== index) list.push(index);
+          previous = page;
+        }
+      });
+      this.pageRuns = pageRuns;
+    }
+    return this.pageRuns[pageIndex];
   }
 
   pageAt(x: number, y: number): number {
@@ -175,11 +199,10 @@ export class ScenePageViews {
 
     scene.textInstanceCount = scene.sourceTextCount = scene.textInPageCount = primitives.text.length; scene.textOutOfPageCount = 0;
     scene.textInstanceA = take("textInstanceA", primitives.text); scene.textInstanceB = take("textInstanceB", primitives.text); scene.textInstanceC = take("textInstanceC", primitives.text);
-    const glyphs: number[] = [], glyphMap = new Map<number, number>(), textClips: number[] = [], textClipMap = new Map<number, number>();
+    // Glyph outlines are font data: every page keeps the document's immutable
+    // glyph store, so pages share one glyph atlas instead of rasterizing their own.
+    const textClips: number[] = [], textClipMap = new Map<number, number>();
     for (let i = 0; i < scene.textInstanceB.length; i += 4) {
-      const glyph = scene.textInstanceB[i + 2];
-      if (!glyphMap.has(glyph)) { glyphMap.set(glyph, glyphs.length); glyphs.push(glyph); }
-      scene.textInstanceB[i + 2] = glyphMap.get(glyph)!;
       const clip = scene.textInstanceB[i + 3] - 1;
       if (clip >= 0) {
         if (!textClipMap.has(clip)) { textClipMap.set(clip, textClips.length); textClips.push(clip); }
@@ -187,15 +210,6 @@ export class ScenePageViews {
       }
     }
     scene.textClipRects = textClips.length ? take("textClipRects", textClips) : undefined;
-    scene.textGlyphCount = glyphs.length; scene.textGlyphMetaA = take("textGlyphMetaA", glyphs); scene.textGlyphMetaB = take("textGlyphMetaB", glyphs);
-    const glyphSegments: number[] = [];
-    for (let i = 0; i < glyphs.length; i++) {
-      const first = scene.textGlyphMetaA[i * 4], count = scene.textGlyphMetaA[i * 4 + 1];
-      scene.textGlyphMetaA[i * 4] = glyphSegments.length;
-      for (let j = 0; j < count; j++) glyphSegments.push(first + j);
-    }
-    scene.textGlyphSegmentCount = glyphSegments.length;
-    scene.textGlyphSegmentsA = take("textGlyphSegmentsA", glyphSegments); scene.textGlyphSegmentsB = take("textGlyphSegmentsB", glyphSegments);
     scene.pageTextRanges = Uint32Array.of(0, scene.textInstanceCount);
     const text = source.textIndex?.pages[pageIndex];
     if (text) scene.textIndex = { version: 2, pages: [{ ...text,
@@ -221,16 +235,16 @@ export class ScenePageViews {
       const clip = source.clipPaths![old], parent = clip.parent < 0 ? -1 : clipIndex(clip.parent);
       const index = scene.clipPaths!.length; clipMap.set(old, index); scene.clipPaths!.push({ ...clip, parent }); return index;
     };
-    runs.forEach((run, oldIndex) => {
-      const ids = primitives[run.kind];
+    for (const oldIndex of this.runsOnPage(pageIndex, runs)) {
+      const run = runs[oldIndex], ids = primitives[run.kind];
       const first = lowerBound(ids, run.first), end = lowerBound(ids, run.first + run.count);
-      if (first === end) return;
+      if (first === end) continue;
       // Compaction preserves canonical store order, so any selected subset of
       // one source interval is contiguous in the compact store.
       const next: VectorDrawRun = { ...run, first, count: end - first,
         ...(run.clipIndex === undefined ? {} : { clipIndex: clipIndex(run.clipIndex) }) };
       runMap.set(oldIndex, [scene.drawRuns!.length]); scene.drawRuns!.push(next);
-    });
+    }
     const retainedMap = new Map<number, number>();
     const nodes = (input: readonly ScenePaintNode[]): ScenePaintNode[] => input.flatMap((node): ScenePaintNode[] => {
       if (node.kind === "draw") return (runMap.get(node.runIndex) ?? []).map(runIndex => ({ ...node, runIndex }));

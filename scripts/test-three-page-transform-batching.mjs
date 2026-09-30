@@ -54,6 +54,23 @@ try {
     let camera=new THREE.OrthographicCamera(-90,90,56.25,-56.25,.1,1000);camera.position.z=300;
     camera.coordinateSystem=backend==='webgpu'?THREE.WebGPUCoordinateSystem:THREE.WebGLCoordinateSystem;camera.updateProjectionMatrix();
     const frame=()=>{camera.updateMatrixWorld();scene.updateMatrixWorld(true);scene.onBeforeRender(host,scene,camera,null);};
+    frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','pages in the loaded layout draw as the document itself');
+    assert(pdf.materialPipelineActive && pdf.pageMesh.visible && !pdf.pageBatch.visible,'the document pipeline replaces page batches');
+    assert(pages.every(p=>!p.materialPipelineActive && p.pageMesh.parent===null),'dormant pages keep depth rectangles out of the scene graph');
+    pages[3].setVectorColorOverride(1,0,0,1);frame();
+    assert.equal(pdf.getPageBatchingStats().reason,'page-appearance','a page-level appearance change leaves document drawing');
+    pages[3].setVectorColorOverride(0,0,0,0);frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document');
+    const loaded=pages.map(p=>p.position.clone());
+    pages[5].position.z=.001;frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','any page movement uses page rendering');
+    assert(!pdf.pageMesh.visible && pdf.pageBatch.visible);
+    pages[5].position.copy(loaded[5]);frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','returning to the loaded layout restores document drawing');
+    pdf.setSearchHighlights(pdf.searchText('page'),{currentIndex:0});frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','page overlays follow document drawing');
+    pdf.setSearchHighlights(null);
     for(const [i,p] of pages.entries()) {p.rotation.set(.06*(i%3),-.04*(i%4),.02*(i%2));p.scale.set(i%2?-0.85:0.85,.9,1);p.position.z=i*.4;}
     frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched',JSON.stringify(pdf.getPageBatchingStats()));
@@ -117,12 +134,24 @@ try {
     pages[0].rotation.set(0,0,0);pages[0].scale.set(1,1,1);pages[0].position.z=0;
     pages[1].position.copy(pages[0].position);pages[1].rotation.set(0,0,0);pages[1].scale.set(1,1,1);pages[1].position.z=15;
     frame();assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','opaque depth-separated pages stay batched');
+    pages[1].position.z=0;frame();
+    assert.equal(pdf.getPageBatchingStats().reason,'overlapping-page-paints','coplanar overlaps need page order');
+    assert.equal(pdf.getPageOverlapMode(),'exact');
+    pdf.setPageOverlapMode('fast');frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','fast overlap mode keeps coplanar pages batched');
+    assert(pdf.isPaintOrderApproximated(),'fast overlaps report approximate paint order');
+    pdf.setPageOverlapMode('bogus');assert.equal(pdf.getPageOverlapMode(),'exact','unknown overlap modes are exact');
+    pages[1].position.z=15;frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'pages-batched');
     pdf.setSelection([{kind:'stroke',index:0},{kind:'stroke',index:1}]);frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','interaction overlays retain content batching');
     assert(pages[0].renderOrder<pages[1].renderOrder,'overlays retain back-to-front page order');
     pdf.setSelection([]);
     pdf.setPageBackgroundColor(1,1,1,.5);frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-separate','translucent overlap needs ordered page rendering');
+    pdf.setPageOverlapMode('fast');frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'pages-separate','fast overlap mode keeps translucent page order');
+    pdf.setPageOverlapMode('exact');
     assert.equal(batch.visible,false);assert(pages[0].materialPipelineActive);
     await pdf.setPageTransform(1,saved);pdf.setPageBackgroundColor(1,1,1,1);frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','safe pages rejoin existing batches');
@@ -134,6 +163,11 @@ try {
     await pdf.setPageTransform(4,shear);frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','explicit affine matrices retain batching');
     assert(pages[4].matrix.equals(shear));
+    for(const [i,p] of pages.entries()) {p.matrixAutoUpdate=true;p.position.copy(loaded[i]);p.rotation.set(0,0,0);p.scale.set(1,1,1);}
+    frame();assert.equal(pdf.getPageBatchingStats().mode,'document');
+    pdf.setPrimitiveOverrides([{kind:'stroke',index:0}],{color:'yellow'});frame();
+    assert.notEqual(pdf.getPageBatchingStats().mode,'document','colors applied after preparation reach only the pages');
+    pdf.clearPrimitiveOverrides();
     let freed=0;table.matrices.addEventListener('dispose',()=>freed++);pdf.dispose();
     assert.equal(freed,1);assert.equal(disposals,1);
     assert.deepEqual(source,canonical);
@@ -189,6 +223,50 @@ try {
       raster.dispose();gradient.dispose();table.dispose();
     }
   }
+  {
+    // Page layouts in 3D: opaque pages whose screen boxes and depth ranges
+    // overlap still share batches wherever depth orders them exactly.
+    const partition=new ScenePageViews(composeVectorScenesInGrid([page,page],2)),table=new ThreePageTransforms(partition);
+    const viewport={width:800,height:600};
+    const camera=new THREE.PerspectiveCamera(50,viewport.width/viewport.height,50,400);camera.position.z=100;camera.updateMatrixWorld();
+    const views=[0,1].map(i=>partition.extract(i));
+    const place=(model,{distance=100,paint,opaque=true}={})=>(view=>{
+      const center=new THREE.Matrix4().makeTranslation(-(view.scene.pageBounds.minX+view.scene.pageBounds.maxX)/2,-(view.scene.pageBounds.minY+view.scene.pageBounds.maxY)/2,0);
+      camera.position.z=distance;camera.updateMatrixWorld();
+      const dataToDocument=model.clone().multiply(center);
+      return {...view,paintBounds:paint?.(view.scene.pageBounds)??view.paintBounds,dataToDocument,opaque,visible:true,
+        dataToClip:camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse).multiply(dataToDocument)};
+    });
+    const layout=(a,b,options={},approximate=false)=>updateThreePageBatchFrame(table,[place(a,options)(views[0]),place(b,options)(views[1])],viewport,-1,approximate);
+    const tilt=(angle,x=0,z=0)=>new THREE.Matrix4().makeRotationY(angle).setPosition(x,0,z);
+    const normal=new THREE.Vector3(Math.sin(.6),0,Math.cos(.6));
+    const behind=(offset,lateral)=>tilt(.6).setPosition(normal.clone().multiplyScalar(-offset).add(new THREE.Vector3(Math.cos(.6)*lateral,0,-Math.sin(.6)*lateral)));
+    let result=layout(tilt(.6),behind(3,5));
+    assert.deepEqual([result.reason,result.approximated],[null,false],'tilted stacked sheets are depth separated despite overlapping depth ranges');
+    result=layout(tilt(.6),behind(0,5));
+    assert.equal(result.reason,'overlapping-page-paints','coplanar overlapping sheets keep page order');
+    result=layout(tilt(.6),behind(0,5),{},true);
+    assert.deepEqual([result.reason,result.approximated],[null,true],'approximate overlaps batch coplanar sheets and report it');
+    result=layout(tilt(.6),behind(3,5),{opaque:false},true);
+    assert.equal(result.reason,'overlapping-page-paints','translucent overlaps always keep page order');
+    result=layout(tilt(.7),tilt(-.7));
+    assert.deepEqual([result.reason,result.approximated],[null,false],'steeply crossing sheets resolve by depth outside the crossing line');
+    result=layout(tilt(0),tilt(.002));
+    assert.equal(result.reason,'overlapping-page-paints','shallow crossings keep page order');
+    const far=tilt(.6).setPosition(0,0,0);
+    // A near plane just in front of distant content keeps their depth apart;
+    // the sheets are further apart than a pixel of their depth slope.
+    camera.near=19900;camera.far=20200;camera.updateProjectionMatrix();
+    result=layout(far,behind(60,5),{distance:20000});
+    assert.deepEqual([result.reason,result.approximated],[null,true],'thumbnail antialiasing may reach past a sheet, reported as approximate');
+    camera.near=50;camera.far=400;camera.updateProjectionMatrix();
+    const bleed=bounds=>({minX:bounds.minX-4,minY:bounds.minY,maxX:bounds.maxX,maxY:bounds.maxY});
+    result=layout(tilt(.6),behind(3,5),{paint:bleed});
+    assert.equal(result.reason,'overlapping-page-paints','paint outside an overlapping sheet keeps page order');
+    result=layout(tilt(.6),behind(3,5),{paint:bleed},true);
+    assert.deepEqual([result.reason,result.approximated],[null,true]);
+    table.dispose();
+  }
   const {ThreeVectorLodStrokeLayer}=await import('../src/vectorStrokeLod.ts');
   const {ThreeVectorDrawPlan}=await import('../src/threeVectorDrawPlan.ts');
   const densePage=structuredClone(page);
@@ -223,7 +301,7 @@ try {
     assert.equal(table.revision,revision,'depth-only motion does not invalidate text selection');
     layer.dispose();table.dispose();
   }
-  console.log('Page table materials: clipped rasters/strips, axial and mesh gradients, gradient strokes, LOD owners and near-plane fallback passed.');
+  console.log('Page table materials: clipped rasters/strips, axial and mesh gradients, gradient strokes, LOD owners, 3D overlap eligibility and near-plane fallback passed.');
 } finally {hooks.deregister();globalThis.document=previousDocument;}
 function build(material,geometry) {
   const renderer={contextNode:TSL.context({}),library:{fromMaterial:v=>v},getRenderTarget:()=>null,getMRT:()=>null,

@@ -32,6 +32,15 @@ import {
 } from "./exampleManifest";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import {
+  applyExamplePageLayout,
+  computeExamplePageLayout,
+  interpolateExamplePageLayout,
+  ExamplePageLayoutAnimator,
+  type ExamplePageLayout,
+  type ExamplePageLayoutPage,
+  type ExamplePageLayoutTarget
+} from "./examplePageLayouts";
 import { createThreePdfObject } from "./threePdfObject";
 import { reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import { formatLoadProgressStage } from "./loadProgress";
@@ -95,6 +104,11 @@ const textSearchCount = document.querySelector<HTMLSpanElement>("#text-search-co
 const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-search-prev");
 const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
 const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
+const pageLayoutRow = document.querySelector<HTMLDivElement>("#page-layout-row");
+const pageLayoutProgress = document.querySelector<HTMLSpanElement>("#page-layout-progress");
+const pageLayoutProgressBar = document.querySelector<HTMLProgressElement>("#page-layout-progress-bar");
+const pageLayoutProgressText = document.querySelector<HTMLSpanElement>("#page-layout-progress-text");
+const pageLayoutButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("#page-layout-row button[data-page-layout]"));
 
 if (
   !canvas ||
@@ -142,7 +156,11 @@ if (
   !textSearchCount ||
   !textSearchPrevButton ||
   !textSearchNextButton ||
-  !textSearchCaseButton
+  !textSearchCaseButton ||
+  !pageLayoutRow ||
+  !pageLayoutProgress ||
+  !pageLayoutProgressBar ||
+  !pageLayoutProgressText
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -185,6 +203,10 @@ const textSearchCountElement = textSearchCount;
 const textSearchPrevButtonElement = textSearchPrevButton;
 const textSearchNextButtonElement = textSearchNextButton;
 const textSearchCaseButtonElement = textSearchCaseButton;
+const pageLayoutRowElement = pageLayoutRow;
+const pageLayoutProgressElement = pageLayoutProgress;
+const pageLayoutProgressBarElement = pageLayoutProgressBar;
+const pageLayoutProgressTextElement = pageLayoutProgressText;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 const drawCallMeter = createDrawCallMeter(drawCallsValue, { signal: lifetimeSignal });
@@ -197,6 +219,9 @@ const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
 const CAMERA_CLIP_MARGIN_MULTIPLIER = 3.5;
 const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
+const PAGE_LAYOUT_DURATION_MS = 2000;
+/** Sub-pixel first step of a transition, rendered once to warm page batches. */
+const PAGE_LAYOUT_WARM_UP_PROGRESS = 1e-3;
 const NATIVE_CLEAR_COLOR_R = 160 / 255;
 const NATIVE_CLEAR_COLOR_G = 169 / 255;
 const NATIVE_CLEAR_COLOR_B = 175 / 255;
@@ -205,6 +230,9 @@ const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
 const tempViewDirection = new THREE.Vector3();
 const tempClipDelta = new THREE.Vector3();
+const tempClipForward = new THREE.Vector3();
+const tempPageMatrix = new THREE.Matrix4();
+const unitScale = new THREE.Vector3(1, 1, 1);
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 
@@ -240,6 +268,21 @@ updatePerspectiveCameraProjection();
 let controls = createMapControls();
 
 let currentPdfObject: HeprThreePdfObject | null = null;
+
+/** Page views of the current document, prepared once it first leaves the grid. */
+interface PageLayoutView {
+  object: HeprThreePdfObject;
+  pages: readonly HeprThreePdfObject[];
+  layoutPages: ExamplePageLayoutPage[];
+  layout: ExamplePageLayout;
+  targets: ExamplePageLayoutTarget[];
+}
+
+let activePageLayout: ExamplePageLayout = "grid";
+let pageLayoutView: PageLayoutView | null = null;
+let pageLayoutRequest = 0;
+let pageLayoutWarmingUp = false;
+const pageLayoutAnimator = new ExamplePageLayoutAnimator();
 
 // Drawing selection always starts off, even if the browser restores form state.
 textSelectionCheckboxElement.disabled = false;
@@ -530,6 +573,9 @@ function renderFrame(now: number = performance.now()): void {
   updateFpsMeter(now);
   const profile = captureProfiler?.enabled ? captureProfiler : null;
   profile?.beginFrame(now);
+  const pageLayoutAnimating = pageLayoutAnimator.update(now);
+  // Crossing pages keep shared batches while moving; the settled layout is exact.
+  pageLayoutView?.object.setPageOverlapMode(pageLayoutAnimating || pageLayoutWarmingUp ? "fast" : "exact");
   profile?.beginSection("controls");
   const controlsChanged = controls.update();
   updateCameraClipping();
@@ -561,7 +607,7 @@ function renderFrame(now: number = performance.now()): void {
   resolveRenderedFrameWaiters();
   profile?.endFrame();
   if (profile && !profile.enabled) { captureGlCalls?.dispose(); captureGlCalls = null; }
-  if (controlsChanged) {
+  if (controlsChanged || pageLayoutAnimating) {
     requestRender();
   }
 }
@@ -718,6 +764,173 @@ textSelectionCheckboxElement.addEventListener("change", () => {
   }
   setStatus(`Text selection ${textSelectionCheckboxElement.checked ? "enabled" : "disabled"}.`);
 }, { signal: lifetimeSignal });
+
+for (const button of pageLayoutButtons) {
+  button.addEventListener("click", () => {
+    void setPageLayout(readPageLayout(button.dataset.pageLayout));
+  }, { signal: lifetimeSignal });
+}
+
+// --- Page layouts: demo of the public per-page transform API. ---
+// `getPages()` returns one THREE.Group per page, centered on the page and
+// positioned in the loaded layout. The example tweens their ordinary
+// position/quaternion from the render loop, like three.js' css3d periodic table.
+async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
+  const pdfObject = currentPdfObject;
+  if (!pdfObject || pdfObject.pageCount <= 1) {
+    return;
+  }
+  const request = ++pageLayoutRequest;
+  activePageLayout = layout;
+  syncPageLayoutControls();
+  // Grid is the loaded layout. A document that never left it keeps its
+  // ordinary document rendering path instead of preparing page views.
+  if (!pageLayoutView && layout === "grid") {
+    setStatus("Page layout set to Grid.");
+    return;
+  }
+  try {
+    let warmUp = false;
+    if (!pageLayoutView) {
+      setStatus(`Preparing ${pdfObject.pageCount.toLocaleString()} pages...`);
+      // Preparation is shared by overlapping requests and reports until it settles.
+      const stopProgress = pdfObject.subscribePagePreparationProgress(setPageLayoutProgress);
+      let pages: readonly HeprThreePdfObject[];
+      try {
+        pages = await pdfObject.getPages({ signal: lifetimeSignal });
+      } finally {
+        stopProgress();
+      }
+      if (request !== pageLayoutRequest || pdfObject !== currentPdfObject) {
+        return;
+      }
+      pageLayoutView = createPageLayoutView(pdfObject, pages);
+      warmUp = true;
+    }
+    const view = pageLayoutView;
+    const loaded = view.targets;
+    view.layout = layout;
+    view.targets = computeExamplePageLayout(layout, view.layoutPages);
+    includePageLayoutInClipRange(view);
+    if (warmUp) {
+      // Pages in the loaded layout draw as the document itself. Leaving it
+      // switches to shared page batches, whose first frame compiles shaders
+      // and uploads data. Take that frame a hair into the transition, so the
+      // transition itself then plays in full.
+      applyExamplePageLayout(view.pages, interpolateExamplePageLayout(loaded, view.targets, PAGE_LAYOUT_WARM_UP_PROGRESS));
+      pageLayoutWarmingUp = true;
+      setPageLayoutProgress(100);
+      try {
+        await waitForNextRenderedFrame(loadToken);
+      } finally {
+        pageLayoutWarmingUp = false;
+        setPageLayoutProgress(null);
+      }
+      if (request !== pageLayoutRequest || pdfObject !== currentPdfObject) {
+        return;
+      }
+    }
+    pageLayoutAnimator.animate(view.pages, view.targets, PAGE_LAYOUT_DURATION_MS);
+    setStatus(`Page layout set to ${formatPageLayout(layout)}.`);
+    requestRender();
+  } catch (error) {
+    if (request !== pageLayoutRequest || pdfObject !== currentPdfObject) {
+      return;
+    }
+    // Page views are only missing here, so the document is still on its grid.
+    activePageLayout = "grid";
+    syncPageLayoutControls();
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to prepare pages: ${message}`);
+  }
+}
+
+function createPageLayoutView(object: HeprThreePdfObject, pages: readonly HeprThreePdfObject[]): PageLayoutView {
+  const rects = object.sceneData.pageRects;
+  // Fresh page views still hold the loaded layout.
+  const layoutPages = pages.map((page, index) => ({
+    gridPosition: page.position.clone(),
+    width: readPageExtent(rects[index * 4 + 2] - rects[index * 4]),
+    height: readPageExtent(rects[index * 4 + 3] - rects[index * 4 + 1])
+  }));
+  return { object, pages, layoutPages, layout: "grid", targets: computeExamplePageLayout("grid", layoutPages) };
+}
+
+/**
+ * Keep every page inside the clipping sphere. Transitions interpolate between
+ * two arrangements that are both inside it, so they stay inside too.
+ */
+function includePageLayoutInClipRange(view: PageLayoutView): void {
+  let radius = currentContentRadius;
+  view.targets.forEach((target, index) => {
+    const page = view.layoutPages[index];
+    const center = view.object.localToWorld(tempClipDelta.copy(target.position));
+    radius = Math.max(radius, center.distanceTo(currentContentCenter) + Math.hypot(page.width, page.height) / 2);
+  });
+  updateClipAnchor(currentContentCenter, radius);
+  updateCameraClipping(true);
+}
+
+/** Give a backend replacement the current arrangement before it is shown. */
+async function preparePageLayoutReplacement(
+  nextObject: HeprThreePdfObject,
+  signal: AbortSignal
+): Promise<PageLayoutView | null> {
+  if (activePageLayout === "grid" || nextObject.pageCount <= 1) {
+    return null;
+  }
+  const stopProgress = nextObject.subscribePagePreparationProgress(setPageLayoutProgress);
+  try {
+    const view = createPageLayoutView(nextObject, await nextObject.getPages({ signal }));
+    view.layout = activePageLayout;
+    view.targets = computeExamplePageLayout(activePageLayout, view.layoutPages);
+    applyExamplePageLayout(view.pages, view.targets);
+    return view;
+  } catch (error) {
+    signal.throwIfAborted();
+    // Switching the renderer matters more than the arrangement; use the grid.
+    console.warn("[Three Example] Failed to restore page layout:", error);
+    return null;
+  } finally {
+    stopProgress();
+    setPageLayoutProgress(null);
+  }
+}
+
+/** Page views belong to one object: a replacement brings its own or starts on the grid. */
+function resetPageLayout(view: PageLayoutView | null = null): void {
+  pageLayoutAnimator.cancel();
+  pageLayoutRequest += 1;
+  pageLayoutView = view;
+  activePageLayout = view?.layout ?? "grid";
+  syncPageLayoutControls();
+}
+
+function setPageLayoutProgress(percentage: number | null): void {
+  pageLayoutProgressElement.hidden = percentage === null;
+  if (percentage === null) return;
+  pageLayoutProgressBarElement.value = percentage;
+  pageLayoutProgressTextElement.textContent = `${percentage}%`;
+}
+
+function syncPageLayoutControls(): void {
+  pageLayoutRowElement.hidden = (currentPdfObject?.pageCount ?? 0) <= 1;
+  for (const button of pageLayoutButtons) {
+    button.setAttribute("aria-pressed", String(button.dataset.pageLayout === activePageLayout));
+  }
+}
+
+function readPageLayout(value: string | undefined): ExamplePageLayout {
+  return value === "sphere" || value === "helix" ? value : "grid";
+}
+
+function formatPageLayout(layout: ExamplePageLayout): string {
+  return layout === "sphere" ? "Sphere" : layout === "helix" ? "Helix" : "Grid";
+}
+
+function readPageExtent(value: number): number {
+  return Number.isFinite(value) ? Math.max(MIN_OBJECT_EXTENT, Math.abs(value)) : MIN_OBJECT_EXTENT;
+}
 
 window.addEventListener("pointerdown", (event) => {
   if (event.pointerType !== "touch" || touchControlsAvailable) {
@@ -883,10 +1096,26 @@ function flyToMatch(match: HeprTextSearchMatch): void {
   }
   scene.updateMatrixWorld(true);
 
-  const localBounds = match.localBounds;
-  const center = pdfObject.localToWorld(
-    new THREE.Vector3((localBounds.minX + localBounds.maxX) * 0.5, (localBounds.minY + localBounds.maxY) * 0.5, 0)
-  );
+  const view = pageLayoutView?.object === pdfObject && pageLayoutView.layout !== "grid" ? pageLayoutView : null;
+  // localBounds flatten transformed pages onto the document plane. In a page
+  // layout, frame the match where its page is heading and face the page.
+  const localBounds = view ? match.bounds : match.localBounds;
+  let center: THREE.Vector3;
+  if (view) {
+    const target = view.targets[match.pageIndex];
+    const rects = pdfObject.sceneData.pageRects, rect = match.pageIndex * 4;
+    tempPageMatrix.compose(target.position, target.quaternion, unitScale).premultiply(pdfObject.matrixWorld);
+    // Each page's local origin is the center of its page rectangle.
+    center = new THREE.Vector3(
+      (localBounds.minX + localBounds.maxX - rects[rect] - rects[rect + 2]) * 0.5,
+      (localBounds.minY + localBounds.maxY - rects[rect + 1] - rects[rect + 3]) * 0.5,
+      0
+    ).applyMatrix4(tempPageMatrix);
+  } else {
+    center = pdfObject.localToWorld(
+      new THREE.Vector3((localBounds.minX + localBounds.maxX) * 0.5, (localBounds.minY + localBounds.maxY) * 0.5, 0)
+    );
+  }
   const matchWidth = Math.max(localBounds.maxX - localBounds.minX, MIN_OBJECT_EXTENT);
   const matchHeight = Math.max(localBounds.maxY - localBounds.minY, MIN_OBJECT_EXTENT);
 
@@ -905,7 +1134,11 @@ function flyToMatch(match: HeprTextSearchMatch): void {
   const distance =
     currentDistance >= framedDistance * 0.8 && currentDistance <= framedDistance * 6 ? currentDistance : framedDistance;
 
-  tempViewDirection.subVectors(camera.position, controls.target);
+  if (view) {
+    tempViewDirection.set(0, 0, 1).transformDirection(tempPageMatrix);
+  } else {
+    tempViewDirection.subVectors(camera.position, controls.target);
+  }
   if (tempViewDirection.lengthSq() <= 1e-12) {
     tempViewDirection.set(0, 0, 1);
   } else {
@@ -1271,7 +1504,9 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
 
     await layerControls.prepareReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
-    replacePdfObject(nextObject, { fitCamera: false });
+    const pageLayoutReplacement = await preparePageLayoutReplacement(nextObject, controller.signal);
+    controller.signal.throwIfAborted();
+    replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement });
     targetInstalled = true;
     const installedObject = nextObject;
     nextObject = null;
@@ -1340,7 +1575,10 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   }
 }
 
-function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?: boolean } = {}): void {
+function replacePdfObject(
+  nextObject: HeprThreePdfObject,
+  options: { fitCamera?: boolean; pageLayoutView?: PageLayoutView | null } = {}
+): void {
   const previousObject = currentPdfObject;
   const sameScene = previousObject?.sceneData === nextObject.sceneData;
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
@@ -1351,6 +1589,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
+  resetPageLayout(options.pageLayoutView);
   layerControls.objectChanged();
   scene.add(nextObject);
   resetFpsMeter();
@@ -1392,6 +1631,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   const clearMetrics = options.clearMetrics !== false;
   const previousObject = currentPdfObject;
   currentPdfObject = null;
+  resetPageLayout();
   layerControls.objectChanged();
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
@@ -1436,6 +1676,9 @@ function setLoadControlsEnabled(enabled: boolean): void {
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
+  for (const button of pageLayoutButtons) {
+    button.disabled = !enabled;
+  }
 }
 
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
@@ -2093,10 +2336,16 @@ function updateCameraClipping(force = false): void {
   const targetOffset = tempClipDelta.subVectors(currentContentCenter, controls.target).length();
   const span = Math.max(MIN_OBJECT_EXTENT, currentContentRadius + targetOffset);
   const margin = span * CAMERA_CLIP_MARGIN_MULTIPLIER;
+  // No content is nearer than the clip sphere's closest view depth. Keeping the
+  // near plane just in front of it preserves depth precision for 3D page layouts.
+  const contentDepth = distanceToTarget > 0
+    ? tempClipDelta.subVectors(currentContentCenter, camera.position)
+      .dot(tempClipForward.subVectors(controls.target, camera.position)) / distanceToTarget - currentContentRadius
+    : 0;
 
   const nextNear = Math.max(
     CAMERA_CLIP_NEAR_MIN,
-    Math.min(distanceToTarget * 0.5, distanceToTarget - margin)
+    Math.min(distanceToTarget * 0.5, Math.max(distanceToTarget - margin, contentDepth * 0.9))
   );
   const nextFar = Math.max(nextNear + 10, distanceToTarget + margin);
 

@@ -284,6 +284,8 @@ export { createLayerVisibilityController } from "./layerVisibility";
 export type { LayerVisibilityController, LayerVisibilityOptions } from "./layerVisibility";
 export { createPdfLayerControls } from "./pdfLayerControls";
 export type { PdfLayerControlsOptions } from "./pdfLayerControls";
+export { createPdfAnnotationControls } from "./pdfAnnotationControls";
+export type { PdfAnnotationControls, PdfAnnotationControlsController, PdfAnnotationControlsOptions } from "./pdfAnnotationControls";
 export { createThreePdfLayerControls } from "./threePdfLayerControls";
 export type { ThreePdfLayerControlsOptions } from "./threePdfLayerControls";
 export { isSceneTextCharVisible } from "./optionalContentText";

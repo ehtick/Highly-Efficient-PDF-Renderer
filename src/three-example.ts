@@ -7,6 +7,7 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
   buildHep,
+  createPdfAnnotationControls,
   createThreePrimitiveInteractionController,
   createThreePdfLayerControls,
   createTextSelectionController,
@@ -67,6 +68,7 @@ const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rot
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
+const pdfAnnotationsContainer = document.querySelector<HTMLDivElement>("#pdf-annotations");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -114,6 +116,7 @@ if (
   !textSelectionCheckbox ||
   !drawingSelectionContainer ||
   !pdfLayersContainer ||
+  !pdfAnnotationsContainer ||
   !touchRotateRow ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -323,7 +326,8 @@ const annotationOverlay = createAnnotationOverlay({
     getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
     clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvasElement) ?? null,
     sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement) ?? null,
-    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+    isAnnotationEnabled: annotation => annotationControls.isAnnotationEnabled(annotation)
   },
   onActivate: annotation => linkNavigation.activate(annotation),
   getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
@@ -344,6 +348,16 @@ const layerControls = createThreePdfLayerControls({
     drawingSelection.onFrame();
     annotationOverlay.onFrame();
   }
+});
+const annotationControls = createPdfAnnotationControls({
+  container: pdfAnnotationsContainer,
+  controller: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    getAnnotationLayers: () => currentPdfObject?.getAnnotationLayers() ?? [],
+    setAnnotationVisibility: (ids, visible) =>
+      currentPdfObject?.setAnnotationVisibility(ids, visible) ?? Promise.reject(new Error("No PDF is loaded."))
+  },
+  onChange: () => annotationOverlay.onFrame()
 });
 
 initializeBackendSelect();
@@ -1060,6 +1074,7 @@ function disposeExample(): void {
   captureProfiler?.dispose();
   captureProfiler = null;
   layerControls.dispose();
+  annotationControls.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
   linkNavigation.dispose();
@@ -1352,6 +1367,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
     finally { releasePdfObject(previousObject!); }
   } else drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
+  annotationControls.sceneChanged();
   updateDrawStatsMeter();
   setDownloadDataButtonState(true);
   refreshSearchAvailability();
@@ -1379,6 +1395,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   layerControls.objectChanged();
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
+  annotationControls.sceneChanged();
   releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {

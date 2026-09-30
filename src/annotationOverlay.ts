@@ -10,6 +10,11 @@ export interface AnnotationOverlayAdapter {
   sceneToClientPoint(sceneX: number, sceneY: number): AnnotationPoint | null;
   /** For example, while drawing selection is enabled or a text selection is active. */
   isInteractionSuppressed?(): boolean;
+  /**
+   * Return false to leave an annotation out of hover, bubbles and activation,
+   * for example while the host shows it as turned off.
+   */
+  isAnnotationEnabled?(annotation: SceneAnnotation): boolean;
 }
 export interface AnnotationOverlayOptions {
   getCanvas(): HTMLCanvasElement | null;
@@ -85,7 +90,7 @@ export function pickSceneAnnotation(scene: VectorScene, clientX: number, clientY
   const snapshot = adapter.getOptionalContentVisibility?.();
   let best: SceneAnnotation | null = null, bestArea = Infinity;
   for (const a of scene.annotations ?? []) {
-    if (!visible(a, scene, snapshot) || !insidePage(scene, a.pageIndex, point)) continue;
+    if (!visible(a, scene, snapshot) || adapter.isAnnotationEnabled?.(a) === false || !insidePage(scene, a.pageIndex, point)) continue;
     const b = a.bounds;
     let hit = false, area = (b.maxX - b.minX) * (b.maxY - b.minY);
     if (a.quadPoints?.length) {
@@ -202,9 +207,12 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     if (scene !== next) { hide(); clearPointer(); gesture = null; pointers.clear(); scene = next; }
   }
   function suppressed(): boolean { return !enabled || disposed || !!adapter.isInteractionSuppressed?.(); }
+  function shown(annotation: SceneAnnotation): boolean {
+    return !!scene && visible(annotation, scene, adapter.getOptionalContentVisibility?.()) && adapter.isAnnotationEnabled?.(annotation) !== false;
+  }
   function position(): void {
     if (!active || !scene) return;
-    if (suppressed() || !visible(active, scene, adapter.getOptionalContentVisibility?.())) { hide(); return; }
+    if (suppressed() || !shown(active)) { hide(); return; }
     const b = active.bounds, offset = active.pageIndex * 4, rects = scene.pageRects;
     const minX = Math.max(b.minX, rects[offset]), maxX = Math.min(b.maxX, rects[offset + 2]);
     const minY = Math.max(b.minY, rects[offset + 1]), maxY = Math.min(b.maxY, rects[offset + 3]);
@@ -307,7 +315,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   window.addEventListener("pointercancel", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, eventOptions);
   window.addEventListener("keydown", event => {
     sceneChanged();
-    if (active && scene && !visible(active, scene, adapter.getOptionalContentVisibility?.())) hide();
+    if (active && !shown(active)) hide();
     if (event.key === "Escape" && active) { const focused = panel.contains(document.activeElement); clearPointer(); hide(); if (focused) options.getCanvas()?.focus(); }
     else if (event.key === "Enter" && event.target === options.getCanvas() && active && !suppressed()) {
       event.preventDefault();
@@ -322,7 +330,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   panel.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });
   activate.addEventListener("click", () => {
     sceneChanged();
-    if (active && !isLink(active) && scene && !suppressed() && visible(active, scene, adapter.getOptionalContentVisibility?.()) &&
+    if (active && !isLink(active) && !suppressed() && shown(active) &&
       options.onActivate?.(active)) { clearPointer(); hide(); options.getCanvas()?.focus(); }
   }, { signal: lifetime.signal });
   close.addEventListener("click", () => { clearPointer(); hide(); options.getCanvas()?.focus(); }, { signal: lifetime.signal });
@@ -332,7 +340,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     isEnabled: () => enabled && !disposed,
     show(annotation) {
       sceneChanged();
-      if (!suppressed() && scene?.annotations?.includes(annotation) &&
+      if (!suppressed() && scene?.annotations?.includes(annotation) && adapter.isAnnotationEnabled?.(annotation) !== false &&
         (!isLink(annotation) || pointer && pickSceneAnnotation(scene, pointer.x, pointer.y, adapter) === annotation)) display(annotation, true);
     },
     hide() { clearPointer(); hide(); }, onFrame, sceneChanged,

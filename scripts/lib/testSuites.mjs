@@ -41,6 +41,7 @@ export const fastTests = [
   "fill-area-coverage",
   "projected-coverage-margin",
   "pdf-layer-controls",
+  "pdf-annotation-controls",
   "raster-layer-updates",
   "raster-strip-batches",
   "webgl-raster-strip-batches",

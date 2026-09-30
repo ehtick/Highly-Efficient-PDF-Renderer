@@ -87,6 +87,7 @@ try {
     annotationBubblesCheckbox: { checked: true },
     drawingSelection: { isEnabled: () => false },
     textSelection: { getSelectedText: () => "" },
+    annotationControls: { isAnnotationEnabled: () => true },
     fixtureScene: scene,
     fixtureRenderer: { getOptionalContentVisibility: () => visibility,
       clientToScenePoint: adapter.clientToScenePoint, sceneToClientPoint: adapter.sceneToClientPoint }
@@ -273,5 +274,23 @@ try {
   event("keydown", 0, 0, { key: "Enter" });
   assert.equal(passivePanel.hidden, true);
   passive.dispose();
-  console.log("Annotation overlay: precise picking, safe HTML text, pinning, pointer-following links, cursor ownership, gestures, visibility, projection and lifecycle passed.");
+  // Annotations the host has turned off, as in the example Annotations panel.
+  const turnedOff = new Set([annotations[1].id]), activated = [];
+  const hostAdapter = { ...adapter, isAnnotationEnabled: a => !turnedOff.has(a.id) };
+  assert.equal(pickSceneAnnotation(scene, 20, 20, hostAdapter), annotations[0], "turned-off annotations leave hits to annotations underneath");
+  const hosted = createAnnotationOverlay({ getCanvas: () => canvas, adapter: hostAdapter,
+    onActivate: a => { activated.push(a); return a === annotations[1]; } });
+  const hostedPanel = document.body.children[0];
+  event("pointerdown"); event("pointerup");
+  assert.deepEqual(activated, [annotations[0]], "a turned-off link is never activated");
+  assert.equal(hostedPanel.hidden, false); assert(text(hostedPanel).includes("Comment 0"));
+  turnedOff.add(annotations[0].id); hosted.onFrame(); window.frame();
+  assert.equal(hostedPanel.hidden, true, "turning an annotation off dismisses its pinned bubble");
+  hosted.show(annotations[0]); assert.equal(hostedPanel.hidden, true, "show() skips turned-off annotations");
+  event("pointermove"); window.frame();
+  assert.equal(hasPointerCursor(), false, "turned-off annotations have no pointer cursor");
+  turnedOff.clear(); event("pointermove"); window.frame();
+  assert.equal(hasPointerCursor(), true); assert.equal(hostedPanel.hidden, false, "turning it back on restores hover");
+  hosted.dispose();
+  console.log("Annotation overlay: precise picking, safe HTML text, pinning, pointer-following links, cursor ownership, gestures, visibility, host-disabled annotations, projection and lifecycle passed.");
 } finally { hooks.deregister(); }

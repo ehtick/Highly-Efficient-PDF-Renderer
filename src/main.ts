@@ -5,6 +5,7 @@ import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
 import { createLayerVisibilityController } from "./layerVisibility";
 import { createPdfLayerControls } from "./pdfLayerControls";
+import { createPdfAnnotationControls } from "./pdfAnnotationControls";
 import { waitForLoad } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
@@ -268,6 +269,7 @@ textSearchController = createTextSearchController({
 function applyTextSearchScene(scene: VectorScene): void {
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
+  annotationControls.sceneChanged();
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
   textSearchController.setScene(scene);
@@ -345,7 +347,8 @@ const annotationOverlay = createAnnotationOverlay({
     getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
     clientToScenePoint: (x, y) => renderer.clientToScenePoint?.(x, y) ?? null,
     sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
-    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+    isAnnotationEnabled: annotation => annotationControls.isAnnotationEnabled(annotation)
   },
   onActivate: annotation => linkNavigation.activate(annotation),
   getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
@@ -368,6 +371,15 @@ const layerVisibility = createLayerVisibilityController({
 });
 const pdfLayerControls = createPdfLayerControls({
   container: document.querySelector<HTMLDivElement>("#pdf-layers")!, controller: layerVisibility
+});
+const annotationControls = createPdfAnnotationControls({
+  container: document.querySelector<HTMLDivElement>("#pdf-annotations")!,
+  controller: {
+    getScene: () => lastParsedScene,
+    getAnnotationLayers: () => layerVisibility.getAnnotationLayers(),
+    setAnnotationVisibility: (ids, visible) => layerVisibility.setAnnotationVisibility(ids, visible)
+  },
+  onChange: () => annotationOverlay.onFrame()
 });
 
 let lastRuntimeTextUpdate = -Infinity;
@@ -626,6 +638,7 @@ window.addEventListener("beforeunload", () => {
   annotationOverlay.dispose();
   linkNavigation.dispose();
   pdfLayerControls.dispose();
+  annotationControls.dispose();
   layerVisibility.dispose();
   activeHepExportController?.abort();
   sourceLoadController?.abort();

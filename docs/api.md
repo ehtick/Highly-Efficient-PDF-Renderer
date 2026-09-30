@@ -373,7 +373,9 @@ const bubbles = createAnnotationOverlay({
       pdf.clientToScenePoint(camera, x, y, renderer.domElement),
     sceneToClientPoint: (x, y) =>
       pdf.sceneToClientPoint(camera, x, y, renderer.domElement),
-    isInteractionSuppressed: () => drawingSelectionEnabled
+    isInteractionSuppressed: () => drawingSelectionEnabled,
+    // Optional: leave annotations the user turned off out of hover and activation.
+    isAnnotationEnabled: annotation => !turnedOff.has(annotation.id)
   },
   // Optional: replace the bubble body while keeping its lifecycle and controls.
   renderContent(annotation, container) {
@@ -409,6 +411,10 @@ Call `enable()` / `disable()` for a toggle, or `show(annotation)` /
 `hide()` for an accessible host-provided annotation list. Call `onFrame()`
 after visibility changes even when the camera is idle. Use
 `isInteractionSuppressed` to give drawing or active text selection precedence.
+Return `false` from `isAnnotationEnabled(annotation)` to leave an annotation out
+of hover, previews, pinning, `show()`, activation and `pickSceneAnnotation`;
+annotations underneath it can then be picked. A pinned bubble closes at the next
+`onFrame()`.
 
 Supply `onActivate(annotation)` to handle a click, tap or Enter on the canvas.
 Return `true` when handled to dismiss the bubble; return `false` to keep the
@@ -524,6 +530,48 @@ so use it for user actions rather than per-frame effects.
 NoZoom and NoRotate appearances, including most sticky-note icons, keep their
 page geometry and scale with the page instead of forcing the page into a
 raster; `annotation.view-transform-approximated` reports this.
+
+`createPdfAnnotationControls({ container, controller, onChange? })` mounts the
+reusable **Annotations** panel used by all three demos. It lists every annotation
+except popups and Invisible, Hidden or NoView annotations, each with a checkbox.
+Turning one off hides its appearance through `controller.setAnnotationVisibility`.
+Annotations without an appearance layer, such as most links, are turned off only
+in the panel's own state. `isAnnotationEnabled(annotation | id)` reports that state
+for every annotation; pass it to the bubble overlay so turned-off annotations stop
+responding too:
+
+```ts
+import { createAnnotationOverlay, createPdfAnnotationControls } from "@soadzoor/hepr";
+
+const annotations = createPdfAnnotationControls({
+  container: document.querySelector<HTMLElement>("#pdf-annotations")!,
+  controller: {
+    getScene: () => currentPdf?.sceneData ?? null,
+    getAnnotationLayers: () => currentPdf?.getAnnotationLayers() ?? [],
+    setAnnotationVisibility: (ids, visible) =>
+      currentPdf?.setAnnotationVisibility(ids, visible) ?? Promise.reject(new Error("No PDF is loaded."))
+  },
+  onChange: () => bubbles.onFrame()
+});
+const bubbles = createAnnotationOverlay({
+  getCanvas: () => renderer.domElement,
+  adapter: { /* ... */ isAnnotationEnabled: annotation => annotations.isAnnotationEnabled(annotation) }
+});
+
+// After replacing the document, its renderer or its PDF object (including null):
+annotations.sceneChanged();
+// At host teardown:
+annotations.dispose();
+```
+
+For native views, pass `getAnnotationLayers` and `setAnnotationVisibility` from
+`createLayerVisibilityController()`. `sceneChanged()` resets the panel when
+`getScene()` returns a different scene object, starting from the applied
+appearance state. For the same scene, as after a backend switch, it reapplies the
+panel's choices to the new renderer. With a filter active, **All** affects only the
+matching annotations. A failed change shows an error in the panel and returns the
+checkbox to the applied state. The panel exposes CSS classes under
+`.pdf-annotations`; `pdfLayerControls.css` includes them.
 
 ### Drawing primitives
 

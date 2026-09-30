@@ -5,6 +5,7 @@ import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
+  createPdfAnnotationControls,
   createThreePdfLayerControls,
   createThreePrimitiveInteractionController,
   detectRooms,
@@ -212,7 +213,8 @@ const annotationOverlay = createAnnotationOverlay({
     getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
     clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvas) ?? null,
     sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvas) ?? null,
-    isInteractionSuppressed: () => drawingSelection.isEnabled()
+    isInteractionSuppressed: () => drawingSelection.isEnabled(),
+    isAnnotationEnabled: annotation => annotationControls.isAnnotationEnabled(annotation)
   },
   onActivate: annotation => linkNavigation.activate(annotation),
   getActivationLabel: annotation => linkNavigation.getActivationLabel(annotation),
@@ -227,6 +229,16 @@ const layerControls = createThreePdfLayerControls({
   getPdfObject: () => currentPdfObject,
   requestRender,
   onVisibilityChange: () => { drawingSelection.onFrame(); annotationOverlay.onFrame(); }
+});
+const annotationControls = createPdfAnnotationControls({
+  container: requireElement<HTMLDivElement>("#pdf-annotations"),
+  controller: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    getAnnotationLayers: () => currentPdfObject?.getAnnotationLayers() ?? [],
+    setAnnotationVisibility: (ids, visible) =>
+      currentPdfObject?.setAnnotationVisibility(ids, visible) ?? Promise.reject(new Error("No PDF is loaded."))
+  },
+  onChange: () => annotationOverlay.onFrame()
 });
 
 const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
@@ -603,6 +615,7 @@ async function loadSceneSource(file: File, sourceUrl?: string): Promise<boolean>
     drawingSelection.sceneChanged();
     annotationOverlay.sceneChanged();
     layerControls.objectChanged();
+    annotationControls.sceneChanged();
     setStatus(`${file.name} loaded. Add a TSV overlay.`);
     return true;
   } catch (error) {
@@ -1297,6 +1310,7 @@ function clearCurrentPdfObject(): void {
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
   layerControls.objectChanged();
+  annotationControls.sceneChanged();
   previousPdfObject.renderer.setInteractionViewportProvider(null);
   previousPdfObject.setFrameListener(null);
   scene.remove(previousPdfObject);
@@ -1616,6 +1630,7 @@ function disposeDemo(): void {
   }
   controls.dispose();
   layerControls.dispose();
+  annotationControls.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
   linkNavigation.dispose();

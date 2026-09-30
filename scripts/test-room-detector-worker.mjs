@@ -165,6 +165,7 @@ async function testDemoLifetime() {
       drawCallMeter: { reset() {} },
       drawingSelection: { sceneChanged() {} },
       annotationOverlay: { sceneChanged() {} },
+      annotationControls: { sceneChanged() {} },
       layerControls: { objectChanged() {
         assert.equal(context.currentPdfObject, null);
         assert.equal(pdfDisposed, false, "detach layer subscriptions before releasing the PDF");

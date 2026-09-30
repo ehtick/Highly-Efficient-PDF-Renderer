@@ -670,6 +670,27 @@ Hosts can mount `createThreePdfLayerControls()` for an object that may be replac
 mount `createPdfLayerControls()` directly, or use the
 [layer APIs](api.md#pdf-layers-optional-content) with their own controls.
 
+## Annotations
+
+All three demos show a collapsible **Annotations** panel below **PDF Layers**. It
+lists the document's annotations, such as comments, markups, stamps, form fields
+and links, with their type, page and text or link target. Popups and annotations
+the PDF marks as hidden are not listed. Every row has a checkbox. Turning an
+annotation off hides its drawn appearance and stops its bubble, link preview and
+link activation. **All** turns every annotation on or off. While a filter is
+active it becomes **All matching** and affects only the matching annotations,
+for example every link. The filter matches type, page, text, author and ID. Long
+lists show the first 500 matches; refine the filter to reach the rest.
+
+A change reaches bubbles and links at once, and drawn appearances once the
+renderer applies it. Some appearances cannot be hidden: those on pages drawn as
+a single image, and all appearances in HEP files converted before annotation
+layers existed. For these, turning the annotation off only stops its bubble and
+link. Switching backends keeps these choices; opening another document turns
+every annotation on again. Annotation choices are never exported. Hosts can
+mount `createPdfAnnotationControls()` or use the
+[annotation APIs](api.md#hiding-annotation-appearances) with their own controls.
+
 ## HEP files
 
 HEP (`.hep`) stores a pre-parsed document for reuse. It includes geometry, page

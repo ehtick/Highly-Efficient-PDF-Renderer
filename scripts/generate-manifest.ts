@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 
 import { encodeExampleAssetPathSegment } from "./example-asset-path.ts";
 
@@ -84,8 +85,14 @@ async function main(): Promise<void> {
     examples: manifestEntries
   };
 
-  await fs.writeFile(outputManifestPath, JSON.stringify(manifest, null, 2), "utf8");
-  console.log(`[examples] manifest written: ${outputManifestPath}`);
+  // Keep the file, including its generatedAt, when no example entry changed.
+  const existingManifest = await readExistingManifest(outputManifestPath);
+  if (existingManifest && isDeepStrictEqual(existingManifest.examples, manifest.examples)) {
+    console.log(`[examples] manifest unchanged: ${outputManifestPath}`);
+  } else {
+    await fs.writeFile(outputManifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    console.log(`[examples] manifest written: ${outputManifestPath}`);
+  }
   console.log(`[examples] matched ${manifestEntries.length} PDF/HEP pair(s).`);
 
   if (missingHepPdfs.length > 0) {
@@ -93,6 +100,15 @@ async function main(): Promise<void> {
   }
   if (unusedHepNames.length > 0) {
     console.warn(`[examples] HEP files without matching PDF (${unusedHepNames.length}): ${unusedHepNames.join(", ")}`);
+  }
+}
+
+async function readExistingManifest(manifestPath: string): Promise<Partial<ExampleManifest> | undefined> {
+  try {
+    return JSON.parse(await fs.readFile(manifestPath, "utf8")) as Partial<ExampleManifest>;
+  } catch {
+    // A missing or malformed manifest is simply rewritten.
+    return undefined;
   }
 }
 

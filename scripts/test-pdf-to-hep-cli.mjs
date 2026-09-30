@@ -11,6 +11,7 @@ import {
   discoverPdfFiles,
   formatPdfToHepDuration,
   formatPdfToHepTimingSummary,
+  hepDiffersOnlyInGeneratedAt,
   hepOutputPathForPdf,
   loadSourceHepBuilder,
   parsePdfToHepArguments,
@@ -22,6 +23,7 @@ import {
   startPdfToHepWorker,
   writeHepBlobAtomically
 } from "../PDFtoHEP.js";
+import { HepArchive } from "../src/hepContainer.ts";
 
 for (const version of ["20.19.0", "22.13.0", "22.14.0", "23.0.0", "23.4.0"]) {
   assert.throws(() => assertSupportedNodeVersion(version), /Node.js 22\.15\+/);
@@ -63,6 +65,24 @@ assert.throws(() => parsePdfToHepArguments(["--output-dir=", "input"]), /non-emp
 assert.throws(
   () => parsePdfToHepArguments(["--output-dir=one", "--output-dir=two", "input"]),
   /exactly one/
+);
+
+assert.deepEqual(parsePdfToHepArguments(["--force", "--keep-unchanged", "./pdfs"]), {
+  force: true,
+  keepUnchanged: true,
+  help: false,
+  inputPath: "./pdfs"
+});
+assert.throws(
+  () => parsePdfToHepArguments(["--keep-unchanged", "./pdfs"]),
+  /only applies together with --force/,
+  "without --force existing HEPs are skipped, so the flag would silently do nothing"
+);
+assert.equal(
+  parsePdfToHepArguments(pdfToHepWorkerArguments("plan.pdf", true, 8192, undefined, undefined, undefined, true).slice(2))
+    .keepUnchanged,
+  true,
+  "batch workers receive the parent's --keep-unchanged"
 );
 
 for (const policy of ["error", "alternate"]) {
@@ -137,11 +157,13 @@ assert.throws(
 let sourceBuilderViteOptions;
 let sourceBuilderCloseCount = 0;
 const fakeBuildHep = () => {};
+const fakeHepArchive = { loadAsync() {} };
 const sourceBuilder = await loadSourceHepBuilder({
   async createServer(options) {
     sourceBuilderViteOptions = options;
     return {
       async ssrLoadModule(moduleId) {
+        if (moduleId === "/src/hepContainer.ts") return { HepArchive: fakeHepArchive };
         assert.equal(moduleId, "/src/hepBuilder.ts");
         return { buildHep: fakeBuildHep };
       },
@@ -157,8 +179,44 @@ assert.equal(
   "the one-shot builder must not watch generated HEP files under public/"
 );
 assert.equal(sourceBuilder.buildHep, fakeBuildHep);
+assert.equal(sourceBuilder.HepArchive, fakeHepArchive);
 await sourceBuilder.close();
 assert.equal(sourceBuilderCloseCount, 1);
+
+async function encodeTestHep(generatedAt, {
+  sceneByte = 7,
+  extraSection = false,
+  sourceFile = "plan.pdf",
+  compression = "DEFLATE"
+} = {}) {
+  const archive = new HepArchive();
+  archive.file("manifest.json", JSON.stringify({ formatVersion: 9, sourceFile, generatedAt, scene: { pages: [1, 2] } }));
+  archive.file("scene/positions.bin", new Uint8Array(20_000).fill(sceneByte));
+  archive.file("text/small.json", "{\"glyphs\":[]}");
+  archive.file("empty.bin", new Uint8Array(0));
+  if (extraSection) archive.file("structure/structure.json", "{}");
+  return archive.generateAsync({ type: "uint8array", compression });
+}
+const existingTestHep = await encodeTestHep("2026-09-29T15:45:20.289Z");
+assert.equal(
+  await hepDiffersOnlyInGeneratedAt(existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z"), HepArchive),
+  true,
+  "a rebuild that only changes generatedAt must keep the existing HEP"
+);
+for (const [label, existing, candidate] of [
+  ["same-length section content", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { sceneByte: 8 })],
+  ["an added section", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { extraSection: true })],
+  ["other manifest fields", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { sourceFile: "plan2.pdf" })],
+  // An older writer's encoding of the same sections must still be replaced.
+  ["container encoding", await encodeTestHep("2026-09-29T15:45:20.289Z", { compression: "STORE" }),
+    await encodeTestHep("2026-09-30T11:19:41.033Z")]
+]) {
+  assert.equal(
+    await hepDiffersOnlyInGeneratedAt(existing, candidate, HepArchive),
+    false,
+    `a rebuild that changes ${label} must replace the existing HEP`
+  );
+}
 
 const unusualWorkerPdf = path.resolve("-Größe [A] & plan.pdf");
 const workerArguments = pdfToHepWorkerArguments(unusualWorkerPdf, true, 8_192);
@@ -509,5 +567,5 @@ try {
 }
 
 console.log(
-  "PDF-to-HEP CLI argument, timing, source-loader, filesystem, and atomic-write tests passed."
+  "PDF-to-HEP CLI argument, timing, source-loader, unchanged-HEP, filesystem, and atomic-write tests passed."
 );

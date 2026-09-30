@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import {
   link,
@@ -34,6 +35,8 @@ export const PDF_TO_HEP_USAGE = `Usage:
 
 Options:
   -f, --force  Replace existing regular HEP files after conversion succeeds.
+  --keep-unchanged  With --force, leave an existing HEP file untouched when the
+      new conversion would only change its generatedAt timestamp.
   -h, --help   Show this help text.
   --output-dir=<directory>  Write all HEP files into this directory.
   --icc-engine=qcms|lcms|alternate|none  ICC conversion (default: qcms).
@@ -50,6 +53,7 @@ Examples:
   node PDFtoHEP.js ./Level1.pdf
   node PDFtoHEP.js ./pdfs
   node PDFtoHEP.js --force ./pdfs
+  node PDFtoHEP.js --force --keep-unchanged ./pdfs
 
 When given a directory, the script scans it recursively and processes regular
 .pdf files in isolated child processes, one at a time. Outputs use the client
@@ -68,6 +72,7 @@ class ExistingOutputError extends Error {
 
 export function parsePdfToHepArguments(args) {
   let force = false;
+  let keepUnchanged = false;
   let help = false;
   let positionalOnly = false;
   let inputPath;
@@ -86,6 +91,10 @@ export function parsePdfToHepArguments(args) {
     }
     if (!positionalOnly && (argument === "--force" || argument === "-f")) {
       force = true;
+      continue;
+    }
+    if (!positionalOnly && argument === "--keep-unchanged") {
+      keepUnchanged = true;
       continue;
     }
     if (!positionalOnly && argument.startsWith("--output-dir=")) {
@@ -124,9 +133,14 @@ export function parsePdfToHepArguments(args) {
   if (!help && inputPath === undefined) {
     throw new Error("Pass a PDF file or directory.");
   }
+  if (keepUnchanged && !force) {
+    // Without --force, existing HEP files are skipped before conversion.
+    throw new Error("--keep-unchanged only applies together with --force.");
+  }
 
   return {
     force, help, inputPath,
+    ...(keepUnchanged ? { keepUnchanged } : {}),
     ...(outputDirectory === undefined ? {} : { outputDirectory }),
     ...(iccEngine === undefined ? {} : { iccEngine }),
     ...(annotationAppearances === undefined ? {} : { annotationAppearances })
@@ -266,11 +280,14 @@ function parseWorkerHeapMb(value, label) {
   return heapMb;
 }
 
-export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances) {
+export function pdfToHepWorkerArguments(
+  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged
+) {
   return [
     `--max-old-space-size=${heapMb}`,
     scriptPath,
     ...(force ? ["--force"] : []),
+    ...(keepUnchanged ? ["--keep-unchanged"] : []),
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),
     ...(annotationAppearances === undefined ? [] : [`--annotation-appearances=${annotationAppearances}`]),
@@ -353,8 +370,13 @@ export async function loadSourceHepBuilder(dependencies = {}) {
     if (typeof builderModule.buildHep !== "function") {
       throw new Error("The HEPR source builder did not export buildHep().");
     }
+    const containerModule = await viteServer.ssrLoadModule("/src/hepContainer.ts");
+    if (typeof containerModule.HepArchive?.loadAsync !== "function") {
+      throw new Error("The HEPR source container did not export HepArchive.");
+    }
     return {
       buildHep: builderModule.buildHep,
+      HepArchive: containerModule.HepArchive,
       close: () => viteServer.close()
     };
   } catch (error) {
@@ -375,6 +397,62 @@ async function regularOutputExists(filePath) {
       return false;
     }
     throw error;
+  }
+}
+
+async function readHepManifest(archive) {
+  const text = await archive.file("manifest.json")?.async("string");
+  const manifest = text === undefined ? undefined : JSON.parse(text);
+  return manifest && typeof manifest === "object" && typeof manifest.generatedAt === "string"
+    ? manifest
+    : undefined;
+}
+
+/**
+ * True when the candidate HEP would only change the existing file's
+ * generatedAt timestamp. The candidate is stamped with the existing timestamp
+ * and re-encoded; the container writer is deterministic, so it must reproduce
+ * the existing bytes exactly. Encoding-only changes therefore still count.
+ * The candidate must come from the default DEFLATE writer, as this CLI's
+ * buildHep() calls do, or the re-encoding would not match its encoding.
+ */
+export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal) {
+  const existing = await HepArchive.loadAsync(existingBytes, { signal });
+  const candidate = await HepArchive.loadAsync(candidateBytes, { signal });
+  const existingSections = Object.values(existing.files);
+  const candidateSections = Object.values(candidate.files);
+  // Differing section names, order or lengths are visible in the index, so
+  // most real changes are found without decompressing or re-encoding.
+  if (
+    existingSections.length !== candidateSections.length ||
+    existingSections.some((section, index) =>
+      section.name !== candidateSections[index].name ||
+      section.uncompressedSize !== candidateSections[index].uncompressedSize)
+  ) {
+    return false;
+  }
+  const existingManifest = await readHepManifest(existing);
+  const candidateManifest = await readHepManifest(candidate);
+  if (!existingManifest || !candidateManifest) {
+    return false;
+  }
+  candidateManifest.generatedAt = existingManifest.generatedAt;
+  candidate.file("manifest.json", JSON.stringify(candidateManifest));
+  const restamped = await candidate.generateAsync({ type: "uint8array", signal });
+  return Buffer.compare(restamped, existingBytes) === 0;
+}
+
+async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal) {
+  try {
+    const existingBytes = await readFile(outputPath, { signal });
+    const candidateBytes = new Uint8Array(await hepBlob.arrayBuffer());
+    return await hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal);
+  } catch (error) {
+    if (signal?.aborted) {
+      throw error;
+    }
+    // A missing, unreadable or legacy existing file is simply replaced.
+    return false;
   }
 }
 
@@ -532,7 +610,9 @@ export function startPdfToHepWorker(
   const workerToken = randomUUID();
   const child = spawnImplementation(
     process.execPath,
-    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances),
+    pdfToHepWorkerArguments(
+      item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged
+    ),
     {
       stdio: "inherit",
       shell: false,
@@ -801,6 +881,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         outputDirectory: options.outputDirectory,
         iccEngine: options.iccEngine,
         annotationAppearances: options.annotationAppearances,
+        keepUnchanged: options.keepUnchanged,
         fileNumber: index + 1,
         fileCount: pdfPaths.length
       });
@@ -876,16 +957,27 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           onProgress: createProgressLogger(sourceLabel, itemNumber, itemCount)
         });
         abortController.signal.throwIfAborted();
-        await writeHepBlobAtomically(
+        if (options.keepUnchanged && await existingHepDiffersOnlyInGeneratedAt(
           outputPath,
           hepBlob,
-          options.force,
+          builder.HepArchive,
           abortController.signal
-        );
+        )) {
+          console.log(
+            `[${itemNumber}/${itemCount}] Kept ${outputPath}; only its generatedAt timestamp would change`
+          );
+        } else {
+          await writeHepBlobAtomically(
+            outputPath,
+            hepBlob,
+            options.force,
+            abortController.signal
+          );
+          console.log(
+            `[${itemNumber}/${itemCount}] Wrote ${outputPath} (${formatBytes(hepBlob.size)})`
+          );
+        }
         generatedCount += 1;
-        console.log(
-          `[${itemNumber}/${itemCount}] Wrote ${outputPath} (${formatBytes(hepBlob.size)})`
-        );
         if (hepBlob.size > pdfBytes.byteLength) {
           console.warn(
             `[${itemNumber}/${itemCount}] Warning: ${sourceLabel} produced a HEP larger than its PDF ` +

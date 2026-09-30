@@ -217,22 +217,38 @@ and disables `matrixAutoUpdate`; subsequent `setPagePosition` calls preserve tha
 matrix's linear part. To resume ordinary position/rotation/scale updates, set
 `page.matrixAutoUpdate = true` (a decomposed transform cannot preserve shear).
 
-The first accessor prepares all independent page views asynchronously. Repeated
-calls reuse the same page objects. Both Three.js backends keep compatible pages
+The first accessor prepares all independent page views asynchronously, in
+short slices that keep the page responsive; observe it with
+`pdf.subscribePagePreparationProgress(listener)` (integer percentage, or `null`
+when idle). Page views share the document's glyph outlines and glyph atlas.
+Repeated calls reuse the same page objects. Both Three.js backends keep compatible pages
 in shared geometry batches: shaders look up each primitive's page transform,
 and backgrounds use one instanced draw. Moving a page updates a small matrix
 table; camera/document movement uses the shared projection uniform. Geometry
 and primitive ownership stay unchanged. Text LOD uses each page's projection;
 stroke LOD conservatively uses the most magnified visible page.
 
-Batching applies to disjoint projected pages and to opaque, depth-separated
-pages whose paint (including antialiasing) stays inside their background. Pages
-with translucent/intersecting overlaps, different appearance settings or
-primitive overrides, PDF compositing effects, retained replay, or unsupported
-host resources use separate page rendering. Safe layouts automatically rejoin
-the batch. Independent fallback resources are prepared with the page views.
-Images, gradients, clips and paint-order boundaries can still require multiple
-draws; there is no fixed draw-count guarantee.
+Batching applies to disjoint projected pages and to overlapping opaque pages
+whose paint stays inside their background and that depth orders exactly: one
+lies wholly in front of the other's plane, or they cross steeply enough that
+only about a pixel along the crossing is ambiguous (as with separate rendering).
+3D arrangements such as spheres or helices of pages therefore stay batched.
+On thumbnail-sized pages, antialiasing may reach past a background and blend
+out of page order; `isPaintOrderApproximated()` reports this. Pages with
+translucent or nearly coplanar overlaps, paint outside their page, different
+appearance settings or primitive overrides, PDF compositing effects, retained
+replay, or unsupported host resources use separate page rendering. Safe layouts
+automatically rejoin the batch. Independent fallback resources are prepared
+with the page views. Images, gradients, clips and paint-order boundaries can
+still require multiple draws; there is no fixed draw-count guarantee.
+
+Moving pages can cross nearly coplanar for a few frames, which would drop the
+whole document to separate rendering. While animating, call
+`pdf.setPageOverlapMode("fast")` to keep opaque pages batched regardless (such
+overlaps may z-fight and are reported by `isPaintOrderApproximated()`), and
+restore `"exact"` once the pages settle. Translucent overlaps always keep page
+order. Depth-based ordering needs depth precision: keep the camera's near plane
+close to the nearest content rather than at a tiny fixed value.
 
 After rendering, `pdf.getPageBatchingStats()` reports `mode` (`"document"`,
 `"pages-batched"`, or `"pages-separate"`), `pageCount`, and a nullable fallback
@@ -262,9 +278,10 @@ the document returns `null` for their independent LOD statistics. While batched,
 query those statistics on the document.
 
 Newly composed scenes store exact primitive ownership in HEP. Existing HEP files
-without that metadata infer stroke/fill ownership from their original layout and
-emit a warning; out-of-page or overlapping source content may be assigned
-approximately. Transforms are runtime presentation state and are not saved by
+without that metadata infer stroke/fill ownership from their original layout.
+Paint inside one page rectangle is assigned exactly; a warning reports how many
+strokes/fills reach past their nearest page and may be assigned approximately.
+Exporting such a HEP again stores exact ownership. Transforms are runtime presentation state and are not saved by
 `buildHep(pdf.sceneData)`. Treat `sceneData` as read-only.
 
 | Member | Purpose |
@@ -272,6 +289,8 @@ approximately. Transforms are runtime presentation state and are not saved by
 | `pageCount` | Number of displayed pages. |
 | `getPage(index, options?)` / `getPages(options?)` | Prepare and return independent page objects with automatic shared batching. |
 | `getPageBatchingStats()` | Report the current batching mode, page count and fallback reason. |
+| `subscribePagePreparationProgress(listener)` | Observe page view preparation as an integer percentage, or `null` when idle; returns an unsubscribe function. |
+| `setPageOverlapMode(mode)` / `getPageOverlapMode()` | `"exact"` (default) or `"fast"`: keep opaque overlapping pages batched even where depth cannot order them, e.g. while animating a layout. |
 | `setPagePosition(index, x, y, z?)` | Set a page center in document-local coordinates; default Z is zero. |
 | `setPageTransform(index, matrix)` | Replace a page's finite affine `THREE.Matrix4`. |
 | `hasSearchableText` | Whether the scene has searchable indexed text. |

@@ -45,7 +45,8 @@ export class VectorStrokeRedundancy {
     if (!strokes) runs.forEach((run, index) => {
       if (run.kind === "stroke") sourceRuns.fill(index, run.first, run.first + run.count);
     });
-    const domains = paintDomains(scene, geometry, sourceRuns, runs);
+    // Domains only classify strokes; skip scanning every fill and glyph without any.
+    const domains = count ? paintDomains(scene, geometry, sourceRuns, runs) : new Uint32Array(runs.length);
     const lists: number[][] = [];
     const axes: number[] = [];
     const keys = new Map<string, number>();

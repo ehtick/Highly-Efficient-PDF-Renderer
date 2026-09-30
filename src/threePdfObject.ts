@@ -2,7 +2,7 @@ import { ThreePageTransforms } from "./threePageTransforms";
 import { updateThreePageBatchFrame } from "./threePageBatchFrame";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, type ScenePageView } from "./scenePageViews";
 import { SharedPageRenderer } from "./sharedPageRenderer";
-import { yieldForLoad } from "./loadCancellation";
+import { createLoadYielder, yieldAfterPaint } from "./loadCancellation";
 import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
 import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
@@ -71,6 +71,9 @@ export interface ThreePdfSceneSource {
   sourceLabel: string;
   sourceKind: LoadedPdfScene["sourceKind"] | "scene";
 }
+
+/** How page views that depth cannot order exactly are drawn; see `setPageOverlapMode`. */
+export type HeprPageOverlapMode = "exact" | "fast";
 
 /** A text-search match with bounds in PDF scene space and this object's local space. */
 export interface HeprTextSearchMatch extends TextSearchMatch {
@@ -318,6 +321,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private pageBatch: HeprThreePdfObject | null = null;
   private pageBatchActive = false;
   private pageBatchReason: string | null = "not-prepared";
+  private pageBatchFringesApproximated = false;
+  private pageOverlapMode: HeprPageOverlapMode = "exact";
   private readonly pageTransforms: ThreePageTransforms | undefined;
   private pageBatchView: DerivedThreeCameraView | null = null;
   private pagePreparation: Promise<readonly HeprThreePdfObject[]> | null = null;
@@ -345,6 +350,26 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.pageCount <= 1) return Object.freeze(this.pageCount ? [this] : []);
     this.pagePreparation ??= this.preparePageViews().catch(error => { this.pagePreparation = null; throw error; });
     return waitForLoad(this.pagePreparation, options.signal);
+  }
+
+  /**
+   * Observe page view preparation started by `getPage` / `getPages`. The current
+   * integer percentage (or null when idle, prepared or failed) is delivered
+   * immediately. Unsubscribe when the host detaches from this object.
+   */
+  subscribePagePreparationProgress(listener: (percentage: number | null) => void): () => void {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    this.pagePreparationListeners.add(listener);
+    try { listener(this.pagePreparationProgress); } catch { /* Observers cannot interrupt preparation. */ }
+    return () => { this.pagePreparationListeners.delete(listener); };
+  }
+
+  private reportPagePreparationProgress(percentage: number | null): void {
+    if (this.pagePreparationProgress === percentage) return;
+    this.pagePreparationProgress = percentage;
+    for (const listener of this.pagePreparationListeners) {
+      try { listener(percentage); } catch { /* Observers cannot interrupt preparation. */ }
+    }
   }
 
   /** Zero-based displayed page index, independent of the PDF's source page number. */
@@ -378,6 +403,11 @@ export class HeprThreePdfObject extends THREE.Group {
 
   private async preparePageViews(): Promise<readonly HeprThreePdfObject[]> {
     const signal = this.pagePreparationAbort.signal;
+    this.reportPagePreparationProgress(0);
+    // Let hosts present their progress UI before the first slice of work.
+    await yieldAfterPaint(signal);
+    // Page views take ~75%, the shared batches most of the rest.
+    const yieldControl = createLoadYielder(signal);
     const partition = new ScenePageViews(this.sceneData);
     const pool = new SharedPageRenderer(this.renderer, this.renderCanvas);
     const prepared: { object: HeprThreePdfObject; view: ScenePageView }[] = [];
@@ -391,23 +421,25 @@ export class HeprThreePdfObject extends THREE.Group {
       vectorOverrideColor: config.vectorOverride.slice(0, 3) as [number, number, number], vectorOverrideOpacity: config.vectorOverride[3] };
     try {
       for (let index = 0; index < partition.pageCount; index++) {
-        await yieldForLoad(signal);
+        await yieldControl();
         const view = partition.extract(index);
         const object = await createThreePdfObject({ scene: view.scene, sourceKind: this.sourceKind,
           sourceLabel: `${this.sourceLabel} — page ${index + 1}` }, options, signal, undefined,
-          canvas => pool.createView(view.scene, canvas));
+          canvas => pool.createView(view.scene, canvas), undefined, yieldControl);
         prepared.push({ object, view });
         object.sourcePageSlot = index; object.pageOwner = this;
         object.layerVisibility.dispose(); object.layerVisibility = this.layerVisibility;
         object.position.set(object.sceneCenterX - this.sceneCenterX, object.sceneCenterY - this.sceneCenterY, 0);
         object.updateMatrix();
+        this.reportPagePreparationProgress(Math.floor(75 * (index + 1) / partition.pageCount));
       }
       this.pageBatchReason = "pdf-compositing";
       if (!sceneRequiresPaintCompositing(this.sceneData) && !this.sceneData.retainedPages?.length) {
         try {
           table = new ThreePageTransforms(partition);
+          await yieldControl();
           batch = await createThreePdfObject({ scene: this.sceneData, sourceKind: this.sourceKind, sourceLabel: `${this.sourceLabel} — page batches` },
-            options, signal, undefined, canvas => pool.createView(this.sceneData, canvas), table);
+            options, signal, undefined, canvas => pool.createView(this.sceneData, canvas), table, yieldControl);
           batch.pageOwner = this;
           batch.layerVisibility.dispose(); batch.layerVisibility = this.layerVisibility;
           batch.visible = false;
@@ -419,6 +451,7 @@ export class HeprThreePdfObject extends THREE.Group {
           console.warn("[HEPR] Shared page batches exceed material capacity; using independent page rendering.", error.message);
         }
       }
+      this.reportPagePreparationProgress(95);
       let revision: number;
       do {
         // A layer update begun on the batched object must commit before views
@@ -459,8 +492,10 @@ export class HeprThreePdfObject extends THREE.Group {
       this.setSelection(this.primitiveAppearance.getSelection());
       this.setHover(this.primitiveAppearance.getHover());
       this.applyPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates());
+      this.reportPagePreparationProgress(null);
       return Object.freeze(prepared.map(page => page.object));
     } catch (error) {
+      this.reportPagePreparationProgress(null);
       this.pageViews = null; this.pagePartition = null; this.pageBatch = null;
       batch?.removeFromParent();
       if (batch) batch.dispose(); else table?.dispose();
@@ -470,6 +505,23 @@ export class HeprThreePdfObject extends THREE.Group {
       for (const { object } of prepared) { object.removeFromParent(); object.dispose(); }
       throw error;
     }
+  }
+
+  /**
+   * Choose how page views that overlap on screen are drawn when depth cannot
+   * order them exactly, e.g. nearly coplanar pages crossing mid-animation.
+   * `"exact"` (default) renders them separately in page order. `"fast"` keeps
+   * opaque pages in shared batches, so such overlaps may z-fight or blend out
+   * of page order; `isPaintOrderApproximated()` reports when that happens.
+   * Use it while pages move and restore `"exact"` once they settle.
+   * Translucent overlaps always keep page order.
+   */
+  setPageOverlapMode(mode: HeprPageOverlapMode): void {
+    this.pageOverlapMode = mode === "fast" ? "fast" : "exact";
+  }
+
+  getPageOverlapMode(): HeprPageOverlapMode {
+    return this.pageOverlapMode;
   }
 
   /** Whether transformed pages currently share draws, and why a separate path is needed. */
@@ -515,8 +567,10 @@ export class HeprThreePdfObject extends THREE.Group {
         visible: object.visible && !object.isDisposed, opaque: object.rendererConfig.pageBackground[3] >= 1,
         cullingBounds: derived?.cullingBounds };
     });
-    const frame = updateThreePageBatchFrame(table, frames, viewport, camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1);
+    const frame = updateThreePageBatchFrame(table, frames, viewport, camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1,
+      this.pageOverlapMode === "fast");
     this.pageBatchReason = frame.reason;
+    this.pageBatchFringesApproximated = frame.approximated;
     if (frame.reason) return false;
     for (const { object } of this.pageViews!) {
       if (!this.pageBatchActive) object.configureDormantPipeline();
@@ -621,6 +675,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private primitivePicker: ScenePrimitivePicker | null = null;
   private primitivePreparationProgress: number | null = null;
   private readonly primitivePreparationListeners = new Set<(percentage: number | null) => void>();
+  private pagePreparationProgress: number | null = null;
+  private readonly pagePreparationListeners = new Set<(percentage: number | null) => void>();
   private primitiveHighlightLayer: ThreePrimitiveHighlightLayer | null = null;
   private primitiveHighlightBackend: HeprRendererType | null = null;
   private primitiveHighlightColorCompositing: ThreeColorCompositing | null = null;
@@ -1696,9 +1752,11 @@ export class HeprThreePdfObject extends THREE.Group {
    * Whether the active pipeline is holding the paint scheduler's coverage
    * margin. Every paint is still drawn; on a thumbnail-sized page, paints
    * within a fraction of a pixel of each other may swap to bound draw calls.
+   * Batched overlapping pages report the same when a thumbnail's antialiasing
+   * fringe reaches past its opaque background and may blend out of page order.
    */
   isPaintOrderApproximated(): boolean {
-    if (this.pageBatchActive) return this.pageBatch!.isPaintOrderApproximated();
+    if (this.pageBatchActive) return this.pageBatchFringesApproximated || this.pageBatch!.isPaintOrderApproximated();
     if (this.pageViews) return this.pageViews.some(page => page.object.visible && page.object.isPaintOrderApproximated());
     return this.materialPipelineActive
       ? this.drawPlan?.paintOrderApproximated ?? false
@@ -1906,6 +1964,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.primitivePicker = null;
     this.reportPrimitivePreparationProgress(null);
     this.primitivePreparationListeners.clear();
+    this.reportPagePreparationProgress(null);
+    this.pagePreparationListeners.clear();
     if (!this.pageOwner) this.layerVisibility.dispose();
     this.layerVisibilityProgressListeners.clear();
     this.retainedReplay?.dispose();
@@ -3525,7 +3585,9 @@ export async function createThreePdfObject(
   signal?: AbortSignal,
   preparedVectorLod?: VectorStrokeLodRuntimeReservation | null,
   pageRenderer?: (canvas: HTMLCanvasElement) => RendererApi,
-  pageTransforms?: ThreePageTransforms
+  pageTransforms?: ThreePageTransforms,
+  /** Lets long background preparation return to the event loop between layers. */
+  yieldControl?: () => Promise<void>
 ): Promise<HeprThreePdfObject> {
   signal?.throwIfAborted();
   const rendererType = options.rendererType ?? "webgl";
@@ -3590,6 +3652,7 @@ export async function createThreePdfObject(
       rasterMaterialLayer.group,
       gradientMaterialLayer.getOrderedPaintMeshes()
     );
+    await yieldControl?.();
 
     const fillMaterialLayer = new ThreeMaterialFillLayer(loadedScene.scene, {
       pageTransforms,
@@ -3599,6 +3662,7 @@ export async function createThreePdfObject(
       vectorOverride: rendererConfig.vectorOverride
     });
     owned.push(fillMaterialLayer);
+    await yieldControl?.();
 
     const strokeMaterialLayer =
       !useVectorLodStrokeLayer
@@ -3614,6 +3678,7 @@ export async function createThreePdfObject(
 
     if (strokeMaterialLayer) owned.push(strokeMaterialLayer);
     const triangleStrokeLayer = null;
+    await yieldControl?.();
 
     vectorLodStrokeLayer =
       useVectorLodStrokeLayer
@@ -3629,9 +3694,11 @@ export async function createThreePdfObject(
 
     if (vectorLodStrokeLayer) owned.push(vectorLodStrokeLayer);
     const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
+    await yieldControl?.();
 
     const textLodLayer = ThreeTextLodLayer.create(loadedScene.scene, sceneRequiresPaintCompositing(loadedScene.scene) ? "off" : rendererConfig.textLodMode, pageTransforms);
     owned.push(textLodLayer);
+    await yieldControl?.();
     let textMaterialLayer: ThreeMaterialTextLayer;
     try {
       textMaterialLayer = new ThreeMaterialTextLayer(textLodLayer.getRenderScene(), {

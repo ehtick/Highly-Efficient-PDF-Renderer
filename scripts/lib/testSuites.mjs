@@ -120,6 +120,7 @@ export const fastTests = [
   "primitive-appearance",
   "primitive-interaction",
   "drawing-selection-controls",
+  "example-page-layouts",
   "three-primitive-interaction-controller",
   "three-primitive-interaction",
   "three-paint-compositor",

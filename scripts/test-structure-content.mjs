@@ -50,6 +50,26 @@ try {
   assert.deepEqual(findStructureElement(scene, itemOf(scene, "stroke", 6).elementId).userProperties[1], { name: "IfcType", value: "IfcDoor" });
   assert.deepEqual(scene.structureElements.map(element => element.id), ["ref:7:0", "ref:8:0", "ref:9:0", "ref:6:0"]);
 
+  // Cancelling the first structure read must not poison later page compilations.
+  const cancelled = await openPdf({ kind: "bytes", bytes: bimSample() });
+  try {
+    const controller = new AbortController(), document = cancelled.document;
+    const root = document.catalog.get("StructTreeRoot"), resolveValue = document.resolveValue.bind(document);
+    let rootReads = 0;
+    // Abort precisely when the lazy structure reader first resolves the root.
+    document.resolveValue = async (value, signal) => {
+      if (value === root && ++rootReads === 1) controller.abort();
+      return resolveValue(value, signal);
+    };
+    await assert.rejects(cancelled.compileVectorPage(0, { signal: controller.signal }), error => error.code === "aborted");
+    for (let retry = 0; retry < 2; retry++) {
+      const recovered = await cancelled.compileVectorPage(0, { signal: new AbortController().signal });
+      assert.deepEqual(recovered.markedContent, scene.markedContent);
+      assert.deepEqual(recovered.structureElements, scene.structureElements);
+    }
+    assert.equal(rootReads, 2, "the cancelled root is retried, then the successful result stays cached");
+  } finally { await cancelled.close(); }
+
   // The retained lowering attributes only the page's own marked content, and only when told where it ends.
   assert.equal((await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal })).markedContent, undefined);
   const retained = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal,
@@ -89,6 +109,18 @@ try {
   assert.deepEqual([0, 1].map(index => itemOf(form.scene, "fill", index)?.mcid), [4, undefined]);
   assert.equal(itemOf(form.scene, "fill", 0).elementId, "ref:21:0");
   assert(form.diagnostics.some(d => d.code === "structure.form-content-items"));
+
+  // Lexical BMC parents and invocation parents both preserve the innermost page MCID.
+  for (const retained of [false, true]) {
+    const nested = await compile(nestedSample(retained));
+    validateSceneStructure(nested.scene);
+    assert.equal(nested.scene.rasterLayers.length, 0);
+    assert.deepEqual(Array.from({ length: nested.scene.fillPathCount }, (_, index) => itemOf(nested.scene, "fill", index)?.mcid),
+      [0, 1, 0, 0, undefined], `${retained ? "retained" : "direct"}: nested tags preserve page items and Form-local MCIDs stay ignored`);
+    assert.equal(itemOf(nested.scene, "fill", 0).elementId, "ref:7:0");
+    assert.equal(itemOf(nested.scene, "fill", 1).elementId, "ref:8:0");
+    assert(nested.diagnostics.some(d => d.code === "structure.form-content-items"));
+  }
 
   // Number-tree kids, role maps, attribute classes, titles and typed values.
   const rich = await compile(richSample());
@@ -164,5 +196,22 @@ function richSample() {
     { number: 30, body: "<< /Type /StructElem /S /Mur /P 5 0 R /K 0 /T (Wall A) /ActualText <feff00570061006c006c> /C /Fire " +
       "/A [<< /O /UserProperties /P [<< /N (Width) /V .2 /F (20 cm) >> << /N (Structural) /V true /H true >> " +
       "<< /N (Kind) /V /Exterior >> << /N (Nested) /V [1 2] >>] >> 0] >>" }
+  ] });
+}
+
+function nestedSample(retained) {
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /StructParents 0 " +
+      "/Resources << /ExtGState << /GS << /BM /Screen >> >> /XObject << /Fm 9 0 R >> >> >>" },
+    { number: 4, body: tinyPdfStream("", [retained ? "/GS gs" : "", "/Figure <</MCID 0>> BDC /Span BMC",
+      "0.5 g 0 0 10 10 re f", "/Figure <</MCID 1>> BDC /Span BMC 20 0 10 10 re f EMC EMC",
+      "40 0 10 10 re f", "/Fm Do", "EMC EMC", "/Fm Do"].join("\n")) },
+    { number: 5, body: "<< /Type /StructTreeRoot /ParentTree << /Nums [0 [7 0 R 8 0 R]] >> >>" },
+    { number: 7, body: "<< /Type /StructElem /S /Figure /P 5 0 R /K 0 >>" },
+    { number: 8, body: "<< /Type /StructElem /S /Figure /P 5 0 R /K 1 >>" },
+    { number: 9, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /StructParents 1",
+      "/Figure <</MCID 2>> BDC /Span BMC 0.5 g 60 0 10 10 re f EMC EMC") }
   ] });
 }

@@ -102,7 +102,11 @@ export class NativePdfStructureTree {
       };
       return { dictionary, identity: isPdfRef(raw) ? `ref:${pdfRefKey(raw)}` : null, parentTree: dictionary.get("ParentTree"),
         roleMap: await map("RoleMap"), classMap: await map("ClassMap") };
-    })();
+    })().catch(error => {
+      // A cancelled operation must not leave a rejected root cached for later pages.
+      if (signal?.aborted || (error instanceof PdfError && error.code === "aborted")) this.root = null;
+      throw error;
+    });
     return this.root;
   }
 

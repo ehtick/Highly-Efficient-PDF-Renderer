@@ -233,18 +233,21 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (!scope || !pageMarkedContentCount) return -1;
     let item = itemScopes.get(scope);
     if (item === undefined) {
-      const node = scope.index, mcid = page.stores.markedContent.mcids[node] ?? -1;
-      if (node < pageMarkedContentCount && mcid >= 0) {
+      const { mcids, tags, parentIndices } = page.stores.markedContent;
+      // Execution scopes link invocations; lexical BMC/BDC parents live in the store.
+      for (let node = scope.index; node >= 0; node = parentIndices[node] ?? -1) {
+        const mcid = mcids[node] ?? -1;
+        if (mcid < 0) continue;
+        if (node >= pageMarkedContentCount) { ignoredFormContentItems = true; continue; }
         item = contentItemIndexes.get(node);
         if (item === undefined) {
           item = contentItems.length;
           contentItemIndexes.set(node, item);
-          contentItems.push({ mcid, tag: page.stores.markedContent.tags[node] });
+          contentItems.push({ mcid, tag: tags[node] });
         }
-      } else {
-        if (mcid >= 0) ignoredFormContentItems = true;
-        item = itemOf(scope.parent);
+        break;
       }
+      item ??= itemOf(scope.parent);
       itemScopes.set(scope, item);
     }
     return item;

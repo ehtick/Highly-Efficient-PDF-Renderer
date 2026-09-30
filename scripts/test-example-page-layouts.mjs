@@ -4,7 +4,8 @@ import {
   applyExamplePageLayout,
   computeExamplePageLayout,
   easeOutExpo,
-  ExamplePageLayoutAnimator
+  ExamplePageLayoutAnimator,
+  interpolateExamplePageLayout
 } from "../src/examplePageLayouts.ts";
 
 const A4 = { width: 595, height: 842 };
@@ -185,6 +186,20 @@ for (const count of [2, 5, 118, 400]) {
     assert.ok(object.position.equals(helix[index].position));
     assert.ok(object.quaternion.equals(helix[index].quaternion));
   });
+}
+
+// A warm-up step leaves the loaded layout by a sub-pixel amount.
+{
+  const pages = gridPages(3, 3);
+  const grid = computeExamplePageLayout("grid", pages), sphere = computeExamplePageLayout("sphere", pages);
+  const step = interpolateExamplePageLayout(grid, sphere, 1e-3);
+  step.forEach((target, index) => {
+    const distance = target.position.distanceTo(grid[index].position);
+    assert.ok(distance > 0 && distance < 1e-3 * grid[index].position.distanceTo(sphere[index].position) * 1.0001);
+    assert.ok(target.quaternion.angleTo(grid[index].quaternion) < 1e-3 * grid[index].quaternion.angleTo(sphere[index].quaternion) + 1e-6);
+  });
+  interpolateExamplePageLayout(grid, sphere, 1).forEach((target, index) =>
+    assert.ok(target.position.distanceTo(sphere[index].position) < 1e-9));
 }
 
 console.log("example page layout checks passed");

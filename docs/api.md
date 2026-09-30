@@ -250,6 +250,12 @@ restore `"exact"` once the pages settle. Translucent overlaps always keep page
 order. Depth-based ordering needs depth precision: keep the camera's near plane
 close to the nearest content rather than at a tiny fixed value.
 
+While every page view stays in its loaded layout with the document's
+appearance (no page transforms, page-level settings or colors), the document
+draws itself exactly as before page views existed; page overlays still follow.
+Moving any page switches to page rendering, and restoring the loaded layout
+switches back.
+
 After rendering, `pdf.getPageBatchingStats()` reports `mode` (`"document"`,
 `"pages-batched"`, or `"pages-separate"`), `pageCount`, and a nullable fallback
 `reason`. Query document rendering/LOD statistics while pages are batched;

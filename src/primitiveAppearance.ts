@@ -80,6 +80,7 @@ export class PrimitiveAppearanceState {
   getColorUpdates(): PrimitiveColorUpdate[] {
     return [...this.colors.values()].map(({ ref, color }) => ({ ref: { ...ref }, color: color && [...color] }));
   }
+  hasAnyOverrides(): boolean { return this.colors.size > 0; }
   hasOverrides(kind: PrimitiveKind): boolean {
     for (const update of this.colors.values()) if (update.ref.kind === kind) return true;
     return false;

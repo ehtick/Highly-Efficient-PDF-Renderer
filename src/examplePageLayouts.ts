@@ -98,6 +98,18 @@ export function applyExamplePageLayout(pages: readonly THREE.Object3D[], targets
   });
 }
 
+/** Transforms `amount` of the way from one arrangement to another. */
+export function interpolateExamplePageLayout(
+  from: readonly ExamplePageLayoutTarget[],
+  to: readonly ExamplePageLayoutTarget[],
+  amount: number
+): ExamplePageLayoutTarget[] {
+  return from.map((start, index) => ({
+    position: start.position.clone().lerp(to[index].position, amount),
+    quaternion: start.quaternion.clone().slerp(to[index].quaternion, amount)
+  }));
+}
+
 /** Exponential ease-out: fast departure, long settle. */
 export function easeOutExpo(amount: number): number {
   return amount >= 1 ? 1 : 1 - Math.pow(2, -10 * amount);

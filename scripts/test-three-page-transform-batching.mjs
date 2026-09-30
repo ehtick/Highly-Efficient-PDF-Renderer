@@ -54,6 +54,23 @@ try {
     let camera=new THREE.OrthographicCamera(-90,90,56.25,-56.25,.1,1000);camera.position.z=300;
     camera.coordinateSystem=backend==='webgpu'?THREE.WebGPUCoordinateSystem:THREE.WebGLCoordinateSystem;camera.updateProjectionMatrix();
     const frame=()=>{camera.updateMatrixWorld();scene.updateMatrixWorld(true);scene.onBeforeRender(host,scene,camera,null);};
+    frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','pages in the loaded layout draw as the document itself');
+    assert(pdf.materialPipelineActive && pdf.pageMesh.visible && !pdf.pageBatch.visible,'the document pipeline replaces page batches');
+    assert(pages.every(p=>!p.materialPipelineActive && p.pageMesh.parent===null),'dormant pages keep depth rectangles out of the scene graph');
+    pages[3].setVectorColorOverride(1,0,0,1);frame();
+    assert.equal(pdf.getPageBatchingStats().reason,'page-appearance','a page-level appearance change leaves document drawing');
+    pages[3].setVectorColorOverride(0,0,0,0);frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document');
+    const loaded=pages.map(p=>p.position.clone());
+    pages[5].position.z=.001;frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','any page movement uses page rendering');
+    assert(!pdf.pageMesh.visible && pdf.pageBatch.visible);
+    pages[5].position.copy(loaded[5]);frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','returning to the loaded layout restores document drawing');
+    pdf.setSearchHighlights(pdf.searchText('page'),{currentIndex:0});frame();
+    assert.equal(pdf.getPageBatchingStats().mode,'document','page overlays follow document drawing');
+    pdf.setSearchHighlights(null);
     for(const [i,p] of pages.entries()) {p.rotation.set(.06*(i%3),-.04*(i%4),.02*(i%2));p.scale.set(i%2?-0.85:0.85,.9,1);p.position.z=i*.4;}
     frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched',JSON.stringify(pdf.getPageBatchingStats()));
@@ -146,6 +163,11 @@ try {
     await pdf.setPageTransform(4,shear);frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched','explicit affine matrices retain batching');
     assert(pages[4].matrix.equals(shear));
+    for(const [i,p] of pages.entries()) {p.matrixAutoUpdate=true;p.position.copy(loaded[i]);p.rotation.set(0,0,0);p.scale.set(1,1,1);}
+    frame();assert.equal(pdf.getPageBatchingStats().mode,'document');
+    pdf.setPrimitiveOverrides([{kind:'stroke',index:0}],{color:'yellow'});frame();
+    assert.notEqual(pdf.getPageBatchingStats().mode,'document','colors applied after preparation reach only the pages');
+    pdf.clearPrimitiveOverrides();
     let freed=0;table.matrices.addEventListener('dispose',()=>freed++);pdf.dispose();
     assert.equal(freed,1);assert.equal(disposals,1);
     assert.deepEqual(source,canonical);

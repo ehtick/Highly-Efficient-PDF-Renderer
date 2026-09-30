@@ -34,6 +34,7 @@ import { createDrawingSelectionControls } from "./drawingSelectionControls";
 import {
   applyExamplePageLayout,
   computeExamplePageLayout,
+  interpolateExamplePageLayout,
   ExamplePageLayoutAnimator,
   type ExamplePageLayout,
   type ExamplePageLayoutPage,
@@ -216,6 +217,8 @@ const CAMERA_CLIP_NEAR_MIN = 0.01;
 const CAMERA_CLIP_MARGIN_MULTIPLIER = 3.5;
 const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
 const PAGE_LAYOUT_DURATION_MS = 2000;
+/** Sub-pixel first step of a transition, rendered once to warm page batches. */
+const PAGE_LAYOUT_WARM_UP_PROGRESS = 1e-3;
 const NATIVE_CLEAR_COLOR_R = 160 / 255;
 const NATIVE_CLEAR_COLOR_G = 169 / 255;
 const NATIVE_CLEAR_COLOR_B = 175 / 255;
@@ -275,6 +278,7 @@ interface PageLayoutView {
 let activePageLayout: ExamplePageLayout = "grid";
 let pageLayoutView: PageLayoutView | null = null;
 let pageLayoutRequest = 0;
+let pageLayoutWarmingUp = false;
 const pageLayoutAnimator = new ExamplePageLayoutAnimator();
 
 // Drawing selection always starts off, even if the browser restores form state.
@@ -557,7 +561,7 @@ function renderFrame(now: number = performance.now()): void {
   profile?.beginFrame(now);
   const pageLayoutAnimating = pageLayoutAnimator.update(now);
   // Crossing pages keep shared batches while moving; the settled layout is exact.
-  pageLayoutView?.object.setPageOverlapMode(pageLayoutAnimating ? "fast" : "exact");
+  pageLayoutView?.object.setPageOverlapMode(pageLayoutAnimating || pageLayoutWarmingUp ? "fast" : "exact");
   profile?.beginSection("controls");
   const controlsChanged = controls.update();
   updateCameraClipping();
@@ -772,6 +776,7 @@ async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
     return;
   }
   try {
+    let warmUp = false;
     if (!pageLayoutView) {
       setStatus(`Preparing ${pdfObject.pageCount.toLocaleString()} pages...`);
       // Preparation is shared by overlapping requests and reports until it settles.
@@ -786,22 +791,32 @@ async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
         return;
       }
       pageLayoutView = createPageLayoutView(pdfObject, pages);
-      // The first frame with page views compiles their shaders and uploads the
-      // shared batches. Take it before the transition so that plays in full.
+      warmUp = true;
+    }
+    const view = pageLayoutView;
+    const loaded = view.targets;
+    view.layout = layout;
+    view.targets = computeExamplePageLayout(layout, view.layoutPages);
+    includePageLayoutInClipRange(view);
+    if (warmUp) {
+      // Pages in the loaded layout draw as the document itself. Leaving it
+      // switches to shared page batches, whose first frame compiles shaders
+      // and uploads data. Take that frame a hair into the transition, so the
+      // transition itself then plays in full.
+      applyExamplePageLayout(view.pages, interpolateExamplePageLayout(loaded, view.targets, PAGE_LAYOUT_WARM_UP_PROGRESS));
+      pageLayoutWarmingUp = true;
       setPageLayoutProgress(100);
       try {
         await waitForNextRenderedFrame(loadToken);
       } finally {
+        pageLayoutWarmingUp = false;
         setPageLayoutProgress(null);
       }
       if (request !== pageLayoutRequest || pdfObject !== currentPdfObject) {
         return;
       }
     }
-    pageLayoutView.layout = layout;
-    pageLayoutView.targets = computeExamplePageLayout(layout, pageLayoutView.layoutPages);
-    includePageLayoutInClipRange(pageLayoutView);
-    pageLayoutAnimator.animate(pageLayoutView.pages, pageLayoutView.targets, PAGE_LAYOUT_DURATION_MS);
+    pageLayoutAnimator.animate(view.pages, view.targets, PAGE_LAYOUT_DURATION_MS);
     setStatus(`Page layout set to ${formatPageLayout(layout)}.`);
     requestRender();
   } catch (error) {

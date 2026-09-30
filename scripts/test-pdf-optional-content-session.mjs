@@ -136,16 +136,17 @@ EMC
       `hidden glyph advances still update the live PDF text position (${secondX - firstX})`
     );
 
+    // The drawn annotation appearance is marked with its annotation id.
     assert.deepEqual(
       page.stores.markedContent.tags,
-      ["Artifact", "OC", "OC", "OC", "Span", "OC"]
+      ["Artifact", "OC", "OC", "OC", "Span", "OC", "Annot"]
     );
     assert.deepEqual(
       page.stores.markedContent.propertyNames,
-      [null, "Hidden", "Visible", "Hidden", "Meta", "Hidden"]
+      [null, "Hidden", "Visible", "Hidden", "Meta", "Hidden", "ref:21:0"]
     );
-    assert.deepEqual([...page.stores.markedContent.mcids], [-1, -1, -1, -1, 7, -1]);
-    assert.deepEqual([...page.stores.markedContent.parentIndices], [-1, 0, 0, 2, 0, -1]);
+    assert.deepEqual([...page.stores.markedContent.mcids], [-1, -1, -1, -1, 7, -1, -1]);
+    assert.deepEqual([...page.stores.markedContent.parentIndices], [-1, 0, 0, 2, 0, -1, -1]);
 
     const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
     assert.equal(rootCommands.length, 7);
@@ -256,14 +257,17 @@ EMC
     assert.equal(scene.fillPathCount, 3, "default-hidden fill and annotation geometry are retained");
     assert.equal(scene.segmentCount, 1, "default-hidden Form geometry is retained");
     assert.equal(scene.rasterLayers.length, 1, "default-hidden image resources are decoded");
-    assert.equal(scene.optionalContent.groups.length, 3);
+    assert.equal(scene.optionalContent.groups.length, 4);
+    assert.deepEqual(scene.optionalContent.groups.map(group => group.annotationId), [undefined, undefined, undefined, "ref:22:0"],
+      "the PDF layers are followed by the annotation's own layer");
+    const pdfLayerIds = scene.optionalContent.groups.filter(group => !group.annotationId).map(group => group.id);
     assert.equal(scene.optionalContent.groups[0].name, scene.optionalContent.groups[1].name);
     assert.notEqual(scene.optionalContent.groups[0].id, scene.optionalContent.groups[1].id, "names do not identify groups");
     assert.equal(scene.optionalContent.groups[2].locked, true);
     assert.equal(scene.optionalContent.order[0].kind, "label");
     assert.equal(scene.optionalContent.order[0].children[0].children[0].groupId, scene.optionalContent.groups[1].id);
     const stroke = scene.drawRuns.find(run => run.kind === "stroke");
-    assert.deepEqual(new Set(getOptionalContentGroupIds(scene.optionalContent, stroke.optionalContent)), new Set(scene.optionalContent.groups.map(group => group.id)), "nested Form and caller scopes are conjoined");
+    assert.deepEqual(new Set(getOptionalContentGroupIds(scene.optionalContent, stroke.optionalContent)), new Set(pdfLayerIds), "nested Form and caller scopes are conjoined");
     const visibility = new OptionalContentController(scene);
     assert.equal(visibility.isVisible(stroke.optionalContent), false);
     await visibility.setLayerVisibility(scene.optionalContent.groups[1].id, true);
@@ -279,7 +283,8 @@ EMC
     const second = await layersSession.compileVectorPage(1, { vectorFallback: "error" });
     const composed = composeVectorScenesInGrid([scene, second], 2);
     validateSceneOptionalContentReferences(composed);
-    assert.equal(composed.optionalContent.groups.length, 3, "document layer identities are shared across pages");
+    assert.equal(composed.optionalContent.groups.length, 4,
+      "document layer identities, and the annotation both pages reference, are shared across pages");
     assert.equal(composed.drawRuns.filter(run => run.kind === "stroke").length, 2);
     assert.ok(composed.textIndex.pages[1].optionalContent[0] >= scene.optionalContent.conditions.length, "page-local text condition references are remapped");
     const retainedPage = await layersSession.compilePage(0, { retainOptionalContent: true });

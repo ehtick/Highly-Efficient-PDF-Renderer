@@ -1,4 +1,6 @@
 import type { SceneOptionalContent } from "../optionalContentData";
+import { AnnotationLayerBuilder } from "../annotationLayers";
+import { ContentItemRangeBuilder } from "../structureData";
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
@@ -159,6 +161,11 @@ export function buildNativeVectorPage(
   throwIfAborted(signal);
   validatePackedGeometry(compiled, pageInfo.sourcePageIndex);
   const sidecar = readVectorSceneData(compiled, pageInfo.sourcePageIndex);
+  const conditions = resolveVectorEventConditions(sidecar, input.optionalContent, pageInfo.sourcePageIndex);
+  if (conditions.unavailableAnnotationLayers) input.onDiagnostic?.({ code: "annotation.layer-limit", severity: "warning",
+    pageIndex: pageInfo.sourcePageIndex,
+    message: `${conditions.unavailableAnnotationLayers} annotation appearance(s) exceed the layer limit and cannot be hidden individually.`,
+    details: { annotationCount: conditions.unavailableAnnotationLayers } });
   const gradients = buildNativeVectorGradients(sidecar.shadingPaints ?? [], input.shadingRegistry, maxPaths, signal,
     input.maxPathCoordinates);
   if (gradients.gradientCount) input.onDiagnostic?.({ code: "gradient-color-approximation", severity: "warning",
@@ -186,6 +193,7 @@ export function buildNativeVectorPage(
     textCompilation,
     fonts,
     sidecar,
+    conditions.eventConditions,
     pageBounds,
     sourceOrder.requiresLateImageProof,
     maxPaths,
@@ -241,7 +249,7 @@ export function buildNativeVectorPage(
     maxY: pageBounds.maxY
   };
   const scene: VectorScene = {
-    ...(input.optionalContent ? { optionalContent: input.optionalContent } : {}),
+    ...(conditions.optionalContent ? { optionalContent: conditions.optionalContent } : {}),
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([
@@ -300,6 +308,14 @@ export function buildNativeVectorPage(
   if (sidecar.pathPaintRanges) {
     const runs: NonNullable<VectorScene["drawRuns"]> = [];
     const clipBuilder = new NativeVectorClipBuilder();
+    // Structure content items (MCIDs) are attributed per primitive range,
+    // beside the runs, so tagged objects never split draw runs.
+    const contentItems = sidecar.contentItems ?? [];
+    const itemRanges = new ContentItemRangeBuilder();
+    if (sidecar.sourceContentItems && (sidecar.sourceContentItems.length !== sidecar.sourceEvents.length / 2 ||
+        sidecar.sourceContentItems.some(item => item < -1 || item >= contentItems.length))) {
+      throw invalid("The native VectorScene content items are misaligned.", pageInfo.sourcePageIndex, "vector-content-items");
+    }
     const imageOrder = Array.from(sidecar.imageIndices, (_, i) => i).sort((a, b) =>
       sidecar.imagePaintOrders[a] - sidecar.imagePaintOrders[b] || a - b);
     const imageLayers = new Uint32Array(imageOrder.length);
@@ -308,8 +324,9 @@ export function buildNativeVectorPage(
       const kind = sidecar.sourceEvents[offset];
       const index = sidecar.sourceEvents[offset + 1];
       const blendMode = sidecar.sourceBlendModes?.[offset / 2] === 1 ? "Multiply" : undefined;
-      const condition = sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1;
+      const condition = conditions.eventConditions?.[offset / 2] ?? -1;
       const optionalContent = condition >= 0 ? condition : undefined;
+      const item = sidecar.sourceContentItems?.[offset / 2] ?? -1;
       const clipIndex = kind === DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT ||
         kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE ? undefined : clipBuilder.add(sidecar.sourceClips?.[offset / 2], signal);
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL || kind === DENSE_PDF_VECTOR_SCENE_EVENT_STROKE) {
@@ -318,6 +335,8 @@ export function buildNativeVectorPage(
         }
         appendVectorDrawRun(runs, kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
           sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode, optionalContent);
+        itemRanges.add(kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
+          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         const first = sidecar.glyphRunMeta[index * 3];
         const end = first + sidecar.glyphRunMeta[index * 3 + 1];
@@ -337,21 +356,32 @@ export function buildNativeVectorPage(
         for (let glyph = first; glyph < end; glyph++) {
           const instance = text.glyphToInstance[glyph];
           if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode, optionalContent);
+          if (instance >= 0) itemRanges.add("text", instance, 1, item);
           const strokeInstance = strokeText.glyphToInstance?.[glyph] ?? -1;
           if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode, optionalContent);
+          if (strokeInstance >= 0) itemRanges.add("text", strokeInstance, 1, item);
           const hairlineFirst = hairlines?.glyphRanges[glyph * 2] ?? 0, hairlineCount = hairlines?.glyphRanges[glyph * 2 + 1] ?? 0;
           if (hairlineCount) appendVectorDrawRun(runs, "stroke", hairlineFirst, hairlineCount, hairlineClipIndex, blendMode, optionalContent);
+          if (hairlineCount) itemRanges.add("stroke", hairlineFirst, hairlineCount, item);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode, optionalContent);
+        itemRanges.add("raster", imageLayers[index], 1, item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
         appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode, optionalContent);
+        itemRanges.add("gradient-fill", index, 1, item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE) {
         for (let layer = imageLayerCount; layer < rasterLayers.length; layer++) {
-          if (rasterLayers[layer].paintOrder === index) appendVectorDrawRun(runs, "raster", layer, 1, undefined, undefined, optionalContent);
+          if (rasterLayers[layer].paintOrder !== index) continue;
+          appendVectorDrawRun(runs, "raster", layer, 1, undefined, undefined, optionalContent);
+          itemRanges.add("raster", layer, 1, item);
         }
       }
     }
+    if (!itemRanges.isEmpty) scene.markedContent = {
+      items: contentItems.map(({ mcid, tag }) => ({ pageIndex: 0, sourcePageIndex: pageInfo.sourcePageIndex, mcid, tag })),
+      ranges: itemRanges.build()
+    };
     scene.drawRuns = runs;
     if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
     if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",
@@ -360,6 +390,36 @@ export function buildNativeVectorPage(
     simplifyVectorDrawRuns(scene);
   }
   return scene;
+}
+
+/**
+ * One visibility condition per source event: its PDF layer membership, combined
+ * with the event's own annotation layer when it paints an annotation appearance.
+ */
+function resolveVectorEventConditions(
+  sidecar: DensePdfVectorSceneData,
+  optionalContent: SceneOptionalContent | undefined,
+  pageIndex: number
+): { eventConditions?: Int32Array; optionalContent?: SceneOptionalContent; unavailableAnnotationLayers: number } {
+  const eventCount = sidecar.sourceEvents.length / 2;
+  const annotations = sidecar.sourceAnnotationIndices, annotationIds = sidecar.annotationIds ?? [];
+  if (!annotations || annotationIds.length === 0) {
+    return { eventConditions: sidecar.sourceOptionalContentIndices, optionalContent, unavailableAnnotationLayers: 0 };
+  }
+  if (!(annotations instanceof Int32Array) || annotations.length !== eventCount) {
+    throw invalid("The native VectorScene annotation events are misaligned.", pageIndex, "vector-annotation-events");
+  }
+  const layers = new AnnotationLayerBuilder(optionalContent, [...(optionalContent?.conditions ?? [])]);
+  const eventConditions = new Int32Array(eventCount);
+  for (let event = 0; event < eventCount; event++) {
+    const condition = sidecar.sourceOptionalContentIndices?.[event] ?? -1, annotation = annotations[event];
+    if (annotation < -1 || annotation >= annotationIds.length) {
+      throw invalid("A native VectorScene event references an unknown annotation.", pageIndex, "vector-annotation-events");
+    }
+    eventConditions[event] = annotation < 0 ? condition
+      : layers.condition(condition >= 0 ? condition : undefined, annotationIds[annotation]) ?? -1;
+  }
+  return { eventConditions, optionalContent: layers.build(), unavailableAnnotationLayers: layers.unavailableCount };
 }
 
 function readVectorSceneData(
@@ -801,6 +861,7 @@ function buildVectorText(
   compilation: NativeTextCompilation,
   fonts: readonly NativePdfFont[],
   sidecar: DensePdfVectorSceneData,
+  eventConditions: Int32Array | undefined,
   pageBounds: Readonly<DensePdfBounds>,
   captureSourceGlyphPaintBounds: boolean,
   maxPaths: number,
@@ -821,11 +882,17 @@ function buildVectorText(
   const clipTester = new NativeTextClipTester();
   const glyphInkBounds = new Map<string, readonly number[] | null>();
   const indexQuads = new Map<number, readonly number[]>();
-  const glyphConditions = sidecar.sourceOptionalContentIndices ? new Int32Array(compilation.glyphs.glyphIds.length).fill(-1) : undefined;
+  // Pages with PDF layers always carry text conditions; annotation layers add
+  // them only when an annotation appearance paints text.
+  let conditionedText = sidecar.sourceOptionalContentIndices !== undefined;
+  for (let event = 0; !conditionedText && eventConditions && event < sidecar.sourceEvents.length; event += 2) {
+    conditionedText = sidecar.sourceEvents[event] === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH && eventConditions[event / 2] >= 0;
+  }
+  const glyphConditions = eventConditions && conditionedText ? new Int32Array(compilation.glyphs.glyphIds.length).fill(-1) : undefined;
   if (glyphConditions) for (let event = 0; event < sidecar.sourceEvents.length; event += 2) {
     if (sidecar.sourceEvents[event] !== DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) continue;
     const run = sidecar.sourceEvents[event + 1], first = sidecar.glyphRunMeta[run * 3];
-    glyphConditions.fill(sidecar.sourceOptionalContentIndices![event / 2], first, first + sidecar.glyphRunMeta[run * 3 + 1]);
+    glyphConditions.fill(eventConditions![event / 2], first, first + sidecar.glyphRunMeta[run * 3 + 1]);
   }
   const geometryByKey = new Map<string, number>();
   const geometries: GlyphGeometry[] = [];

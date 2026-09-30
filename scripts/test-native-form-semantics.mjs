@@ -244,10 +244,17 @@ try {
   assert(acroForm.defaultResources instanceof Map);
 
   const annotations = await registry.listPageAnnotations(0);
-  assert.equal(annotations.length, 21);
-  assert.deepEqual(annotations.map((annotation) => annotation.annotationIndex), [...annotations.keys()]);
-  assert.equal(annotations[0].id, annotations[5].id, "duplicate /Annots entries retain source positions and identity");
-  assert.notEqual(annotations[0], annotations[5]);
+  // Entries keep their source /Annots positions; look them up by that index.
+  const at = (annotationIndex) => annotations.find((annotation) => annotation.annotationIndex === annotationIndex);
+  assert.equal(annotations.length, 20);
+  assert.deepEqual(
+    annotations.map((annotation) => annotation.annotationIndex),
+    Array.from({ length: 21 }, (_, index) => index).filter((index) => index !== 5),
+    "a repeated /Annots reference is one annotation: it is used once and keeps its first source position"
+  );
+  assert.equal(new Set(annotations.map((annotation) => annotation.id)).size, annotations.length, "ids are unique on a page");
+  assert(emittedDiagnostics.some((diagnostic) => diagnostic.code === "annotation.duplicate-reference" &&
+    diagnostic.pageIndex === 0 && diagnostic.details.duplicateCount === 1));
   assert.deepEqual(annotations[0].rectangle, [20, 10, 40, 30]);
   assert.deepEqual(
     annotations.slice(0, 5).map((annotation) => annotation.visibleInDefaultView),
@@ -259,9 +266,7 @@ try {
   }
 
   const link = await registry.resolveAnnotationAppearance(annotations[0]);
-  const duplicateLink = await registry.resolveAnnotationAppearance(annotations[5]);
-  assert(link && duplicateLink);
-  assert.equal(link.normalAppearance.form, duplicateLink.normalAppearance.form);
+  assert(link);
   assert.equal(link.optionalContentIndex >= 0, true);
   assert.deepEqual(link.normalAppearance.form.bbox, [0, -5, 10, 20]);
   assert.deepEqual(link.normalAppearance.form.matrix, [2, 0, 0, 3, 4, 5]);
@@ -272,8 +277,8 @@ try {
   const printed = await registry.resolveAnnotationAppearance(annotations[4]);
   assert(printed);
 
-  const radioB = annotations[6];
-  const radioA = annotations[7];
+  const radioB = at(6);
+  const radioA = at(7);
   assert.equal(radioB.widget.fieldType, "Btn");
   assert.equal(radioB.widget.fullyQualifiedName, "Choices");
   assert.equal(radioB.widget.fieldFlags, 32768);
@@ -281,12 +286,12 @@ try {
   assert.equal((await registry.resolveAnnotationAppearance(radioB)).stateName, "Off");
   assert.equal((await registry.resolveAnnotationAppearance(radioA)).stateName, "ChoiceA");
   assert.equal(
-    (await registry.resolveAnnotationAppearance(annotations[20])).stateName,
+    (await registry.resolveAnnotationAppearance(at(20))).stateName,
     "ChoiceB",
     "an explicit Widget /AS takes precedence over its inherited field /V"
   );
 
-  const textWidget = annotations[8];
+  const textWidget = at(8);
   assert.deepEqual(textWidget.widget.partialNames, ["Parent", "Child"]);
   assert.equal(textWidget.widget.fullyQualifiedName, "Parent.Child");
   assert.equal(decodeString(textWidget.widget.value), "inherited value");
@@ -298,11 +303,11 @@ try {
   assert.equal(inferred.stateName, "Only");
   assert.equal(inferred.normalAppearance.form.resourceOrigin, "inherited");
   await registry.resolveAnnotationAppearance(textWidget);
-  assert.equal(registry.getDiagnostics().length, 1, "sole-state inference is diagnosed once per annotation");
-  assert.equal(emittedDiagnostics.length, 1);
-  assert.equal(emittedDiagnostics[0].code, "annotation.appearance-state-inferred");
+  const inferredDiagnostics = (diagnostics) => diagnostics.filter((diagnostic) => diagnostic.code === "annotation.appearance-state-inferred");
+  assert.equal(inferredDiagnostics(registry.getDiagnostics()).length, 1, "sole-state inference is diagnosed once per annotation");
+  assert.equal(inferredDiagnostics(emittedDiagnostics).length, 1);
 
-  const signature = annotations[9];
+  const signature = at(9);
   assert.equal(signature.widget.fieldType, "Sig");
   assert(signature.widget.value instanceof Map, "signature dictionaries are retained without validation");
   const signatureAppearance = await registry.resolveAnnotationAppearance(signature);
@@ -314,22 +319,22 @@ try {
   );
 
   await assert.rejects(
-    registry.resolveAnnotationAppearance(annotations[10]),
+    registry.resolveAnnotationAppearance(at(10)),
     pdfError("unsupported-content", "appearance-synthesis-not-implemented")
   );
-  assert.equal(await registry.resolveAnnotationAppearance(annotations[11]), null, "default-hidden /OC suppresses placement");
-  assert.equal((await registry.resolveAnnotationAppearance(annotations[12])).stateName, "Good");
+  assert.equal(await registry.resolveAnnotationAppearance(at(11)), null, "default-hidden /OC suppresses placement");
+  assert.equal((await registry.resolveAnnotationAppearance(at(12))).stateName, "Good");
   await assert.rejects(
-    registry.resolveAnnotationAppearance(annotations[13]),
+    registry.resolveAnnotationAppearance(at(13)),
     pdfError("unsupported-content", "xobject-not-form")
   );
   await assert.rejects(
-    registry.resolveAnnotationAppearance(annotations[14]),
+    registry.resolveAnnotationAppearance(at(14)),
     pdfError("unsupported-content", "annotation-appearance-state-missing")
   );
   for (const index of [15, 16, 17, 18, 19]) {
     await assert.rejects(
-      registry.resolveAnnotationAppearance(annotations[index]),
+      registry.resolveAnnotationAppearance(at(index)),
       pdfError("invalid-object")
     );
   }

@@ -734,13 +734,16 @@ npm install
 node PDFtoHEP.js ./Level1.pdf
 node PDFtoHEP.js --output-dir=./heps ./pdfs
 node PDFtoHEP.js --force ./pdfs
+node PDFtoHEP.js --annotation-appearances=none ./pdfs
 ```
 
 Directory input is scanned recursively and converted one PDF at a time in
 isolated child processes. `Level1.pdf` produces `Level1-parsed-data.hep` beside
 the input unless `--output-dir=<directory>` is supplied. Output-name collisions
 are rejected. Existing files are skipped; `--force` replaces them only after a
-successful conversion. Use `--help` for the complete command syntax.
+successful conversion. `--annotation-appearances=render|forms|none` chooses which
+annotation appearances become page content (default `render`); annotation metadata
+is kept in every mode. Use `--help` for the complete command syntax.
 
 The worker heap ceiling defaults to 12,288 MiB for dense documents. Override it
 with `HEPR_PDF_TO_HEP_HEAP_MB` or Node's `--max-old-space-size=<MiB>` argument.

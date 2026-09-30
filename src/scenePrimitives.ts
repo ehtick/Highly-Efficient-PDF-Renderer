@@ -1,7 +1,8 @@
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
-import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { createDefaultOptionalContentSnapshot, getAnnotationLayerIds } from "./optionalContent";
+import { findSceneContentItem, type SceneContentItem } from "./structureData";
 import { sampleSceneGradientChannel } from "./gradientSampling";
 import { getGradientMeshTriangle, gradientMeshTriangleCount, type GradientMeshTriangle } from "./gradientMesh";
 import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions, scenePaintRunAlpha, releaseScenePaintQuery, type ScenePaintSample } from "./scenePaintQuery";
@@ -29,6 +30,10 @@ export interface PrimitiveSegmentStyle {
 }
 export interface PrimitiveInfo {
   optionalContent: PrimitiveOptionalContent;
+  /** `SceneAnnotation.id` when this primitive paints a compiled annotation appearance. */
+  annotationId?: string;
+  /** The structure content item (MCID) that painted this primitive, in tagged content. */
+  markedContent?: SceneContentItem;
   ref: PrimitiveRef;
   kind: PrimitiveKind;
   index: number;
@@ -59,6 +64,10 @@ export interface PrimitiveInfo {
 }
 export interface PrimitiveHit {
   optionalContent: PrimitiveOptionalContent;
+  /** `SceneAnnotation.id` when the hit primitive paints a compiled annotation appearance. */
+  annotationId?: string;
+  /** The structure content item (MCID) that painted the hit primitive, in tagged content. */
+  markedContent?: SceneContentItem;
   primitive: PrimitiveRef;
   point: PrimitivePoint;
   closestPoint: PrimitivePoint;
@@ -127,21 +136,47 @@ function primitiveRun(scene: VectorScene, ref: PrimitiveRef): VectorDrawRun | un
 }
 
 export function getPrimitiveOptionalContent(scene: VectorScene, ref: PrimitiveRef): PrimitiveOptionalContent {
+  return getPrimitiveConditionFields(scene, ref).optionalContent;
+}
+
+/** `SceneAnnotation.id` of the compiled annotation appearance painting this primitive, if any. */
+export function getPrimitiveAnnotationId(scene: VectorScene, ref: PrimitiveRef): string | undefined {
+  return getPrimitiveConditionFields(scene, ref).annotationId;
+}
+
+/** The structure content item (MCID) that painted a primitive, if any. */
+export function getPrimitiveMarkedContent(scene: VectorScene, ref: PrimitiveRef): SceneContentItem | undefined {
+  validatePrimitiveRef(scene, ref);
+  const item = findSceneContentItem(scene, ref);
+  return item && { ...item };
+}
+
+/** PDF layers and the owning annotation share one condition walk; annotation layers are not PDF layers. */
+function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
+  optionalContent: PrimitiveOptionalContent; annotationId?: string; markedContent?: SceneContentItem;
+} {
   validatePrimitiveRef(scene, ref);
   const conditionId = primitiveRun(scene, ref)?.optionalContent ?? null;
+  const annotationLayers = getAnnotationLayerIds(scene.optionalContent);
   const groups = new Set<string>();
   const visited = new Set<number>();
   const pending = scenePaintRunConditions(scene, primitiveRun(scene, ref));
+  let annotationId: string | undefined;
   while (pending.length) {
     const index = pending.pop()!;
     if (visited.has(index)) continue;
     visited.add(index);
     const condition = scene.optionalContent?.conditions[index];
-    if (condition?.kind === "group") groups.add(condition.groupId);
-    else if (condition?.kind === "not") pending.push(condition.operand);
+    if (condition?.kind === "group") {
+      const annotation = annotationLayers.get(condition.groupId);
+      if (annotation === undefined) groups.add(condition.groupId);
+      else annotationId ??= annotation;
+    } else if (condition?.kind === "not") pending.push(condition.operand);
     else if (condition?.kind === "and" || condition?.kind === "or") pending.push(...condition.operands);
   }
-  return { conditionId, layerIds: [...groups] };
+  const markedContent = findSceneContentItem(scene, ref);
+  return { optionalContent: { conditionId, layerIds: [...groups] }, ...(annotationId === undefined ? {} : { annotationId }),
+    ...(markedContent ? { markedContent: { ...markedContent } } : {}) };
 }
 
 /** Lookup costs depend on paint runs, rather than the number of stored primitives. */
@@ -335,7 +370,7 @@ export function getScenePrimitive(scene: VectorScene, reference: PrimitiveRef): 
   const maskGradientIndex = gradientPaint && gradientPaint[i + gradientOffset + 1] >= 0 ? gradientPaint[i + gradientOffset + 1] : null;
   const shadingKind = gradientIndex === null ? undefined : scene.gradientMetaA[gradientIndex * 4] === 2 ? "mesh" :
     scene.gradientMetaA[gradientIndex * 4] === 1 ? "radial" : "axial";
-  return { ref: { ...ref }, optionalContent: getPrimitiveOptionalContent(scene, ref), kind: ref.kind, index: ref.index, bounds, pageIndex: primitivePage(scene, ref, bounds), color, opacity,
+  return { ref: { ...ref }, ...getPrimitiveConditionFields(scene, ref), kind: ref.kind, index: ref.index, bounds, pageIndex: primitivePage(scene, ref, bounds), color, opacity,
     segmentCount: store.count, ...(fillRule ? { fillRule } : {}),
     ...(gradientPaint ? { gradientIndex, maskGradientIndex } : {}),
     ...(shadingKind ? { shadingKind } : {}),
@@ -922,7 +957,7 @@ export class ScenePrimitivePicker {
       const layer = options.rasterLayers?.get(ref.index) ?? scene.rasterLayers[ref.index];
       const sampledLayer = shapeOnly ? { ...layer, opacity: 1 } : layer;
       if (rasterAlpha(scene, ref.index, options.point, sampledLayer) > ALPHA_EPSILON)
-        return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
+        return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
       const uv = inverse(options.point, layer.matrix);
       // A transparent pixel inside the layer must not become a rectangle hit.
       if (!uv || (uv.x >= 0 && uv.x <= 1 && uv.y >= 0 && uv.y <= 1)) return null;
@@ -934,7 +969,7 @@ export class ScenePrimitivePicker {
       }
       if (!nearest || nearest.distance > tolerance || rasterAlpha(scene, ref.index, nearest.point, sampledLayer) <= ALPHA_EPSILON ||
           !withinClips(scene, nearest.point, clip.clipIndex, clip.rect)) return null;
-      return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance };
+      return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance };
     }
     const store = segmentStore(scene, ref), stroke = ref.kind === "stroke" || ref.kind === "gradient-stroke";
     let alpha = 1, evenodd = false, source = -1, mask = -1;
@@ -991,7 +1026,7 @@ export class ScenePrimitivePicker {
     }
     const inside = !stroke && (evenodd ? Math.abs(winding) % 2 === 1 : winding !== 0);
     if (inside && alpha * gradientAlpha(scene, source, options.point) * gradientAlpha(scene, mask, options.point) > ALPHA_EPSILON)
-      return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
+      return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
     let nearestTriangle = -1;
     // Mesh coverage can end inside the paint's enclosing path. Include its
     // triangle edges when applying screen-space tolerance around that domain.
@@ -1026,7 +1061,7 @@ export class ScenePrimitivePicker {
       }
     }
     if (!nearest || nearest.distance > tolerance + 1e-7) return null;
-    return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance,
+    return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance,
       ...(nearestTriangle >= 0 ? { triangleIndex: nearestTriangle } : { segmentIndex: nearestIndex }) };
   }
 }

@@ -78,6 +78,20 @@ for (const engine of ["qcms", "lcms", "alternate", "none"]) {
 assert.throws(() => parsePdfToHepArguments(["--icc-engine=typo", "plan.pdf"]), /icc-engine/);
 assert.throws(() => parsePdfToHepArguments(["--icc-engine=qcms", "--icc-engine=none", "plan.pdf"]), /exactly one/);
 
+for (const mode of ["render", "forms", "none"]) {
+  assert.equal(parsePdfToHepArguments([`--annotation-appearances=${mode}`, "plan.pdf"]).annotationAppearances, mode);
+  const args = pdfToHepWorkerArguments("plan.pdf", false, 8192, undefined, "lcms", mode);
+  const options = parsePdfToHepArguments(args.slice(2));
+  assert.equal(options.annotationAppearances, mode, "batch workers receive the parent's appearance mode");
+  assert.equal(options.iccEngine, "lcms");
+}
+assert.equal(parsePdfToHepArguments(["plan.pdf"]).annotationAppearances, undefined);
+assert.throws(() => parsePdfToHepArguments(["--annotation-appearances=hidden", "plan.pdf"]), /annotation-appearances/);
+assert.throws(
+  () => parsePdfToHepArguments(["--annotation-appearances=none", "--annotation-appearances=forms", "plan.pdf"]),
+  /exactly one/
+);
+
 assert.equal(sanitizeHepSourceName("Level 1.pdf"), "Level_1");
 assert.equal(sanitizeHepSourceName("Mürrieta 楼.pdf"), "M_rrieta_");
 assert.equal(sanitizeHepSourceName(".pdf"), "floorplan");

@@ -127,8 +127,42 @@ try {
   const limited = await openPdf({ kind: "bytes", bytes: fixture(), }, { limits: { maxPathCoordinatesPerPage: 4 } });
   try { await assert.rejects(limited.getPageAnnotations(0), e => e.code === "resource-limit"); }
   finally { await limited.close(); }
-  console.log("Annotation metadata: strings, fields, relationships, actions, geometry, laziness, lifetime and page/scene preservation passed.");
+
+  // Identity contract: ids come from the /Annots entry, never from counters.
+  const identitySessions = [await openPdf({ kind: "bytes", bytes: identityFixture() }), await openPdf({ kind: "bytes", bytes: identityFixture() })];
+  try {
+    const [first, second] = identitySessions;
+    const page = await first.getPageAnnotations(0);
+    assert.deepEqual(page.map(a => a.id), ["ref:5:0", "page:0:annotation:1", "ref:7:0"],
+      "indirect annotations use their object reference; inline ones their source position");
+    assert.deepEqual(page.map(a => a.annotationIndex), [0, 1, 3], "source indexes survive a skipped repeat");
+    assert.deepEqual(page.map(a => a.name), ["square-guid", undefined, "note-guid"]);
+    const duplicate = first.getDiagnostics().find(d => d.code === "annotation.duplicate-reference");
+    assert.equal(duplicate?.pageIndex, 0);
+    assert.equal(duplicate?.details?.duplicateCount, 1);
+    assert.deepEqual((await first.getPageAnnotations(1)).map(a => a.id), ["ref:7:0"],
+      "one object shared by two pages keeps its id on each page");
+    assert.deepEqual((await second.getPageAnnotations(0)).map(a => a.id), page.map(a => a.id), "ids are deterministic");
+    const scene = await first.compileVectorPage(0, {});
+    assert.equal(scene.segmentCount, 8, "the repeated Square is drawn once (plus the inline Square)");
+    assert.deepEqual(scene.annotations.map(a => a.id), page.map(a => a.id));
+  } finally { for (const session of identitySessions) await session.close(); }
+  console.log("Annotation metadata: strings, fields, relationships, actions, geometry, laziness, lifetime, page/scene preservation and identity passed.");
 } finally { hooks.deregister(); }
+
+function identityFixture() {
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 8 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Annots [5 0 R " +
+      "<< /Subtype /Square /Rect [10 10 30 30] /AP << /N 6 0 R >> >> 5 0 R 7 0 R] >>" },
+    { number: 4, body: tinyPdfStream("", "") },
+    { number: 5, body: "<< /Subtype /Square /Rect [50 50 110 110] /NM (square-guid) /AP << /N 6 0 R >> >>" },
+    { number: 6, body: tinyPdfStream("/Subtype /Form /BBox [0 0 10 10]", "1 0 0 RG 1 w 1 1 8 8 re S") },
+    { number: 7, body: "<< /Subtype /Text /Rect [150 150 160 160] /F 2 /NM (note-guid) >>" },
+    { number: 8, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Annots [7 0 R] >>" }
+  ] });
+}
 
 function fixture({ lazy = false, rotation = 90, malformedWidget = false, cyclicActions = false } = {}) {
   return writeTinyPdf({ objects: [

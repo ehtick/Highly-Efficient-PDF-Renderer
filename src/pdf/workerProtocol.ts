@@ -84,6 +84,7 @@ export interface PdfWorkerOpenOptions {
 export interface PdfWorkerCompileOptions {
   readonly limits?: Partial<PdfResourceLimits>;
   readonly optimization?: PdfCompileOptions["optimization"];
+  readonly annotationAppearances?: PdfCompileOptions["annotationAppearances"];
 }
 
 export interface PdfWorkerVectorCompileOptions extends PdfWorkerCompileOptions {

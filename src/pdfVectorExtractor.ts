@@ -1,6 +1,7 @@
 import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
-import { placeSceneAnnotation, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
+import { placeSceneAnnotation, type AnnotationAppearanceMode, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
+import { composeSceneStructure, type SceneMarkedContent, type StructureElement } from "./structureData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import {
   createLoadProgressReporter,
@@ -106,6 +107,12 @@ export interface VectorDrawRun {
 export interface VectorScene {
   /** Annotation geometry in composed scene coordinates; absent in older HEP files. */
   annotations?: readonly SceneAnnotation[];
+  /** Compile-time appearance filter; absent means every appearance was compiled (`"render"`). */
+  annotationAppearances?: AnnotationAppearanceMode;
+  /** Which structure content item (MCID) painted each primitive; absent for untagged content. */
+  markedContent?: SceneMarkedContent;
+  /** Structure elements owning `markedContent` items, with their ancestors. */
+  structureElements?: readonly StructureElement[];
   /** Source page identities and PDF-to-scene transforms; absent in older HEP files. */
   pdfPages?: readonly ScenePdfPage[];
   /** Self-contained replay sources for layer-aware composite fallback islands. */
@@ -214,6 +221,8 @@ export interface VectorExtractOptions extends PdfIccOptions {
   onProgress?: LoadProgressCallback;
   /** Also expose word-level text strings with scene-space positions. Default false. */
   extractTextContent?: boolean;
+  /** Which annotation appearances become page content. Default `"render"`. */
+  annotationAppearances?: AnnotationAppearanceMode;
 }
 
 class Float4Builder {
@@ -438,6 +447,7 @@ async function extractPdfPageScenesWithNative(
             : "safe",
         enableSegmentMerge: options.enableSegmentMerge !== false,
         enableInvisibleCull: options.enableInvisibleCull !== false,
+        ...(options.annotationAppearances ? { annotationAppearances: options.annotationAppearances } : {}),
         onProgress: reportProgress
       });
       signal?.throwIfAborted();
@@ -707,8 +717,9 @@ function assertPdfSourceBytes(pdfData: ArrayBuffer): void {
   assertPdfBytes(new Uint8Array(pdfData, 0, Math.min(pdfData.byteLength, PDF_HEADER_SCAN_BYTES)));
 }
 
-export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
-  return composeScenesInGrid(pageScenes, requestedPagesPerRow);
+export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
+  return composeScenesInGrid(pageScenes, requestedPagesPerRow, onDiagnostic);
 }
 
 export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
@@ -809,7 +820,8 @@ interface PagePlacement {
   translateY: number;
 }
 
-function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
+function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
   if (pageScenes.length === 0) {
     return createEmptyVectorScene();
   }
@@ -944,6 +956,9 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let combinedPageBounds: Bounds | null = null;
 
   const layers = composeOptionalContent(pageScenes.map(scene => scene.optionalContent));
+  if (layers.droppedAnnotationLayers) onDiagnostic?.({ code: "annotation.layer-limit", severity: "warning",
+    message: `${layers.droppedAnnotationLayers} annotation appearance(s) exceed the scene's layer limit and cannot be hidden individually.`,
+    details: { annotationCount: layers.droppedAnnotationLayers } });
   const paintGraph: ScenePaintGraph | undefined = pageScenes.some(scene => scene.paintGraph) ? { roots: [] } : undefined;
   const retainedPages: SceneRetainedPage[] = [];
   const clipPaths: VectorClipPath[] = [];
@@ -955,6 +970,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const combinedTextContent: SceneTextItem[] = [];
   const annotations: SceneAnnotation[] = [];
   const pdfPages: ScenePdfPage[] = [];
+  const structurePages: Parameters<typeof composeSceneStructure>[0][number][] = [];
   let hasTextContent = false;
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
@@ -964,6 +980,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const tx = placement.translateX;
     const ty = placement.translateY;
     const pageRectBase = pageRectOffset;
+    structurePages.push({ scene, offsets: { pageRectBase, primitives: {
+      fill: fillPathOffset, stroke: segmentOffset, text: textInstanceOffset, raster: rasterLayers.length,
+      "gradient-fill": gradientFillPathOffset, "gradient-stroke": gradientStrokeRunOffset
+    } } });
     if (pagePrimitiveRanges) {
       validatePagePrimitiveRanges(scene);
       const offsets = [segmentOffset, fillPathOffset, textInstanceOffset, rasterLayers.length, gradientFillPathOffset, gradientStrokeRunOffset];
@@ -1301,8 +1321,14 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
+  const { droppedPages: structureDroppedPages, ...structure } = composeSceneStructure(structurePages);
+  if (structureDroppedPages) onDiagnostic?.({ code: "structure.limit", severity: "warning",
+    message: `${structureDroppedPages} page(s) exceed the scene's structure attribution limit; their content has no MCIDs.`,
+    details: { pageCount: structureDroppedPages } });
   const composedScene: VectorScene = {
     annotations,
+    ...(pageScenes[0].annotationAppearances ? { annotationAppearances: pageScenes[0].annotationAppearances } : {}),
+    ...structure,
     pdfPages,
     ...(paintGraph ? { paintGraph } : {}),
     ...(retainedPages.length ? { retainedPages } : {}),

@@ -93,8 +93,11 @@ try {
   const {createLayerVisibilityController}=await import("../src/layerVisibility.ts");
   const {createEmptyVectorScene}=await import("../src/emptyVectorScene.ts");
   const scene=createEmptyVectorScene();
-  scene.optionalContent={groups:[group("a","Choice A",true),group("b","Choice B",false),group("free","Free",false),group("locked","Locked",true,true)],
+  // An annotation layer shares the table but is never a panel entry.
+  scene.optionalContent={groups:[group("a","Choice A",true),group("b","Choice B",false),group("free","Free",false),group("locked","Locked",true,true),
+    {id:"annotation:ref:9:0",name:"Annotation ref:9:0",defaultVisible:true,locked:true,usedInView:false,annotationId:"ref:9:0"}],
     conditions:[],order:[],radioGroups:[["a","b"]]};
+  scene.annotations=[{id:"ref:9:0"}];
   const native=createLayerVisibilityController({getScene:()=>scene,getRenderer:()=>({})});
   native.sceneChanged();
   const root=new Element(), panel=createPdfLayerControls({container:root,controller:native});
@@ -132,6 +135,8 @@ try {
       },
       setAllLayerVisibility:visible=>visibility.setAllLayerVisibility(visible),
       resetLayerVisibility:()=>visibility.resetLayerVisibility(),
+      getAnnotationLayers:()=>visibility.getAnnotationLayers(),
+      setAnnotationVisibility:(ids,visible)=>visibility.setAnnotationVisibility(ids,visible),
       subscribeLayerVisibility(callback) {
         visibilityListeners.add(callback);
         const unsubscribe=visibility.subscribe(callback);
@@ -197,6 +202,10 @@ try {
   await adapter.prepareReplacement(prepared);
   assert.equal(copies,2,"preparation catches up with an external visibility change during state transfer");
   assert.equal(prepared.getLayers().find(layer=>layer.id==="free").visible,true);
+  assert.equal(checkbox("annotation:ref:9:0"),undefined,"annotation layers never appear in the layer panel");
+  await original.setAnnotationVisibility(["ref:9:0"],false);
+  await adapter.prepareReplacement(prepared);
+  assert.deepEqual(prepared.getAnnotationLayers(),[{annotationId:"ref:9:0",visible:false}],"hidden annotation appearances survive a backend switch");
   const aborted=new AbortController();aborted.abort();
   await assert.rejects(adapter.prepareReplacement(prepared,aborted.signal),{name:"AbortError"});
   assert.equal(threeRoot.querySelector("fieldset").disabled,false,"an aborted backend switch restores layer controls");

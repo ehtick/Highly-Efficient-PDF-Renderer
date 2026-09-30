@@ -15,15 +15,16 @@ try {
   const { buildStrokeScene } = await import('../src/strokeSceneBuilder.ts');
   const { composeVectorScenesInGrid } = await import('../src/pdfVectorExtractor.ts');
   const { createThreePdfObject } = await import('../src/threePdfObject.ts');
-  const pageScene = color => {
+  const pageScene = (color, mcid) => {
     const scene = buildStrokeScene([{ points: [[0,0],[20,20]], color, width: 1 }]);
+    scene.markedContent = { items: [{ pageIndex: 0, sourcePageIndex: 0, mcid, tag: 'Figure' }], ranges: { stroke: Uint32Array.of(0,1,0) } };
     scene.optionalContent={groups:[{id:'drawing',name:'Drawing',defaultVisible:true,locked:false,usedInView:true}],
       conditions:[{kind:'group',groupId:'drawing'}],order:[],radioGroups:[]};
     scene.drawRuns=[{kind:'stroke',first:0,count:scene.segmentCount,optionalContent:0}];
     scene.textIndex = { version: 2, pages: [{ text: 'page', charInstance: Int32Array.of(-2,-2,-2,-2), fallbackQuads: Float32Array.of(2,2,4,4) }] };
     return scene;
   };
-  const scene = composeVectorScenesInGrid([pageScene('red'), pageScene('blue'), pageScene('green')], 3);
+  const scene = composeVectorScenesInGrid([pageScene('red', 5), pageScene('blue', 6), pageScene('green', 7)], 3);
   const original = structuredClone(scene);
   for (const backend of ['webgl', 'webgpu']) {
     const native = mockNative();
@@ -86,8 +87,11 @@ try {
       assert(Math.hypot(canonical.x-x,canonical.y-y)<1e-8,'document coordinate mapping intersects the transformed page');
       const hit = await pdf.pick({camera,element,clientX:client.x,clientY:client.y,tolerancePx:2,kinds:['stroke']});
       assert.deepEqual(hit?.primitive,{kind:'stroke',index:1},'document picking preserves canonical primitive references');
+      assert.deepEqual(hit?.markedContent,{pageIndex:1,sourcePageIndex:0,mcid:6,tag:'Figure'},'document picks report the document page slot');
       const localHit = await second.pick({camera,element,clientX:client.x,clientY:client.y,tolerancePx:2,kinds:['stroke']});
       assert.deepEqual(localHit?.primitive,{kind:'stroke',index:0},'page picking uses its local primitive store');
+      assert.deepEqual(localHit?.markedContent,{pageIndex:0,sourcePageIndex:0,mcid:6,tag:'Figure'},'page picks follow the local primitive order');
+      assert.equal(second.getPrimitive({kind:'stroke',index:0}).markedContent.mcid,6);
     }
     const matrix = new THREE.Matrix4().set(1,.2,0,20, 0,1,.1,5, .3,0,1,12, 0,0,0,1);
     await pdf.setPageTransform(1,matrix);

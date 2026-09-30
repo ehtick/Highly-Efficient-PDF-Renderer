@@ -128,6 +128,11 @@ Scene v9 optionally references `annotations/annotations.json` through
 { "file": "annotations/annotations.json", "version": 1, "count": 0 }
 ```
 
+An optional `"appearances": "forms"` or `"appearances": "none"` records that
+the file was converted with only form-field appearances, or no annotation
+appearances, compiled into page content. It is absent when every appearance was
+compiled. Readers that predate it ignore it.
+
 The UTF-8 JSON section contains `{ "version": 1, "annotations": [], "pdfPages": [] }` with
 `SceneAnnotation` records as described in [the API reference](api.md#pdf-annotations-and-html-bubbles).
 The optional `pdfPages` array holds `{pageIndex, sourcePageIndex, pdfToScene}`
@@ -150,6 +155,34 @@ This optional section changes none of the container, scene v9 or page v8
 versions. Existing supported files without metadata remain readable.
 Repacking cannot recover omitted annotations; reconvert the original PDF to
 obtain them.
+
+## Structure content
+
+Scene v9 optionally references tagged-PDF attribution through
+`manifest.scene.structure`:
+
+```json
+{ "file": "structure/structure.json", "rangesFile": "structure/content-ranges.varint",
+  "version": 1, "itemCount": 3, "elementCount": 4, "rangeCount": 3 }
+```
+
+`structure/structure.json` contains `{ "version": 1, "items": [], "elements": [] }`
+with the `SceneContentItem` and `StructureElement` records described in
+[the API reference](api.md#tagged-pdf-structure-mcids). An item records one
+marked-content sequence with an MCID: its scene page slot, source page, MCID, tag
+and optional owning `elementId`. Elements include every owner's ancestors.
+
+`structure/content-ranges.varint` assigns primitives to items. For each kind, in
+the order stroke, fill, text, raster, gradient-fill, gradient-stroke, it holds an
+unsigned varint range count followed by one triple per range: the gap from the
+previous range's end, the range length and the item index. Ranges within a kind
+are sorted, non-overlapping and address the canonical primitive stores; unlisted
+primitives belong to no item.
+
+Readers validate the descriptor counts, range bounds against the scene's stores,
+item and element references, and the element, property and text budgets. Older
+readers ignore the descriptor, and files without it carry no attribution. This
+optional section changes none of the container, scene v9 or page v8 versions.
 
 ## Scene draw order
 
@@ -276,6 +309,16 @@ stores and retains its primitive indices when layers are toggled.
 `{kind:"label",label,children}`. `radioGroups` lists arrays of mutually exclusive
 group IDs. Runtime visibility belongs to a view and is never written over these
 original definitions or exported defaults.
+
+A group with a nonempty string `annotationId` is an annotation layer rather than
+a PDF layer: it shows or hides the compiled appearance of the annotation with
+that `SceneAnnotation.id`, and its `id` is `annotation:<annotationId>`. The
+annotation's draw runs use its group condition, or an `and` of that condition
+and the PDF layer condition the appearance already had. Annotation layers are
+`defaultVisible`, `locked` and not `usedInView`, and appear in neither `order`
+nor `radioGroups`. Readers without annotation layers therefore treat them as
+fixed, visible layers and cannot hide them through layer controls. A scene
+without PDF layers can carry this object for annotation layers alone.
 
 When searchable characters need visibility associations, `manifest.textIndex`
 adds `optionalContentFile`, naming `text/optional-content.varint`. Its unsigned

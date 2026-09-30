@@ -121,6 +121,24 @@ export const ANNOTATION_LIMITS = Object.freeze({
   count: 262_144, numbers: 2_000_000, text: 8_000_000, actions: 4096, depth: 32
 });
 
+/**
+ * Which annotation appearances become page content at compile time. `"forms"`
+ * keeps only Widget (form field) appearances. Metadata is extracted either way.
+ */
+export type AnnotationAppearanceMode = "render" | "forms" | "none";
+
+export const ANNOTATION_APPEARANCE_MODES: readonly AnnotationAppearanceMode[] = Object.freeze(["render", "forms", "none"]);
+
+export function validateAnnotationAppearanceMode(value: unknown): asserts value is AnnotationAppearanceMode | undefined {
+  if (value !== undefined && !ANNOTATION_APPEARANCE_MODES.includes(value as AnnotationAppearanceMode)) {
+    throw new RangeError('annotationAppearances must be "render", "forms" or "none".');
+  }
+}
+
+export function annotationAppearanceIncluded(mode: AnnotationAppearanceMode | undefined, subtype: string): boolean {
+  return mode === undefined || mode === "render" || (mode === "forms" && subtype === "Widget");
+}
+
 export function transformAnnotationPoints(values: readonly number[], matrix: PdfMatrix): number[] {
   const result: number[] = [];
   for (let i = 0; i < values.length; i += 2) {

@@ -42,6 +42,9 @@ Options:
       alternate: skip engines and use approximate colors, with a warning.
       none:      disable built-in conversion and approximation; reject ICC content.
       Fallback warnings identify affected pages and the engine used.
+  --annotation-appearances=render|forms|none  Annotation appearances compiled
+      into page content (default: render). forms keeps only form-field widgets;
+      none draws no annotation. Annotation metadata is kept in every mode.
 
 Examples:
   node PDFtoHEP.js ./Level1.pdf
@@ -70,6 +73,7 @@ export function parsePdfToHepArguments(args) {
   let inputPath;
   let outputDirectory;
   let iccEngine;
+  let annotationAppearances;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -100,6 +104,14 @@ export function parsePdfToHepArguments(args) {
       iccEngine = value;
       continue;
     }
+    if (!positionalOnly && argument.startsWith("--annotation-appearances=")) {
+      const value = argument.slice("--annotation-appearances=".length);
+      if (annotationAppearances !== undefined || !["render", "forms", "none"].includes(value)) {
+        throw new Error("Pass exactly one --annotation-appearances=render, --annotation-appearances=forms, or --annotation-appearances=none.");
+      }
+      annotationAppearances = value;
+      continue;
+    }
     if (!positionalOnly && argument.startsWith("-")) {
       throw new Error(`Unknown option: ${argument}`);
     }
@@ -116,7 +128,8 @@ export function parsePdfToHepArguments(args) {
   return {
     force, help, inputPath,
     ...(outputDirectory === undefined ? {} : { outputDirectory }),
-    ...(iccEngine === undefined ? {} : { iccEngine })
+    ...(iccEngine === undefined ? {} : { iccEngine }),
+    ...(annotationAppearances === undefined ? {} : { annotationAppearances })
   };
 }
 
@@ -253,13 +266,14 @@ function parseWorkerHeapMb(value, label) {
   return heapMb;
 }
 
-export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory, iccEngine) {
+export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances) {
   return [
     `--max-old-space-size=${heapMb}`,
     scriptPath,
     ...(force ? ["--force"] : []),
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),
+    ...(annotationAppearances === undefined ? [] : [`--annotation-appearances=${annotationAppearances}`]),
     "--",
     pdfPath
   ];
@@ -518,7 +532,7 @@ export function startPdfToHepWorker(
   const workerToken = randomUUID();
   const child = spawnImplementation(
     process.execPath,
-    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine),
+    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances),
     {
       stdio: "inherit",
       shell: false,
@@ -786,6 +800,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         outputPath,
         outputDirectory: options.outputDirectory,
         iccEngine: options.iccEngine,
+        annotationAppearances: options.annotationAppearances,
         fileNumber: index + 1,
         fileCount: pdfPaths.length
       });
@@ -852,6 +867,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           sourceLabel,
           signal: abortController.signal,
           iccEngine: options.iccEngine,
+          annotationAppearances: options.annotationAppearances,
           onDiagnostic: (diagnostic) => {
             if (diagnostic.severity !== "warning") return;
             const page = diagnostic.pageIndex === undefined ? "" : ` page ${diagnostic.pageIndex + 1}`;

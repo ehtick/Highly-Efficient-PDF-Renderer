@@ -1,5 +1,6 @@
 import { validatePagePrimitiveRanges } from "./scenePageViews";
 import { writeHepAnnotations, readHepAnnotations } from "./hepAnnotations";
+import { readHepStructure, writeHepStructure } from "./hepStructure";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateSceneOptionalContent, validateSceneOptionalContentReferences } from "./optionalContent";
 import { validateSceneRetainedPages } from "./retainedPageData";
@@ -167,6 +168,7 @@ interface ParsedDataTextureEntry {
 
 interface ParsedDataSceneEntry {
   annotations?: unknown;
+  structure?: unknown;
   retainedPages?: unknown;
   paintGraph?: unknown;
   optionalContent?: unknown;
@@ -270,6 +272,7 @@ export async function buildHepBlobForLayout(
   );
   const archive = new HepArchive();
   const annotations = writeHepAnnotations(archive, scene);
+  const structure = writeHepStructure(archive, scene);
   const gradientMesh = writeHepGradientMesh(archive, scene);
   const retainedFiles = new Map<HeprPageData, string>();
   const retainedPages = scene.retainedPages?.map(resource => {
@@ -407,6 +410,7 @@ export async function buildHepBlobForLayout(
       : undefined,
     scene: {
       annotations,
+      structure,
       bounds: scene.bounds,
       pageBounds: scene.pageBounds,
       pageRects: Array.from(scene.pageRects),
@@ -2148,6 +2152,7 @@ async function loadSceneFromHepInternal(
     preparedStrokeGeometry.set(scene, strokeGeometry.encoded);
   }
   scene.annotations = await readHepAnnotations(archive, sceneMeta.annotations, scene, signal);
+  await readHepStructure(archive, sceneMeta.structure, scene, signal);
   preparedHepScenes.add(scene);
   progress.complete({ sourceType: "hep" });
   return scene;

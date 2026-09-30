@@ -1,12 +1,16 @@
-import { validateAnnotations, validateScenePdfPages, type SceneAnnotation } from "./annotationData";
+import { validateAnnotationAppearanceMode, validateAnnotations, validateScenePdfPages, type AnnotationAppearanceMode,
+  type SceneAnnotation } from "./annotationData";
 import type { HepArchive } from "./hepContainer";
 import type { VectorScene } from "./pdfVectorExtractor";
 
 export const HEP_ANNOTATIONS_PATH = "annotations/annotations.json";
 export const MAX_HEP_ANNOTATION_BYTES = 64 * 1024 * 1024;
 
-export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): { file: string; version: 1; count: number } | undefined {
+export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): {
+  file: string; version: 1; count: number; appearances?: AnnotationAppearanceMode;
+} | undefined {
   if (scene.annotations === undefined && scene.pdfPages === undefined) return undefined;
+  validateAnnotationAppearanceMode(scene.annotationAppearances);
   const annotations = scene.annotations ?? [];
   validateScenePdfPages(scene.pdfPages, scene.pageCount);
   validateAnnotations(annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
@@ -16,14 +20,17 @@ export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): { 
   const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations, pdfPages: scene.pdfPages }));
   if (bytes.length > MAX_HEP_ANNOTATION_BYTES) throw new Error("Annotation metadata exceeds the HEP section limit.");
   archive.file(HEP_ANNOTATIONS_PATH, bytes);
-  return { file: HEP_ANNOTATIONS_PATH, version: 1, count: annotations.length };
+  // Older readers ignore the optional mode; "render" is recorded by omission.
+  return { file: HEP_ANNOTATIONS_PATH, version: 1, count: annotations.length,
+    ...(scene.annotationAppearances && scene.annotationAppearances !== "render" ? { appearances: scene.annotationAppearances } : {}) };
 }
 
 export async function readHepAnnotations(archive: HepArchive, descriptor: unknown, scene: VectorScene,
   signal?: AbortSignal): Promise<readonly SceneAnnotation[]> {
   if (descriptor === undefined) return [];
-  const meta = descriptor as { file?: unknown; version?: unknown; count?: unknown };
-  if (!meta || meta.file !== HEP_ANNOTATIONS_PATH || meta.version !== 1 || !Number.isSafeInteger(meta.count) || (meta.count as number) < 0) {
+  const meta = descriptor as { file?: unknown; version?: unknown; count?: unknown; appearances?: unknown };
+  if (!meta || meta.file !== HEP_ANNOTATIONS_PATH || meta.version !== 1 || !Number.isSafeInteger(meta.count) || (meta.count as number) < 0 ||
+      (meta.appearances !== undefined && meta.appearances !== "forms" && meta.appearances !== "none")) {
     throw new Error("Invalid HEP annotation descriptor.");
   }
   signal?.throwIfAborted();
@@ -39,5 +46,6 @@ export async function readHepAnnotations(archive: HepArchive, descriptor: unknow
   validateAnnotations(data.annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
   validateScenePdfPages(data.pdfPages, scene.pageCount);
   scene.pdfPages = data.pdfPages;
+  if (meta.appearances !== undefined) scene.annotationAppearances = meta.appearances as AnnotationAppearanceMode;
   return data.annotations as SceneAnnotation[];
 }

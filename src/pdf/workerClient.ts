@@ -1,4 +1,4 @@
-import type { PdfAnnotation } from "../annotationData";
+import { validateAnnotationAppearanceMode, type PdfAnnotation } from "../annotationData";
 import type {
   HeprPageData,
   PdfCompileOptions,
@@ -325,6 +325,7 @@ class WorkerPdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: PdfCompileOptions = {}
   ): Promise<HeprPageData> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const signal = combineSignals(this.lifetime.signal, options.signal);
     let release: (() => void) | null = null;
     try {
@@ -344,6 +345,7 @@ class WorkerPdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: NativeVectorCompileOptions = {}
   ): Promise<VectorScene> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const signal = combineSignals(this.lifetime.signal, options.signal);
     let release: (() => void) | null = null;
     try {
@@ -359,6 +361,7 @@ class WorkerPdfSession implements NativeVectorPdfSession {
   }
 
   compilePages(options: PdfCompilePagesOptions = {}): AsyncIterable<HeprPageData> {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const indexes = normalizePageIndexes(options.sourcePageIndexes, this.info.pageCount);
     const session = this;
     const operation = new AbortController();
@@ -561,7 +564,11 @@ class PdfWorkerConnection {
     return (this.request({
       operation: "compile-page",
       sourcePageIndex,
-      options: { limits: options.limits, optimization: options.optimization }
+      options: {
+        limits: options.limits,
+        optimization: options.optimization,
+        ...(options.annotationAppearances ? { annotationAppearances: options.annotationAppearances } : {})
+      }
     }, [], signal, options.onProgress) as Promise<CompileSuccess>).then((response) => {
       this.replaceDiagnostics(response.diagnostics);
       return response.page;
@@ -581,6 +588,7 @@ class PdfWorkerConnection {
         optimization: options.optimization,
         enableSegmentMerge: options.enableSegmentMerge,
         enableInvisibleCull: options.enableInvisibleCull,
+        ...(options.annotationAppearances ? { annotationAppearances: options.annotationAppearances } : {}),
         ...(options.vectorFallback ? { vectorFallback: options.vectorFallback } : {})
       }
     }, [], signal, options.onProgress) as Promise<CompileVectorSuccess>).then((response) => {

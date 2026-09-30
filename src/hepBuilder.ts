@@ -15,6 +15,7 @@ import {
 } from "./loadProgress";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import type { AnnotationAppearanceMode } from "./annotationData";
 
 /** Compression algorithm used inside a generated HEP file. */
 export type HepCompression = "deflate" | "store";
@@ -53,6 +54,13 @@ export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOption
 
   /** Maximum pages per row in the composed scene. */
   maxPagesPerRow?: number;
+
+  /**
+   * Which annotation appearances are compiled into page content. The HEP
+   * records the mode; annotation metadata is kept in every mode.
+   * @default "render"
+   */
+  annotationAppearances?: AnnotationAppearanceMode;
 }
 
 /** Options when building parsed data from an existing HEPR scene. */
@@ -101,6 +109,7 @@ async function buildHepFromPdf(
     invisibleCull: options.invisibleCull,
     pages: options.pages,
     maxPagesPerRow: options.maxPagesPerRow,
+    annotationAppearances: options.annotationAppearances,
     sourceKind: "pdf",
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
   }, options.signal);

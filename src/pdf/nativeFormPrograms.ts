@@ -16,6 +16,7 @@ import {
 } from "./nativeCos";
 import type { NativePdfDocument } from "./nativeDocument";
 import type { NativeOptionalContentRegistry } from "./nativeOptionalContent";
+import { annotationAppearanceIncluded, type AnnotationAppearanceMode } from "../annotationData";
 import {
   computeNativePdfAnnotationPlacement,
   type NativePdfAnnotationPlacement
@@ -77,6 +78,8 @@ export interface NativePdfFormGraphOptions {
   readonly retainOptionalContent?: boolean;
   /** Deterministic fallback for visible Widgets without a usable `/AP /N`. */
   readonly appearanceSynthesizer?: NativePdfAppearanceSynthesizer;
+  /** Appearances left out of page content; their metadata is unaffected. */
+  readonly annotationAppearances?: AnnotationAppearanceMode;
   /** Reuse the caller's exact page scan instead of lexing page content again. */
   readonly pageResourceReferences?: DensePdfResourceReferences;
   readonly signal?: AbortSignal;
@@ -213,6 +216,8 @@ export class NativePdfFormGraphBuilder {
     const annotations = await registry.listPageAnnotations(this.pageIndex, options.signal);
     for (const annotation of annotations) {
       throwIfAborted(options.signal);
+      // Excluded before resolution, so their appearance streams stay lazy.
+      if (!annotationAppearanceIncluded(options.annotationAppearances, annotation.subtype)) continue;
       const appearance = options.appearanceSynthesizer
         ? await resolveNativePdfAnnotationAppearanceWithSynthesis(
             registry,

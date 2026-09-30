@@ -11,6 +11,7 @@ import { hasPdfHeader } from "./pdfSignature";
 import { waitForLoad } from "./loadCancellation";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -86,6 +87,19 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   extractText?: boolean;
 
   /**
+   * Which PDF annotation appearances are compiled into page content:
+   * `"render"` draws them all, `"forms"` keeps only form-field (Widget)
+   * appearances and `"none"` draws none. Annotation metadata in
+   * `VectorScene.annotations` is extracted in every mode, so hosts can draw
+   * their own markers without a duplicate appearance underneath.
+   *
+   * PDF sources only; a HEP file keeps the mode it was converted with.
+   *
+   * @default "render"
+   */
+  annotationAppearances?: AnnotationAppearanceMode;
+
+  /**
    * Force source interpretation. Use this when bytes or URLs do not make the
    * format obvious.
    *
@@ -141,9 +155,11 @@ async function loadPdfSceneFromSourceInternal(
   const sourceLabel = resolveSourceLabel(source, sourceKind);
 
   if (sourceKind === "pdf") {
+    validateAnnotationAppearanceMode(options.annotationAppearances);
     const extractOptions: VectorExtractOptions = {
       iccTransformResolver: options.iccTransformResolver,
       iccEngine: options.iccEngine,
+      annotationAppearances: options.annotationAppearances,
       onDiagnostic: options.onDiagnostic,
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
@@ -158,7 +174,7 @@ async function loadPdfSceneFromSourceInternal(
     );
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
-    const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow));
+    const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow, options.onDiagnostic));
     signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     signal?.throwIfAborted();

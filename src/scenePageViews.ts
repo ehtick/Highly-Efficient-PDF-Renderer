@@ -4,6 +4,7 @@ import type { PrimitiveKind, PrimitiveRef } from "./scenePrimitives";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import { defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateScenePaintGraph } from "./scenePaintGraph";
+import { selectSceneMarkedContent } from "./structureData";
 
 export const PAGE_PRIMITIVE_KINDS = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
 export const PAGE_PRIMITIVE_RANGE_STRIDE = PAGE_PRIMITIVE_KINDS.length * 2;
@@ -202,6 +203,10 @@ export class ScenePageViews {
     scene.textContent = source.textContent?.filter(item => item.pageIndex === pageIndex).map(item => ({ ...item, pageIndex: 0 }));
     scene.annotations = source.annotations?.filter(a => a.pageIndex === pageIndex).map(a => ({ ...a, pageIndex: 0 }));
     scene.pdfPages = source.pdfPages?.filter(p => p.pageIndex === pageIndex).map(p => ({ ...p, pageIndex: 0 }));
+    // Attribution follows the local primitive order; structure elements are document-wide.
+    const markedContent = selectSceneMarkedContent(source, primitives);
+    if (markedContent) scene.markedContent = markedContent;
+    else delete scene.markedContent;
     scene.rasterLayers = Array.from(primitives.raster, index => ({ ...source.rasterLayers[index], pageIndex: 0 }));
     const raster = scene.rasterLayers[0];
     scene.rasterLayerWidth = raster?.width ?? 0; scene.rasterLayerHeight = raster?.height ?? 0;
